@@ -1,4 +1,4 @@
-# cargo-deny config (design §13). Wiring into CI lands with the B1 follow-ups.
+# cargo-deny config (design §13); enforced by the cargo-deny job in CI.
 [advisories]
 version = 2
 yanked = "deny"

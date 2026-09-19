@@ -6,6 +6,6 @@
 mod tests {
     #[test]
     fn smoke() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
+        assert_eq!(env!("CARGO_PKG_NAME"), "golem-server");
     }
 }

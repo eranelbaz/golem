@@ -338,7 +338,7 @@ One envelope everywhere (HTTP + CLI + logs):
              "detail": { /* structured, e.g. per-tier byte overruns */ } } }
 ```
 
-Codes (stable, documented): `golem_backend_unavailable`, `golem_plan_infeasible`, `golem_model_mismatch`, `golem_multimodal_unsupported`, `golem_unsupported_field`, `golem_storage_unavailable`, `golem_instance_not_found`, `golem_busy`, `golem_invalid_request`. All 4xx/5xx carry `code`; the doc table maps codes → remediation.
+Codes (stable, documented): `golem_backend_unavailable`, `golem_plan_infeasible`, `golem_model_mismatch`, `golem_multimodal_unsupported`, `golem_unsupported_field`, `golem_storage_unavailable`, `golem_instance_not_found`, `golem_not_found`, `golem_busy`, `golem_invalid_request`. All 4xx/5xx carry `code`; the doc table maps codes → remediation.
 
 ### 8.5 Server posture
 
@@ -486,7 +486,7 @@ Select and lock the fork commit (GLM-5.3-Flash text support present); build HIP 
 | PCIe becomes the bottleneck; cold decode unusably slow | unknown | existential for the product | M0 measures before building; prefetch + resident-set design attacks exactly this; if the floor isn't met, re-scope happens at M0, not M4 |
 | Fork patch conflicts on rebase | medium | medium | ≤1k-line diff, confined files, T4 as rebase gate; P2 is the deepest patch and is isolated to one scheduler function |
 | Cache-state-dependent nondeterminism (I1 violation) | low | fatal to the core claim | T3 is a first-class test from M2 onward, run in nightly hardware CI |
-| Multi-instance VRAM oversubscription crashes the driver | medium | medium | plan-time warnings (§9.5), per-instance budgets, documented limits; no silent overcommit |
+| Multi-instance VRAM oversubscription crashes the driver | medium | medium | plan-time warnings (§9.3), per-instance budgets, documented limits; no silent overcommit |
 | RAM pool + page cache pressure on smaller-RAM machines | medium | low | pool default ≤75% free RAM, mlock'd; `--ram-experts-gib`; plan reports RAM fit explicitly |
 | Checksum verify slows startup (~170 GB) | certain | low | ~1–2 min amortized, `--skip-verify` loud-flagged; CRC32C keeps steady-state cost near zero |
 

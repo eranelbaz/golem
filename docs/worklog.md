@@ -19,7 +19,7 @@ to resume from this file alone.
 5. **Implement** exactly the task's scope — the design section(s) it cites are the spec for the code. Follow §13 of the design (clippy `-D warnings`, fmt, nextest; `unsafe` rules). TDD where the task defines test acceptance.
 6. **Verify acceptance** — run the exact commands the task lists; paste the relevant output tail into the PR body.
 7. **Commit** with Conventional Commits (`feat:`, `test:`, `fix:`, `docs:`, `build:`). Multiple commits fine; keep them reviewable.
-8. **Update this file on the task branch**: set the task's status to `PR open (#N)`, append an entry under **Log** (newest first) with: date, task id, branch, PR number, what landed, any deviations from the design (deviations must also be flagged in the PR body).
+8. **Update this file on the task branch**: set the task's status to `PR open (#N)`, append an entry under **Log** (newest first) with: date, task id, branch, PR number, what landed, any deviations from the design (deviations must also be flagged in the PR body). Mark `PR open (#N)` **only** — `done` is set exclusively after step 2's `gh pr list` confirms the merge in a later session.
 9. **Push and open the PR:** `gh pr create --repo eranelbaz/golem --fill` — title `task(<id>): <slug>`; body: task id, design sections implemented, acceptance evidence, deviation notes.
 10. **Report to the user:** branch, PR link, what to review, what the next session should pick up.
 
@@ -39,9 +39,9 @@ to resume from this file alone.
 ## 1. Status snapshot
 
 - **Phase:** M0 — feasibility spike (gates everything; design §14)
-- **Next task:** **B1** (workspace skeleton) — M0 hardware tasks unlocked after B1
-- **Open PRs:** none
-- **Last session:** 2026-09-19 — bootstrap: repo created, design v1.0, worklog initialized
+- **Next task:** **M0.1** (fork-pin) — after PR #1 merges
+- **Open PRs:** #1 — task B1, workspace skeleton (branch `task/b1-workspace-skeleton`)
+- **Last session:** 2026-09-19 — bootstrap + B1 scaffold (see Log)
 
 ---
 
@@ -66,7 +66,7 @@ Legend: ☐ `todo` · ◐ `in-progress` · ◑ `PR open` · ☑ `done`. IDs are 
 
 ### Phase B — Bootstrap (no GPU needed)
 
-- ☑ **B1 · workspace-skeleton** — Cargo workspace per design §13: crates `golem-cli`, `golem-server`, `golem-engine`, `golem-llama-sys`, `golem-placement`, `golem-store`, `golem-plan`, `golem-api`, `golem-registry`, plus `xtask`; `rust-toolchain.toml`; clippy/fmt/deny config; all crates compile, `cargo clippy -D warnings` clean, `cargo nextest run` green (placeholder smoke test per crate). *(done — PR #1)*
+- ◑ **B1 · workspace-skeleton** — Cargo workspace per design §13: crates `golem-cli`, `golem-server`, `golem-engine`, `golem-llama-sys`, `golem-placement`, `golem-store`, `golem-plan`, `golem-api`, `golem-registry`, plus `xtask`; `rust-toolchain.toml`; clippy/fmt/deny config; error envelope in `golem-api` (design §8.4) with table-driven wire-format tests; CI enforces fmt + clippy `-D warnings` + nextest + cargo-deny. Accept: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green locally; same gates (nextest) enforced in CI. *(PR open — #1)*
 
 ### Phase M0 — Feasibility spike on the 7900 XTX (gates everything; exit criteria design §14)
 
@@ -116,6 +116,17 @@ Legend: ☐ `todo` · ◐ `in-progress` · ◑ `PR open` · ☑ `done`. IDs are 
 ---
 
 ## 4. Log (append-only, newest first)
+
+### 2026-09-19 — session 2: B1 workspace skeleton (PR #1)
+
+- Implemented B1 on `task/b1-workspace-skeleton`: 9 crates + `xtask` + `golem` bin, workspace lints (`unsafe_code` deny), toolchain pin `1.98.1`, `deny.toml`, CI (fmt / clippy `-D warnings` / nextest / cargo-deny).
+- `golem-api` ships the full error envelope (design §8.4): 10 codes with exact `golem_*` wire strings, table-driven serde tests, `detail` field for structured payloads.
+- Zai reviewer subagent quality pass (2 Critical / 5 Important / 5 Minor) — **all 12 applied**:
+  - Design amendments: `golem_not_found` added to §8.4 code list (was referenced by §8.1 but missing — 9 → 10 codes); §15 citation §9.5 → §9.3.
+  - Worklog protocol: step 8 now forbids marking `done` before merge confirmation (step 2 verifies).
+  - CI now runs nextest + cargo-deny (was orphaned); smoke tests assert crate name, not version; README layout annotated with landing tasks.
+- **Deviations:** nextest not installed locally — local acceptance runs `cargo test --workspace`; CI enforces `cargo nextest run`. Recorded here and in the PR body per protocol.
+- Next session: merge PR #1 (if green), mark B1 `done (PR #1)`, then start **M0.1** (fork-pin).
 
 ### 2026-09-19 — session 1: bootstrap
 
