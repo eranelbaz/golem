@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Model weights & runtime data — never in git
+models/
+*.gguf
+data/
+journals/
+logs/
+
+# Vendored fork build artifacts
+vendor/llama.cpp/build/
+
+# Local scratch
+.m0-work/
+*.local.toml
+
+# Agent tooling scratch
+.pi/
