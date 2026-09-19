@@ -15,17 +15,21 @@ to resume from this file alone.
    - `git -C ~/Projects/golem pull --ff-only` (this file may have moved)
    - `gh pr list --repo eranelbaz/golem --state open` (are prior task PRs merged? If a PR is merged: check its task done here; if a PR has review comments, address them **first** on its branch)
 3. **Pick the first task** on the board below with status `todo` whose dependencies are all `done` (or `n/a`). Do **not** skip ahead.
-4. **Branch:** `git checkout -b task/<task-id>-<slug>` from up-to-date `main` (e.g. `task/b1-workspace-skeleton`).
-5. **Implement** exactly the task's scope — the design section(s) it cites are the spec for the code. Follow §13 of the design (clippy `-D warnings`, fmt, nextest; `unsafe` rules). TDD where the task defines test acceptance.
-6. **Verify acceptance** — run the exact commands the task lists; paste the relevant output tail into the PR body.
-7. **Commit** with Conventional Commits (`feat:`, `test:`, `fix:`, `docs:`, `build:`). Multiple commits fine; keep them reviewable.
-8. **Update this file on the task branch**: set the task's status to `PR open (#N)`, append an entry under **Log** (newest first) with: date, task id, branch, PR number, what landed, any deviations from the design (deviations must also be flagged in the PR body). Mark `PR open (#N)` **only** — `done` is set exclusively after step 2's `gh pr list` confirms the merge in a later session.
-9. **Push and open the PR:** `gh pr create --repo eranelbaz/golem --fill` — title `task(<id>): <slug>`; body: task id, design sections implemented, acceptance evidence, deviation notes.
-10. **Report to the user:** branch, PR link, what to review, what the next session should pick up.
+4. **Branch:** `git checkout -b task/<task-id>-<slug>` from up-to-date `main` (e.g. `task/b1-workspace-skeleton`). A plain branch in the main checkout is fine here — the writing-plans skill's isolated-worktree advice is optional, not required.
+5. **Write the implementation plan first — no code before it exists:** load the writing-plans skill at `~/.pi/agent/git/github.com/eranelbaz/superpowers/skills/writing-plans/SKILL.md` and author `docs/superpowers/plans/YYYY-MM-DD-<task-id>-<slug>.md` in its exact format — skill header (agentic-workers banner, Goal / Architecture / Tech Stack / Spec lines), Global Constraints, bite-sized tasks with exact files, exact commands, failing-test-first steps, and per-task commit points; no placeholders. The design section(s) the board task cites are the plan's spec. Where the plan must refine the board's wording (e.g. a concrete acceptance command), fix the board line in the same PR. Commit the plan.
+6. **Plan review gate:** dispatch ONE zai reviewer subagent (quick mode) using `~/.pi/agent/git/github.com/eranelbaz/superpowers/skills/writing-plans/plan-document-reviewer-prompt.md`, passing the plan path and the spec path (the board task's cited design sections). If Status = **Issues Found** → fix and re-dispatch the whole plan, same mode, max 3 rounds; still unresolved at round 3 → stop and list the open items for the human. Only an **Approved** plan unlocks step 7. Summarize the review verdict in the PR body.
+7. **Implement exactly per the approved plan**, in plan order, ticking its checkboxes as steps complete (`- [ ]` → `- [x]`), following design §13 (clippy `-D warnings`, fmt, nextest; `unsafe` rules). If reality forces a deviation, update the plan doc in the same PR so it stays truthful — the plan, not chat memory, is the record.
+8. **Verify acceptance** — run the exact commands the task/plan lists; paste the relevant output tail into the PR body.
+9. **Commit** with Conventional Commits (`feat:`, `test:`, `fix:`, `docs:`, `build:`). The plan doc, its checkbox updates, and the implementation travel in the same PR. Multiple commits fine; keep them reviewable.
+10. **Push and open the PR:** compose the body (task id, plan link, design sections implemented, acceptance evidence, plan-review verdict, deviation notes) and run `gh pr create --repo eranelbaz/golem --title "task(<id>): <slug>" --body-file <body-file>` — do **not** use `--fill`, it cannot produce the mandated fields.
+11. **Update this file with the real PR number** (step 10 created it): set the task's status to `PR open (#N)`, append an entry under **Log** (newest first) with: date, task id, branch, PR number, **plan path**, what landed, any deviations from the design (deviations must also be flagged in the PR body). Mark `PR open (#N)` **only** — `done` is set exclusively after step 2's `gh pr list` confirms the merge in a later session. Commit and push the worklog update.
+12. **Report to the user:** branch, PR link, plan path, what to review, what the next session should pick up.
 
 **Rules**
 
 - One task = one branch = one PR. No drive-by refactors; fix-through-PR if something is broken.
+- **Plan-first is absolute:** no implementation commits for a board task before its plan doc exists and its review returned **Approved** (steps 5–6). Plans live in `docs/superpowers/plans/`, travel with the task's PR, and are historical record after merge — corrections go in follow-up PRs, never silent edits.
+- Docs/process changes that are not board tasks use a `docs/<slug>` branch with the same PR discipline (plan not required).
 - Never commit `vendor/llama.cpp` history — vendor as a **squashed single commit** (record the upstream SHA in the commit message and in `engine/llama-cpp.lock`).
 - Model weights never enter git (`.gitignore` covers `models/`, `*.gguf`).
 - If a task turns out larger than one session: split it on the board (edit this file in the PR), finish the first coherent half, note the split in Log.
@@ -39,9 +43,9 @@ to resume from this file alone.
 ## 1. Status snapshot
 
 - **Phase:** M0 — feasibility spike (gates everything; design §14)
-- **Next task:** **M0.1** (fork-pin) — after PR #1 merges
-- **Open PRs:** #1 — task B1, workspace skeleton (branch `task/b1-workspace-skeleton`)
-- **Last session:** 2026-09-19 — bootstrap + B1 scaffold (see Log)
+- **Next task:** **M0.1** (fork-pin) — executed plan-first per protocol steps 5–6
+- **Open PRs:** #2 — docs: planning protocol (branch `docs/planning-protocol`)
+- **Last session:** 2026-09-19 — PR #1 merged (B1 done); planning protocol wired into design + worklog
 
 ---
 
@@ -51,7 +55,7 @@ to resume from this file alone.
 |------|-------|
 | Machine | Arch Linux, author's own box — the v1 target machine (spec §Hardware) |
 | GPU | AMD RX 7900 XTX (Navi 31, PCI `1002:744c`), `amdgpu` bound — **gfx1100** |
-| ROCm | installed at `/opt/rocm` (`hipcc`, `rocminfo` present; exact version to pin in M0.2) |
+| ROCm | **7.2.4** at `/opt/rocm` (`hipcc`, `rocminfo` present; exact version recorded 2026-09-19 — pin goes into `llama-cpp.lock` at M0.2) |
 | RAM | 93 GiB total, ~75 GiB available |
 | Drives | `nvme0n1` Samsung 990 PRO 4TB (~1.9 TB free, hosts `/home`) · `nvme1n1` PNY CS2130 1TB — **two physical NVMe** for replica mode (design §5) |
 | Toolchain | rustc/cargo 1.98.1 (edition 2024), `gh` authed as `eranelbaz` (repo+workflow scopes) |
@@ -64,9 +68,11 @@ to resume from this file alone.
 
 Legend: ☐ `todo` · ◐ `in-progress` · ◑ `PR open` · ☑ `done`. IDs are stable — never renumber, only append.
 
+Every task executes **plan-first** (protocol steps 5–6): a per-task implementation plan in writing-plans format, stored under `docs/superpowers/plans/`, must pass plan review before any implementation commit; the plan lands in the same PR as its implementation.
+
 ### Phase B — Bootstrap (no GPU needed)
 
-- ◑ **B1 · workspace-skeleton** — Cargo workspace per design §13: crates `golem-cli`, `golem-server`, `golem-engine`, `golem-llama-sys`, `golem-placement`, `golem-store`, `golem-plan`, `golem-api`, `golem-registry`, plus `xtask`; `rust-toolchain.toml`; clippy/fmt/deny config; error envelope in `golem-api` (design §8.4) with table-driven wire-format tests; CI enforces fmt + clippy `-D warnings` + nextest + cargo-deny. Accept: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green locally; same gates (nextest) enforced in CI. *(PR open — #1)*
+- ☑ **B1 · workspace-skeleton** — Cargo workspace per design §13: crates `golem-cli`, `golem-server`, `golem-engine`, `golem-llama-sys`, `golem-placement`, `golem-store`, `golem-plan`, `golem-api`, `golem-registry`, plus `xtask`; `rust-toolchain.toml`; clippy/fmt/deny config; error envelope in `golem-api` (design §8.4) with table-driven wire-format tests; CI enforces fmt + clippy `-D warnings` + nextest + cargo-deny. Accept: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green locally; same gates (nextest) enforced in CI. *(done — PR #1)*
 
 ### Phase M0 — Feasibility spike on the 7900 XTX (gates everything; exit criteria design §14)
 
@@ -116,6 +122,15 @@ Legend: ☐ `todo` · ◐ `in-progress` · ◑ `PR open` · ☑ `done`. IDs are 
 ---
 
 ## 4. Log (append-only, newest first)
+
+### 2026-09-19 — session 3: planning protocol (writing-plans wired in)
+
+> Old protocol steps 5–10 were renumbered 5–12 in this session; session-2's "step 8" note below now refers to step 10.
+
+- Merged PR #1 (CI green, 1m0s); B1 → `done (PR #1)`.
+- Wired **superpowers:writing-plans** into the execution flow — protocol steps 3–12 now read: pick task → branch → **write plan** (`docs/superpowers/plans/YYYY-MM-DD-<id>-<slug>.md`, skill format, no placeholders) → **plan review gate** (one zai reviewer, `plan-document-reviewer-prompt.md`, ≤3 fix rounds, only Approved unlocks implementation) → implement per plan checkboxes → verify → PR carries plan + implementation together. Rules: plan-first is absolute; plans are historical record after merge; docs-only changes use `docs/<slug>` branches.
+- Design §13/§14 updated: plans directory in repo layout; plan-first execution noted at milestones. ROCm version recorded (7.2.4).
+- **Deliberately no task implementation this session.** Next chat: write + review the M0.1 plan, then implement on its own branch (PR #3).
 
 ### 2026-09-19 — session 2: B1 workspace skeleton (PR #1)
 
