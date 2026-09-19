@@ -1,0 +1,4 @@
+# Pins the exact compiler once rustup is present. This box currently uses
+# Arch's system rust (no rustup), for which this file is inert documentation.
+[toolchain]
+channel = "1.98.1"

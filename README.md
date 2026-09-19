@@ -28,11 +28,11 @@ Design approved, execution starting. Task board and current phase:
 
 ```
 docs/          spec, design, worklog, baselines, ADRs
-engine/        llama-cpp.lock — pinned fork commit + validated flags
-vendor/        vendored llama.cpp fork (squashed import; added at M0.1)
+engine/        llama-cpp.lock — pinned fork commit + validated flags (lands M0.1)
+vendor/        vendored llama.cpp fork — squashed import (lands M0.1)
 crates/        Rust workspace (golem-cli, -server, -engine, -llama-sys,
                -placement, -store, -plan, -api, -registry) + xtask
-scripts/       substrate build + hardware test scripts
+scripts/       substrate build + hardware test scripts (lands M0.2)
 ```
 
 ## Working on Golem

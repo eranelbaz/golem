@@ -1,0 +1,15 @@
+[package]
+name = "golem-cli"
+description = "golem CLI: run, serve, list, stop, plan, pull (tech design section 9)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "golem"
+path = "src/main.rs"
+
+[lints]
+workspace = true

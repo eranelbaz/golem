@@ -1,0 +1,11 @@
+[package]
+name = "golem-llama-sys"
+description = "Raw bindings to the vendored llama.cpp fork (tech design section 3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
