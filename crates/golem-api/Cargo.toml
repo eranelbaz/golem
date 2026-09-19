@@ -1,0 +1,15 @@
+[package]
+name = "golem-api"
+description = "OpenAI-compatible API types, error envelope, field policy (tech design section 8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

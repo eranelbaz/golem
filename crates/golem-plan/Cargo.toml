@@ -1,0 +1,11 @@
+[package]
+name = "golem-plan"
+description = "Offline VRAM/RAM/disk estimation shared by CLI and runtime (tech design section 10)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

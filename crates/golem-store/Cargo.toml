@@ -1,0 +1,11 @@
+[package]
+name = "golem-store"
+description = "Multi-disk mirrored storage, striped reads, checksums (tech design section 5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

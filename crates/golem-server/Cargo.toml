@@ -1,0 +1,11 @@
+[package]
+name = "golem-server"
+description = "Instance process: HTTP server, slot scheduler, decode loop (tech design sections 2 and 7)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
