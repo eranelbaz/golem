@@ -438,7 +438,7 @@ KV per token without loading the model: read from the arch table (glm5_next entr
 
 ```
 golem/
-├── product-spec.md, docs/ (tech-design.md, baselines/, adr/ ...)
+├── product-spec.md, docs/  (tech-design.md, worklog.md, superpowers/plans/, baselines/, adr/ ...)
 ├── engine/llama-cpp.lock          # pinned fork commit, ROCm line, patch list, M0-validated flags
 ├── vendor/llama.cpp/              # the fork (P1–P4 patches + golem-hooks.h)
 ├── crates/
@@ -461,6 +461,8 @@ Toolchain and standards: Rust stable (currently 1.98, `rust-toolchain.toml` pins
 ## 14. Milestones
 
 Execution is tracked task-by-task in [`docs/worklog.md`](worklog.md) (task board, statuses, PRs). Each milestone below defines *exit criteria*; the worklog decomposes them into branch/PR-sized tasks.
+
+Execution is **plan-first**: every board task is implemented from a written implementation plan in the superpowers:writing-plans format, stored under `docs/superpowers/plans/`, and that plan must pass a dedicated plan review (one reviewer subagent, quick mode; fix-and-redo loop capped at 3 rounds) **before** any implementation commit. The plan travels in the task's PR and is the authoritative execution record afterwards (worklog §0, steps 5–9).
 
 **M0 — Feasibility spike on the 7900 XTX (gates everything).**
 Select and lock the fork commit (GLM-5.3-Flash text support present); build HIP for gfx1100; validate FA/precision settings for MLA on ROCm (the open risk the spec flags); run `--n-cpu-moe`-style host-buffered experts; measure: cold-expert copy cost per step, achievable disk bandwidth (threads vs io_uring, 1 vs 2 drives), ROCm overhead, KV bytes/token, tok/s cold vs warm. Exit: T2 parity ≥ threshold on 8 prompts *and* measured cold tok/s above the "viable" line the author sets from the baseline (if disk→PCIe math says cold decode is unusable even with prefetch, the project re-scopes before more code exists). Deliverables: `engine/llama-cpp.lock`, baseline JSON #1, the M0 numbers feeding §10 constants.
