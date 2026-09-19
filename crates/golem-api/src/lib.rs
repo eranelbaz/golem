@@ -74,7 +74,13 @@ impl ErrorEnvelope {
         message: impl Into<String>,
         detail: Option<serde_json::Value>,
     ) -> Self {
-        Self { error: ErrorBody { code, message: message.into(), detail } }
+        Self {
+            error: ErrorBody {
+                code,
+                message: message.into(),
+                detail,
+            },
+        }
     }
 }
 
@@ -88,7 +94,10 @@ mod tests {
             (ErrorCode::BackendUnavailable, "golem_backend_unavailable"),
             (ErrorCode::PlanInfeasible, "golem_plan_infeasible"),
             (ErrorCode::ModelMismatch, "golem_model_mismatch"),
-            (ErrorCode::MultimodalUnsupported, "golem_multimodal_unsupported"),
+            (
+                ErrorCode::MultimodalUnsupported,
+                "golem_multimodal_unsupported",
+            ),
             (ErrorCode::UnsupportedField, "golem_unsupported_field"),
             (ErrorCode::StorageUnavailable, "golem_storage_unavailable"),
             (ErrorCode::InstanceNotFound, "golem_instance_not_found"),
@@ -102,7 +111,10 @@ mod tests {
                 serde_json::Value::String(wire.into()),
                 "wire string mismatch for {code:?}"
             );
-            assert_eq!(serde_json::from_value::<ErrorCode>(serde_json::to_value(code).unwrap()).unwrap(), code);
+            assert_eq!(
+                serde_json::from_value::<ErrorCode>(serde_json::to_value(code).unwrap()).unwrap(),
+                code
+            );
         }
     }
 
@@ -110,7 +122,10 @@ mod tests {
     fn envelope_roundtrips_and_omits_absent_detail() {
         let env = ErrorEnvelope::new(ErrorCode::BackendUnavailable, "no HIP device gfx1100");
         let json = serde_json::to_string(&env).unwrap();
-        assert!(json.contains(r#""code":"golem_backend_unavailable""#), "{json}");
+        assert!(
+            json.contains(r#""code":"golem_backend_unavailable""#),
+            "{json}"
+        );
         assert!(!json.contains("detail"), "{json}");
         let back: ErrorEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.error.code, ErrorCode::BackendUnavailable);
@@ -125,8 +140,14 @@ mod tests {
             Some(serde_json::json!({ "vram_over_bytes": 1_572_864 })),
         );
         let json = serde_json::to_string(&env).unwrap();
-        assert!(json.contains(r#""detail":{"vram_over_bytes":1572864}"#), "{json}");
+        assert!(
+            json.contains(r#""detail":{"vram_over_bytes":1572864}"#),
+            "{json}"
+        );
         let back: ErrorEnvelope = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.error.detail, Some(serde_json::json!({ "vram_over_bytes": 1_572_864 })));
+        assert_eq!(
+            back.error.detail,
+            Some(serde_json::json!({ "vram_over_bytes": 1_572_864 }))
+        );
     }
 }
