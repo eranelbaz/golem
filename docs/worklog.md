@@ -123,6 +123,10 @@ Every task executes **plan-first** (protocol steps 5–6): a per-task implementa
 
 ## 4. Log (append-only, newest first)
 
+### 2026-09-20 — session 5 (cont.): M0.2 follow-ups from quality pass (PR open)
+
+- Quality-pass findings applied in one follow-up PR: plan checkboxes ticked (14; protocol step-7 miss in PR #4), ADR 0001 recipe amended to the build-pruned `cs()` form (matches the M0.2 script; no-op on pristine trees), plan smoke command corrected to as-executed (`-st -v`), `7/7` layer claim fixed, `m0-notes` date/provenance/timing-caveat fixed, `build-substrate.sh` hardened (missing-key greps now loud FATAL instead of silent exit 1; `-o`-in-`[` removed; dead fallback comment removed; `BUILD-OK` asserts the binary exists).
+- No behavior change on this machine's inputs: re-ran the script after hardening — `pin-ok` / `rocm-check: ok (7.2.4 satisfies lock 7.2.4)` / `BUILD-OK` all print (skip leg re-verified via the stub PATH).
 ### 2026-09-20 — session 5: M0.2 hip-build (PR #4, merge 2b7ad58)
 
 - Executed M0.2 plan-first on `task/m0.2-hip-build` (plan: `docs/superpowers/plans/2026-09-19-m0.2-hip-build.md`; plan review 3 rounds — rounds 1–2 caught real script bugs: pin-hash didn't prune the build dir (poisoned re-runs), dead smoke URLs, untestable skip-leg; round 3 **Approved** with empirical verification on this machine).
