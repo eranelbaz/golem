@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the pinned vendored llama.cpp fork for gfx1100 (HIP). Design §14/M0.2.
+# Build the pinned vendored llama.cpp fork for gfx1100 (HIP).
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
@@ -20,7 +20,7 @@ pin=$(sed -n 's/^commit *= *//p' "$LOCK" | head -n1)
 [ -n "$pin" ] || { echo "FATAL: commit key missing in $LOCK"; exit 1; }
 echo "pin-ok: $pin"
 
-# --- advisory ROCm version check: WARN or skip, never fail (design §3.5) ---
+# --- advisory ROCm version check: WARN or skip, never fail ---
 lock_rocm=$(sed -n 's/^rocm *= *//p' "$LOCK" | head -n1)
 [ -n "$lock_rocm" ] || { echo "FATAL: rocm key missing in $LOCK"; exit 1; }
 if ! command -v rocminfo >/dev/null 2>&1; then
@@ -29,9 +29,9 @@ else
   # installed version from /opt/rocm/.info/version (no fallback needed on ROCm installs; absence → skip)
   inst=$(cat /opt/rocm/.info/version 2>/dev/null || true)
   if [ -z "$inst" ]; then echo "rocm-check: skipped (no /opt/rocm/.info/version)"; fi
-  # advisory-minimum semantics: equal major.minor → ok; older/newer → WARN; never fail (design §3.5)
+  # advisory-minimum semantics: equal major.minor → ok; older/newer → WARN; never fail
   if [ -n "$inst" ] && [ "$(printf '%s\n' "$inst" | cut -d. -f1-2)" != "$(printf '%s\n' "$lock_rocm" | cut -d. -f1-2)" ]; then
-    echo "WARN: rocminfo reports ROCm $inst, lock pins $lock_rocm — advisory minimum (design §3.5); continuing"
+    echo "WARN: rocminfo reports ROCm $inst, lock pins $lock_rocm — advisory minimum; continuing"
   elif [ -n "$inst" ]; then
     echo "rocm-check: ok ($inst satisfies lock $lock_rocm)"
   fi

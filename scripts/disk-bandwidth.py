@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""O_DIRECT pread64 disk bandwidth benchmark (M0.4, design §14).
+"""O_DIRECT disk bandwidth benchmark (M0.4).
 
 O_DIRECT bypasses the page cache, so no root drop_caches is needed.
-Chunk = 8 MiB (expert-read scale, design §5.4). Legs: per-file and
-striped-across-files x {seq, rand} x {1, 8 threads}.
+Legs: per-file and striped-across-files x {seq, rand} x {N threads}.
 """
 import argparse, errno, hashlib, json, mmap, os, random, shutil, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
-CHUNK = 8 << 20  # 8 MiB
-ALIGN = 4096
+CHUNK = 8 << 20  # 8 MiB per read: proxy for one expert-tensor slice read
+ALIGN = 4096  # O_DIRECT requires page-aligned buffer/length/offset
 
 
 def open_direct(path):
@@ -41,7 +40,7 @@ def seq_offsets(fsize, nbytes):
     return out
 
 
-def rand_offsets(fsize, nbytes, seed):  # seed is the file index; diversified per file
+def rand_offsets(fsize, nbytes, seed):  # seed = file index, for reproducible legs
     if fsize < 2 * CHUNK:
         raise ValueError(f"file too small for rand pattern: {fsize} bytes")
     rnd = random.Random(seed)
@@ -52,10 +51,9 @@ def rand_offsets(fsize, nbytes, seed):  # seed is the file index; diversified pe
 
 def run_jobs(jobs, threads):
     fds = sorted({fd for fd, _, _ in jobs})
-    # fresh buffer per job: with --striped and threads > 1, two jobs can share
-    # an fd concurrently; a per-fd buffer would race (matters for verify modes)
+    # per-job buffer (not per-fd): striped legs read the same fd concurrently
     work = [(fd, aligned_buf(), off) for fd, _, off in jobs]
-    random.Random(1).shuffle(work)  # same interleaving discipline per leg
+    random.Random(1).shuffle(work)
     try:
         t0 = time.perf_counter()
         with ThreadPoolExecutor(threads) as ex:
@@ -70,8 +68,7 @@ def run_jobs(jobs, threads):
 
 
 def selftest():
-    # /tmp is often tmpfs, which rejects O_DIRECT — use a scratch dir on the
-    # caller's (disk-backed) filesystem instead.
+    # /tmp is often tmpfs, which rejects O_DIRECT — scratch on caller's disk
     sysd = tempfile.mkdtemp(dir=os.environ.get("GOLEM_SELFTEST_DIR", "."))
     try:
         _selftest_body(sysd)

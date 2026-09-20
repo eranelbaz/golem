@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M0.4 measurement runner: wraps llama-cli with wall timing, VRAM sampling, log capture.
+# Wraps llama-cli with wall timing, VRAM sampling, and log capture.
 # usage: glm-run.sh <name> <model.gguf> [llama-cli args...]
 set -euo pipefail
 
@@ -18,7 +18,6 @@ vram_sample() {
   rocm-smi --showmeminfo vram --json | python3 -c \
     'import json,sys,time; d=json.load(sys.stdin); k=next(iter(d)); print(time.time(), d[k]["VRAM Total Used Memory (B)"])'
 }
-
 vram_sample > "$VLOG"
 IDLE=$(tail -1 "$VLOG" | awk '{print $2}')
 if ! [[ "$IDLE" =~ ^[0-9]+$ ]]; then
@@ -43,7 +42,6 @@ print(f"MEAS wall_s={dt:.1f} max_rss_kib={ru.ru_maxrss}", file=sys.stderr)
 sys.exit(rc)
 ' "$BIN/llama-cli" -m "$MODEL" "$@" > "$LOG" 2>&1 || RC=$?
 grep -E 'MEAS wall_s' "$LOG" >> "$TIMEF" || true
-
 PEAK=$(awk '{print $2}' "$VLOG" | sort -n | tail -1)
 TS=$(grep -o '\[ Prompt: [^]]*\]' "$LOG" | tail -1 || true)
 GEN=$(grep -o 'Generation: [0-9.]* t/s' "$LOG" | tail -1 || true)
