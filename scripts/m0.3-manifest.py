@@ -89,6 +89,8 @@ def main():
         for t in r.tensors:
             tensor_count += 1
             if not MOE_RE.search(t.name):
+                if "mmproj" in t.name:
+                    sys.exit(f"FATAL: mmproj (vision) tensor present, text path only in v1: {t.name}")
                 continue
             m = BLK_RE.search(t.name)
             if not m:
@@ -110,8 +112,10 @@ def main():
     by_name = {e["tensor"]: e for e in expert_index}
     if len(by_name) != len(expert_index):
         sys.exit("FATAL: same expert tensor name in multiple shards — split boundary corruption")
-    # Completeness: exactly 3 expert tensors per MoE layer, covering blk.N for
-    # every non-dense layer. Catches truncated tensor tables at split boundaries.
+    # Completeness: exactly 3 expert tensors per MoE layer (gate/up/down —
+    # glm5next has no ffn_gate_up_exps). Catches truncated tensor tables at
+    # split boundaries. If this script is ever reused for a gate_up-fused arch,
+    # the * 3 here and the MOE_RE alternation must be revisited together.
     moe_layers = sorted({e["layer"] for e in expert_index})
     expected_layers = list(range(dense_count, block_count))
     if moe_layers != expected_layers or len(expert_index) != len(expected_layers) * 3:
@@ -129,11 +133,13 @@ def main():
     primary = os.path.abspath(args.dir)
     shards = []
     for f in files:
-        size = os.stat(f).st_size
+        st = os.stat(f)
+        size = st.st_size
         h = hashlib.sha256()
         with open(f, "rb") as fh:
-            if os.fstat(fh.fileno()).st_size != size:
-                sys.exit(f"FATAL: {f} changed size between stat and open — file in flight, aborting")
+            fst = os.fstat(fh.fileno())
+            if (fst.st_size != size or fst.st_ino != st.st_ino or fst.st_dev != st.st_dev):
+                sys.exit(f"FATAL: {f} replaced/changed between stat and open — file in flight, aborting")
             while chunk := fh.read(CHUNK):
                 h.update(chunk)
         if os.stat(f).st_size != size:
