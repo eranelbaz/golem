@@ -2,7 +2,7 @@
 """M0.3: build a manifest.json for one quant dir of GGUF shards.
 
 Usage:
-  m0.3-manifest.py <dir> <name> <repo> <revision> <quant> [--replica PATH ...] [--header-only]
+  manifest-builder.py <dir> <name> <repo> <revision> <quant> [--replica PATH ...] [--header-only]
 
 <dir> holds the .gguf shards (nested <outer>/<QUANT>/ layout from `hf download
 --local-dir`; pass the inner dir). --header-only skips hashing/streaming and
