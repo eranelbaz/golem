@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -153,9 +154,14 @@ def acquire_lock(outdir: str) -> None:
                 pid = int(open(lock).read().strip() or 0)
                 os.kill(pid, 0)  # liveness probe
                 sys.exit(f"FATAL: another leg holds {lock} (live pid {pid}).")
-            except (ProcessLookupError, PermissionError, ValueError):
-                print(f"PARITY: stale lock from dead pid — reclaiming {lock}", flush=True)
+            except ProcessLookupError:
+                print(f"PARITY: stale lock from dead pid {pid} — reclaiming {lock}", flush=True)
                 os.remove(lock)  # loop and retry the O_EXCL create
+            except PermissionError:
+                sys.exit(f"FATAL: {lock} held by live foreign pid {pid} — cannot reclaim.")
+            except ValueError:
+                print(f"PARITY: malformed lock {lock} — reclaiming", flush=True)
+                os.remove(lock)
 
 
 def release_lock(outdir: str) -> None:
@@ -215,13 +221,18 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
                 print(f"PARITY: leg={name} prompt={idx} stale cache (config drift) — re-running", flush=True)
             args = leg_args(bin_path, model, PROMPTS[idx], hip, threads, n_tokens)
             t0 = time.perf_counter()
+            # Own process group: on timeout, kill the whole tree so an orphaned
+            # child cannot hold the stdout pipe open and stall communicate().
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, start_new_session=True)
             try:
-                proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout_s)
-                rc, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-            except subprocess.TimeoutExpired as e:
+                stdout, stderr = proc.communicate(timeout=timeout_s)
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                stdout, stderr = proc.communicate()  # drains whatever was buffered
+                stderr = (stderr or "") + f"\nTIMEOUT after {timeout_s}s (partial output preserved)"
                 rc = -9
-                stdout = e.stdout or ""
-                stderr = (e.stderr or "") + f"\nTIMEOUT after {timeout_s}s (partial stdout preserved)"
             wall = time.perf_counter() - t0
             atomic_write(log_path, stderr)
             combined = stdout + "\n" + stderr
@@ -272,6 +283,15 @@ def compare(a: str, b: str, outdir: str) -> int:
         sys.exit(f"FATAL: legs disagree on -n ({la.get('n_tokens')} vs {lb.get('n_tokens')})")
     if la.get("model") != lb.get("model"):
         sys.exit("FATAL: legs ran different models")
+    ia = {r["idx"]: r for r in la["prompts"]}
+    ib = {r["idx"]: r for r in lb["prompts"]}
+    if sorted(ia) != list(range(len(PROMPTS))) or sorted(ib) != list(range(len(PROMPTS))):
+        sys.exit(f"FATAL: incomplete legs (a has prompts {sorted(ia)}, b has {sorted(ib)}) — "
+                 f"both legs must cover all {len(PROMPTS)} prompts")
+    oka = sum(1 for r in la["prompts"] if r["rc"] == 0)
+    okb = sum(1 for r in lb["prompts"] if r["rc"] == 0)
+    if oka != len(PROMPTS) or okb != len(PROMPTS):
+        sys.exit(f"FATAL: refuse to compare: a ok={oka}/{len(PROMPTS)}, b ok={okb}/{len(PROMPTS)}")
     if la.get("hip") == lb.get("hip") and la.get("threads") == lb.get("threads"):
         sys.exit(f"FATAL: identical backend config on both legs (hip={la.get('hip')}, "
                  f"threads={la.get('threads')}) — that is not a parity comparison")
@@ -282,15 +302,6 @@ def compare(a: str, b: str, outdir: str) -> int:
     if len(builds_a) != 1 or len(builds_b) != 1 or builds_a != builds_b or None in (builds_a | builds_b):
         sys.exit(f"FATAL: build identity missing or mismatched (a={builds_a}, b={builds_b}) — "
                  f"both legs must run binaries of the same pinned build")
-    ia = {r["idx"]: r for r in la["prompts"]}
-    ib = {r["idx"]: r for r in lb["prompts"]}
-    if sorted(ia) != list(range(len(PROMPTS))) or sorted(ib) != list(range(len(PROMPTS))):
-        sys.exit(f"FATAL: incomplete legs (a has prompts {sorted(ia)}, b has {sorted(ib)}) — "
-                 f"both legs must cover all {len(PROMPTS)} prompts")
-    oka = sum(1 for r in la["prompts"] if r["rc"] == 0)
-    okb = sum(1 for r in lb["prompts"] if r["rc"] == 0)
-    if oka != len(PROMPTS) or okb != len(PROMPTS):
-        sys.exit(f"FATAL: refuse to compare: a ok={oka}/{len(PROMPTS)}, b ok={okb}/{len(PROMPTS)}")
     ta = [ia[i]["text"] for i in range(len(PROMPTS))]
     tb = [ib[i]["text"] for i in range(len(PROMPTS))]
     empties = [i for i, (x, y) in enumerate(zip(ta, tb)) if not x or not y]
