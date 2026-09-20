@@ -214,7 +214,7 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
     os.makedirs(legdir, exist_ok=True)
     sha = config_sha(bin_path, model, hip, threads, n_tokens)
     psha = pin_sha()  # one tree walk per leg, not per prompt
-    want = open("vendor/VENDOR_SHA").read().split("=", 1)[1].strip()
+    want = open("vendor/VENDOR_SHA").readline().split("=", 1)[1].strip()
     if psha != want:
         sys.exit(f"FATAL: vendor tree drifted ({psha[:12]} != {want[:12]}) — re-vendor per ADR 0001")
     meta = {"leg": name, "bin": bin_path, "model": model, "hip": hip,
