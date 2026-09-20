@@ -43,9 +43,9 @@ to resume from this file alone.
 ## 1. Status snapshot
 
 - **Phase:** M0 — feasibility spike (gates everything; design §14)
-- **Next task:** **M0.3** (model-manifest)
-- **Open PRs:** none
-- **Last session:** session 5 — PR #4 merged (M0.2 hip-build done, `2b7ad58`)
+- **Next task:** **M0.4** (m0-measurements) — after M0.3 PR merges
+- **Open PRs:** #6 (M0.3 model-manifest)
+- **Last session:** session 6 — M0.3 executed plan-first, PR open (#6)
 
 ---
 
@@ -78,7 +78,7 @@ Every task executes **plan-first** (protocol steps 5–6): a per-task implementa
 
 - ☑ **M0.1 · fork-pin** — Research the state of GLM-5.3-Flash (`glm5next`) text support upstream: pin the head of PR #27754 (PR hosted on `ggml-org/llama.cpp`; head branch `glm5next/upstream` from the unslothai fork); select the commit. Vendor it **squashed** into `vendor/llama.cpp/` (no patches yet, no nested `.git`). Write `engine/llama-cpp.lock` (repo, branch, commit, pr, base_upstream, content hashes, file_count, ROCm line, `patches = none-yet`) and `docs/adr/0001-fork-pin.md` (why this commit, what it contains). Accept: CI's `vendor-pin-check` recomputes `content_sha256` from `vendor/llama.cpp` (canonical recipe, ADR) and matches `vendor/VENDOR_SHA` and the lock; design §3.2. Deps: B1. *(done — PR #3, merge ac09f05)*
 - ☑ **M0.2 · hip-build** — *(done — PR #4, merge 2b7ad58)* Scripted substrate build: `scripts/build-substrate.sh` (cmake `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100`; warns on `rocminfo` vs lock `rocm` mismatch and skips the check when `rocminfo` is absent — M0.1 pre-fills `rocm = 7.2.4`). Smoke: `llama-cli` with a small GGUF on the 7900 XTX. Accept: build + smoke log committed under `docs/baselines/m0-notes.md`; ROCm version pinned. Deps: M0.1.
-- ☐ **M0.3 · model-manifest** — Download `unsloth/GLM-5.3-Flash-GGUF` **UD-Q4_K_XL** (exact revision pinned) to a chosen drive location + replica location on the second NVMe; compute per-shard SHA-256; hand-write the `manifest.json` per design §4.2 (the `golem pull` tool itself comes in M3.2); record exact byte sizes, layer/expert counts, bytes-per-expert in `docs/baselines/m0-notes.md`. Also fetch **Q8_0** of the same revision for parity work. Accept: manifests committed, hashes verified, sizes recorded. Deps: M0.2.
+- ◑ **M0.3 · model-manifest** — Download `unsloth/GLM-5.3-Flash-GGUF` **UD-Q4_K_XL** (exact revision pinned) to a chosen drive location + replica location on the second NVMe; compute per-shard SHA-256; hand-write the `manifest.json` per design §4.2 (the `golem pull` tool itself comes in M3.2); record exact byte sizes, layer/expert counts, bytes-per-expert in `docs/baselines/m0-notes.md`. Also fetch **Q8_0** of the same revision for parity work. Accept: manifests committed, hashes verified, sizes recorded. Deps: M0.2. **PR open (#6)** — branch `task/m0.3-model-manifest`, plan `docs/superpowers/plans/2026-09-20-m0.3-model-manifest.md` (review Approved round 2).
 - ☐ **M0.4 · m0-measurements** — The spike proper: run the pinned build with host-buffered experts (`-ncmoe`-style) on the real model; measure per design §14/M0: cold-expert copy cost per step, KV bytes/token, ROCm VRAM overhead, tok/s cold vs warm, FA/precision settings that make MLA correct on ROCm (design §3.5 open risk). Freeze validated settings + numbers into `engine/llama-cpp.lock`, `docs/baselines/baseline-001.json` (design §12.3 fields). Accept: all five measurement classes recorded; settings frozen. Deps: M0.3.
 - ☐ **M0.5 · parity-floor** — 8-prompt greedy parity: HIP run vs CPU reference run of the *same pinned build*; compute match rate; set the T2 threshold at ≥ (reference-noise-floor + margin) per design §12.2. Accept: numbers + threshold recorded in `docs/baselines/baseline-001.json`; **M0 exit review** written (continue / re-scope verdict per design §14). Deps: M0.4.
 
@@ -122,6 +122,14 @@ Every task executes **plan-first** (protocol steps 5–6): a per-task implementa
 ---
 
 ## 4. Log (append-only, newest first)
+
+### 2026-09-20 — session 6: M0.3 model-manifest (PR #6)
+
+- Executed plan-first on `task/m0.3-model-manifest` (plan review 2 rounds — round 1 caught: nested `--local-dir` shard path, shard 1 carries zero tensors so `expert_index` must walk every shard, wrong gguf-py attr names (`data_offset`/`n_bytes`); round 2 **Approved**).
+- Landed: `scripts/m0.3-gguf-header.sh` (arch gate), `scripts/m0.3-manifest.py` (streamed sha256 + expert_index builder, `--header-only`), manifests for both quants under `docs/baselines/manifests/`, m0-notes M0.3 section.
+- Facts: revision `621d456e…`, arch `glm5next`, 46 blocks / 288 experts / 8 used / 3 dense; UD-Q4_K_XL 199,707,321,347 B (6 shards, primary + byte-verified replica on nvme1n1), Q8_0 340,981,966,112 B (8 shards); 129 expert tensors; all 14 shards `sha256sum -c` OK on primary + replica, and all 14 proven content-identical to the Hub head via LFS-sha256 comparison.
+- **Deviations:** (1) shards already existed from an earlier same-day session — this session's duplicate re-download was killed and ~504 GB deleted; plan paths amended to the existing dirs with identity proven via LFS-sha256. (2) Wrong-arch gate branch exercised only via a malformed fixture (loud exit 1), not a valid wrong-arch GGUF. (3) `hf download --include <Q>/*` mirrors the repo prefix (nested `<dir>/<Q>/`) — corrected in plan/gate at review round 1.
+- Next session: after merge, mark M0.3 `done (PR #6)` and start **M0.4** (m0-measurements).
 
 ### 2026-09-20 — session 5 (cont.): M0.2 follow-ups from quality pass (PR #5, merge cc5dc21)
 
