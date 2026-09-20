@@ -44,7 +44,31 @@ PROMPTS = [
 GEN_RE = re.compile(r"Generation: ([0-9.]+) t/s\s*\]")
 BUILD_RE = re.compile(r"^build\s*:\s*(\S+)", re.MULTILINE)
 FA_WARN_RE = re.compile(r"^.*(flash[- ]?att|\bfa\b).*(not support|fallback|disabl|ignor).*$", re.IGNORECASE | re.MULTILINE)
-HARNESS_VERSION = 2  # bump on any change to prompts, flag contract, or extraction logic
+HARNESS_VERSION = 3  # bump on any change to prompts, flag contract, or extraction logic
+
+
+def pin_sha() -> str:
+    """Content hash of the vendored substrate (ADR 0001 canonical recipe, python form).
+
+    The llama.cpp banner build id is USELESS here: with no .git inside vendor/,
+    its cmake walks up and reads the enclosing golem repo's HEAD at configure
+    time — so banners differ between build dirs built from the identical pin.
+    The tree content hash is the only honest binary provenance.
+    """
+    base = "vendor/llama.cpp"
+    paths = []
+    for root, dirs, files in os.walk(base):
+        if root == base:
+            dirs[:] = [d for d in dirs if d not in (".git", "build")]
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for f in files:
+            paths.append("./" + os.path.relpath(os.path.join(root, f), base))
+    paths.sort(key=lambda s: s.encode())
+    inner = hashlib.sha256()
+    for p in paths:
+        with open(os.path.join(base, p[2:]), "rb") as f:
+            inner.update(f"{hashlib.sha256(f.read()).hexdigest()}  {p}\n".encode())
+    return inner.hexdigest()
 
 
 def extract_text(raw: str) -> str:
@@ -189,8 +213,12 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
     legdir = os.path.join(outdir, name)
     os.makedirs(legdir, exist_ok=True)
     sha = config_sha(bin_path, model, hip, threads, n_tokens)
+    psha = pin_sha()  # one tree walk per leg, not per prompt
+    want = open("vendor/VENDOR_SHA").read().split("=", 1)[1].strip()
+    if psha != want:
+        sys.exit(f"FATAL: vendor tree drifted ({psha[:12]} != {want[:12]}) — re-vendor per ADR 0001")
     meta = {"leg": name, "bin": bin_path, "model": model, "hip": hip,
-            "threads": threads, "n_tokens": n_tokens, "args_sha": sha,
+            "threads": threads, "n_tokens": n_tokens, "args_sha": sha, "pin_sha": psha,
             "harness_version": HARNESS_VERSION,
             "wall_s_note": "informational only — page-cache warmth differs between legs"}
     if only_idx is not None:
@@ -215,7 +243,7 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
                         print(f"PARITY: leg={name} prompt={idx} empty cached text — re-running", flush=True)
                     else:
                         results.append({"idx": idx, "rc": 0, "cached": True,
-                                        "gen_s": old.get("gen_s"), "build_id": old.get("build_id"),
+                                        "gen_s": old.get("gen_s"), "pin_sha": old.get("pin_sha"), "build_id": old.get("build_id"),
                                         "text": txt, "fa_warnings": old.get("fa_warnings", [])})
                         print(f"PARITY: leg={name} prompt={idx} cached (config match)", flush=True)
                         write_leg_json(legdir, meta, results, sum(1 for r in results if r["rc"] == 0))
@@ -265,8 +293,8 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
                 print(f"PARITY: leg={name} prompt={idx} WARN U+FFFD in text (token-boundary truncation)", flush=True)
             atomic_write(txt_path, text)
             atomic_write(meta_path, json.dumps({"rc": 0, "args_sha": sha, "gen_s": gen_s,
-                                                "build_id": build_id, "fa_warnings": fa_warnings}))
-            results.append({"idx": idx, "rc": 0, "cached": False, "gen_s": gen_s, "build_id": build_id,
+                                                "pin_sha": psha, "build_id": build_id, "fa_warnings": fa_warnings}))
+            results.append({"idx": idx, "rc": 0, "cached": False, "gen_s": gen_s, "pin_sha": psha, "build_id": build_id,
                             "wall_s": round(wall, 1), "text": text, "fa_warnings": fa_warnings})
             print(f"PARITY: leg={name} prompt={idx} rc=0 gen_s={gen_s} "
                   f"wall_s={wall:.1f} words={len(text.split())}", flush=True)
@@ -279,6 +307,9 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
 
 
 def compare(a: str, b: str, outdir: str) -> int:
+    for leg in (a, b):
+        if not os.path.exists(os.path.join(outdir, leg, "leg.json")):
+            sys.exit(f"FATAL: no leg record for '{leg}' under {outdir} — run-leg first")
     la = json.load(open(os.path.join(outdir, a, "leg.json")))
     lb = json.load(open(os.path.join(outdir, b, "leg.json")))
     if la.get("n_tokens") != lb.get("n_tokens"):
@@ -297,13 +328,13 @@ def compare(a: str, b: str, outdir: str) -> int:
     if la.get("hip") == lb.get("hip") and la.get("threads") == lb.get("threads"):
         sys.exit(f"FATAL: identical backend config on both legs (hip={la.get('hip')}, "
                  f"threads={la.get('threads')}) — that is not a parity comparison")
-    builds_a = {r.get("build_id") for r in la["prompts"]}
-    builds_b = {r.get("build_id") for r in lb["prompts"]}
-    # Both binaries are built from the SAME pinned source, so their banner build
-    # ids must be present and identical; a difference means mismatched codebases.
+    builds_a = {r.get("pin_sha") for r in la["prompts"]}
+    builds_b = {r.get("pin_sha") for r in lb["prompts"]}
+    # Binary provenance = vendored source content hash (see pin_sha); banner build
+    # ids are recorded but NOT compared — they track the enclosing repo, not the pin.
     if len(builds_a) != 1 or len(builds_b) != 1 or builds_a != builds_b or None in (builds_a | builds_b):
-        sys.exit(f"FATAL: build identity missing or mismatched (a={builds_a}, b={builds_b}) — "
-                 f"both legs must run binaries of the same pinned build")
+        sys.exit(f"FATAL: pin identity missing or mismatched (a={builds_a}, b={builds_b}) — "
+                 f"both legs must run binaries built from the same pinned tree")
     ta = [ia[i]["text"] for i in range(len(PROMPTS))]
     tb = [ib[i]["text"] for i in range(len(PROMPTS))]
     empties = [i for i, (x, y) in enumerate(zip(ta, tb)) if not x or not y]
