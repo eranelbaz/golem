@@ -5,7 +5,7 @@ O_DIRECT bypasses the page cache, so no root drop_caches is needed.
 Chunk = 8 MiB (expert-read scale, design §5.4). Legs: per-file and
 striped-across-files x {seq, rand} x {1, 8 threads}.
 """
-import argparse, hashlib, json, mmap, os, random, shutil, tempfile, time
+import argparse, hashlib, json, mmap, os, random, shutil, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 CHUNK = 8 << 20  # 8 MiB
@@ -35,6 +35,9 @@ def seq_offsets(fsize, nbytes):
     while off + CHUNK <= fsize and len(out) * CHUNK < nbytes:
         out.append(off)
         off += CHUNK
+    if len(out) * CHUNK < nbytes:
+        print(f"WARN: file truncated seq leg to {len(out) * CHUNK / 2**30:.1f} GiB "
+              f"(requested {nbytes / 2**30:.1f} GiB, file {fsize / 2**30:.1f} GiB)", file=sys.stderr)
     return out
 
 

@@ -20,6 +20,10 @@ vram_sample() {
 
 vram_sample > "$VLOG"
 IDLE=$(tail -1 "$VLOG" | awk '{print $2}')
+if ! [[ "$IDLE" =~ ^[0-9]+$ ]]; then
+  echo "FATAL: could not read idle VRAM from rocm-smi (got '$IDLE')" >&2
+  exit 2
+fi
 : > "$LOG"
 : > "$TIMEF"
 
