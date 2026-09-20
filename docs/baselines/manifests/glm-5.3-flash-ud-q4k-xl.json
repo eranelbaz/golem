@@ -9,55 +9,37 @@
       "file": "GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
       "bytes": 9429859,
       "sha256": "00dceaf3ed08781b1e44513a44ebb19e96248d01ba2a80b17f675a2b6fa9a1ee",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL",
-        "/mnt/data/golem/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL"
-      ]
+      "replica_count": 2
     },
     {
       "file": "GLM-5.3-Flash-UD-Q4_K_XL-00002-of-00006.gguf",
       "bytes": 49198039200,
       "sha256": "d3ecb6ff3957a99878f9a0352676a0913748a431a9a4a1b1ffa5ade9b8947a74",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL",
-        "/mnt/data/golem/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL"
-      ]
+      "replica_count": 2
     },
     {
       "file": "GLM-5.3-Flash-UD-Q4_K_XL-00003-of-00006.gguf",
       "bytes": 49988626304,
       "sha256": "328073c004e7c5395b208247feed26089db247b94dd8fa4ab0f2569d86c1d770",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL",
-        "/mnt/data/golem/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL"
-      ]
+      "replica_count": 2
     },
     {
       "file": "GLM-5.3-Flash-UD-Q4_K_XL-00004-of-00006.gguf",
       "bytes": 48700701344,
       "sha256": "6803ab7effa6da4a0b02c9c7865952fdd6c5b2e10e53903348da369e90bd13f9",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL",
-        "/mnt/data/golem/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL"
-      ]
+      "replica_count": 2
     },
     {
       "file": "GLM-5.3-Flash-UD-Q4_K_XL-00005-of-00006.gguf",
       "bytes": 49026026752,
       "sha256": "852f3df9dacde3d196796f9fe738468e80c8701555ff0a8c30bc010fb8974dd8",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL",
-        "/mnt/data/golem/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL"
-      ]
+      "replica_count": 2
     },
     {
       "file": "GLM-5.3-Flash-UD-Q4_K_XL-00006-of-00006.gguf",
       "bytes": 2784497888,
       "sha256": "c6ba510fafc1e12cc0addbc361a329c0c592ab96980098e7e25e107d8faa983e",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL",
-        "/mnt/data/golem/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL"
-      ]
+      "replica_count": 2
     }
   ],
   "expert_index": [
@@ -38246,5 +38228,6 @@
       ]
     }
   ],
-  "chat_template_sha": "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724"
+  "chat_template_sha": "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724",
+  "storage_note": "Replica/storage locations are machine-local (see docs/baselines/m0-notes.md, local-only). Committed manifest carries content identity only (file/bytes/sha256); golem pull (M3.2) regenerates locations from its own resolved paths."
 }

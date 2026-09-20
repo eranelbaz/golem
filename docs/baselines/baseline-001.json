@@ -11,14 +11,15 @@
         "model": "Samsung 990 PRO 4TB",
         "dev": "nvme0n1",
         "role": "primary",
-        "hosts": "/home"
+        "hosts": "OS + model primary",
+        "fstype": "btrfs (compress=zstd:3)"
       },
       {
         "model": "PNY CS2130 1TB",
         "dev": "nvme1n1",
         "role": "replica",
         "mounted": true,
-        "mount": "/mnt/data (nvme1n1p1)"
+        "fstype": "ext4"
       }
     ],
     "kernel": "7.1.11-arch1-1",
@@ -90,7 +91,7 @@
       "nvme1n1_cs2130_seq_t1_gib_s": 2.24,
       "nvme1n1_cs2130_rand_t1_gib_s": 2.16,
       "note_t8_anomaly": "8-thread O_DIRECT legs DROP to 1.9-2.0 GiB/s on BOTH drives (vs t1) - concurrency regresses throughput; cause not investigated",
-      "hardware_flag": "RESOLVED (2026-09-20 follow-up): EIO is NOT a drive problem. Controlled matrix (5 legs/point): concurrent O_DIRECT reads on /home (btrfs, compress=zstd:3) fail EIO at t2=2/5, t4=5/5, t8=5/5, t16=5/5 legs; identical test on /mnt/data (ext4) 0 failures at every thread count; full single-thread O_DIRECT sweep of the 45.8 GiB shard = 5864/5864 chunks OK. Kernel/filesystem-level btrfs concurrent-O_DIRECT failure (kernel 7.1.11-arch1-1), no nvme errors in journal, PCIe AER clean, firmware 4B2QJXD7. M3.1 must probe O_DIRECT viability per replica at open and fall back to buffered reads (design §5.4 opt-in stance vindicated).",
+      "hardware_flag": "RESOLVED (2026-09-20 follow-up): EIO is NOT a drive problem. Controlled matrix (5 legs/point): concurrent O_DIRECT reads on the primary drive's btrfs filesystem (compress=zstd:3) fail EIO at t2=2/5, t4=5/5, t8=5/5, t16=5/5 legs; identical test on the ext4 replica drive 0 failures at every thread count; full single-thread O_DIRECT sweep of the 45.8 GiB shard = 5864/5864 chunks OK. Kernel/filesystem-level btrfs concurrent-O_DIRECT failure (kernel 7.1.11-arch1-1), no nvme errors in journal, PCIe AER clean, firmware 4B2QJXD7. M3.1 must probe O_DIRECT viability per replica at open and fall back to buffered reads (design §5.4 opt-in stance vindicated).",
       "striped_2drive_seq_t2_gib_s": [
         4.73,
         4.81,
@@ -99,5 +100,6 @@
       "striped_2drive_rand_t2_gib_s": 4.6
     }
   },
-  "notes": "warm_tok_s is NOT recorded as a number: at this pin there is no persistent device cache (P2/M2.4) and the sweep could not isolate copy cost; the extrapolation from §14 M0 is deferred to M2 hardware baselines. Kernel string, GLM-RUN summary lines and generation texts are in docs/baselines/m0-notes.md (local-only)."
+  "notes": "warm_tok_s is NOT recorded as a number: at this pin there is no persistent device cache (P2/M2.4) and the sweep could not isolate copy cost; the extrapolation from §14 M0 is deferred to M2 hardware baselines. Kernel string, GLM-RUN summary lines and generation texts are in docs/baselines/m0-notes.md (local-only).",
+  "storage_note": "Replica/storage locations are machine-local (see docs/baselines/m0-notes.md, local-only). Committed manifest carries content identity only (file/bytes/sha256); golem pull (M3.2) regenerates locations from its own resolved paths."
 }

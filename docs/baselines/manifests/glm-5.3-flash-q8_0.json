@@ -9,65 +9,49 @@
       "file": "GLM-5.3-Flash-Q8_0-00001-of-00008.gguf",
       "bytes": 9429888,
       "sha256": "0b21d951c7d14562c479c6a7342c71166d222b21ac2e9c1e32b529a9e017a2df",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     },
     {
       "file": "GLM-5.3-Flash-Q8_0-00002-of-00008.gguf",
       "bytes": 49665857344,
       "sha256": "8aabbbc0a92c551894f62a0737b433c9fad60a94baaa61e669f96329bb1d88a6",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     },
     {
       "file": "GLM-5.3-Flash-Q8_0-00003-of-00008.gguf",
       "bytes": 49822821280,
       "sha256": "7b50941b404fed3413be4e0ca52af43e79113e4b3e2c940d1f4cdf74e95ebb39",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     },
     {
       "file": "GLM-5.3-Flash-Q8_0-00004-of-00008.gguf",
       "bytes": 49849652064,
       "sha256": "ff27fb4536d524cae687c4fb88dfa1b43a8ee0b4256e55304f95dc1aa38e8b81",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     },
     {
       "file": "GLM-5.3-Flash-Q8_0-00005-of-00008.gguf",
       "bytes": 49974608352,
       "sha256": "c088636854c5da312e44a7be4195cd765dd9eb6339d7b014d1da4192851a9b5b",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     },
     {
       "file": "GLM-5.3-Flash-Q8_0-00006-of-00008.gguf",
       "bytes": 49840638624,
       "sha256": "4bece55cb9e98720f3ef2e1e9683983aeced77434dbcd54584c0b7c80a2e95cb",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     },
     {
       "file": "GLM-5.3-Flash-Q8_0-00007-of-00008.gguf",
       "bytes": 49831834720,
       "sha256": "a9f792204b0b58155e6092f9a4160a0659fcdc98a1c126e563ecc3cd02ad68ad",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     },
     {
       "file": "GLM-5.3-Flash-Q8_0-00008-of-00008.gguf",
       "bytes": 41987123840,
       "sha256": "a6cb6887c0047653f08c0ab6e564972451d9511322202970f7052e36052aefd6",
-      "replicas": [
-        "/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0"
-      ]
+      "replica_count": 1
     }
   ],
   "expert_index": [
@@ -38256,5 +38240,6 @@
       ]
     }
   ],
-  "chat_template_sha": "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724"
+  "chat_template_sha": "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724",
+  "storage_note": "Replica/storage locations are machine-local (see docs/baselines/m0-notes.md, local-only). Committed manifest carries content identity only (file/bytes/sha256); golem pull (M3.2) regenerates locations from its own resolved paths."
 }
