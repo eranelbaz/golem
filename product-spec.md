@@ -87,7 +87,7 @@ Placement combines two mechanisms:
 
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) — 321B total
 (rounded to 320B in the model's own README) / 18B active parameters,
-`glm5_next` architecture, text (the vision tower is out of scope for v1; see
+`glm5next` architecture, text (the vision tower is out of scope for v1; see
 below).
 
 **Weight source, in priority order:**
