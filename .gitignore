@@ -24,3 +24,4 @@ __pycache__/
 # Local-only docs (not part of the repo)
 docs/baselines/m0-notes.md
 docs/superpowers/
+docs/worklog.md
