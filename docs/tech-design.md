@@ -103,15 +103,24 @@ Everything that is **not** an expert weight (embeddings, attention projections, 
 
 ### 3.2 The fork
 
-- Upstream: `ggml-org/llama.cpp`, pinned to a commit that contains GLM-5.3-Flash (`glm5_next`) text support — the successor state of PR #27754. The spec itself flags that this support is unmerged/moving; therefore the commit is selected and frozen during **M0** (§14) and recorded in `engine/llama-cpp.lock`:
+- Upstream: the **unslothai/llama.cpp** fork, pinned to the head of PR #27754 (the PR itself is hosted on `ggml-org/llama.cpp`; its head branch `glm5next/upstream` lives on the unslothai fork) — a commit that contains GLM-5.3-Flash (`glm5next`) text support. The spec itself flags that this support is unmerged/moving; therefore the commit is selected and frozen during **M0** (§14) and recorded in `engine/llama-cpp.lock`:
 
   ```
   # engine/llama-cpp.lock
-  repo = https://github.com/ggml-org/llama.cpp
-  commit = <selected during M0>
-  rocm = 6.4.x            # pinned minor line, validated on gfx1100
-  patches = P1, P2, P3, P4  # §3.4
+  repo = https://github.com/unslothai/llama.cpp
+  branch = glm5next/upstream
+  commit = 86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9   # head of PR #27754
+  pr = 27754
+  base_upstream = 930e2fa5995789efbf249a8bf61325bb626e417b  # ggml-org/llama.cpp merge-base at pin
+  content_sha256 = 812b9b4a7848e34a76c8d444e244fa787f6adb0a586e85a7317477a53ea9f794  # recomputable tree hash; CI re-derives it
+  file_count = 3599                       # regular-file count at pin
+  archive_sha256 = dfe22d466b1ceb824651ada7c6f20347f4f18caa241dc3459fb5f10560d265e3  # provenance only
+  rocm = 7.2.4            # advisory minimum; M0.2 warns on rocminfo mismatch, skips the check when rocminfo is absent
+  patches = none-yet      # pristine upstream-at-pin; P1–P4 land in M2.x (§3.4)
+  # fa = <set at M0.4>    # FlashAttention/precision setting for MLA on ROCm (§3.5)
   ```
+
+- The vendored tree carries no nested `.git` by design, so the acceptance is content-based, not `git rev-parse`: CI's `vendor-pin-check` recomputes `content_sha256` from `vendor/llama.cpp` (canonical recipe, ADR 0001) and it must match `vendor/VENDOR_SHA` and the lock.
 - The fork is vendored in-tree (`vendor/llama.cpp/`) and built by the `golem-llama-sys` build script via the `cmake` crate with `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100`.
 - Patch discipline: total diff vs upstream ≤ ~1,000 lines, confined to the files listed in §3.4. Every patch has an in-tree regression test (§12.2, T4). Upstream rebase is a scheduled maintenance task (monthly + on GLM-arch fixes), never an ad-hoc drift.
 - The fork carries **no** model-architecture code of its own and **no** product logic in C++ beyond the hooks. If a future rebase turns patches into a maintenance sink (>2 consecutive rebase failures), that is the documented trigger to re-open decision D2, option B.
@@ -121,7 +130,7 @@ Everything that is **not** an expert weight (embeddings, attention projections, 
 | Concern | Source |
 |---------|--------|
 | GGUF parsing, tensor loading, mmap | llama.cpp loader, driven through `llama.h` |
-| Model graph (glm5_next text path), attention, RoPE, norms, router | llama.cpp |
+| Model graph (glm5next text path), attention, RoPE, norms, router | llama.cpp |
 | KV cache (allocation, quantized-KV options, defrag) | llama.cpp (`-ctk/-ctv` exposed as config) |
 | K-quant GEMV/GEMM kernels on HIP | ggml HIP backend |
 | Tokenization (BPE + GGUF chat template) | llama.cpp — *not* a Rust tokenizer; byte-parity with the reference runtime matters more than library purity |
@@ -140,7 +149,7 @@ Everything that is **not** an expert weight (embeddings, attention projections, 
 
 ### 3.5 Backend: ROCm/HIP, and what "not NVIDIA" means
 
-- v1 target: **gfx1100 (RX 7900 XTX)**, ROCm 6.4.x pinned (minor line locked after M0 validates it), HIP backend of the fork with `AMDGPU_TARGETS=gfx1100`.
+- v1 target: **gfx1100 (RX 7900 XTX)**, ROCm **7.2.4** as the advisory minimum recorded in `engine/llama-cpp.lock` (M0.2 warns on `rocminfo` vs lock mismatch and skips the check when `rocminfo` is absent — CI/no-GPU), HIP backend of the fork with `AMDGPU_TARGETS=gfx1100`.
 - The known NVIDIA-specific workarounds from PR #27754 (`NVIDIA_TF32_OVERRIDE=0`, `-fa off` for MLA) are CUDA-specific. Their ROCm analogues (hipBLASLt reduced-precision options, FlashAttention on MLA) are **unknown on gfx1100** — resolving them with correctness evidence is an explicit M0 exit criterion (§14), not an assumption. Whatever setting M0 validates is written into `engine/llama-cpp.lock` and made the default; a config escape hatch (`--fa {on,off}`) stays exposed.
 - Vulkan: out of v1. The seam is clean — the substrate's Vulkan backend is a build-flag swap, and Golem's policy/patch seam (P1–P3) is backend-agnostic. When Vulkan K-quant kernels mature, support is a build+validation effort, not a redesign.
 - NVIDIA: same story — the fork's CUDA backend is a build-flag swap of the same kernels. No NVIDIA-specific code anywhere in Golem's Rust layers.
@@ -172,7 +181,7 @@ Every downloaded model gets `$GOLEM_DATA_DIR/models/<name>/manifest.json`:
   "repo": "unsloth/GLM-5.3-Flash-GGUF",
   "revision": "<hf commit sha>",
   "quant": "UD-Q4_K_XL",
-  "arch": "glm5_next",
+  "arch": "glm5next",
   "shards": [ { "file": "glm-5.3-flash-UD-Q4_K_XL-00001-of-000xx.gguf",
                 "bytes": 0, "sha256": "<...>",
                 "replicas": ["/mnt/ssd0/golem/models/...", "/mnt/ssd1/golem/models/..."] } ],
@@ -394,7 +403,7 @@ DISK =
 
 Output: table per tier, the four governing numbers (VRAM headroom, RAM pool, per-token KV cost, max cold-expert latency estimate from measured bandwidth), and a verdict. Infeasible → exit code 2, `golem_plan_infeasible` with the failing inequality printed with actual numbers. `--json` for tooling. The same functions serve the runtime's load-time feasibility check (§6.4) — one implementation, two callers, no drift.
 
-KV per token without loading the model: read from the arch table (glm5_next entry created in M0 from the loaded context's actual allocation, then frozen as a formula in metadata keys); when the GGUF carries the needed dims, the formula computes exactly.
+KV per token without loading the model: read from the arch table (glm5next entry created in M0 from the loaded context's actual allocation, then frozen as a formula in metadata keys); when the GGUF carries the needed dims, the formula computes exactly.
 
 ---
 
@@ -440,7 +449,7 @@ KV per token without loading the model: read from the arch table (glm5_next entr
 golem/
 ├── product-spec.md, docs/  (tech-design.md, worklog.md, superpowers/plans/, baselines/, adr/ ...)
 ├── engine/llama-cpp.lock          # pinned fork commit, ROCm line, patch list, M0-validated flags
-├── vendor/llama.cpp/              # the fork (P1–P4 patches + golem-hooks.h)
+├── vendor/llama.cpp/              # pristine fork at pin; P1–P4 patches + golem-hooks.h land in M2.x
 ├── crates/
 │   ├── golem-cli/                 # clap commands; thin — all verbs delegate to libraries
 │   ├── golem-server/              # instance process: axum API, slot scheduler, decode loop
