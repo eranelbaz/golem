@@ -6,8 +6,9 @@ set -euo pipefail
 NAME="$1"; shift
 MODEL="$1"; shift
 
-BIN=vendor/llama.cpp/build/bin
-LOGDIR="${GOLEM_M0_WORK:-.m0-work/m04}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$REPO/vendor/llama.cpp/build/bin"
+LOGDIR="${GOLEM_M0_WORK:-$REPO/.m0-work/m04}"
 LOG="$LOGDIR/$NAME.log"
 VLOG="$LOGDIR/$NAME.vram"
 TIMEF="$LOGDIR/$NAME.time"
@@ -29,7 +30,7 @@ fi
 
 ( while true; do vram_sample || echo "WARN: vram sample failed" >&2; sleep 0.5; done ) >> "$VLOG" &
 SAMPLER=$!
-trap 'kill "$SAMPLER" 2>/dev/null || true' EXIT
+trap 'kill "$SAMPLER" 2>/dev/null || true; wait "$SAMPLER" 2>/dev/null || true' EXIT
 
 RC=0
 python3 -c '

@@ -5,7 +5,7 @@ O_DIRECT bypasses the page cache, so no root drop_caches is needed.
 Chunk = 8 MiB (expert-read scale, design §5.4). Legs: per-file and
 striped-across-files x {seq, rand} x {1, 8 threads}.
 """
-import argparse, hashlib, json, mmap, os, random, shutil, sys, tempfile, time
+import argparse, errno, hashlib, json, mmap, os, random, shutil, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 CHUNK = 8 << 20  # 8 MiB
@@ -26,7 +26,7 @@ def read_at(fd, buf, offset):
     while done < CHUNK:
         n = os.preadv(fd, [mv[done:]], offset + done)
         if n == 0:
-            raise OSError(f"preadv returned 0 at offset {offset + done}")
+            raise OSError(errno.EIO, f"preadv returned 0 at offset {offset + done}")
         done += n
 
 
@@ -41,7 +41,7 @@ def seq_offsets(fsize, nbytes):
     return out
 
 
-def rand_offsets(fsize, nbytes, seed):
+def rand_offsets(fsize, nbytes, seed):  # seed is the file index; diversified per file
     if fsize < 2 * CHUNK:
         raise ValueError(f"file too small for rand pattern: {fsize} bytes")
     rnd = random.Random(seed)
@@ -52,8 +52,9 @@ def rand_offsets(fsize, nbytes, seed):
 
 def run_jobs(jobs, threads):
     fds = sorted({fd for fd, _, _ in jobs})
-    bufs = {fd: aligned_buf() for fd in fds}
-    work = [(fd, bufs[fd], off) for fd, _, off in jobs]
+    # fresh buffer per job: with --striped and threads > 1, two jobs can share
+    # an fd concurrently; a per-fd buffer would race (matters for verify modes)
+    work = [(fd, aligned_buf(), off) for fd, _, off in jobs]
     random.Random(1).shuffle(work)  # same interleaving discipline per leg
     try:
         t0 = time.perf_counter()
@@ -94,10 +95,10 @@ def _selftest_body(sysd):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", action="append", required=True)
-    ap.add_argument("--pattern", choices=["seq", "rand"], required=True)
-    ap.add_argument("--threads", type=int, required=True)
-    ap.add_argument("--bytes-gb", type=int, default=4)
+    ap.add_argument("--file", action="append")
+    ap.add_argument("--pattern", choices=["seq", "rand"])
+    ap.add_argument("--threads", type=int)
+    ap.add_argument("--bytes-gib", type=int, default=4, dest="bytes_gib")
     ap.add_argument("--striped", action="store_true",
                     help="stripe chunk offsets round-robin across all files")
     ap.add_argument("--out")
@@ -107,22 +108,24 @@ def main():
     if args.selftest:
         selftest()
         return
+    if not (args.file and args.pattern and args.threads):
+        ap.error("--file, --pattern and --threads are required (unless --selftest)")
 
-    nbytes = args.bytes_gb << 30
+    nbytes = args.bytes_gib << 30
     paths = args.file
     sizes = [os.path.getsize(p) for p in paths]
     leg_files = "+".join(os.path.basename(p) for p in paths)
 
     if args.striped:
         offs = [seq_offsets(s, nbytes // len(paths)) if args.pattern == "seq"
-                else rand_offsets(s, nbytes // len(paths), 7) for s in sizes]
+                else rand_offsets(s, nbytes // len(paths), i) for i, s in enumerate(sizes)]
         fds = [open_direct(p) for p in paths]
         jobs = [(fds[i], None, o) for i, ol in enumerate(offs) for o in ol]
         res = run_jobs(jobs, args.threads)
     else:
         results = []
-        for p, s in zip(paths, sizes):
-            offs = seq_offsets(s, nbytes) if args.pattern == "seq" else rand_offsets(s, nbytes, 7)
+        for i, (p, s) in enumerate(zip(paths, sizes)):
+            offs = seq_offsets(s, nbytes) if args.pattern == "seq" else rand_offsets(s, nbytes, i)
             fd = open_direct(p)
             results.append(run_jobs([(fd, None, o) for o in offs], args.threads))
         agg_bytes = sum(r["bytes"] for r in results)
