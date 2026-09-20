@@ -64,6 +64,8 @@ def main():
 
     block_count = field_int(readers[first], f"{arch}.block_count")
     expert_count = field_int(readers[first], f"{arch}.expert_count")
+    if expert_count is None or expert_count <= 0:
+        sys.exit(f"FATAL: {arch}.expert_count missing or invalid in GGUF header")
     print(f"arch: {arch}  block_count: {block_count}  expert_count: {expert_count}")
 
     # expert_index: walk tensor tables of EVERY shard (shard 1 has zero tensors).
@@ -76,7 +78,8 @@ def main():
             m = MOE_RE.search(t.name)
             if not m:
                 continue
-            layer = int(re.search(r"blk\.(\d+)\.", t.name).group(1))
+            layer = int(re.search(r"blk\.(\d+)\.", t.name).group(1)) if re.search(r"blk\.(\d+)\.", t.name) else sys.exit(
+                f"FATAL: expert-like tensor without blk.N. prefix: {t.name}")
             if t.n_bytes % expert_count != 0:
                 sys.exit(f"FATAL: {t.name} n_bytes {t.n_bytes} not divisible by {expert_count} experts")
             bpe = t.n_bytes // expert_count

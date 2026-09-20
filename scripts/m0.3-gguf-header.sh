@@ -4,10 +4,10 @@
 # layer/expert counts needed for the manifest's expert_index.
 set -euo pipefail
 
-DIR="${1:-$HOME/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL/UD-Q4_K_XL}"
+DIR="${1:-$HOME/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL}"
 GGUF_PY="$HOME/Projects/golem/vendor/llama.cpp/gguf-py"
 
-cd "$DIR"
+cd "$DIR" || { echo "FATAL: cannot cd to $DIR"; exit 1; }
 [ -d "$GGUF_PY" ] || { echo "FATAL: vendored gguf-py not found at $GGUF_PY"; exit 1; }
 
 PYTHONPATH="$GGUF_PY" python3 - <<'EOF'

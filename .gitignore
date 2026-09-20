@@ -18,3 +18,5 @@ vendor/llama.cpp/build/
 
 # Agent tooling scratch
 .pi/
+__pycache__/
+*.pyc
