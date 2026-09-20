@@ -101,5 +101,6 @@
     }
   },
   "notes": "warm_tok_s is NOT recorded as a number: at this pin there is no persistent device cache (P2/M2.4) and the sweep could not isolate copy cost; the extrapolation from §14 M0 is deferred to M2 hardware baselines. Kernel string, GLM-RUN summary lines and generation texts are in docs/baselines/m0-notes.md (local-only).",
-  "storage_note": "Replica/storage locations are machine-local (see docs/baselines/m0-notes.md, local-only). Committed manifest carries content identity only (file/bytes/sha256); golem pull (M3.2) regenerates locations from its own resolved paths."
+  "storage_note": "Replica/storage locations are machine-local (see docs/baselines/m0-notes.md, local-only). Committed manifest carries content identity only (file/bytes/sha256); golem pull (M3.2) regenerates locations from its own resolved paths.",
+  "manifest_note": "Full manifests (shard hashes + expert_index) are machine-local (docs/baselines/manifests/, not committed) and regenerable via golem import (M3.2) or hf download at the pinned revision; baseline-001.json + substrate content_sha256 carry the committed identity."
 }
