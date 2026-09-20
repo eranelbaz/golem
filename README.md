@@ -28,7 +28,7 @@ Golem never downloads models. You obtain the weights yourself (e.g.
 # 1. Import: verify shards, build the manifest, mirror to more disks (optional,
 #    but recommended — one path per physical drive = read striping + redundancy)
 golem import ~/models/glm-5.3-flash-ud-q4k-xl \
-             /mnt/data/golem/models/glm-5.3-flash-ud-q4k-xl
+             /mnt/disk2/models/glm-5.3-flash-ud-q4k-xl
 
 # 2. Check what a config will do to your memory before starting
 golem plan glm-5.3-flash-ud-q4k-xl --ctx 16384
