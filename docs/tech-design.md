@@ -120,6 +120,8 @@ Everything that is **not** an expert weight (embeddings, attention projections, 
   # fa = <set at M0.4>    # FlashAttention/precision setting for MLA on ROCm (§3.5)
   ```
 
+  *(values as of the M0.1 pin; `engine/llama-cpp.lock` is authoritative on divergence)*
+
 - The vendored tree carries no nested `.git` by design, so the acceptance is content-based, not `git rev-parse`: CI's `vendor-pin-check` recomputes `content_sha256` from `vendor/llama.cpp` (canonical recipe, ADR 0001) and it must match `vendor/VENDOR_SHA` and the lock.
 - The fork is vendored in-tree (`vendor/llama.cpp/`) and built by the `golem-llama-sys` build script via the `cmake` crate with `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100`.
 - Patch discipline: total diff vs upstream ≤ ~1,000 lines, confined to the files listed in §3.4. Every patch has an in-tree regression test (§12.2, T4). Upstream rebase is a scheduled maintenance task (monthly + on GLM-arch fixes), never an ad-hoc drift.

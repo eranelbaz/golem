@@ -43,9 +43,9 @@ to resume from this file alone.
 ## 1. Status snapshot
 
 - **Phase:** M0 — feasibility spike (gates everything; design §14)
-- **Next task:** **M0.1** (fork-pin) — executed plan-first per protocol steps 5–6
-- **Open PRs:** #2 — docs: planning protocol (branch `docs/planning-protocol`)
-- **Last session:** 2026-09-19 — PR #1 merged (B1 done); planning protocol wired into design + worklog
+- **Next task:** **M0.2** (hip-build)
+- **Open PRs:** none
+- **Last session:** session 4 — PR #3 merged (M0.1 fork-pin done, `ac09f05`)
 
 ---
 
