@@ -5,7 +5,7 @@ O_DIRECT bypasses the page cache, so no root drop_caches is needed.
 Chunk = 8 MiB (expert-read scale, design §5.4). Legs: per-file and
 striped-across-files x {seq, rand} x {1, 8 threads}.
 """
-import argparse, hashlib, json, mmap, os, random, tempfile, time
+import argparse, hashlib, json, mmap, os, random, shutil, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 CHUNK = 8 << 20  # 8 MiB
@@ -24,7 +24,10 @@ def read_at(fd, buf, offset):
     mv = memoryview(buf)
     done = 0
     while done < CHUNK:
-        done += os.preadv(fd, [mv[done:]], offset + done)
+        n = os.preadv(fd, [mv[done:]], offset + done)
+        if n == 0:
+            raise OSError(f"preadv returned 0 at offset {offset + done}")
+        done += n
 
 
 def seq_offsets(fsize, nbytes):
@@ -36,6 +39,8 @@ def seq_offsets(fsize, nbytes):
 
 
 def rand_offsets(fsize, nbytes, seed):
+    if fsize < 2 * CHUNK:
+        raise ValueError(f"file too small for rand pattern: {fsize} bytes")
     rnd = random.Random(seed)
     hi = (fsize - CHUNK) // ALIGN
     n = min(fsize, nbytes) // CHUNK
@@ -47,12 +52,14 @@ def run_jobs(jobs, threads):
     bufs = {fd: aligned_buf() for fd in fds}
     work = [(fd, bufs[fd], off) for fd, _, off in jobs]
     random.Random(1).shuffle(work)  # same interleaving discipline per leg
-    t0 = time.perf_counter()
-    with ThreadPoolExecutor(threads) as ex:
-        list(ex.map(lambda j: read_at(j[0], j[1], j[2]), work))
-    dt = time.perf_counter() - t0
-    for fd in fds:
-        os.close(fd)
+    try:
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(threads) as ex:
+            list(ex.map(lambda j: read_at(j[0], j[1], j[2]), work))
+        dt = time.perf_counter() - t0
+    finally:
+        for fd in fds:
+            os.close(fd)
     total = len(work) * CHUNK
     return {"bytes": total, "seconds": round(dt, 3),
             "gib_per_sec": round(total / dt / 2**30, 2)}
@@ -62,6 +69,13 @@ def selftest():
     # /tmp is often tmpfs, which rejects O_DIRECT — use a scratch dir on the
     # caller's (disk-backed) filesystem instead.
     sysd = tempfile.mkdtemp(dir=os.environ.get("GOLEM_SELFTEST_DIR", "."))
+    try:
+        _selftest_body(sysd)
+    finally:
+        shutil.rmtree(sysd, ignore_errors=True)
+
+
+def _selftest_body(sysd):
     path = os.path.join(sysd, "t.bin")
     payload = bytes(256) * (CHUNK // 256)
     with open(path, "wb") as f:
@@ -72,8 +86,6 @@ def selftest():
     read_at(fd, buf, 0)  # first chunk = b"\xab" * CHUNK
     os.close(fd)
     assert hashlib.sha256(buf).hexdigest() == hashlib.sha256(b"\xab" * CHUNK).hexdigest()
-    os.unlink(path)
-    os.rmdir(sysd)
     print("SELFTEST-OK")
 
 

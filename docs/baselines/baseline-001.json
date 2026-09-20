@@ -53,9 +53,9 @@
     "cold_load_s": "~60 (first loads; later legs benefit from page cache)",
     "copy_cost_ms_per_expert_layer_per_step": "inconclusive: sweep N in {45,44,43} gave 0.8/0.7/0.6 t/s with INVERTED signal vs the copy model; page-cache noise (+-20%) dominates the ~5% expected copy signal. P4 per-step counters (M2.4) will measure this directly.",
     "sweep": [
-      { "ncmoe": 45, "cpu_expert_layers": 42, "gen_tok_s": 0.8, "peak_vram_gib": 12.85 },
-      { "ncmoe": 44, "cpu_expert_layers": 41, "gen_tok_s": 0.7, "peak_vram_gib": 15.45 },
-      { "ncmoe": 43, "cpu_expert_layers": 40, "gen_tok_s": 0.6, "peak_vram_gib": 19.3 }
+      { "ncmoe": 45, "cpu_expert_layers": 42, "gen_tok_s": 0.8, "peak_vram_gib": 11.06 },
+      { "ncmoe": 44, "cpu_expert_layers": 41, "gen_tok_s": 0.7, "peak_vram_gib": 15.46 },
+      { "ncmoe": 43, "cpu_expert_layers": 40, "gen_tok_s": 0.6, "peak_vram_gib": 19.51 }
     ],
     "disk": {
       "io_uring": "n/a (no fio on machine; deferred to M3 golem-store)",

@@ -23,7 +23,7 @@ IDLE=$(tail -1 "$VLOG" | awk '{print $2}')
 : > "$LOG"
 : > "$TIMEF"
 
-( while true; do vram_sample; sleep 0.5; done ) >> "$VLOG" &
+( while true; do vram_sample || echo "WARN: vram sample failed" >&2; sleep 0.5; done ) >> "$VLOG" &
 SAMPLER=$!
 trap 'kill "$SAMPLER" 2>/dev/null || true' EXIT
 
