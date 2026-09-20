@@ -25,3 +25,5 @@ __pycache__/
 docs/baselines/m0-notes.md
 docs/superpowers/
 docs/worklog.md
+docs/tech-design.md
+docs/product-spec.md
