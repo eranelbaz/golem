@@ -17,13 +17,13 @@ See [`product-spec.md`](product-spec.md) for the what and why, and
 |------|----------|
 | [`product-spec.md`](product-spec.md) | Product requirements, scope, acceptance criteria |
 | [`docs/tech-design.md`](docs/tech-design.md) | Architecture, decisions D1–D12, substrate patches P1–P4, memory model, test matrix |
-| [`docs/worklog.md`](docs/worklog.md) | **Execution state**: continuation protocol, task board, session log |
-| [`docs/superpowers/plans/`](docs/superpowers/plans) | Per-task implementation plans (writing-plans format) — written and reviewed before each task's code |
+| `docs/worklog.md` *(local-only, not in repo)* | Execution state: continuation protocol, task board, session log |
+| `docs/superpowers/plans/` *(local-only, not in repo)* | Per-task implementation plans (writing-plans format) — written and reviewed before each task's code |
 
 ## Status
 
 Design approved, execution starting. Task board and current phase:
-[`docs/worklog.md`](docs/worklog.md).
+`docs/worklog.md` (local-only; not committed).
 
 ## Repository layout
 
@@ -40,6 +40,6 @@ scripts/       substrate build + hardware test scripts (lands M0.2)
 
 Each unit of work is a task from the worklog board: branch `task/<id>-<slug>`,
 write and plan-review an implementation plan under
-[`docs/superpowers/plans/`](docs/superpowers/plans), implement per the
+`docs/superpowers/plans/` (local-only), implement per the
 approved plan, verify the task's acceptance commands, PR. The full protocol is at
-the top of [`docs/worklog.md`](docs/worklog.md).
+the top of `docs/worklog.md` (local-only).
