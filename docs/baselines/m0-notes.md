@@ -27,3 +27,14 @@
   BUILD-OK: vendor/llama.cpp/build/bin/llama-cli
   ```
 - Script failure modes exercised before the real build: drift injection → `FATAL` + exit 1; restricted PATH + cmake stub → `rocm-check: skipped (rocminfo absent)`, flow proven to reach configure with exactly `-S vendor/llama.cpp -B vendor/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100`.
+
+## M0.3 — model-manifest (executed 2026-09-20, this PR)
+
+- Repo `unsloth/GLM-5.3-Flash-GGUF`, revision pinned `621d456e93e926e4b52f85cff5f634358c1828f9`, arch **`glm5next`** (gate on real shard-1 headers of both quants — `GATE-OK`; M0.1 pin cross-check passed).
+- Header facts (both quants identical): `block_count` 46, `expert_count` 288, `expert_used_count` 8, `leading_dense_block_count` 3, `embedding_length` 4096, `attention.head_count` 64, `head_count_kv` 1, `context_length` 1,048,576.
+- **UD-Q4_K_XL** (primary): 6 shards, total **199,707,321,347 bytes** at `/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL/`; replica (full mirror, byte-verified) at `/mnt/data/golem/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL/` (nvme1n1).
+- **Q8_0** (parity): 8 shards, total **340,981,966,112 bytes** (single copy) at `/home/eranelbaz/models/glm-5.3-flash-q8-0/Q8_0/`.
+- Expert tensors: **129** = (46 − 3 dense) × 3 (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`), 288 experts/layer, uniform per tensor (division asserted). Q4 bytes/expert: gate/up 4,718,592, down 5,767,168. Q8 bytes/expert: 8,912,896 (all three).
+- Provenance: shards downloaded 2026-09-20 (earlier same-day session); this session verified all 14 shards **content-identical to the Hub head via LFS-sha256 comparison** (tree API `lfs.oid` vs local `sha256sum`); manifests then built by `scripts/m0.3-manifest.py` (independent streamed hashing) and re-verified with `sha256sum -c` on primary **and** replica — all OK.
+- Manifests: `docs/baselines/manifests/glm-5.3-flash-ud-q4k-xl.json`, `docs/baselines/manifests/glm-5.3-flash-q8_0.json` (design §4.2 schema; `chat_template_sha` over `tokenizer.chat_template`). M3.2 `golem pull` must reproduce the Q4 manifest diff-clean.
+- Timing caveat: wall-clock times for hashing were not captured per-step; NVMe hashing ran at ≳1 GB/s aggregate. M0.4 is the measurement task.
