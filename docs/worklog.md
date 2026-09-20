@@ -123,7 +123,7 @@ Every task executes **plan-first** (protocol steps 5–6): a per-task implementa
 
 ## 4. Log (append-only, newest first)
 
-### 2026-09-20 — session 5 (cont.): M0.2 follow-ups from quality pass (PR open)
+### 2026-09-20 — session 5 (cont.): M0.2 follow-ups from quality pass (PR #5, merge cc5dc21)
 
 - Quality-pass findings applied in one follow-up PR: plan checkboxes ticked (14; protocol step-7 miss in PR #4), ADR 0001 recipe amended to the build-pruned `cs()` form (matches the M0.2 script; no-op on pristine trees), plan smoke command corrected to as-executed (`-st -v`), `7/7` layer claim fixed, `m0-notes` date/provenance/timing-caveat fixed, `build-substrate.sh` hardened (missing-key greps now loud FATAL instead of silent exit 1; `-o`-in-`[` removed; dead fallback comment removed; `BUILD-OK` asserts the binary exists).
 - No behavior change on this machine's inputs: re-ran the script after hardening — `pin-ok` / `rocm-check: ok (7.2.4 satisfies lock 7.2.4)` / `BUILD-OK` all print (skip leg re-verified via the stub PATH).
