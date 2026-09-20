@@ -36,8 +36,10 @@ The pin also inherits a liveness risk: PR #27754 is hosted on ggml-org/llama.cpp
 3. **Pin integrity = recomputable content hash, not a SHA claim.** Because the pin lives on a mutable third-party fork, the accepted anchor is a tree fingerprint recomputable forever from the vendored files. Canonical recipe (paste verbatim; do not re-type):
 
    ```bash
-   (cs() { cd "$1" && find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'; }; cs DIR)
+   (cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'; }; cs DIR)
    ```
+
+   **Amendment (M0.2 follow-ups):** the recipe now prunes `./build` in addition to `./.git` (M0.1 original pruned only `./.git`). Rationale: `scripts/build-substrate.sh` (M0.2) hashes the vendored tree at build time, and build artifacts under `vendor/llama.cpp/build/` would otherwise make every post-build re-fingerprint disagree with `vendor/VENDOR_SHA`. The prune is a no-op on a pristine tree — the pin's hash value is unchanged (`812b9b4a…`), verified before amending. CI (`vendor-pin-check`) runs on a fresh checkout with no build dir and keeps its `./.git`-only form deliberately; any consumer fingerprinting a tree *after* a build must use this build-pruned form.
 
    The `cd`-inside + `find .` form and `LC_ALL=C` are load-bearing: `sha256sum` output embeds file paths, so a repo-root invocation hashes a different path prefix and can never match across checkouts, and `sort` order is locale-dependent and would diverge between machines. The recipe must reproduce itself — the stability canary, run twice before its output is trusted anywhere.
 
@@ -54,7 +56,7 @@ The pin also inherits a liveness risk: PR #27754 is hosted on ggml-org/llama.cpp
 Canonical recipe (identical to Decision §3; paste verbatim):
 
 ```bash
-(cs() { cd "$1" && find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'; }; cs DIR)
+(cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'; }; cs DIR)
 ```
 
 All steps mandatory, in order:
