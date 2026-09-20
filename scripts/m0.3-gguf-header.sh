@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M0.3 gate: read GGUF header via the vendored fork's gguf-py.
-# Asserts arch == glm5next (design D4 / M0.1 pin) and prints the
+# Asserts arch == glm5next (M0.1 pin) and prints the
 # layer/expert counts needed for the manifest's expert_index.
 set -euo pipefail
 
