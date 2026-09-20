@@ -7,8 +7,19 @@
     "vram_mib": 24560,
     "ram_gib": 93,
     "drives": [
-      { "model": "Samsung 990 PRO 4TB", "dev": "nvme0n1", "role": "primary", "hosts": "/home" },
-      { "model": "PNY CS2130 1TB", "dev": "nvme1n1", "role": "replica", "mounted": true, "mount": "/mnt/data (nvme1n1p1)" }
+      {
+        "model": "Samsung 990 PRO 4TB",
+        "dev": "nvme0n1",
+        "role": "primary",
+        "hosts": "/home"
+      },
+      {
+        "model": "PNY CS2130 1TB",
+        "dev": "nvme1n1",
+        "role": "replica",
+        "mounted": true,
+        "mount": "/mnt/data (nvme1n1p1)"
+      }
     ],
     "kernel": "7.1.11-arch1-1",
     "rocm": "7.2.4"
@@ -53,9 +64,24 @@
     "cold_load_s": "~60 (first loads; later legs benefit from page cache)",
     "copy_cost_ms_per_expert_layer_per_step": "inconclusive: sweep N in {45,44,43} gave 0.8/0.7/0.6 t/s with INVERTED signal vs the copy model; page-cache noise (+-20%) dominates the ~5% expected copy signal. P4 per-step counters (M2.4) will measure this directly.",
     "sweep": [
-      { "ncmoe": 45, "cpu_expert_layers": 42, "gen_tok_s": 0.8, "peak_vram_gib": 11.06 },
-      { "ncmoe": 44, "cpu_expert_layers": 41, "gen_tok_s": 0.7, "peak_vram_gib": 15.46 },
-      { "ncmoe": 43, "cpu_expert_layers": 40, "gen_tok_s": 0.6, "peak_vram_gib": 19.51 }
+      {
+        "ncmoe": 45,
+        "cpu_expert_layers": 42,
+        "gen_tok_s": 0.8,
+        "peak_vram_gib": 11.06
+      },
+      {
+        "ncmoe": 44,
+        "cpu_expert_layers": 41,
+        "gen_tok_s": 0.7,
+        "peak_vram_gib": 15.46
+      },
+      {
+        "ncmoe": 43,
+        "cpu_expert_layers": 40,
+        "gen_tok_s": 0.6,
+        "peak_vram_gib": 19.51
+      }
     ],
     "disk": {
       "io_uring": "n/a (no fio on machine; deferred to M3 golem-store)",
@@ -64,8 +90,12 @@
       "nvme1n1_cs2130_seq_t1_gib_s": 2.24,
       "nvme1n1_cs2130_rand_t1_gib_s": 2.16,
       "note_t8_anomaly": "8-thread O_DIRECT legs DROP to 1.9-2.0 GiB/s on BOTH drives (vs t1) - concurrency regresses throughput; cause not investigated",
-      "hardware_flag": "REPRODUCIBLE EIO (errno 5) on nvme0n1 under concurrent (>=2-thread) O_DIRECT reads - intermittent at t2, consistent at t8; single-thread clean. Drive hosts /home. smartctl not installed; recommend SMART long test + firmware check before M3 hardware work. All M0.3 hashes (single-stream) passed, so no data corruption confirmed.",
-      "striped_2drive_seq_t2_gib_s": [4.73, 4.81, 4.89],
+      "hardware_flag": "RESOLVED (2026-09-20 follow-up): EIO is NOT a drive problem. Controlled matrix (5 legs/point): concurrent O_DIRECT reads on /home (btrfs, compress=zstd:3) fail EIO at t2=2/5, t4=5/5, t8=5/5, t16=5/5 legs; identical test on /mnt/data (ext4) 0 failures at every thread count; full single-thread O_DIRECT sweep of the 45.8 GiB shard = 5864/5864 chunks OK. Kernel/filesystem-level btrfs concurrent-O_DIRECT failure (kernel 7.1.11-arch1-1), no nvme errors in journal, PCIe AER clean, firmware 4B2QJXD7. M3.1 must probe O_DIRECT viability per replica at open and fall back to buffered reads (design §5.4 opt-in stance vindicated).",
+      "striped_2drive_seq_t2_gib_s": [
+        4.73,
+        4.81,
+        4.89
+      ],
       "striped_2drive_rand_t2_gib_s": 4.6
     }
   },
