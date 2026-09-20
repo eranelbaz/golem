@@ -172,7 +172,9 @@ def release_lock(outdir: str) -> None:
 
 
 def preflight(bin_path: str) -> None:
-    r = subprocess.run(["pgrep", "-f", "llama-cli"], capture_output=True, text=True)
+    # -x (exact process name): -f would match this harness's own cmdline, which
+    # embeds the llama-cli path.
+    r = subprocess.run(["pgrep", "-x", "llama-cli"], capture_output=True, text=True)
     if r.returncode == 0:
         sys.exit(f"FATAL: llama-cli already running (pid(s): {r.stdout.strip()}) — "
                  f"legs must run strictly sequentially.")
