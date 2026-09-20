@@ -43,9 +43,9 @@ to resume from this file alone.
 ## 1. Status snapshot
 
 - **Phase:** M0 — feasibility spike (gates everything; design §14)
-- **Next task:** **M0.2** (hip-build)
-- **Open PRs:** none
-- **Last session:** session 4 — PR #3 merged (M0.1 fork-pin done, `ac09f05`)
+- **Next task:** **M0.3** (model-manifest) — after M0.2's PR merges
+- **Open PRs:** M0.2 hip-build (session 5)
+- **Last session:** session 5 — M0.2 executed, PR open
 
 ---
 
@@ -77,7 +77,7 @@ Every task executes **plan-first** (protocol steps 5–6): a per-task implementa
 ### Phase M0 — Feasibility spike on the 7900 XTX (gates everything; exit criteria design §14)
 
 - ☑ **M0.1 · fork-pin** — Research the state of GLM-5.3-Flash (`glm5next`) text support upstream: pin the head of PR #27754 (PR hosted on `ggml-org/llama.cpp`; head branch `glm5next/upstream` from the unslothai fork); select the commit. Vendor it **squashed** into `vendor/llama.cpp/` (no patches yet, no nested `.git`). Write `engine/llama-cpp.lock` (repo, branch, commit, pr, base_upstream, content hashes, file_count, ROCm line, `patches = none-yet`) and `docs/adr/0001-fork-pin.md` (why this commit, what it contains). Accept: CI's `vendor-pin-check` recomputes `content_sha256` from `vendor/llama.cpp` (canonical recipe, ADR) and matches `vendor/VENDOR_SHA` and the lock; design §3.2. Deps: B1. *(done — PR #3, merge ac09f05)*
-- ☐ **M0.2 · hip-build** — Scripted substrate build: `scripts/build-substrate.sh` (cmake `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100`; warns on `rocminfo` vs lock `rocm` mismatch and skips the check when `rocminfo` is absent — M0.1 pre-fills `rocm = 7.2.4`). Smoke: `llama-cli` with a small GGUF on the 7900 XTX. Accept: build + smoke log committed under `docs/baselines/m0-notes.md`; ROCm version pinned. Deps: M0.1.
+- ☐ **M0.2 · hip-build** — *(PR open — session 5)* Scripted substrate build: `scripts/build-substrate.sh` (cmake `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100`; warns on `rocminfo` vs lock `rocm` mismatch and skips the check when `rocminfo` is absent — M0.1 pre-fills `rocm = 7.2.4`). Smoke: `llama-cli` with a small GGUF on the 7900 XTX. Accept: build + smoke log committed under `docs/baselines/m0-notes.md`; ROCm version pinned. Deps: M0.1.
 - ☐ **M0.3 · model-manifest** — Download `unsloth/GLM-5.3-Flash-GGUF` **UD-Q4_K_XL** (exact revision pinned) to a chosen drive location + replica location on the second NVMe; compute per-shard SHA-256; hand-write the `manifest.json` per design §4.2 (the `golem pull` tool itself comes in M3.2); record exact byte sizes, layer/expert counts, bytes-per-expert in `docs/baselines/m0-notes.md`. Also fetch **Q8_0** of the same revision for parity work. Accept: manifests committed, hashes verified, sizes recorded. Deps: M0.2.
 - ☐ **M0.4 · m0-measurements** — The spike proper: run the pinned build with host-buffered experts (`-ncmoe`-style) on the real model; measure per design §14/M0: cold-expert copy cost per step, KV bytes/token, ROCm VRAM overhead, tok/s cold vs warm, FA/precision settings that make MLA correct on ROCm (design §3.5 open risk). Freeze validated settings + numbers into `engine/llama-cpp.lock`, `docs/baselines/baseline-001.json` (design §12.3 fields). Accept: all five measurement classes recorded; settings frozen. Deps: M0.3.
 - ☐ **M0.5 · parity-floor** — 8-prompt greedy parity: HIP run vs CPU reference run of the *same pinned build*; compute match rate; set the T2 threshold at ≥ (reference-noise-floor + margin) per design §12.2. Accept: numbers + threshold recorded in `docs/baselines/baseline-001.json`; **M0 exit review** written (continue / re-scope verdict per design §14). Deps: M0.4.
@@ -123,6 +123,14 @@ Every task executes **plan-first** (protocol steps 5–6): a per-task implementa
 
 ## 4. Log (append-only, newest first)
 
+### 2026-09-20 — session 5: M0.2 hip-build (PR open)
+
+> PR number to be filled in after `gh pr create` (this entry is committed before the PR exists — protocol ordering).
+
+- Executed M0.2 plan-first on `task/m0.2-hip-build` (plan: `docs/superpowers/plans/2026-09-19-m0.2-hip-build.md`; plan review 3 rounds — rounds 1–2 caught real script bugs: pin-hash didn't prune the build dir (poisoned re-runs), dead smoke URLs, untestable skip-leg; round 3 **Approved** with empirical verification on this machine).
+- Landed: `scripts/build-substrate.sh` (pin-integrity gate with `./build` pruned from the ADR canonical hash, advisory rocm check warn-or-skip-never-fail, HIP gfx1100 configure, llama-cli target); real HIP build on the 7900 XTX (83 s wall, first compile); GPU smoke run `stories15M-q4_0` at `-ngl 99` — exit 0, 7/7 layers on ROCm0, 1367 t/s generation. Evidence in `docs/baselines/m0-notes.md`.
+- Deviations from plan: none substantive. Two execution notes (recorded in m0-notes): the fork's `llama-cli` chat UI needs `-st` for non-interactive runs (plan's `--no-warmup` invocation hung in interactive mode on first attempt; `-no-cnv` doesn't exist at this pin) and the UI suppresses backend logs (verbose evidence captured with `-v`).
+- Next session: after merge, mark M0.2 `done` and start **M0.3** (model-manifest: download UD-Q4_K_XL + Q8_0, pin revision + SHA-256s, hand-write manifest).
 ### 2026-09-19 — session 4: M0.1 fork-pin (PR #3)
 
 - PR #2 (planning protocol) merged. M0.1 executed plan-first on `task/m0.1-fork-pin` (plan: `docs/superpowers/plans/2026-09-19-m0.1-fork-pin.md`; per-task review gates clean). Status: **PR open (#3)**.
