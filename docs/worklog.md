@@ -123,6 +123,17 @@ Every task executes **plan-first** (protocol steps 5–6): a per-task implementa
 
 ## 4. Log (append-only, newest first)
 
+### 2026-09-19 — session 4: M0.1 fork-pin (PR #3)
+
+- PR #2 (planning protocol) merged. M0.1 executed plan-first on `task/m0.1-fork-pin` (plan: `docs/superpowers/plans/2026-09-19-m0.1-fork-pin.md`; per-task review gates clean). Status: **PR open (#3)**.
+- **Research findings (as of 2026-09-19):** three competing draft PRs on GLM-5.3-Flash support disagree on the GGUF arch string — #27773 (`glm5-next`), #27754 (`glm5next`), #27752 (`glm5next`, text-only). Design D4 pins `unsloth/GLM-5.3-Flash-GGUF`, whose GGUFs carry arch `glm5next` → **#27754 selected** (head `86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9`, branch `glm5next/upstream` from unslothai/llama.cpp; PR hosted on **ggml-org/llama.cpp**, base `930e2fa5…`, state OPEN live-verified). M0.3's gate will cross-check the actual GGUF `general.architecture`.
+- **Vendored:** squashed single commit `5af7f1f` — plain files, no nested `.git`, no submodule; 3,599 files; 16 `.gitignore` files force-added past both ignore layers; pristine tarball parked at `~/.cache/golem/vendor/golem-vendor-tarball.tar.gz` until merge (delete after).
+- **Pin recorded:** `engine/llama-cpp.lock` (`ca61722`; LOCK-MATCHES-VENDOR) + `vendor/VENDOR_SHA`; `content_sha256 = 812b9b4a7848e34a76c8d444e244fa787f6adb0a586e85a7317477a53ea9f794` (canonical `cs()` recipe, ADR 0001).
+- **Design amendments in this PR (`a25661d`):** repo-wide arch string `glm5next`; lock schema §3.2 (superseded by lock+ADR); ROCm 7.2.4 advisory wording (M0.2 warns/skips — no hard assert); worklog M0.1/M0.2 task lines; §13 vendor-layout comment. Acceptance form changed git-rev-parse → content-hash (ADR `ecd37a9`).
+- **Verification mechanism:** recomputable `content_sha256` (ONE canonical recipe used verbatim in fingerprint, verification, CI `vendor-pin-check` at `bdf1da5`, and ADR re-vendor procedure) + parked pristine tarball. All gates green: BASE-OK, ARCH=glm5next (src/llama-arch.cpp:88), NO-SUBMODULES, NO-NESTED-GIT-OK, CONTENT-HASH-OK, COUNT-OK, TREE-IDENTICAL, INDEX-OK (re-run fresh on the committed branch pre-PR).
+- **Deviations:** brief's `--repo unslothai/llama.cpp` wrong (PR is on ggml-org — pin verified live, no re-pin); 0-byte tracked `.gitmodules` kept (upstream content; gate substance = `git submodule status` empty); `file_count=3599` (brief's `fc` form counts pruned `./.git` → 3600); tarball via `--exclude=.git` (`--exclude-vcs` drops 17 tracked files → broke TREE-IDENTICAL); Task-2 verify one-liner normalized (whitespace/order artifacts, values byte-identical); ADR records PR state OPEN (live-verified), not "draft".
+- merge SHA: <pending>
+
 ### 2026-09-19 — session 3: planning protocol (writing-plans wired in)
 
 > Old protocol steps 5–10 were renumbered 5–12 in this session; session-2's "step 8" note below now refers to step 10.
