@@ -18,3 +18,10 @@ vendor/llama.cpp/build/
 
 # Agent tooling scratch
 .pi/
+__pycache__/
+*.pyc
+
+# Local-only docs (not part of the repo)
+docs/baselines/m0-notes.md
+docs/superpowers/
+docs/worklog.md
