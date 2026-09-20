@@ -1,0 +1,73 @@
+{
+  "id": "baseline-001",
+  "date": "2026-09-20",
+  "task": "M0.4",
+  "machine": {
+    "gpu": "AMD Radeon RX 7900 XTX (gfx1100, 1002:744c)",
+    "vram_mib": 24560,
+    "ram_gib": 93,
+    "drives": [
+      { "model": "Samsung 990 PRO 4TB", "dev": "nvme0n1", "role": "primary", "hosts": "/home" },
+      { "model": "PNY CS2130 1TB", "dev": "nvme1n1", "role": "replica", "mounted": true, "mount": "/mnt/data (nvme1n1p1)" }
+    ],
+    "kernel": "7.1.11-arch1-1",
+    "rocm": "7.2.4"
+  },
+  "substrate": {
+    "repo": "https://github.com/unslothai/llama.cpp",
+    "branch": "glm5next/upstream",
+    "commit": "86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9",
+    "content_sha256": "812b9b4a7848e34a76c8d444e244fa787f6adb0a586e85a7317477a53ea9f794",
+    "fa_locked": "on"
+  },
+  "model": {
+    "repo": "unsloth/GLM-5.3-Flash-GGUF",
+    "revision": "621d456e93e926e4b52f85cff5f634358c1828f9",
+    "quant": "UD-Q4_K_XL",
+    "arch": "glm5next",
+    "total_bytes": 199707321347,
+    "t_ne_bytes": 9850053635,
+    "expert_bytes_per_layer_max": 5303697408
+  },
+  "placement_finding": {
+    "ncmoe_semantics_at_pin": "whole-tensor: blocks < N experts CPU_Mapped (mmap-backed), blocks >= N experts get full VRAM buffers; verified by -ncmoe 16 OOM (136 GiB ROCm alloc attempt) and kv-4k verbose logs (CPU_Mapped 180.8 GiB, ROCm0 8.35 GiB)",
+    "model_vs_machine": "model 186.0 GiB > RAM+VRAM 117 GiB; every viable run keeps nearly all experts mmap-paged — this is effectively the cold disk tier via page cache, validating the disk-tier thesis early",
+    "load_log_line": "load_tensors: offloaded 47/47 layers to GPU (misleading; experts CPU_Mapped)"
+  },
+  "measurements": {
+    "ctx": 4096,
+    "fa_decision": {
+      "method": "256-token greedy gens at -ncmoe 45, seed 42 (ppl legs infeasible: prompt processing page-fault-bound at ~0.6 t/s -> one 2048-token window ~1 h; formal ppl gate deferred to M0.5)",
+      "ppl_off": null,
+      "ppl_on": null,
+      "greedy_common_prefix_words": 48,
+      "coherence": "both settings produce coherent, structured output with [Start thinking] delimiters",
+      "decision": "fa = on (design decision rule 2); formal M0.5 gate owns the threshold"
+    },
+    "kv_bytes_per_token": 19712,
+    "kv_crosscheck_bytes_per_token": 19802,
+    "kv_detail": "MLA: K-only f16, V=0; two buffers (n_embd 512 + 128); 77 MiB @4096 cells, 308 MiB @16384; plus fixed 145.56 MiB R/S decode state (ctx-independent)",
+    "vram_overhead_ws_plus_rocm_gib": 2.64,
+    "vram_overhead_formula": "peak - idle - ROCm0 model buffer (8550.87 MiB, from verbose log) - KV",
+    "cold_tok_s": "0.6-0.8 (mmap page-cache thrash regime)",
+    "cold_load_s": "~60 (first loads; later legs benefit from page cache)",
+    "copy_cost_ms_per_expert_layer_per_step": "inconclusive: sweep N in {45,44,43} gave 0.8/0.7/0.6 t/s with INVERTED signal vs the copy model; page-cache noise (+-20%) dominates the ~5% expected copy signal. P4 per-step counters (M2.4) will measure this directly.",
+    "sweep": [
+      { "ncmoe": 45, "cpu_expert_layers": 42, "gen_tok_s": 0.8, "peak_vram_gib": 12.85 },
+      { "ncmoe": 44, "cpu_expert_layers": 41, "gen_tok_s": 0.7, "peak_vram_gib": 15.45 },
+      { "ncmoe": 43, "cpu_expert_layers": 40, "gen_tok_s": 0.6, "peak_vram_gib": 19.3 }
+    ],
+    "disk": {
+      "io_uring": "n/a (no fio on machine; deferred to M3 golem-store)",
+      "nvme0n1_990pro_seq_t1_gib_s": 5.81,
+      "nvme0n1_990pro_rand_t1_gib_s": 5.76,
+      "nvme1n1_cs2130_seq_t1_gib_s": 2.24,
+      "nvme1n1_cs2130_rand_t1_gib_s": 2.16,
+      "note_t8_anomaly": "8-thread O_DIRECT legs DROP to 1.9-2.0 GiB/s on BOTH drives (vs t1) - concurrency regresses throughput; cause not investigated",
+      "hardware_flag": "REPRODUCIBLE EIO (errno 5) on nvme0n1 under concurrent (>=2-thread) O_DIRECT reads - intermittent at t2, consistent at t8; single-thread clean. Drive hosts /home. smartctl not installed; recommend SMART long test + firmware check before M3 hardware work. All M0.3 hashes (single-stream) passed, so no data corruption confirmed.",
+      "striped_2drive_seq_t2_gib_s": [4.73, 4.81, 4.89],
+      "striped_2drive_rand_t2_gib_s": 4.6
+    }
+  },
+  "notes": "warm_tok_s is NOT recorded as a number: at this pin there is no persistent device cache (P2/M2.4) and the sweep could not isolate copy cost; the extrapolation from §14 M0 is deferred to M2 hardware baselines. Kernel string, GLM-RUN summary lines and generation texts are in docs/baselines/m0-notes.md (local-only)."
+}
