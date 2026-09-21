@@ -143,8 +143,8 @@ fn download() {
         ".{}.{}.{}.tmp",
         fixture_name(),
         std::process::id(),
-        // e.g. ThreadId(3) — Debug format, unique per process
-        format!("{:?}", std::thread::current().id())
+        // e.g. "ThreadId(3)" — Debug format, unique per process
+        format_args!("{:?}", std::thread::current().id())
     ));
     eprintln!("downloading pinned fixture to {tmp:?}");
     let status = std::process::Command::new("curl")
