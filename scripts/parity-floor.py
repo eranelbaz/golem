@@ -297,9 +297,9 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
             only_idx: int | None, n_tokens: int, timeout_s: int, outdir: str) -> int:
     if only_idx is not None and not 0 <= only_idx < len(PROMPTS):
         sys.exit(f"FATAL: --prompts must be 0..{len(PROMPTS) - 1}, got {only_idx}")
-    preflight(bin_path)
     lock_fd = acquire_lock(outdir)
     try:
+        preflight(bin_path)
         legdir = os.path.join(outdir, name)
         os.makedirs(legdir, exist_ok=True)
         sha = config_sha(bin_path, model, hip, threads, n_tokens)
@@ -390,6 +390,26 @@ def load_leg(outdir: str, leg: str) -> dict:
         return json.load(f)
 
 
+def verify_texts(outdir: str, leg: str, rec: dict) -> list[str]:
+    """Re-hash leg.json texts against the per-prompt meta sidecars (tamper check)."""
+    legdir = os.path.join(outdir, leg)
+    texts = []
+    for r in rec["prompts"]:
+        if r.get("rc") != 0:
+            continue
+        meta_path = prompt_paths(legdir, r["idx"])["meta"]
+        try:
+            with open(meta_path) as f:
+                recorded = json.load(f).get("text_sha")
+        except OSError:
+            sys.exit(f"FATAL: leg={leg} prompt={r['idx']} meta sidecar missing ({meta_path})")
+        if not recorded or hashlib.sha256(r["text"].encode()).hexdigest() != recorded:
+            sys.exit(f"FATAL: leg={leg} prompt={r['idx']} text_sha mismatch vs sidecar — "
+                     f"leg.json was altered after the run; re-run the leg")
+        texts.append(r["text"])
+    return texts
+
+
 def compare(a: str, b: str, outdir: str) -> int:
     la, lb = load_leg(outdir, a), load_leg(outdir, b)
     if la.get("n_tokens") != lb.get("n_tokens"):
@@ -420,18 +440,22 @@ def compare(a: str, b: str, outdir: str) -> int:
                  f"both legs must run binaries built from the same pinned tree")
     ta = [ia[i]["text"] for i in range(len(PROMPTS))]
     tb = [ib[i]["text"] for i in range(len(PROMPTS))]
+    verify_texts(outdir, a, la)
+    verify_texts(outdir, b, lb)
     empties = [i for i, (x, y) in enumerate(zip(ta, tb)) if not x or not y]
     if empties:
         sys.exit(f"FATAL: empty texts at prompt indices {empties} — legs are not trustworthy")
     mc = match_count(ta, tb)
     prefixes = [prefix_words(x, y) for x, y in zip(ta, tb)]
+    pin = next(iter(pins_a))
     report = {"a": a, "b": b, "n_tokens": la.get("n_tokens"), "prompts": len(PROMPTS),
+              "pin_sha": pin,
               "match_count": mc,
               "match_rate": round(100.0 * mc / len(PROMPTS), 2),
               "prefix_words": prefixes}
     out = os.path.join(outdir, f"{a}_vs_{b}.json")
     atomic_write(out, json.dumps(report, indent=2) + "\n")
-    print(f"PARITY: a={a} b={b} match={mc}/{len(PROMPTS)} prefixes={prefixes}")
+    print(f"PARITY: a={a} b={b} pin={pin[:12]} match={mc}/{len(PROMPTS)} prefixes={prefixes}")
     print(f"PARITY: wrote {out}")
     return 0
 
