@@ -1,0 +1,37 @@
+{
+  "baseline": 1,
+  "date": "2026-09-21",
+  "machine": { "gpu": "AMD Radeon RX 7900 XTX (gfx1100)", "vram_mib": 24560, "ram_gib": 93,
+               "drives": "nvme0n1 Samsung 990 PRO 4TB (/home, btrfs zstd:3) + nvme1n1 PNY CS2130 1TB (/mnt/data, ext4)",
+               "kernel": "7.2.5-4-omarchy" },
+  "substrate": { "repo": "unslothai/llama.cpp", "branch": "glm5next/upstream",
+                 "commit": "86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9", "pr": 27754, "patches": "none-yet",
+                 "rocm": "7.2.4", "fa": "on" },
+  "model": { "repo": "unsloth/GLM-5.3-Flash-GGUF", "revision": "621d456e93e926e4b52f85cff5f634358c1828f9",
+             "quant": "UD-Q4_K_XL", "total_bytes": 199707321347, "expert_bytes": 189857267712, "non_expert_bytes": 9850053635 },
+  "measurements": {
+    "kv_bytes_per_token": 19712,
+    "vram_overhead_gib": 2.64,
+    "cold_gen_tok_s": [0.6, 0.8],
+    "ncmoe_semantics": "whole-tensor; feasible N ∈ {43,44,45} on 93 GiB RAM + 24 GiB VRAM",
+    "disk_gib_s": { "nvme0n1_seq_t1": 5.81, "nvme0n1_rand_t1": 5.76, "nvme1n1_seq_t1": 2.24,
+                    "nvme1n1_rand_t1": 2.16, "striped2_seq": [4.7, 4.9], "striped2_rand": 4.6,
+                    "note": "t8 regression ~1.9-2.0 GiB/s on both drives, unexplained" },
+    "hardware_flags": "btrfs fails concurrent O_DIRECT reads with EIO (t2+); ext4 clean; single-stream always clean → M3.1 per-replica O_DIRECT probe + buffered fallback"
+  },
+  "parity": {
+    "method": "8-prompt greedy (-temp 0, seed 42, n 96, b 512) generation-text comparison; all match rates are percent (0-100), matching harness report match_rate; HIP(-ngl 99 -ncmoe 45 -fa on -t 16) vs CPU(-t 16 primary, -t 4 secondary), same pinned build; CPU substrate built with GGML_CPU_REPACK=OFF (repack ON requires a single ~106 GiB CPU_REPACK allocation, impossible on 93 GiB RAM); token-ID-level comparison arrives with the native runtime harness",
+    "prompts": 8,
+    "noise_floor_match_pct": 100.0,
+    "noise_floor_legs": {"t32_vs_t16": {"match_rate_pct": 0.0, "prefix_words": null, "note": "superseded t32 legs, aborted before compare ran — prefix detail not recorded"},
+                         "t32_vs_t1": {"match_rate_pct": 0.0, "prefix_words": null, "note": "superseded t32 legs, aborted before compare ran — prefix detail not recorded"},
+                         "t16_vs_t4": {"match_rate_pct": 100.0, "prefix_words": [null, null, null, null, null, null, null, null]}},
+    "parity_match_pct": 25.0,
+    "parity_vs": "cpu-t16",
+    "parity_prefix_words": [49, 25, 33, 31, 34, 27, null, null],
+    "parity_vs_t4_prefix_words": [49, 25, 33, 31, 34, 27, null, null],
+    "preamble_only": false,
+    "t2_threshold_pct": 100.0,
+    "pass": false
+  }
+}
