@@ -35,5 +35,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace
+      # --success-output=immediate: keep `fixture-ok:`/pin-ok stdout of passing
+      # tests visible directly in green CI logs (plan's log assertion).
+      - run: cargo nextest run --workspace --success-output=immediate
       - uses: EmbarkStudios/cargo-deny-action@v2

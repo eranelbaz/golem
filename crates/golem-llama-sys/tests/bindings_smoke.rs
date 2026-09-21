@@ -22,9 +22,10 @@ fn engine_surface_symbols_exist() {
 
 #[test]
 fn hook_abi_types_generated() {
-    // Type-level only: forces bindgen's P1 typedefs into the compile.
-    let _never_called: Option<
-        unsafe extern "C" fn(*mut core::ffi::c_void, *const core::ffi::c_void, i32, i32),
-    > = None;
+    // Type-level only: names bindgen's generated P1 typedef so it must exist
+    // in `raw` at this pin. Bindgen emits the typedef already wrapped as
+    // Option<unsafe extern "C" fn …>, so the annotation is the bare alias —
+    // an extra Option would be Option<Option<…>> and misstate the ABI.
+    let _never_called: raw::golem_ensure_host_resident_fn = None;
     let _ = _never_called;
 }

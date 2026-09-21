@@ -25,24 +25,30 @@ const SKIP_GATE_ENV: &str = "GOLEM_LLAMA_SYS_SKIP_PIN_GATE";
 const AMDGPU_TARGET: &str = "gfx1100";
 const ROCM_HIP_COMPILER: &str = "/opt/rocm/llvm/bin/clang++";
 
+/// Usable-ROCm probe: `auto` selects hip only when both the HIP compiler and
+/// the shared HIP runtime library exist.
+fn usable_rocm_toolchain() -> bool {
+    Path::new("/opt/rocm/bin/hipcc").exists() && Path::new("/opt/rocm/lib/libamdhip64.so").exists()
+}
+
 /// Resolve the compute backend. Returns the raw env input (`auto|cpu|hip`) and
-/// the resolved backend (`cpu|hip`). A non-UTF-8 env value panics instead of
-/// silently falling through to auto (controller addendum #1).
+/// the resolved backend (`cpu|hip`). Explicit `auto` behaves identically to
+/// unset: probe for a usable ROCm toolchain, hip when present, cpu otherwise
+/// (final-review finding: `auto` used to fall into the unknown-value panic).
+/// A non-UTF-8 env value panics instead of silently falling through to auto
+/// (controller addendum #1).
 fn detect_backend() -> (&'static str, &'static str) {
-    match env::var(BACKEND_ENV) {
-        Ok(value) => match value.as_str() {
-            "cpu" => ("cpu", "cpu"),
-            "hip" => ("hip", "hip"),
-            other => panic!(
-                "{BACKEND_ENV}: unknown value {other:?} (expected auto|cpu|hip); \
-                 hint: set GOLEM_LLAMA_SYS_BACKEND=cpu to force the CPU substrate"
-            ),
-        },
-        Err(env::VarError::NotPresent) => {
-            let usable_rocm = Path::new("/opt/rocm/bin/hipcc").exists()
-                && Path::new("/opt/rocm/lib/libamdhip64.so").exists();
-            ("auto", if usable_rocm { "hip" } else { "cpu" })
+    match env::var(BACKEND_ENV).as_deref() {
+        Ok("cpu") => ("cpu", "cpu"),
+        Ok("hip") => ("hip", "hip"),
+        Ok("auto") | Err(env::VarError::NotPresent) => {
+            let hip = usable_rocm_toolchain();
+            ("auto", if hip { "hip" } else { "cpu" })
         }
+        Ok(other) => panic!(
+            "{BACKEND_ENV}: unknown value {other:?} (expected auto|cpu|hip); \
+             hint: set GOLEM_LLAMA_SYS_BACKEND=cpu to force the CPU substrate"
+        ),
         Err(env::VarError::NotUnicode(value)) => panic!(
             "{BACKEND_ENV}: non-UTF-8 value {value:?} (expected auto|cpu|hip); \
              hint: set GOLEM_LLAMA_SYS_BACKEND=cpu to force the CPU substrate"
@@ -57,7 +63,9 @@ fn main() {
     let repo_root = manifest_dir.join("../..");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    // (d) Rerun discipline — no latchable state. Absolute paths; the vendor dir
+    // (d) Rerun discipline — no latchable state. Paths are absolute: joined
+    // onto the absolute CARGO_MANIFEST_DIR (repo_root keeps its `../..`
+    // components un-normalized, which cargo resolves fine). The vendor dir
     // is watched recursively by cargo, so any in-tree drift (including the
     // files the pin gate hashes) re-runs this script. Parsed headers
     // additionally get automatic rerun-if-changed from bindgen's
@@ -310,8 +318,9 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
 /// `llama → ggml → {ggml-cpu, ggml-hip} → ggml-base` (acyclic).
 ///
 /// As-built table (lib set and ordering match the plan verbatim; archive
-/// LOCATIONS confirmed empirically in Step 3 — all ggml archives are flat in
-/// `ggml/src/` at this pin, not in per-target subdirs). Cross-checked against
+/// LOCATIONS confirmed empirically in Step 3 — the ggml archives are flat in
+/// `ggml/src/` at this pin except `ggml-hip`, which lands in its per-target
+/// output subdir `ggml/src/ggml-hip`). Cross-checked against
 /// `ldd` of the M0-built `.m0-work/build-cpu/bin/llama-cli`, whose system-lib
 /// set is libstdc++/libgomp/libm/libc — libpthread/libdl live in libc at
 /// glibc ≥ 2.34, and libssl/brotli/zstd there come from curl in common/server,
@@ -322,7 +331,7 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
 ///      then dylib=stdc++, dylib=gomp (only when GGML_OPENMP_ENABLED=ON),
 ///           dylib=pthread, dylib=dl, dylib=m
 /// HIP: static=llama (src/), static=ggml (ggml/src/),
-///      static=ggml-cpu (ggml/src/), static=ggml-hip (ggml/src/),
+///      static=ggml-cpu (ggml/src/), static=ggml-hip (ggml/src/ggml-hip),
 ///      static=ggml-base (ggml/src/)
 ///      then dylib=stdc++, dylib=gomp (conditional as above), dylib=hipblas,
 ///           dylib=rocblas, dylib=amdhip64, dylib=pthread, dylib=dl, dylib=m
@@ -330,7 +339,8 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
 fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) {
     // (archive name, archive dir relative to the binary dir). Order is the
     // link order. cmake-rs does not override ARCHIVE_OUTPUT_DIRECTORY; at this
-    // pin llama lands in src/ and all ggml archives in ggml/src/.
+    // pin llama lands in src/ and the ggml archives in ggml/src/, except
+    // ggml-hip, which lands in its per-target subdir ggml/src/ggml-hip.
     let archives: &[(&str, &str)] = match backend {
         "cpu" => &[
             ("llama", "src"),
