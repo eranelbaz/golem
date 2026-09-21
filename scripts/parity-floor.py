@@ -195,12 +195,30 @@ def release_lock(outdir: str) -> None:
         pass
 
 
+def _live_llama_pids() -> list[str]:
+    # pgrep -x also matches zombies (e.g. a defunct child systemd --user never
+    # reaped), which would block legs forever. Treat state 'Z' as dead.
+    r = subprocess.run(["pgrep", "-x", "llama-cli"], capture_output=True, text=True)
+    live = []
+    for pid in r.stdout.split():
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                # stat: pid (comm) state ... — comm can contain spaces/parens,
+                # so anchor on the last ')'.
+                state = f.read().rsplit(b")", 1)[1].split()[0]
+        except OSError:
+            continue
+        if state != b"Z":
+            live.append(pid)
+    return live
+
+
 def preflight(bin_path: str) -> None:
     # -x (exact process name): -f would match this harness's own cmdline, which
     # embeds the llama-cli path.
-    r = subprocess.run(["pgrep", "-x", "llama-cli"], capture_output=True, text=True)
-    if r.returncode == 0:
-        sys.exit(f"FATAL: llama-cli already running (pid(s): {r.stdout.strip()}) — "
+    live = _live_llama_pids()
+    if live:
+        sys.exit(f"FATAL: llama-cli already running (pid(s): {', '.join(live)}) — "
                  f"legs must run strictly sequentially.")
     if not os.path.exists(bin_path):
         sys.exit(f"FATAL: binary not found: {bin_path}")
