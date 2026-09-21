@@ -10,60 +10,58 @@ import sys
 def acquire_lock(outdir: str) -> int:
     """One model leg at a time (shared RAM/page cache/GPU).
 
-    flock advisory lock: the kernel releases it when the holder dies
-    (SIGKILL/OOM), so stale reclaim is automatic and race-free — unlike
-    O_EXCL create + liveness check, which has a reclaim TOCTOU window.
-    Returns the fd (keep it open for the leg's lifetime).
+    flock so the kernel releases the lock when the holder dies (SIGKILL/OOM);
+    returns the fd — keep it open for the leg's lifetime.
     """
     os.makedirs(outdir, exist_ok=True)
-    lock = os.path.join(outdir, ".leg-lock")
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    lock_path = os.path.join(outdir, ".leg-lock")
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        holder = ""
-        try:
-            holder = " (pid " + os.read(fd, 64).decode(errors="replace").strip() + ")"
-        except OSError:
-            pass
-        os.close(fd)
-        sys.exit(f"FATAL: another leg holds {lock}{holder}.")
-    os.truncate(fd, 0)
-    os.pwrite(fd, str(os.getpid()).encode(), 0)  # diagnostics only
-    return fd
+        holder_pid = _read_holder_pid(lock_fd)
+        os.close(lock_fd)
+        sys.exit(f"FATAL: another leg holds {lock_path}{holder_pid}.")
+    os.truncate(lock_fd, 0)
+    os.pwrite(lock_fd, str(os.getpid()).encode(), 0)
+    return lock_fd
 
 
-def release_lock(fd: int) -> None:
+def _read_holder_pid(lock_fd: int) -> str:
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        holder = os.read(lock_fd, 64).decode(errors="replace").strip()
+        return f" (pid {holder})" if holder else ""
+    except OSError:
+        return ""
+
+
+def release_lock(lock_fd: int) -> None:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
     finally:
-        os.close(fd)
+        os.close(lock_fd)
 
 
 def _live_model_pids(bin_path: str) -> list[str]:
-    live = []
-    targets = {os.path.realpath(bin_path)}
-    r = subprocess.run(["pgrep", "-x", "llama-cli"], capture_output=True, text=True)
-    for pid in r.stdout.split():
+    live_pids = []
+    target_paths = {os.path.realpath(bin_path)}
+    pgrep = subprocess.run(["pgrep", "-x", "llama-cli"], capture_output=True, text=True)
+    for pid in pgrep.stdout.split():
         try:
-            with open(f"/proc/{pid}/stat", "rb") as f:
-                # stat: pid (comm) state ... — comm can contain spaces/parens,
-                # so anchor on the last ')'.
-                state = f.read().rsplit(b")", 1)[1].split()[0]
-            if state == b"Z":
-                # pgrep -x also matches zombies (a defunct child systemd --user
-                # never reaped), which would block legs forever. Treat as dead.
-                continue
-            try:
-                exe = os.path.realpath(f"/proc/{pid}/exe")
-                if exe not in targets:
-                    continue
-            except OSError:
-                pass  # exe unreadable — fall back to the name match
+            if _process_state(pid) == b"Z":
+                continue  # zombie: parent never reaped it, must not block legs
+            if os.path.realpath(f"/proc/{pid}/exe") in target_paths:
+                live_pids.append(pid)
         except OSError:
             continue
-        live.append(pid)
-    return live
+    return live_pids
+
+
+def _process_state(pid: str) -> bytes:
+    # /proc/<pid>/stat: pid (comm) state ... — comm can contain spaces/parens,
+    # so anchor on the last ')'.
+    with open(f"/proc/{pid}/stat", "rb") as stat_file:
+        return stat_file.read().rsplit(b")", 1)[1].split()[0]
 
 
 def preflight(bin_path: str) -> None:
@@ -71,7 +69,7 @@ def preflight(bin_path: str) -> None:
         sys.exit(f"FATAL: binary not found: {bin_path}")
     if not os.access(bin_path, os.X_OK):
         sys.exit(f"FATAL: binary not executable: {bin_path}")
-    live = _live_model_pids(bin_path)
-    if live:
-        sys.exit(f"FATAL: llama-cli already running (pid(s): {', '.join(live)}) — "
+    live_pids = _live_model_pids(bin_path)
+    if live_pids:
+        sys.exit(f"FATAL: llama-cli already running (pid(s): {', '.join(live_pids)}) — "
                  f"legs must run strictly sequentially.")
