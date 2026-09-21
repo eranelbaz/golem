@@ -17,8 +17,12 @@ use sha2::{Digest, Sha256};
 const FIXTURE_URL: &str =
     "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf";
 const FIXTURE_SHA256: &str = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739";
-/// Hash-embedded filename: `stories15M-q4_0-<first12ofsha256>.gguf`.
-const FIXTURE_NAME: &str = "stories15M-q4_0-66967fbece6d.gguf";
+/// Hash-derived cache filename: `stories15M-q4_0-<first12ofsha256>.gguf`.
+/// Derived from FIXTURE_SHA256 — never transcribed, so the name can never
+/// drift from the pin.
+fn fixture_name() -> String {
+    format!("stories15M-q4_0-{}.gguf", &FIXTURE_SHA256[..12])
+}
 
 /// Memoized resolution — one download (and one `fixture-ok`) per process, no
 /// concurrent-test re-fetch.
@@ -48,7 +52,7 @@ fn resolve() -> PathBuf {
 
     // 2. Download slot (~/.cache/golem/test-models/) — CI-cache-compatible,
     //    never dirties the worktree; the only slot this helper writes.
-    let cached = download_slot().join(FIXTURE_NAME);
+    let cached = download_slot().join(fixture_name());
     if let Some(got) = check_download_slot_hit(&cached) {
         println!("fixture-ok: {got} {}", cached.display());
         return cached;
@@ -56,7 +60,7 @@ fn resolve() -> PathBuf {
 
     // 3. Repo-local pre-seed slot — checked but NEVER written (no deletes
     //    here either; a corrupt pre-seed just warns and falls through).
-    let preseed = preseed_slot().join(FIXTURE_NAME);
+    let preseed = preseed_slot().join(fixture_name());
     if preseed.is_file() {
         match sha256_file(&preseed) {
             Ok(got) if got == FIXTURE_SHA256 => {
@@ -72,7 +76,7 @@ fn resolve() -> PathBuf {
 
     // 4. Pinned download into the download slot.
     download();
-    let final_path = download_slot().join(FIXTURE_NAME);
+    let final_path = download_slot().join(fixture_name());
     let got = sha256_file(&final_path)
         .unwrap_or_else(|e| panic!("downloaded fixture {final_path:?} unreadable: {e}"));
     assert!(
@@ -136,7 +140,8 @@ fn download() {
     let slot = download_slot();
     fs::create_dir_all(&slot).unwrap_or_else(|e| panic!("cannot create cache dir {slot:?}: {e}"));
     let tmp = slot.join(format!(
-        ".{FIXTURE_NAME}.{}.{}.tmp",
+        ".{}.{}.{}.tmp",
+        fixture_name(),
         std::process::id(),
         // e.g. ThreadId(3) — Debug format, unique per process
         format!("{:?}", std::thread::current().id())
@@ -174,7 +179,7 @@ fn download() {
             ),
         );
     }
-    if let Err(e) = fs::rename(&tmp, slot.join(FIXTURE_NAME)) {
+    if let Err(e) = fs::rename(&tmp, slot.join(fixture_name())) {
         clean_fail(&tmp, format!("atomic rename into {slot:?} failed: {e}"));
     }
 }
@@ -182,11 +187,12 @@ fn download() {
 /// Remove the temp file and panic with the got/want evidence plus remediation.
 fn clean_fail(tmp: &Path, msg: String) -> ! {
     let _ = fs::remove_file(tmp);
+    let name = fixture_name();
     panic!(
         "{msg}\
-         \nremediation: set GOLEM_TEST_MODEL=/path/to/{FIXTURE_NAME} \
+         \nremediation: set GOLEM_TEST_MODEL=/path/to/{name} \
          (sha256 {FIXTURE_SHA256}), or pre-seed {} or {} with that file",
-        download_slot().join(FIXTURE_NAME).display(),
-        preseed_slot().join(FIXTURE_NAME).display(),
+        download_slot().join(&name).display(),
+        preseed_slot().join(&name).display(),
     );
 }
