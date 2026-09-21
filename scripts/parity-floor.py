@@ -10,7 +10,8 @@ Commands:
 Integrity rules (the harness must never manufacture a clean result):
   - a prompt's text is persisted only when the run exited 0 AND extraction is non-empty
   - empty extraction on rc=0 is a harness error: the leg aborts immediately
-  - cached prompts skip only when the config sidecar matches exactly
+  - cached prompts skip only when the config sidecar matches exactly AND the
+    recorded pin_sha equals the live vendored-tree hash AND the text hash verifies
   - compare refuses legs that are not ok=8/8 with identical -n and non-empty texts
 """
 from __future__ import annotations
@@ -20,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import fcntl
 import signal
 import subprocess
 import sys
@@ -34,7 +36,9 @@ VENDOR_DIR = "vendor/llama.cpp"
 VENDOR_SHA_FILE = "vendor/VENDOR_SHA"
 DEFAULT_OUTDIR = os.environ.get("GOLEM_M05_WORK", ".m0-work/m05")
 
-PROMPTS = [
+PROMPTS = [  # all single-line: extract_generation strips the '> '-echo only when the
+    # whole prompt sits on the first body line (multi-line prompts fail closed via
+    # the empty-extraction FATAL in run_leg)
     "Write a short story about a robot who learns to paint.",
     "Summarize the plot of Romeo and Juliet in three sentences.",
     "Explain how photosynthesis works to a ten-year-old.",
@@ -48,7 +52,7 @@ PROMPTS = [
 GEN_RE = re.compile(r"Generation: ([0-9.]+) t/s\s*\]")
 BUILD_RE = re.compile(r"^build\s*:\s*(\S+)", re.MULTILINE)
 FA_WARN_RE = re.compile(r"^.*(flash[- ]?att|\bfa\b).*(not support|fallback|disabl|ignor).*$", re.IGNORECASE | re.MULTILINE)
-HARNESS_VERSION = 3  # bump on any change to prompts, flag contract, or extraction logic
+HARNESS_VERSION = 4  # bump on any change to prompts, flag contract, or extraction logic
 
 
 def pin_sha() -> str:
@@ -61,7 +65,7 @@ def pin_sha() -> str:
     """
     paths = []
     for root, dirs, files in os.walk(VENDOR_DIR):
-        dirs[:] = [d for d in dirs if d != ".git" and not (root == VENDOR_DIR and d == "build")]
+        dirs[:] = [d for d in dirs if d not in (".git", "build")]  # any depth
         paths += [os.path.relpath(os.path.join(root, f), VENDOR_DIR) for f in files]
     inner = hashlib.sha256()
     for p in sorted(paths, key=lambda s: s.encode()):
@@ -137,7 +141,7 @@ def config_sha(bin_path: str, model: str, hip: bool, threads: int | None, n_toke
 
 
 def atomic_write(path: str, content: str) -> None:
-    tmp = path + ".tmp"
+    tmp = f"{path}.tmp.{os.getpid()}"  # pid-suffixed: compare runs outside the leg lock
     with open(tmp, "w") as f:
         f.write(content)
     os.replace(tmp, path)
@@ -150,88 +154,106 @@ def prompt_paths(legdir: str, idx: int) -> dict[str, str]:
 
 
 def write_leg_json(legdir: str, meta: dict, results: list) -> None:
+    # rewritten after every prompt: intentional crash-resume durability, cheap at n=8
     ok = sum(1 for r in results if r["rc"] == 0)
     atomic_write(os.path.join(legdir, "leg.json"),
                  json.dumps({**meta, "ok": ok, "prompts": results}, indent=2))
 
 
-def acquire_lock(outdir: str) -> None:
+def acquire_lock(outdir: str) -> int:
     """One model leg at a time (shared RAM/page cache/GPU).
 
-    Atomic O_EXCL create; a lock left by a dead process (SIGKILL/OOM) is
-    reclaimed automatically after a liveness check.
+    flock advisory lock: the kernel releases it when the holder dies
+    (SIGKILL/OOM), so stale reclaim is automatic and race-free — unlike
+    O_EXCL create + liveness check, which has a reclaim TOCTOU window.
+    Returns the fd (keep it open for the leg's lifetime).
     """
     os.makedirs(outdir, exist_ok=True)
     lock = os.path.join(outdir, ".leg-lock")
-    while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            return
-        except FileExistsError:
-            try:
-                pid = int(open(lock).read().strip() or 0)
-                os.kill(pid, 0)
-                sys.exit(f"FATAL: another leg holds {lock} (live pid {pid}).")
-            except ProcessLookupError:
-                print(f"PARITY: stale lock from dead pid {pid} — reclaiming {lock}", flush=True)
-                os.remove(lock)
-            except PermissionError:
-                sys.exit(f"FATAL: {lock} held by live foreign pid {pid} — cannot reclaim.")
-            except ValueError:
-                print(f"PARITY: malformed lock {lock} — reclaiming", flush=True)
-                os.remove(lock)
-
-
-def release_lock(outdir: str) -> None:
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        os.remove(os.path.join(outdir, ".leg-lock"))
-    except FileNotFoundError:
-        pass
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = ""
+        try:
+            holder = " (pid " + os.read(fd, 64).decode(errors="replace").strip() + ")"
+        except OSError:
+            pass
+        os.close(fd)
+        sys.exit(f"FATAL: another leg holds {lock}{holder}.")
+    os.truncate(fd, 0)
+    os.pwrite(fd, str(os.getpid()).encode(), 0)  # diagnostics only
+    return fd
 
 
-def _live_llama_pids() -> list[str]:
-    # pgrep -x also matches zombies (a defunct child systemd --user never reaped),
-    # which would block legs forever. Treat state 'Z' as dead.
-    r = subprocess.run(["pgrep", "-x", "llama-cli"], capture_output=True, text=True)
+def release_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _live_model_pids(bin_path: str) -> list[str]:
     live = []
+    targets = {os.path.realpath(bin_path)}
+    r = subprocess.run(["pgrep", "-x", "llama-cli"], capture_output=True, text=True)
     for pid in r.stdout.split():
         try:
             with open(f"/proc/{pid}/stat", "rb") as f:
                 # stat: pid (comm) state ... — comm can contain spaces/parens,
                 # so anchor on the last ')'.
                 state = f.read().rsplit(b")", 1)[1].split()[0]
+            if state == b"Z":
+                # pgrep -x also matches zombies (a defunct child systemd --user
+                # never reaped), which would block legs forever. Treat as dead.
+                continue
+            try:
+                exe = os.path.realpath(f"/proc/{pid}/exe")
+                if exe not in targets:
+                    continue
+            except OSError:
+                pass  # exe unreadable — fall back to the name match
         except OSError:
             continue
-        if state != b"Z":
-            live.append(pid)
+        live.append(pid)
     return live
 
 
 def preflight(bin_path: str) -> None:
-    live = _live_llama_pids()
+    if not os.path.exists(bin_path):
+        sys.exit(f"FATAL: binary not found: {bin_path}")
+    if not os.access(bin_path, os.X_OK):
+        sys.exit(f"FATAL: binary not executable: {bin_path}")
+    live = _live_model_pids(bin_path)
     if live:
         sys.exit(f"FATAL: llama-cli already running (pid(s): {', '.join(live)}) — "
                  f"legs must run strictly sequentially.")
-    if not os.path.exists(bin_path):
-        sys.exit(f"FATAL: binary not found: {bin_path}")
 
 
-def cached_result(legdir: str, idx: int, sha: str) -> dict | None:
-    """Previous result for this prompt when its recorded config matches exactly."""
+def cached_result(legdir: str, idx: int, sha: str, psha: str) -> dict | None:
+    """Previous result for this prompt when config, pin, and text hash all verify."""
     paths = prompt_paths(legdir, idx)
     if not (os.path.exists(paths["txt"]) and os.path.exists(paths["meta"])):
         return None
-    old = json.load(open(paths["meta"]))
+    with open(paths["meta"]) as f:
+        old = json.load(f)
     if old.get("args_sha") != sha or old.get("rc") != 0:
         return None
-    txt = extract_text(open(paths["txt"]).read())
+    if old.get("pin_sha") != psha:
+        print(f"PARITY: leg cache prompt={idx} rejected — pin drift "
+              f"({str(old.get('pin_sha'))[:12]} != {psha[:12]})", flush=True)
+        return None
+    with open(paths["txt"]) as f:
+        txt = extract_text(f.read())
     if not txt:
+        return None
+    recorded = old.get("text_sha")
+    if recorded and hashlib.sha256(txt.encode()).hexdigest() != recorded:
+        print(f"PARITY: leg cache prompt={idx} rejected — text hash mismatch (tamper/partial write)", flush=True)
         return None
     return {"idx": idx, "rc": 0, "cached": True, "gen_s": old.get("gen_s"),
             "pin_sha": old.get("pin_sha"), "build_id": old.get("build_id"),
-            "text": txt, "fa_warnings": old.get("fa_warnings", [])}
+            "wall_s": None, "text": txt, "fa_warnings": old.get("fa_warnings", [])}
 
 
 def run_prompt(args: list[str], timeout_s: int) -> tuple[int, str, str, float]:
@@ -248,7 +270,13 @@ def run_prompt(args: list[str], timeout_s: int) -> tuple[int, str, str, float]:
         rc = proc.returncode
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # a grandchild that escaped the process group still holds the pipe;
+            # abandon the pipes rather than hang forever
+            proc.kill()
+            stdout, stderr = "", ""
         stderr = (stderr or "") + f"\nTIMEOUT after {timeout_s}s (partial output preserved)"
         rc = -9
     return rc, stdout, stderr, time.perf_counter() - t0
@@ -262,30 +290,45 @@ def parse_run_output(combined: str, stderr: str) -> tuple[str | None, list[str]]
 
 def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None,
             only_idx: int | None, n_tokens: int, timeout_s: int, outdir: str) -> int:
+    if only_idx is not None and not 0 <= only_idx < len(PROMPTS):
+        sys.exit(f"FATAL: --prompts must be 0..{len(PROMPTS) - 1}, got {only_idx}")
     preflight(bin_path)
-    acquire_lock(outdir)
+    lock_fd = acquire_lock(outdir)
     try:
         legdir = os.path.join(outdir, name)
         os.makedirs(legdir, exist_ok=True)
         sha = config_sha(bin_path, model, hip, threads, n_tokens)
         psha = pin_sha()
-        want = open(VENDOR_SHA_FILE).readline().split("=", 1)[1].strip()
+        try:
+            with open(VENDOR_SHA_FILE) as f:
+                first = f.readline()
+            want = first.split("=", 1)[1].strip()
+        except (OSError, IndexError):
+            sys.exit(f"FATAL: cannot read/parse {VENDOR_SHA_FILE} (expected '<name>=<sha256>')")
         if psha != want:
             sys.exit(f"FATAL: vendor tree drifted ({psha[:12]} != {want[:12]}) — re-vendor per ADR 0001")
         meta = {"leg": name, "bin": bin_path, "model": model, "hip": hip,
                 "threads": threads, "n_tokens": n_tokens, "args_sha": sha, "pin_sha": psha,
                 "harness_version": HARNESS_VERSION,
                 "wall_s_note": "informational only — page-cache warmth differs between legs"}
+        idxs = [only_idx] if only_idx is not None else range(len(PROMPTS))
+        results: list = []
         if only_idx is not None:
             prev = os.path.join(legdir, "leg.json")
-            if os.path.exists(prev) and len(json.load(open(prev)).get("prompts", [])) == len(PROMPTS):
-                sys.exit(f"FATAL: --prompts N would clobber the complete leg record {prev} — "
-                         f"use a fresh --name or delete the leg dir deliberately.")
-        idxs = [only_idx] if only_idx is not None else range(len(PROMPTS))
-        results = []
+            if os.path.exists(prev):
+                with open(prev) as f:
+                    prev_rec = json.load(f)
+                if prev_rec.get("args_sha") != sha:
+                    sys.exit(f"FATAL: --prompts N resume of {prev} with a different config "
+                             f"({sha} vs recorded {prev_rec.get('args_sha')}) — use a fresh --name.")
+                if len(prev_rec.get("prompts", [])) == len(PROMPTS):
+                    sys.exit(f"FATAL: --prompts N would clobber the complete leg record {prev} — "
+                             f"use a fresh --name or delete the leg dir deliberately.")
+                # resume: keep existing prompt records, replace only this idx
+                results = [r for r in prev_rec.get("prompts", []) if r.get("idx") != only_idx]
         for idx in idxs:
             paths = prompt_paths(legdir, idx)
-            hit = cached_result(legdir, idx, sha)
+            hit = cached_result(legdir, idx, sha, psha)
             if hit:
                 results.append(hit)
                 print(f"PARITY: leg={name} prompt={idx} cached (config match)", flush=True)
@@ -319,6 +362,7 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
             atomic_write(paths["txt"], text)
             atomic_write(paths["meta"], json.dumps({"rc": 0, "args_sha": sha, "gen_s": gen_s,
                                                     "pin_sha": psha, "build_id": build_id,
+                                                    "text_sha": hashlib.sha256(text.encode()).hexdigest(),
                                                     "fa_warnings": fa_warnings}))
             results.append({"idx": idx, "rc": 0, "cached": False, "gen_s": gen_s, "pin_sha": psha,
                             "build_id": build_id, "wall_s": round(wall, 1), "text": text,
@@ -330,14 +374,15 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
         print(f"PARITY-LEG: name={name} ok={ok}/{len(results)}")
         return 0 if ok == len(results) else 1
     finally:
-        release_lock(outdir)
+        release_lock(lock_fd)
 
 
 def load_leg(outdir: str, leg: str) -> dict:
     path = os.path.join(outdir, leg, "leg.json")
     if not os.path.exists(path):
         sys.exit(f"FATAL: no leg record for '{leg}' under {outdir} — run-leg first")
-    return json.load(open(path))
+    with open(path) as f:
+        return json.load(f)
 
 
 def compare(a: str, b: str, outdir: str) -> int:
@@ -346,6 +391,9 @@ def compare(a: str, b: str, outdir: str) -> int:
         sys.exit(f"FATAL: legs disagree on -n ({la.get('n_tokens')} vs {lb.get('n_tokens')})")
     if la.get("model") != lb.get("model"):
         sys.exit("FATAL: legs ran different models")
+    if la.get("harness_version") != lb.get("harness_version"):
+        sys.exit(f"FATAL: legs produced by different harness versions "
+                 f"({la.get('harness_version')} vs {lb.get('harness_version')})")
     ia = {r["idx"]: r for r in la["prompts"]}
     ib = {r["idx"]: r for r in lb["prompts"]}
     if sorted(ia) != list(range(len(PROMPTS))) or sorted(ib) != list(range(len(PROMPTS))):
@@ -426,6 +474,33 @@ def selftest() -> int:
         assert "--temp" in flag_set and "0" in flag_set and "--simple-io" in flag_set
     assert GEN_RE.search("[ Prompt: 1.0 t/s | Generation: 12.5 t/s ]").group(1) == "12.5"
     assert GEN_RE.search("Generation: 12.5 t/s trailing junk") is None
+    # cached_result: config match, pin drift, and text-hash tamper detection
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        txt = "generated words"
+        good = {"rc": 0, "args_sha": "AAA", "pin_sha": "PIN", "gen_s": 1.0,
+                "build_id": "b", "text_sha": hashlib.sha256(txt.encode()).hexdigest(),
+                "fa_warnings": []}
+        base = os.path.join(td, "leg")
+        os.makedirs(base)
+        p = prompt_paths(base, 0)
+        atomic_write(p["txt"], txt)
+        atomic_write(p["meta"], json.dumps(good))
+        hit = cached_result(base, 0, "AAA", "PIN")
+        assert hit is not None and hit["text"] == txt and hit["wall_s"] is None
+        assert cached_result(base, 0, "BBB", "PIN") is None          # config mismatch
+        assert cached_result(base, 0, "AAA", "OTHER") is None        # pin drift
+        tampered = dict(good, text_sha="0" * 64)
+        atomic_write(p["meta"], json.dumps(tampered))
+        assert cached_result(base, 0, "AAA", "PIN") is None          # hash mismatch
+    # write_leg_json computes ok from rc
+    with tempfile.TemporaryDirectory() as td:
+        write_leg_json(td, {"leg": "x"}, [{"rc": 0}, {"rc": -9}])
+        with open(os.path.join(td, "leg.json")) as f:
+            assert json.load(f)["ok"] == 1
+    # FA_WARN_RE matches fallback lines
+    assert FA_WARN_RE.search("ggml_flash_attn_ext: flash attention not supported, using fallback")
+    assert not FA_WARN_RE.search("all good, nothing suspicious here")
     print("SELFTEST-OK")
     return 0
 

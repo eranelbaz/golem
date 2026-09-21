@@ -20,12 +20,12 @@
     "hardware_flags": "btrfs fails concurrent O_DIRECT reads with EIO (t2+); ext4 clean; single-stream always clean → M3.1 per-replica O_DIRECT probe + buffered fallback"
   },
   "parity": {
-    "method": "8-prompt greedy (-temp 0, seed 42, n 96, b 512) generation-text comparison; HIP(-ngl 99 -ncmoe 45 -fa on -t 16) vs CPU(-t 16 primary, -t 4 secondary), same pinned build; CPU substrate built with GGML_CPU_REPACK=OFF (repack ON requires a single ~106 GiB CPU_REPACK allocation, impossible on 93 GiB RAM); token-ID-level comparison arrives with the native runtime harness",
+    "method": "8-prompt greedy (-temp 0, seed 42, n 96, b 512) generation-text comparison; all match rates are percent (0-100), matching harness report match_rate; HIP(-ngl 99 -ncmoe 45 -fa on -t 16) vs CPU(-t 16 primary, -t 4 secondary), same pinned build; CPU substrate built with GGML_CPU_REPACK=OFF (repack ON requires a single ~106 GiB CPU_REPACK allocation, impossible on 93 GiB RAM); token-ID-level comparison arrives with the native runtime harness",
     "prompts": 8,
     "noise_floor_match_pct": 100.0,
-    "noise_floor_legs": {"t32_vs_t16": {"match_rate": 0.0, "prefix_words": []},
-                         "t32_vs_t1": {"match_rate": 0.0, "prefix_words": []},
-                         "t16_vs_t4": {"match_rate": 1.0, "prefix_words": [null, null, null, null, null, null, null, null]}},
+    "noise_floor_legs": {"t32_vs_t16": {"match_rate_pct": 0.0, "prefix_words": []},
+                         "t32_vs_t1": {"match_rate_pct": 0.0, "prefix_words": []},
+                         "t16_vs_t4": {"match_rate_pct": 100.0, "prefix_words": [null, null, null, null, null, null, null, null]}},
     "parity_match_pct": 25.0,
     "parity_vs": "cpu-t16",
     "parity_prefix_words": [49, 25, 33, 31, 34, 27, null, null],
