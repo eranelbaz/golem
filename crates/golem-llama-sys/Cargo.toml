@@ -12,5 +12,8 @@ links = "llama-cpp"
 cmake = "0.1"
 bindgen = "0.72"
 
+[dev-dependencies]
+sha2 = { workspace = true }
+
 [lints]
 workspace = true
