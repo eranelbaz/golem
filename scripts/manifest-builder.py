@@ -96,8 +96,6 @@ def main():
             if not m:
                 sys.exit(f"FATAL: expert-like tensor without blk.N. prefix: {t.name}")
             layer = int(m.group(1))
-            if "mmproj" in t.name:
-                sys.exit(f"FATAL: mmproj (vision) tensor present, text path only in v1: {t.name}")
             if t.n_bytes % expert_count != 0:
                 sys.exit(f"FATAL: {t.name} n_bytes {t.n_bytes} not divisible by {expert_count} experts")
             bpe = t.n_bytes // expert_count
