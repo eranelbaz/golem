@@ -27,3 +27,25 @@ pub fn substrate_backend() -> Backend {
 pub fn backend_env_input() -> &'static str {
     BACKEND_INPUT
 }
+
+/// Raw generated bindings over `llama.h` + the `golem-hooks.h` ABI stub
+/// (bindgen in `build.rs`, step (e); allowlisted to `llama_*`/`golem_*`
+/// symbols and `LLAMA_*` vars). Hook typedefs come through as
+/// `Option<unsafe extern "C" fn …>`; enum values are accessed via their
+/// `::default()`/associated consts under the non_exhaustive Rust style.
+pub mod raw {
+    // Generated code (bindgen, see build.rs): style + clippy exemptions are
+    // scoped to this module only. `clippy::all` silences clippy over the
+    // generated items; `unnecessary_transmutes` is the rustc-upstreamed lint
+    // (toolchain 1.98: warn-by-default, NOT in clippy::all) that bindgen's
+    // bitfield accessors trip.
+    #![allow(
+        non_camel_case_types,
+        non_snake_case,
+        non_upper_case_globals,
+        improper_ctypes,
+        unnecessary_transmutes,
+        clippy::all
+    )]
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}

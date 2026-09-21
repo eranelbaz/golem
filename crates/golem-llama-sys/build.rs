@@ -8,7 +8,10 @@
 //! 3. cmake configure+build of the vendored substrate via the `cmake` crate
 //!    (Release, static, `.build_target("llama")` — NOT the default `install`
 //!    target, which transitively builds common/tools/app);
-//! 4. ordered per-backend link directives (see `emit_link_directives`).
+//! 4. ordered per-backend link directives (see `emit_link_directives`);
+//! 5. bindgen bindings over `llama.h` + `headers/golem-hooks.h` →
+//!    `$OUT_DIR/bindings.rs`, included as `golem_llama_sys::raw` (see
+//!    `generate_bindings`).
 
 #[path = "pin_gate.rs"]
 mod pin_gate;
@@ -56,8 +59,10 @@ fn main() {
 
     // (d) Rerun discipline — no latchable state. Absolute paths; the vendor dir
     // is watched recursively by cargo, so any in-tree drift (including the
-    // files the pin gate hashes) re-runs this script. Parsed headers get
-    // automatic rerun-if-changed from bindgen's CargoCallbacks in Task 3.
+    // files the pin gate hashes) re-runs this script. Parsed headers
+    // additionally get automatic rerun-if-changed from bindgen's
+    // CargoCallbacks in step (e); the golem-hooks.h entry also covers edits
+    // bindgen skips over (comments/whitespace).
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("vendor/llama.cpp").display()
@@ -102,6 +107,11 @@ fn main() {
 
     // (c) Ordered link directives.
     emit_link_directives(resolved, openmp_enabled, &binary_dir);
+
+    // (e) Bindgen bindings over llama.h + the golem-hooks ABI stub. Kept
+    // after the cmake section for a simple linear ordering (headers parse
+    // fine without the build; the pin gate above already ran).
+    generate_bindings(&manifest_dir, &repo_root, &out_dir);
 }
 
 /// (a) ADR 0001 pin gate. `GOLEM_LLAMA_SYS_SKIP_PIN_GATE=1` skips the gate with
@@ -226,6 +236,36 @@ fn rocm_advisory_check(repo_root: &Path) {
     }
     // equal major.minor → ok, silent (the shell's "rocm-check: ok" is visible
     // only under -vv anyway; absence of the WARN is the ok signal here).
+}
+
+/// (e) Bindgen bindings over `llama.h` + `headers/golem-hooks.h`, written to
+/// `$OUT_DIR/bindings.rs` and included by `src/lib.rs` as `pub mod raw`.
+///
+/// `size_t_is_usize(false)` keeps generated signatures literal to the header;
+/// Rust `{ non_exhaustive: true }` enums keep future llama.cpp enum additions
+/// non-breaking; `CargoCallbacks` gives automatic rerun-if-changed for every
+/// parsed header (llama.h transitively pulls the ggml headers, hence the two
+/// `-I` search paths).
+fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
+    let vendor = repo_root.join("vendor/llama.cpp");
+    let bindings = bindgen::Builder::default()
+        .header(manifest_dir.join("headers/golem-hooks.h").to_str().unwrap())
+        .header(vendor.join("include/llama.h").to_str().unwrap())
+        .clang_arg(format!("-I{}", vendor.join("include").display()))
+        .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
+        .allowlist_function("llama_.*")
+        .allowlist_function("golem_.*")
+        .allowlist_type("llama_.*")
+        .allowlist_type("golem_.*")
+        .allowlist_var("LLAMA_.*")
+        .default_enum_style(bindgen::EnumVariation::Rust {
+            non_exhaustive: true,
+        })
+        .size_t_is_usize(false)
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("bindgen failed on llama.h + golem-hooks.h");
+    bindings.write_to_file(out_dir.join("bindings.rs")).unwrap();
 }
 
 fn major_minor(version: &str) -> String {
