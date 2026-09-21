@@ -236,7 +236,11 @@ def cached_result(legdir: str, idx: int, sha: str, psha: str) -> dict | None:
     if not (os.path.exists(paths["txt"]) and os.path.exists(paths["meta"])):
         return None
     with open(paths["meta"]) as f:
-        old = json.load(f)
+        try:
+            old = json.load(f)
+        except json.JSONDecodeError:
+            print(f"PARITY: leg cache prompt={idx} rejected — corrupt meta", flush=True)
+            return None
     if old.get("args_sha") != sha or old.get("rc") != 0:
         return None
     if old.get("pin_sha") != psha:
@@ -248,8 +252,8 @@ def cached_result(legdir: str, idx: int, sha: str, psha: str) -> dict | None:
     if not txt:
         return None
     recorded = old.get("text_sha")
-    if recorded and hashlib.sha256(txt.encode()).hexdigest() != recorded:
-        print(f"PARITY: leg cache prompt={idx} rejected — text hash mismatch (tamper/partial write)", flush=True)
+    if not recorded or hashlib.sha256(txt.encode()).hexdigest() != recorded:
+        print(f"PARITY: leg cache prompt={idx} rejected — text hash missing or mismatched (tamper/partial write)", flush=True)
         return None
     return {"idx": idx, "rc": 0, "cached": True, "gen_s": old.get("gen_s"),
             "pin_sha": old.get("pin_sha"), "build_id": old.get("build_id"),
@@ -276,6 +280,7 @@ def run_prompt(args: list[str], timeout_s: int) -> tuple[int, str, str, float]:
             # a grandchild that escaped the process group still holds the pipe;
             # abandon the pipes rather than hang forever
             proc.kill()
+            proc.wait(timeout=5)
             stdout, stderr = "", ""
         stderr = (stderr or "") + f"\nTIMEOUT after {timeout_s}s (partial output preserved)"
         rc = -9
@@ -493,6 +498,11 @@ def selftest() -> int:
         tampered = dict(good, text_sha="0" * 64)
         atomic_write(p["meta"], json.dumps(tampered))
         assert cached_result(base, 0, "AAA", "PIN") is None          # hash mismatch
+        missing = {k: v for k, v in good.items() if k != "text_sha"}
+        atomic_write(p["meta"], json.dumps(missing))
+        assert cached_result(base, 0, "AAA", "PIN") is None          # hash absent
+        atomic_write(p["meta"], "{broken json")
+        assert cached_result(base, 0, "AAA", "PIN") is None          # corrupt meta
     # write_leg_json computes ok from rc
     with tempfile.TemporaryDirectory() as td:
         write_leg_json(td, {"leg": "x"}, [{"rc": 0}, {"rc": -9}])
