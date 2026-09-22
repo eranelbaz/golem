@@ -13,6 +13,8 @@
     "kv_bytes_per_token": 19712,
     "vram_overhead_gib": 2.64,
     "cold_gen_tok_s": [0.6, 0.8],
+    "warm_gen_tok_s": {"status": "deferred", "reason": "2026-09-21 kernel update (linux-omarchy 7.2.5-4) livelocks pinned llama.cpp MAP_POPULATE expert pre-fault; warm/cold tok/s pair requires a comparable regime; measurement recipe (lazy-regime flags + shim + 5-leg protocol) in docs/worklog.md"},
+    "cold_expert_penalty": {"status": "deferred", "reason": "derived from cold_gen_tok_s vs warm_gen_tok_s; deferred with it; derivation method (cross-product of 1000/cold - 1000/warm, reconciliation vs disk_gib_s.nvme0n1_seq_t1) documented in plan docs/superpowers/plans/2026-09-22-taskm04-m0-measurements.md Task 2"},
     "ncmoe_semantics": "whole-tensor; feasible N ∈ {43,44,45} on 93 GiB RAM + 24 GiB VRAM",
     "disk_gib_s": { "nvme0n1_seq_t1": 5.81, "nvme0n1_rand_t1": 5.76, "nvme1n1_seq_t1": 2.24,
                     "nvme1n1_rand_t1": 2.16, "striped2_seq": [4.7, 4.9], "striped2_rand": 4.6,
