@@ -1,9 +1,20 @@
 # .github/workflows/vendor-pin.yml
 name: vendor-pin-check
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Triggers above cannot double-run (push is main-only, PRs fire only
+# pull_request); this group cancels superseded PR runs but never a main run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   pin:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Recompute vendored-tree content hash
