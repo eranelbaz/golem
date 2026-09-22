@@ -1,13 +1,12 @@
-//! Bindings must expose the exact symbols the engine layer (M1.3) and P1 need.
+//! Bindings must expose the exact symbols the engine layer needs.
 #![allow(unsafe_code)]
 
 use golem_llama_sys::raw;
 
 #[test]
 fn engine_surface_symbols_exist() {
-    // Link-time proof: taking addresses of the generated externs requires
-    // them to exist in the substrate at this pin — the failure mode is a
-    // *link error*, so no runtime assert is possible (or needed) here.
+    // Taking addresses of the generated externs fails at *link time* if any
+    // is absent from the substrate — no runtime assert is needed.
     let fns: &[*const ()] = &[
         raw::llama_model_load_from_file as *const (),
         raw::llama_init_from_model as *const (),
@@ -16,15 +15,13 @@ fn engine_surface_symbols_exist() {
         raw::llama_sampler_chain_init as *const (),
         raw::llama_token_eos as *const (),
     ];
-    let _ = fns.len(); // touching the array keeps every cast intentional
+    let _ = fns.len();
 }
 
 #[test]
 fn hook_abi_types_generated() {
-    // Type-level only: names bindgen's generated P1 typedef so it must exist
-    // in `raw` at this pin. Bindgen emits the typedef already wrapped as
-    // Option<unsafe extern "C" fn …>, so the annotation is the bare alias —
-    // an extra Option would be Option<Option<…>> and misstate the ABI.
+    // Bindgen wraps the hook typedef as Option<unsafe extern "C" fn …>, so
+    // the annotation must be the bare alias (not Option<Option<…>>).
     let _never_called: raw::golem_ensure_host_resident_fn = None;
     let _ = _never_called;
 }

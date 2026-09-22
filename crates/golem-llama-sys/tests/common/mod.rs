@@ -1,8 +1,4 @@
-//! Pinned tiny-GGUF fixture resolver shared by this crate's integration tests
-//! (M1.3's hardware tests reuse `common::fixture()`).
-//!
-//! Safe std/sha2 only — no unsafe, no lint attributes (if one is ever added,
-//! it must be line 1 of the file, `mod common;` inner attr).
+//! Pinned tiny-GGUF fixture resolver shared by this crate's integration tests.
 
 use std::fs;
 use std::io::Read;
@@ -11,33 +7,29 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-/// Pinned fixture: stories15M q4_0 — the exact file (same sha256) the vendored
-/// substrate's own suite pins in `tests/CMakeLists.txt` at this commit, from
-/// the same repo path its `cmake/download-models.cmake` fetches.
+/// The exact file (same sha256) the vendored substrate's own suite pins in
+/// `tests/CMakeLists.txt` at this commit.
 const FIXTURE_URL: &str =
     "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf";
 const FIXTURE_SHA256: &str = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739";
-/// Hash-derived cache filename: `stories15M-q4_0-<first12ofsha256>.gguf`.
-/// Derived from FIXTURE_SHA256 — never transcribed, so the name can never
-/// drift from the pin.
+
+/// Hash-derived filename — never transcribed, so it can't drift from the pin.
 fn fixture_name() -> String {
     format!("stories15M-q4_0-{}.gguf", &FIXTURE_SHA256[..12])
 }
 
-/// Memoized resolution — one download (and one `fixture-ok`) per process, no
-/// concurrent-test re-fetch.
+/// One download per process; no concurrent-test re-fetch.
 static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
-/// Resolve the pinned test model: `GOLEM_TEST_MODEL` override, then cache
-/// slots (`~/.cache/golem/test-models/` download destination, repo-local
-/// `.test-cache/` read-only pre-seed), then pinned download. Prints
-/// `fixture-ok: <sha256> <resolved-path>` on every resolution.
+/// Resolve the pinned test model: `GOLEM_TEST_MODEL` override, cache slot
+/// (`~/.cache/golem/test-models/`), repo-local `.test-cache/` pre-seed, then
+/// pinned download. Prints `fixture-ok: <sha256> <resolved-path>` on success.
 pub fn fixture() -> PathBuf {
     FIXTURE.get_or_init(resolve).clone()
 }
 
 fn resolve() -> PathBuf {
-    // 1. Explicit override wins outright — but is still hash-verified.
+    // Explicit override wins outright — but is still hash-verified.
     if let Ok(p) = std::env::var("GOLEM_TEST_MODEL") {
         let p = PathBuf::from(p);
         assert!(p.is_file(), "GOLEM_TEST_MODEL={p:?} is not a regular file");
@@ -50,16 +42,14 @@ fn resolve() -> PathBuf {
         return p;
     }
 
-    // 2. Download slot (~/.cache/golem/test-models/) — CI-cache-compatible,
-    //    never dirties the worktree; the only slot this helper writes.
     let cached = download_slot().join(fixture_name());
     if let Some(got) = check_download_slot_hit(&cached) {
         println!("fixture-ok: {got} {}", cached.display());
         return cached;
     }
 
-    // 3. Repo-local pre-seed slot — checked but NEVER written (no deletes
-    //    here either; a corrupt pre-seed just warns and falls through).
+    // Pre-seed slot is checked but never written; a corrupt pre-seed warns
+    // and falls through.
     let preseed = preseed_slot().join(fixture_name());
     if preseed.is_file() {
         match sha256_file(&preseed) {
@@ -74,7 +64,6 @@ fn resolve() -> PathBuf {
         }
     }
 
-    // 4. Pinned download into the download slot.
     download();
     let final_path = download_slot().join(fixture_name());
     let got = sha256_file(&final_path)
@@ -87,34 +76,26 @@ fn resolve() -> PathBuf {
     final_path
 }
 
-/// Download slot directory (the helper creates it before any write).
 fn download_slot() -> PathBuf {
-    // `home_dir()` (stable 1.85) falls back to passwd entries when `$HOME` is
-    // unset — some CI images and `sudo cargo` contexts lack it.
     let home = std::env::home_dir()
         .filter(|p| !p.as_os_str().is_empty())
         .expect("cannot resolve home directory — cannot resolve fixture cache");
     home.join(".cache/golem/test-models")
 }
 
-/// Repo-local pre-seed slot (relative to this crate's manifest dir).
 fn preseed_slot() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-cache")
 }
 
-/// Hash-check a candidate in the writable download slot. On hash mismatch:
-/// delete the corrupt file, warn, fall through. `Some(sha256)` on a hit.
-///
-/// A concurrent test process may be deleting this same corrupt file right
-/// now (nextest runs per-test processes in parallel) — a vanished or
-/// vanishing file is treated as a miss, never a panic.
+/// Hash-check a candidate in the download slot. A vanished file (a sibling
+/// nextest process may be deleting a corrupt copy right now) is a miss,
+/// never a panic. On mismatch: delete, warn, fall through.
 fn check_download_slot_hit(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
     }
     let got = match sha256_file(path) {
         Ok(got) => got,
-        // Raced with a sibling process's delete → treat as a miss.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => panic!("cache slot fixture {path:?}: {e}"),
     };
@@ -129,7 +110,6 @@ fn check_download_slot_hit(path: &Path) -> Option<String> {
     None
 }
 
-/// Streamed sha256 (hex) — no whole-file buffering.
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -145,10 +125,8 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// `curl -fL` the pinned fixture into a pid+thread-unique temp file inside the
-/// download slot (same filesystem → atomic rename, no concurrent-test
-/// collision), sha256-verify BEFORE renaming into place, panic loudly with
-/// remediation on any failure.
+/// Download to a pid+thread-unique temp file in the same dir (atomic rename),
+/// sha256-verify before renaming into place.
 fn download() {
     let slot = download_slot();
     fs::create_dir_all(&slot).unwrap_or_else(|e| panic!("cannot create cache dir {slot:?}: {e}"));
@@ -156,7 +134,6 @@ fn download() {
         ".{}.{}.{}.tmp",
         fixture_name(),
         std::process::id(),
-        // e.g. "ThreadId(3)" — Debug format, unique per process
         format_args!("{:?}", std::thread::current().id())
     ));
     eprintln!("downloading pinned fixture to {tmp:?}");
@@ -197,7 +174,6 @@ fn download() {
     }
 }
 
-/// Remove the temp file and panic with the got/want evidence plus remediation.
 fn clean_fail(tmp: &Path, msg: String) -> ! {
     let _ = fs::remove_file(tmp);
     let name = fixture_name();

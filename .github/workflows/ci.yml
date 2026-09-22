@@ -8,10 +8,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      # Plan-mandated (M1.1 task 5): explicit backend pin so the non-vacuous
-      # arm of `backend_matches_resolution_rules` executes in CI. The runner
-      # has no ROCm, so `auto` would resolve to Cpu anyway — the explicit
-      # value makes the auto→Cpu resolution itself asserted, not assumed.
+      # Explicit cpu pin so the backend resolution itself is asserted in CI
+      # (the runner has no ROCm, but auto would leave it assumed).
       GOLEM_LLAMA_SYS_BACKEND: cpu
     steps:
       - uses: actions/checkout@v4
@@ -19,13 +17,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # Pinned test-model fixture cache. Source of truth for the cache slot,
-      # the pin, and the hash-derived filename:
-      # crates/golem-llama-sys/tests/common/mod.rs (fixture sha256 starts
-      # 66967fbece6dbe97; slot ~/.cache/golem/test-models/). The key is a
-      # hardcoded literal — never runtime-computed. Must precede nextest so
-      # the test run finds the fixture pre-seeded (helper prints
-      # `fixture-ok: <sha256> <path>` naming this slot on resolution).
+      # Cache for the pinned test-model fixture (see tests/common/mod.rs for
+      # the pin; sha256 starts 66967fbece6dbe97). Must precede nextest.
       - uses: actions/cache@v4
         with:
           path: ~/.cache/golem/test-models
@@ -37,7 +30,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      # --success-output=immediate: keep `fixture-ok:`/pin-ok stdout of passing
-      # tests visible directly in green CI logs (plan's log assertion).
+      # --success-output=immediate keeps `fixture-ok:`/`pin-ok:` lines visible
+      # in green CI logs.
       - run: cargo nextest run --workspace --success-output=immediate
       - uses: EmbarkStudios/cargo-deny-action@v2

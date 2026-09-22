@@ -1,26 +1,10 @@
-//! Regression guard on the trust anchor: byte-compares the Rust pin-gate
-//! implementation ([`golem_llama_sys::pin_gate`], the same source `build.rs`
-//! gates every build with) against the exact shell `cs()` recipe from
-//! `scripts/build-substrate.sh` / ADR 0001, run on a fixture directory.
-//!
-//! The fixture exercises the tricky edges of the recipe:
-//! - a nested `sub/.git` FILE — must be hashed (top-level prune only);
-//! - a top-level `.git` DIR — pruned;
-//! - a top-level `build` DIR — pruned, while a nested `sub/build/` file is
-//!   hashed (prune is top-level-only for BOTH names);
-//! - a backslash-named file — must trigger GNU sha256sum's escaping mode
-//!   (`\` line prefix, backslash doubled);
-//! - a newline-named file — the other escaping edge (`\n` rendered as
-//!   backslash + `n`), the single trickiest coreutils path;
-//! - a non-UTF-8-named file — the byte-exact `os_bytes` path and `LC_ALL=C`
-//!   sort ordering of high-byte names;
-//! - a symlink — never followed nor hashed;
-//! - an empty file — hashed (e3b0c442…);
-//! - an empty dir — skipped.
-//!
-//! Both the full streams and the outer digests are compared, so any future
-//! divergence localizes to the first differing line. CI runs this per-commit
-//! via nextest. `#[cfg(unix)]`: the shell recipe is a Unix contract.
+//! Byte-compares the Rust pin-gate implementation (`golem_llama_sys::pin_gate`,
+//! the same source `build.rs` gates every build with) against the exact shell
+//! `cs()` recipe from `scripts/build-substrate.sh` / ADR 0001, on a fixture
+//! exercising the recipe's tricky edges: nested vs top-level `.git`/`build`
+//! (prune is top-level-only), backslash/newline/non-UTF-8 filenames
+//! (sha256sum escaping mode + `LC_ALL=C` sort), symlinks, and empty
+//! files/dirs. `#[cfg(unix)]`: the shell recipe is a Unix contract.
 
 #![cfg(unix)]
 
@@ -37,13 +21,11 @@ fn unique_fixture_root(tag: &str) -> PathBuf {
         "golem-pin-gate-fixture-{}-{id}-{tag}",
         std::process::id()
     ));
-    let _ = fs::remove_dir_all(&dir); // stale leftovers from crashed runs
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create fixture root");
     dir
 }
 
-/// Removes the fixture tree on drop — assertion failures no longer leak
-/// temp dirs.
 struct FixtureGuard(PathBuf);
 impl Drop for FixtureGuard {
     fn drop(&mut self) {
@@ -80,7 +62,6 @@ fn make_fixture(root: &Path) {
     fs::write(root.join("data.bin"), b"fixture payload").expect("data.bin");
     fs::write(root.join("we\\ird.txt"), b"backslash name: escaping mode").expect("backslash file");
     fs::write(root.join("a\nb.txt"), b"newline name: escaping mode").expect("newline file");
-    // Invalid-UTF-8 filename via raw bytes (0xFF is never valid UTF-8).
     fs::write(
         root.join(OsStr::from_bytes(b"high\xFF.bin")),
         b"non-utf8 name",
@@ -89,15 +70,12 @@ fn make_fixture(root: &Path) {
     std::os::unix::fs::symlink("data.bin", root.join("link.bin")).expect("symlink (skipped)");
 }
 
-/// The canonical recipe body, verbatim from `scripts/build-substrate.sh`
-/// (ADR 0001: paste, do not re-type).
+/// Verbatim from `scripts/build-substrate.sh` (ADR 0001: paste, do not re-type).
 const CS_BODY: &str = "find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 \
                        | LC_ALL=C sort -z | xargs -0 sha256sum";
 
 #[test]
 fn recipe_body_is_verbatim() {
-    // The `\`-continuation above makes the body fragile to reformat; assert
-    // its head so an accidental indent leak can't go unnoticed.
     assert!(CS_BODY.starts_with("find . -path ./.git -prune"));
     assert!(CS_BODY.ends_with("xargs -0 sha256sum"));
     assert!(!CS_BODY.contains('\n'));
@@ -107,8 +85,8 @@ fn shell_stream(dir: &Path) -> Vec<u8> {
     let out = Command::new("sh")
         .arg("-c")
         .arg(format!("cd \"$1\" && {CS_BODY}"))
-        .arg("cs") // $0
-        .arg(dir) // $1
+        .arg("cs")
+        .arg(dir)
         .output()
         .expect("spawn sh");
     assert!(
@@ -125,8 +103,8 @@ fn shell_outer_digest(dir: &Path) -> String {
         .arg(format!(
             "cd \"$1\" && {CS_BODY} | sha256sum | awk '{{print $1}}'"
         ))
-        .arg("cs") // $0
-        .arg(dir) // $1
+        .arg("cs")
+        .arg(dir)
         .output()
         .expect("spawn sh");
     assert!(
@@ -149,8 +127,7 @@ fn rust_gate_stream_is_byte_identical_to_shell() {
     let rust_stream = golem_llama_sys::pin_gate::hash_stream(&dir).expect("rust stream");
     let shell = shell_stream(&dir);
 
-    // First-divergence localization: report the line number where the streams
-    // part, if they part at all.
+    // Report the first differing line, if any.
     if rust_stream != shell {
         for (i, (r, s)) in rust_stream
             .split(|&b| b == b'\n')
@@ -187,11 +164,9 @@ fn rust_gate_outer_digest_agrees_with_shell() {
     );
 }
 
-/// Fixture layout anchor: the digest the shell recipe produced on this exact
-/// fixture (recorded at fixture-construction time — see the task-2 report).
-/// Guards against lockstep drift where BOTH implementations change together
-/// and the pairwise comparisons above would keep passing while the recipe's
-/// meaning silently moved.
+/// Recorded digest of the shell recipe over this exact fixture. Guards
+/// against lockstep drift where both implementations change together and the
+/// pairwise comparisons keep passing while the recipe's meaning moved.
 #[test]
 fn fixture_digest_matches_recorded_anchor() {
     let dir = unique_fixture_root("anchor");
@@ -206,7 +181,5 @@ fn fixture_digest_matches_recorded_anchor() {
     );
 }
 
-/// sha256 over the fixture's emulated sha256sum stream, computed by the shell
-/// recipe on the exact `make_fixture` layout above.
 const ANCHOR_FIXTURE_DIGEST: &str =
     "4da68c99a9896bb0cacc2de6ef6e5aa6e00f891e914aed5118c6745e8e8265d6";

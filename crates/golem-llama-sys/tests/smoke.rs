@@ -1,5 +1,4 @@
-//! Acceptance (board M1.1): load a tiny GGUF via the pinned substrate and
-//! greedy-decode deterministically. Unsafe by definition — this is the FFI crate.
+//! Greedy-decode determinism over the pinned substrate.
 #![allow(unsafe_code, missing_docs)]
 
 mod common;
@@ -7,8 +6,9 @@ mod common;
 use golem_llama_sys::raw::*;
 use golem_llama_sys::{Backend, substrate_backend};
 
-/// Drop guards — declared so that reverse drop order frees contexts BEFORE the model
-/// (llama_context's destructor dereferences the model; freeing the model first is UB).
+/// Drop order matters: contexts must be freed BEFORE the model
+/// (llama_context's destructor dereferences the model; freeing the model
+/// first is UB).
 struct ModelGuard(*mut llama_model);
 impl Drop for ModelGuard {
     fn drop(&mut self) {
@@ -43,7 +43,7 @@ fn greedy_decode_is_deterministic() {
         let mut cparams = llama_context_default_params();
         cparams.n_ctx = 64;
         cparams.n_batch = 64; // default 2048 wastes hundreds of MB scratch at this vocab
-        cparams.n_threads = 4; // pin explicitly — determinism must not ride on GGML_DEFAULT_N_THREADS
+        cparams.n_threads = 4;
         cparams.n_threads_batch = 4;
         cparams.no_perf = true;
 
@@ -56,17 +56,14 @@ fn greedy_decode_is_deterministic() {
 
         let vocab = llama_model_get_vocab(model.0);
         let n_vocab = llama_vocab_n_tokens(vocab);
-        let bos = llama_token_bos(vocab); // vocab-taking API at this pin
+        let bos = llama_token_bos(vocab);
 
         let run = |ctx: *mut llama_context| -> (llama_token, Vec<f32>) {
             let mut tok = bos;
             let batch = llama_batch_get_one(&mut tok, 1);
             assert_eq!(llama_decode(ctx, batch), 0, "llama_decode failed");
             let p = llama_get_logits_ith(ctx, 0);
-            assert!(
-                !p.is_null(),
-                "no logits at i=0 (Release path returns nullptr on failure)"
-            );
+            assert!(!p.is_null(), "no logits at i=0");
             let logits = std::slice::from_raw_parts(p, n_vocab as usize);
             let argmax = (0..n_vocab as isize)
                 .max_by(|a, b| logits[*a as usize].total_cmp(&logits[*b as usize]))
@@ -76,7 +73,6 @@ fn greedy_decode_is_deterministic() {
 
         let (t1, l1) = run(_ctx_a.0);
         let (t2, l2) = run(_ctx_b.0);
-        // guards drop here: contexts freed first, model last (reverse declaration order)
 
         assert!(
             !l1.iter().any(|f| f.is_nan()),
@@ -89,12 +85,8 @@ fn greedy_decode_is_deterministic() {
                 "logits must be bit-identical for identical input/batch"
             );
         } else {
-            // HIP build: determinism is deliberately NOT asserted here — HIP
-            // reductions may reorder near-tied top-2 logits (known substrate
-            // nondeterminism, tech design §7.4). The hardware leg's job is
-            // that the HIP substrate links, loads, decodes, and executes on
-            // the GPU (proved by the init log: ggml_hip_init / offloaded
-            // layers to GPU); the recorded outputs are evidence, not contract.
+            // HIP reductions may reorder near-tied top-2 logits, so bit
+            // determinism is deliberately not asserted on HIP.
             eprintln!(
                 "hip decode run: t1={t1} t2={t2} logits_bit_identical={}",
                 l1 == l2

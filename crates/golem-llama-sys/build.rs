@@ -1,17 +1,6 @@
-//! Build script for `golem-llama-sys` (Task 2 slice):
-//!
-//! 1. resolve the compute backend (`GOLEM_LLAMA_SYS_BACKEND`=auto|cpu|hip —
-//!    env wins, auto picks hip when a usable ROCm toolchain exists);
-//! 2. ADR 0001 pin gate over `vendor/llama.cpp` (Rust port of the canonical
-//!    `cs()` recipe, proven byte-identical to the shell — see `pin_gate.rs`
-//!    and `tests/pin_gate_conformance.rs`);
-//! 3. cmake configure+build of the vendored substrate via the `cmake` crate
-//!    (Release, static, `.build_target("llama")` — NOT the default `install`
-//!    target, which transitively builds common/tools/app);
-//! 4. ordered per-backend link directives (see `emit_link_directives`);
-//! 5. bindgen bindings over `llama.h` + `headers/golem-hooks.h` →
-//!    `$OUT_DIR/bindings.rs`, included as `golem_llama_sys::raw` (see
-//!    `generate_bindings`).
+//! Build script for `golem-llama-sys`: resolve the compute backend, run the
+//! ADR 0001 pin gate over `vendor/llama.cpp`, cmake-build the substrate,
+//! emit ordered link directives, and generate bindgen bindings.
 
 #[path = "pin_gate.rs"]
 mod pin_gate;
@@ -26,10 +15,8 @@ const AMDGPU_TARGET_ENV: &str = "GOLEM_LLAMA_SYS_AMDGPU_TARGET";
 const DEFAULT_AMDGPU_TARGET: &str = "gfx1100";
 const ROCM_HIP_COMPILER: &str = "/opt/rocm/llvm/bin/clang++";
 
-/// Usable-ROCm probe: `auto` selects hip only when both the HIP compiler and
-/// the shared HIP runtime library exist AND hipcc is executable — a partial
-/// install (files present, exec bits lost) must fall through to cpu instead
-/// of failing deep inside cmake with a confusing error.
+/// A partial ROCm install (files present, exec bits lost) must fall through
+/// to cpu instead of failing deep inside cmake.
 fn usable_rocm_toolchain() -> bool {
     #[cfg(unix)]
     fn hipcc_executable() -> bool {
@@ -48,12 +35,6 @@ fn usable_rocm_toolchain() -> bool {
     hipcc_executable() && Path::new("/opt/rocm/lib/libamdhip64.so").exists()
 }
 
-/// Resolve the compute backend. Returns the raw env input (`auto|cpu|hip`) and
-/// the resolved backend (`cpu|hip`). Explicit `auto` behaves identically to
-/// unset: probe for a usable ROCm toolchain, hip when present, cpu otherwise
-/// (final-review finding: `auto` used to fall into the unknown-value panic).
-/// A non-UTF-8 env value panics instead of silently falling through to auto
-/// (controller addendum #1).
 fn detect_backend() -> (&'static str, &'static str) {
     match env::var(BACKEND_ENV).as_deref() {
         Ok("cpu") => ("cpu", "cpu"),
@@ -74,8 +55,6 @@ fn detect_backend() -> (&'static str, &'static str) {
 }
 
 fn main() {
-    // The link table below is glibc/Linux-shaped (dylib=pthread/dl/m,
-    // libstdc++); fail fast naming the platform instead of a link error.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         panic!(
             "golem-llama-sys is Linux-only at this pin: the ordered link table \
@@ -83,19 +62,11 @@ fn main() {
         );
     }
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    // build scripts run with cwd = crate root, but all paths are rooted at
-    // CARGO_MANIFEST_DIR explicitly; vendor/ lives two levels up.
     let repo_root = manifest_dir.join("../..");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    // (d) Rerun discipline — no latchable state. Paths are absolute: joined
-    // onto the absolute CARGO_MANIFEST_DIR (repo_root keeps its `../..`
-    // components un-normalized, which cargo resolves fine). The vendor dir
-    // is watched recursively by cargo, so any in-tree drift (including the
-    // files the pin gate hashes) re-runs this script. Parsed headers
-    // additionally get automatic rerun-if-changed from bindgen's
-    // CargoCallbacks in step (e); the golem-hooks.h entry also covers edits
-    // bindgen skips over (comments/whitespace).
+    // cargo watches the vendor dir recursively, so any in-tree drift re-runs
+    // this script; bindgen's CargoCallbacks covers header changes.
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("vendor/llama.cpp").display()
@@ -120,7 +91,6 @@ fn main() {
     println!("cargo:rustc-env={BACKEND_ENV}={resolved}");
     println!("cargo:rustc-env=GOLEM_LLAMA_SYS_BACKEND_INPUT={raw}");
 
-    // backend_info.rs (Task 1 contract, unchanged).
     fs::write(
         out_dir.join("backend_info.rs"),
         format!(
@@ -130,14 +100,10 @@ fn main() {
     )
     .expect("write backend_info.rs");
 
-    // (a) Pin gate — before any cmake work: never build a drifted tree.
     let pin_skipped = run_pin_gate(&repo_root);
-
-    // (b) Configure + build the substrate for this backend.
     let binary_dir = build_substrate(&repo_root, resolved, &out_dir, pin_skipped);
 
-    // (a') Post-build re-verify: the gate→cmake window is TOCTOU — re-hash so
-    // a tree mutated mid-build never ships silently. Cheap relative to cmake.
+    // Re-verify after cmake: the gate→build window is TOCTOU.
     if !pin_skipped {
         if let Err(e) = pin_gate::verify_pin(
             &repo_root.join("vendor/llama.cpp"),
@@ -147,30 +113,16 @@ fn main() {
         }
     }
 
-    // (f) Pin-gate provenance in the artifacts: a hatch-skipped build is
-    // detectable downstream via `golem_llama_sys::pin_gate_skipped()`
-    // (CI/test asserts this stays false for shipped builds).
     println!(
         "cargo:rustc-env=GOLEM_LLAMA_PIN_GATE_SKIPPED={}",
         if pin_skipped { "1" } else { "0" }
     );
 
-    // (b) OpenMP presence decides the `dylib=gomp` entry of the link table.
     let openmp_enabled = read_openmp_enabled(&binary_dir);
-
-    // (c) Ordered link directives.
     emit_link_directives(resolved, openmp_enabled, &binary_dir);
-
-    // (e) Bindgen bindings over llama.h + the golem-hooks ABI stub. Kept
-    // after the cmake section for a simple linear ordering (headers parse
-    // fine without the build; the pin gate above already ran).
     generate_bindings(&manifest_dir, &repo_root, &out_dir);
 }
 
-/// (a) ADR 0001 pin gate. `GOLEM_LLAMA_SYS_SKIP_PIN_GATE=1` skips the gate with
-/// a loud warning (escape hatch, brief (e)); when the tree is actually clean
-/// the hatch is flagged as unnecessary. Thanks to (d) the hatch never sticks
-/// silently: unset, the next build re-runs the gate.
 fn run_pin_gate(repo_root: &Path) -> bool {
     let vendor = repo_root.join("vendor/llama.cpp");
     let vendor_sha = repo_root.join("vendor/VENDOR_SHA");
@@ -196,7 +148,7 @@ fn run_pin_gate(repo_root: &Path) -> bool {
         let commit = pin_gate::read_kv_value(&lock, "commit")
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| panic!("commit key missing in engine/llama-cpp.lock"));
-        println!("pin-ok: {commit}"); // visible with `cargo build -vv`
+        println!("pin-ok: {commit}");
         return false;
     }
 
@@ -204,8 +156,6 @@ fn run_pin_gate(repo_root: &Path) -> bool {
         "cargo:warning={SKIP_GATE_ENV}=1: SKIPPING the ADR 0001 vendor pin gate — \
          never ship or commit a build made with the hatch set"
     );
-    // Leftover-hatch detection: compute the hash anyway and say which way it
-    // would have gone.
     match pin_gate::verify_pin(&vendor, &vendor_sha) {
         Ok(()) => println!(
             "cargo:warning={SKIP_GATE_ENV}=1 is unnecessary: the vendor tree is \
@@ -219,17 +169,10 @@ fn run_pin_gate(repo_root: &Path) -> bool {
     true
 }
 
-/// (b) cmake configure+build of the vendored substrate.
-///
-/// `cmake-rs` puts the binary dir at `<out_dir>/build`, and we pass
-/// `$OUT_DIR/build-{backend}` as out_dir → binary dir
-/// `$OUT_DIR/build-{backend}/build` (per-backend isolation; both dirs grow
-/// monotonically across backend flips — multi-GB each — so the flip ritual is
-/// `cargo clean -p golem-llama-sys`).
-///
-/// BUILD_SHARED_LIBS=OFF is required: the default is ON on Linux at this pin.
 fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped: bool) -> PathBuf {
     let vendor = repo_root.join("vendor/llama.cpp");
+    // Per-backend isolation; both dirs grow to multi-GB across backend flips,
+    // so the flip ritual is `cargo clean -p golem-llama-sys`.
     let build_root = out_dir.join(format!("build-{backend}"));
 
     if backend == "hip" {
@@ -245,7 +188,8 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
     let mut cfg = cmake::Config::new(&vendor);
     cfg.out_dir(&build_root)
         .define("CMAKE_BUILD_TYPE", "Release")
-        .define("BUILD_SHARED_LIBS", "OFF") // required — default is ON on Linux at this pin
+        // Required — the default is ON on Linux at this pin.
+        .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
@@ -254,15 +198,12 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_APP", "OFF")
         .define("GGML_BUILD_TESTS", "OFF")
-        // no LLAMA_CURL define: deprecated no-op at this pin
         .build_target("llama"); // NOT install — that transitively builds common/tools/app
     match backend {
         "cpu" => {
             cfg.define("GGML_HIP", "OFF");
         }
         "hip" => {
-            // Default gfx1100 matches the M1 hardware; overridable per-machine
-            // (rerun-if-env-changed above) so other GPUs need no source edit.
             let amdgpu_target = env::var(AMDGPU_TARGET_ENV)
                 .ok()
                 .filter(|v| !v.is_empty())
@@ -281,9 +222,7 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
     build_root.join("build")
 }
 
-/// Advisory ROCm version check, ported from `scripts/build-substrate.sh`:
-/// equal major.minor → ok; otherwise WARN; never fail. No installed-version
-/// file → skip. Only meaningful for the hip backend.
+/// Advisory only: warn on ROCm major.minor mismatch with the lock pin, never fail.
 fn rocm_advisory_check(repo_root: &Path) {
     let lock = repo_root.join("engine/llama-cpp.lock");
     let text =
@@ -296,7 +235,6 @@ fn rocm_advisory_check(repo_root: &Path) {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     else {
-        println!("cargo:warning=rocm-check: skipped (no /opt/rocm/.info/version)");
         return;
     };
     if major_minor(&installed) != major_minor(&pinned) {
@@ -305,22 +243,14 @@ fn rocm_advisory_check(repo_root: &Path) {
              advisory minimum; continuing"
         );
     }
-    // equal major.minor → ok, silent (the shell's "rocm-check: ok" is visible
-    // only under -vv anyway; absence of the WARN is the ok signal here).
 }
 
-/// (e) Bindgen bindings over `llama.h` + `headers/golem-hooks.h`, written to
-/// `$OUT_DIR/bindings.rs` and included by `src/lib.rs` as `pub mod raw`.
-///
-/// `size_t_is_usize(false)` keeps generated signatures literal to the header;
-/// Rust `{ non_exhaustive: true }` enums keep future llama.cpp enum additions
-/// non-breaking; `CargoCallbacks` gives automatic rerun-if-changed for every
-/// parsed header (llama.h transitively pulls the ggml headers, hence the two
-/// `-I` search paths).
 fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
     let vendor = repo_root.join("vendor/llama.cpp");
     let hooks_header = manifest_dir.join("headers/golem-hooks.h");
     let llama_header = vendor.join("include/llama.h");
+    // size_t kept literal to the header; non_exhaustive Rust enums keep
+    // future llama.cpp enum additions non-breaking.
     let bindings = bindgen::Builder::default()
         .header(
             hooks_header
@@ -349,8 +279,7 @@ fn major_minor(version: &str) -> String {
     version.split('.').take(2).collect::<Vec<_>>().join(".")
 }
 
-/// Read `GGML_OPENMP_ENABLED` from the binary dir's CMakeCache.txt.
-/// `dylib=gomp` is emitted only when it is ON; OFF means the link table needs
+/// GGML_OPENMP_ENABLED=OFF (or absent) means the link table needs
 /// re-derivation, which we refuse to guess.
 fn read_openmp_enabled(binary_dir: &Path) -> bool {
     let cache_path = binary_dir.join("CMakeCache.txt");
@@ -381,35 +310,13 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
     )
 }
 
-/// (c) Ordered per-backend link directives. Static archives resolve
-/// left-to-right and dependents must precede dependencies; order verified
-/// against the real CMake graph at pin 86ebfef2:
-/// `llama → ggml → {ggml-cpu, ggml-hip} → ggml-base` (acyclic).
-///
-/// As-built table (lib set and ordering match the plan verbatim; archive
-/// LOCATIONS confirmed empirically in Step 3 — the ggml archives are flat in
-/// `ggml/src/` at this pin except `ggml-hip`, which lands in its per-target
-/// output subdir `ggml/src/ggml-hip`). Cross-checked against
-/// `ldd` of the M0-built `.m0-work/build-cpu/bin/llama-cli`, whose system-lib
-/// set is libstdc++/libgomp/libm/libc — libpthread/libdl live in libc at
-/// glibc ≥ 2.34, and libssl/brotli/zstd there come from curl in common/server,
-/// which this minimal `llama`-target build does not use:
-///
-/// CPU: static=llama (src/), static=ggml (ggml/src/),
-///      static=ggml-cpu (ggml/src/), static=ggml-base (ggml/src/)
-///      then dylib=stdc++, dylib=gomp (only when GGML_OPENMP_ENABLED=ON),
-///           dylib=pthread, dylib=dl, dylib=m
-/// HIP: static=llama (src/), static=ggml (ggml/src/),
-///      static=ggml-cpu (ggml/src/), static=ggml-hip (ggml/src/ggml-hip),
-///      static=ggml-base (ggml/src/)
-///      then dylib=stdc++, dylib=gomp (conditional as above), dylib=hipblas,
-///           dylib=rocblas, dylib=amdhip64, dylib=pthread, dylib=dl, dylib=m
-///      extra search path /opt/rocm/lib (ROCm 7.2.4 ships these as .so only).
+/// Ordered per-backend link directives. Static archives resolve
+/// left-to-right (dependents before dependencies), verified against the
+/// CMake graph at pin 86ebfef2: `llama → ggml → {ggml-cpu, ggml-hip} →
+/// ggml-base`. HIP archives need /opt/rocm/lib on the search path (ROCm
+/// 7.2.4 ships them as .so only); pthread/dl are in libc at glibc ≥ 2.34
+/// but still linked explicitly.
 fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) {
-    // (archive name, archive dir relative to the binary dir). Order is the
-    // link order. cmake-rs does not override ARCHIVE_OUTPUT_DIRECTORY; at this
-    // pin llama lands in src/ and the ggml archives in ggml/src/, except
-    // ggml-hip, which lands in its per-target subdir ggml/src/ggml-hip.
     let archives: &[(&str, &str)] = match backend {
         "cpu" => &[
             ("llama", "src"),
@@ -421,13 +328,12 @@ fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) 
             ("llama", "src"),
             ("ggml", "ggml/src"),
             ("ggml-cpu", "ggml/src"),
-            ("ggml-hip", "ggml/src/ggml-hip"), // separate target output dir at this pin
+            ("ggml-hip", "ggml/src/ggml-hip"), // per-target output dir at this pin
             ("ggml-base", "ggml/src"),
         ],
         other => unreachable!("detect_backend only yields cpu|hip, got {other:?}"),
     };
 
-    // Search paths first (deduped, table order), then libs in order.
     let mut searched: Vec<PathBuf> = Vec::new();
     for (_, dir) in archives {
         let path = binary_dir.join(dir);
