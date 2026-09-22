@@ -5,6 +5,7 @@
 # Model weights & runtime data — never in git
 models/
 *.gguf
+.test-cache/
 data/
 journals/
 logs/

@@ -6,6 +6,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+links = "llama-cpp"
+
+# Backend selection is deliberately env-based (`GOLEM_LLAMA_SYS_BACKEND`,
+# resolved by build.rs), NOT a cargo feature: the `links = "llama-cpp"` key
+# forbids parallel feature variants of a substrate-linking crate in one graph.
+[features]
+default = []
+
+[build-dependencies]
+cmake = "0.1"
+bindgen = "0.72"
+
+[dev-dependencies]
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

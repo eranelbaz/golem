@@ -7,16 +7,25 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      GOLEM_LLAMA_SYS_BACKEND: cpu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # Pinned test-model fixture (see tests/common/mod.rs).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/golem/test-models
+          key: test-models-66967fbece6dbe97
+          restore-keys: |
+            test-models-
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace
+      - run: cargo nextest run --workspace --success-output=immediate
       - uses: EmbarkStudios/cargo-deny-action@v2
