@@ -7,25 +7,22 @@ include!(concat!(env!("OUT_DIR"), "/backend_info.rs"));
 #[path = "../pin_gate.rs"]
 pub mod pin_gate;
 
-/// Compute backend the vendored substrate was built with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cpu,
     Hip,
 }
 
-/// Backend this build of `golem-llama-sys` carries.
 pub fn substrate_backend() -> Backend {
     BACKEND
 }
 
-/// Raw `GOLEM_LLAMA_SYS_BACKEND` input build.rs resolved (auto|cpu|hip).
 pub fn backend_env_input() -> &'static str {
     BACKEND_INPUT
 }
 
-/// Whether this build skipped the vendored-substrate integrity gate
-/// (`GOLEM_LLAMA_SYS_SKIP_PIN_GATE=1`). Assert `false` for shipped builds.
+/// True if the gate never ran (`GOLEM_LLAMA_SYS_SKIP_PIN_GATE=1`);
+/// assert `false` for shipped builds.
 pub fn pin_gate_skipped() -> bool {
     option_env!("GOLEM_LLAMA_PIN_GATE_SKIPPED") == Some("1")
 }

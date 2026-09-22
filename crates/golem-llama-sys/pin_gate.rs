@@ -1,24 +1,9 @@
-//! Byte-faithful port of the `cs()` recipe from `scripts/build-substrate.sh`.
-//! Included twice on purpose: `build.rs` gates every build on the pinned
-//! vendor tree; `lib.rs` exposes it for `tests/pin_gate_conformance.rs`.
-//! std-only so both inclusion contexts stay clean.
+//! Byte-faithful port of the ADR 0001 `cs()` content-hash recipe — the full
+//! shell contract lives in `docs/adr/0001-fork-pin.md`; the conformance test
+//! (`tests/pin_gate_conformance.rs`) byte-compares this port against the real
+//! shell. Included by both `build.rs` and `lib.rs`; std-only.
 //!
-//! Shell recipe replicated exactly:
-//!
-//! ```sh
-//! cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o \
-//!        -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum \
-//!        | awk '{print $1}'; }
-//! ```
-//!
-//! - only regular files; symlinks/fifos/sockets never followed or hashed;
-//! - prune ONLY top-level `./.git` and `./build` (nested `sub/.git` is hashed);
-//! - names as `<hex>  ./<rel>` GNU sha256sum lines, byte-wise sorted (`LC_ALL=C sort -z`);
-//! - coreutils text-mode escaping for names containing backslash/newline;
-//! - outer digest = sha256 over the concatenated line stream.
-//!
-//! Like the shell, the hash covers untracked + gitignored files: never run
-//! tooling in-tree (worklog session-9 finding).
+//! The hash covers untracked + gitignored files: never run tooling in-tree.
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::Path;
@@ -103,7 +88,6 @@ const H0: [u32; 8] = [
     0x5be0_cd19,
 ];
 
-/// Streaming SHA-256 (dependency-free, FIPS 180-4).
 pub struct Sha256 {
     state: [u32; 8],
     buf: [u8; 64],
@@ -222,7 +206,7 @@ fn hex_of(digest: &[u8; 32]) -> String {
     s
 }
 
-/// Single-shot SHA-256 helper (test convenience only).
+/// Single-shot SHA-256 helper.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -230,9 +214,8 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_of(&h.finish())
 }
 
-/// The exact bytes the shell pipeline `find … | LC_ALL=C sort -z | xargs -0
-/// sha256sum` writes to stdout. Exposed so the conformance test can
-/// byte-compare against the real shell.
+/// Exact stdout bytes of the shell pipeline — the conformance test
+/// byte-compares these against the real shell.
 pub fn hash_stream(root: &Path) -> io::Result<Vec<u8>> {
     let mut relatives = Vec::new();
     walk(root, &empty_os(), true, &mut relatives)?;
@@ -258,7 +241,6 @@ pub fn hash_stream(root: &Path) -> io::Result<Vec<u8>> {
     Ok(stream)
 }
 
-/// Outer digest over the stream — the ADR 0001 `content_sha256`.
 pub fn content_hash(root: &Path) -> io::Result<String> {
     let stream = hash_stream(root)?;
     let mut h = Sha256::new();
@@ -269,16 +251,12 @@ pub fn content_hash(root: &Path) -> io::Result<String> {
 #[derive(Debug)]
 pub enum PinError {
     Io(io::Error),
-    /// `content_sha256` missing/empty/malformed in VENDOR_SHA.
     MissingKey {
-        /// Path of the pin file consulted.
         pin_file: String,
     },
-    /// Tree hash does not match the recorded pin.
     Mismatch {
         expected: String,
         actual: String,
-        /// Path of the pin file the expected hash came from.
         pin_file: String,
     },
 }
@@ -318,8 +296,6 @@ impl From<io::Error> for PinError {
     }
 }
 
-/// Verify the vendor tree's content hash against the recorded
-/// `content_sha256`. `Ok(())` means the tree is pristine (ADR 0001).
 pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinError> {
     let text = fs::read_to_string(vendor_sha_path)?;
     // Compare digests, not spellings: a foreign pin may be uppercase.
@@ -345,8 +321,6 @@ pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinE
     }
 }
 
-/// Read `key`'s value from a bare `key = value` file, skipping `#` comment
-/// lines and stripping inline `#` tails.
 pub fn read_kv_value(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
@@ -361,7 +335,6 @@ pub fn read_kv_value(text: &str, key: &str) -> Option<String> {
         let Some(after_eq) = after_key.strip_prefix('=') else {
             continue;
         };
-        // Inline `#` tails are stripped; current keys can never contain `#`.
         let value = match after_eq.split_once('#') {
             Some((v, _)) => v,
             None => after_eq,
@@ -415,15 +388,12 @@ fn join_rel(parent: &std::ffi::OsStr, name: &std::ffi::OsStr) -> std::ffi::OsStr
     os_from_bytes(&bytes)
 }
 
-/// `LC_ALL=C sort -z` — byte-wise; never delegate to `OsString: Ord` (its
-/// Windows UTF-16 ordering silently disagrees with the recipe). Canonical
-/// only on Unix; non-Unix ordering is deterministic but lossy.
+/// `LC_ALL=C sort -z` — byte-wise; never `OsString: Ord` (Windows UTF-16
+/// ordering disagrees with the recipe). Canonical on Unix only.
 fn sort_bytewise(v: &mut [std::ffi::OsString]) {
     v.sort_by(|a, b| os_bytes(a).cmp(os_bytes(b)));
 }
 
-/// `-type f` walk pruning exactly the top-level `.git`/`build` entries
-/// (GNU find non-`-L` semantics: symlinks never recursed or collected).
 fn walk(
     dir: &Path,
     rel: &std::ffi::OsStr,
@@ -433,7 +403,6 @@ fn walk(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        // Only direct children of the root; nested `sub/.git` is NOT pruned.
         if is_root && (name == *".git" || name == *"build") {
             continue;
         }
@@ -448,8 +417,6 @@ fn walk(
     Ok(())
 }
 
-/// One GNU sha256sum line: `<hex>  ./<rel>` with coreutils text-mode
-/// escaping (leading `\`, doubled backslashes, `\n` for newline).
 fn push_sha256sum_line(hex: &str, rel: &std::ffi::OsStr, stream: &mut Vec<u8>) {
     let mut name = vec![b'.', b'/'];
     name.extend_from_slice(os_bytes(rel));
@@ -488,7 +455,6 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        // FIPS 180-4 multi-block vectors (>64B and near-boundary inputs).
         let msg = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
         assert_eq!(
             sha256_hex(msg.as_bytes()),
@@ -502,8 +468,6 @@ ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
         );
     }
 
-    // Unit tests for the parser entry points the gate trusts
-    // (`read_kv_value`) and `verify_pin` end-to-end.
     mod parser {
         use super::*;
 
@@ -512,8 +476,6 @@ ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             let text = "# comment\ncontent_sha256 = abc123 # inline tail\n\nother_key = x\n";
             assert_eq!(read_kv_value(text, "content_sha256"), Some("abc123".into()));
             assert_eq!(read_kv_value(text, "other_key"), Some("x".into()));
-            // Prefix of the requested key must NOT match: `xcontent_sha256 =`
-            // fails the `=` check and is skipped.
             let tricky = "xcontent_sha256 = deadbeef\n";
             assert_eq!(read_kv_value(tricky, "content_sha256"), None);
         }
@@ -550,9 +512,7 @@ ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             }
         }
 
-        /// Mirrors the real layout: the vendor tree and its VENDOR_SHA pin
-        /// are siblings — the pin must sit OUTSIDE the hashed tree, or the
-        /// digest would cover itself.
+        /// The pin must sit OUTSIDE the hashed tree, or the digest covers itself.
         fn setup(tag: &str) -> (PathBuf, PathBuf) {
             let root = tempdir(tag);
             fs::create_dir_all(root.join("tree")).unwrap();

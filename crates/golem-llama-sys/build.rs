@@ -1,7 +1,4 @@
-//! Build script for `golem-llama-sys`: resolve the compute backend, run the
-//! ADR 0001 pin gate over `vendor/llama.cpp`, cmake-build the substrate,
-//! emit ordered link directives, and generate bindgen bindings.
-
+//! Build script: ADR 0001 pin gate → cmake substrate → link directives → bindgen.
 #[path = "pin_gate.rs"]
 mod pin_gate;
 
@@ -63,8 +60,7 @@ fn main() {
     let repo_root = manifest_dir.join("../..");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    // cargo watches the vendor dir recursively, so any in-tree drift re-runs
-    // this script; bindgen's CargoCallbacks covers header changes.
+    // vendor dir watched recursively; CargoCallbacks covers header changes.
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("vendor/llama.cpp").display()
@@ -217,7 +213,6 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
     build_root.join("build")
 }
 
-/// Advisory only: warn on ROCm major.minor mismatch with the lock pin, never fail.
 fn rocm_advisory_check(repo_root: &Path) {
     let lock = repo_root.join("engine/llama-cpp.lock");
     let text =
