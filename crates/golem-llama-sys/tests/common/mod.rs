@@ -20,30 +20,32 @@ fn fixture_name() -> String {
 static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn fixture() -> PathBuf {
-    match FIXTURE.get() {
+    if let Some(path) = FIXTURE.get() {
         // Hash-verify on every use, not just first resolution — the cached
         // file can be corrupted or replaced while the process runs.
-        Some(path) if still_valid(path) => path.clone(),
-        _ => {
-            let path = resolve();
-            let _ = FIXTURE.set(path.clone());
-            path
+        if let Some(sha) = still_valid(path) {
+            println!("fixture-ok: {sha} {}", path.display());
+            return path.clone();
         }
     }
+    let path = resolve();
+    let _ = FIXTURE.set(path.clone());
+    path
 }
 
-fn still_valid(path: &Path) -> bool {
+/// `Some(hex sha256)` when the memoized fixture still matches the pin.
+fn still_valid(path: &Path) -> Option<String> {
     match sha256_file(path) {
-        Ok(got) if got == FIXTURE_SHA256 => true,
+        Ok(got) if got == FIXTURE_SHA256 => Some(got),
         Ok(got) => {
             eprintln!(
                 "warning: memoized fixture {path:?} changed under us: got sha256 {got}, want {FIXTURE_SHA256} — re-resolving"
             );
-            false
+            None
         }
         Err(e) => {
             eprintln!("warning: memoized fixture {path:?} unreadable: {e} — re-resolving");
-            false
+            None
         }
     }
 }

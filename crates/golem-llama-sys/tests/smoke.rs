@@ -5,6 +5,14 @@ mod common;
 use golem_llama_sys::raw::*;
 use golem_llama_sys::{Backend, substrate_backend};
 
+/// Compile-time exhaustiveness guard: matching every `Backend` variant with
+/// no wildcard arm fails to compile when a variant is added, forcing the
+/// backend-guarded skips below to be revisited.
+const _BACKEND_GUARDS_EXHAUSTIVE: () = match Backend::Cpu {
+    Backend::Cpu => (),
+    Backend::Hip => (),
+};
+
 /// Drop order matters: contexts must be freed BEFORE the model
 /// (the context destructor dereferences the model; freeing the model first is UB).
 struct ModelGuard(*mut llama_model);
