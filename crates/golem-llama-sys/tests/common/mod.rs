@@ -5,9 +5,13 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-const FIXTURE_URL: &str =
-    "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf";
-const FIXTURE_SHA256: &str = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739";
+// Canonical first, mirror second, tried in order — identity is the hash,
+// never the URL.
+const FIXTURE_URLS: [&str; 2] = [
+    "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf",
+    "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf",
+];
+pub const FIXTURE_SHA256: &str = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739";
 
 fn fixture_name() -> String {
     format!("stories15M-q4_0-{}.gguf", &FIXTURE_SHA256[..12])
@@ -16,7 +20,32 @@ fn fixture_name() -> String {
 static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn fixture() -> PathBuf {
-    FIXTURE.get_or_init(resolve).clone()
+    match FIXTURE.get() {
+        // Hash-verify on every use, not just first resolution — the cached
+        // file can be corrupted or replaced while the process runs.
+        Some(path) if still_valid(path) => path.clone(),
+        _ => {
+            let path = resolve();
+            let _ = FIXTURE.set(path.clone());
+            path
+        }
+    }
+}
+
+fn still_valid(path: &Path) -> bool {
+    match sha256_file(path) {
+        Ok(got) if got == FIXTURE_SHA256 => true,
+        Ok(got) => {
+            eprintln!(
+                "warning: memoized fixture {path:?} changed under us: got sha256 {got}, want {FIXTURE_SHA256} — re-resolving"
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("warning: memoized fixture {path:?} unreadable: {e} — re-resolving");
+            false
+        }
+    }
 }
 
 fn resolve() -> PathBuf {
@@ -117,12 +146,34 @@ fn verified_existing(path: &Path) -> Option<String> {
     if got == FIXTURE_SHA256 {
         return Some(got);
     }
-    fs::remove_file(path)
-        .unwrap_or_else(|e| eprintln!("warning: could not remove corrupt {path:?}: {e}"));
-    eprintln!(
-        "warning: deleted corrupt fixture {path:?}: got sha256 {got}, want {FIXTURE_SHA256} — falling through to download"
-    );
+    replace_corrupt(path, &got);
     None
+}
+
+/// Corrupt-cache repair without racing concurrent test processes: a plain
+/// `remove_file` can delete a good copy another process just renamed into
+/// place. Write a unique empty temp and rename it over the bad file instead —
+/// the slot always holds a regular file, and a losing racer's placeholder just
+/// fails the next verifier and falls through to download.
+fn replace_corrupt(path: &Path, got: &str) {
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.corrupt.tmp",
+        fixture_name(),
+        std::process::id(),
+        format_args!("{:?}", std::thread::current().id())
+    ));
+    let replaced = fs::File::create(&tmp).and_then(|f| {
+        drop(f);
+        fs::rename(&tmp, path)
+    });
+    match replaced {
+        Ok(()) => eprintln!(
+            "warning: replaced corrupt fixture {path:?}: got sha256 {got}, want {FIXTURE_SHA256} — falling through to download"
+        ),
+        Err(e) => eprintln!(
+            "warning: could not replace corrupt {path:?}: {e} — falling through to download"
+        ),
+    }
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -149,42 +200,53 @@ fn download() {
         std::process::id(),
         format_args!("{:?}", std::thread::current().id())
     ));
-    eprintln!("downloading pinned fixture to {tmp:?}");
-    let status = std::process::Command::new("curl")
-        .args([
-            "-fL",
-            "--retry",
-            "3",
-            "--retry-delay",
-            "2",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "300",
-            "-o",
-        ])
-        .arg(&tmp)
-        .arg(FIXTURE_URL)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn curl for {FIXTURE_URL}: {e}"));
-    if !status.success() {
-        clean_fail(&tmp, format!("curl exited {status} for {FIXTURE_URL}"));
+    for url in FIXTURE_URLS {
+        eprintln!("downloading pinned fixture from {url} to {tmp:?}");
+        let status = std::process::Command::new("curl")
+            .args([
+                "-fL",
+                "--retry",
+                "3",
+                "--retry-delay",
+                "2",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "300",
+                "-o",
+            ])
+            .arg(&tmp)
+            .arg(url)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to spawn curl for {url}: {e}"));
+        if !status.success() {
+            let _ = fs::remove_file(&tmp);
+            eprintln!("warning: curl exited {status} for {url} — trying next mirror");
+            continue;
+        }
+        let got = match sha256_file(&tmp) {
+            Ok(got) => got,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                eprintln!(
+                    "warning: downloaded temp file unreadable from {url}: {e} — trying next mirror"
+                );
+                continue;
+            }
+        };
+        if got != FIXTURE_SHA256 {
+            let _ = fs::remove_file(&tmp);
+            eprintln!(
+                "warning: downloaded {url} hash mismatch: got sha256 {got}, want {FIXTURE_SHA256} — trying next mirror"
+            );
+            continue;
+        }
+        if let Err(e) = fs::rename(&tmp, slot.join(fixture_name())) {
+            clean_fail(&tmp, format!("atomic rename into {slot:?} failed: {e}"));
+        }
+        return;
     }
-    let got = match sha256_file(&tmp) {
-        Ok(got) => got,
-        Err(e) => clean_fail(&tmp, format!("downloaded temp file unreadable: {e}")),
-    };
-    if got != FIXTURE_SHA256 {
-        clean_fail(
-            &tmp,
-            format!(
-                "downloaded {FIXTURE_URL} hash mismatch: got sha256 {got}, want {FIXTURE_SHA256}"
-            ),
-        );
-    }
-    if let Err(e) = fs::rename(&tmp, slot.join(fixture_name())) {
-        clean_fail(&tmp, format!("atomic rename into {slot:?} failed: {e}"));
-    }
+    clean_fail(&tmp, format!("all fixture URLs failed: {FIXTURE_URLS:?}"));
 }
 
 fn clean_fail(tmp: &Path, msg: String) -> ! {
