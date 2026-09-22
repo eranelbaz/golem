@@ -8,7 +8,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Recompute vendored-tree content hash
         run: |
-          cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'; }
+          cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'; }
           got=$(cs vendor/llama.cpp)
           want=$(grep '^content_sha256' vendor/VENDOR_SHA | cut -d= -f2)
           test "$got" = "$want" || { echo "PIN DRIFT: $got != $want"; exit 1; }
