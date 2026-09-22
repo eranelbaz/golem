@@ -1,19 +1,11 @@
-//! ADR 0001 canonical vendor content-hash — the `cs()` recipe from
-//! `scripts/build-substrate.sh`, ported byte-faithfully to Rust.
+//! ADR 0001 canonical vendor content-hash — a byte-faithful port of the `cs()`
+//! recipe from `scripts/build-substrate.sh`. Included twice on purpose:
+//! `build.rs` (`#[path = "pin_gate.rs"]`) gates every build on the pinned
+//! vendor tree; `lib.rs` (`#[path = "../pin_gate.rs"]`) exposes it for
+//! `tests/pin_gate_conformance.rs`, which byte-compares this implementation
+//! against the real shell. std-only so both inclusion contexts stay clean.
 //!
-//! This file is included twice on purpose:
-//! - `build.rs`: `#[path = "pin_gate.rs"] mod pin_gate;` — gates every build on
-//!   the pinned `vendor/llama.cpp` tree;
-//! - `lib.rs`: `#[path = "../pin_gate.rs"] pub mod pin_gate;` — exports the same
-//!   source so the committed conformance test
-//!   (`tests/pin_gate_conformance.rs`) can byte-compare this implementation
-//!   against the shell recipe on a fixture directory.
-//!
-//! Keep it dependency-free (std only) so both inclusion contexts stay clean.
-//!
-//! # Byte-faithfulness contract (GNU find/xargs/coreutils semantics)
-//!
-//! The shell recipe being replicated is exactly:
+//! Byte-faithfulness contract (GNU find/xargs/coreutils semantics):
 //!
 //! ```sh
 //! cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o \
@@ -21,42 +13,27 @@
 //!        | awk '{print $1}'; }
 //! ```
 //!
-//! - walk: `-type f` regular files only; symlinks are never followed and never
-//!   hashed (broken symlinks, fifos, sockets likewise skipped);
-//! - prune ONLY the top-level `./.git` and `./build` entries (either may be a
-//!   file or a directory — both are pruned); a nested `sub/.git` file is NOT
-//!   pruned and IS hashed, exactly like the shell (`-path ./.git` matches only
-//!   the literal top-level path; verified against GNU find);
-//! - emitted names are the paths as find prints them: `./<relative-path>`,
-//!   sorted byte-wise (`LC_ALL=C sort -z` over NUL-delimited names; on Unix,
-//!   `OsStr` comparison is bytewise, which is equivalent);
-//! - per-file lines are GNU `sha256sum` output: `<hex>␣␣./<rel>` — two ASCII
-//!   spaces, no asterisk, LF terminator on every line including the last;
-//! - **escaping mode**: if the name contains `\` or `\n`, the line is prefixed
-//!   with `\` and in the name each `\` becomes `\\` and each newline becomes
-//!   the two characters `\` `n`. This is exactly coreutils text-mode escaping;
-//!   no other byte is ever escaped (tabs, spaces, CR pass through verbatim —
-//!   verified against GNU coreutils on this machine);
-//! - outer digest = sha256 over the concatenated line stream (always
-//!   newline-terminated after the last line).
+//! - `-type f` only; symlinks (incl. broken) / fifos / sockets never followed
+//!   or hashed;
+//! - prune ONLY the top-level `./.git` and `./build` (file or dir either way);
+//!   a nested `sub/.git` file IS hashed;
+//! - names emitted as the walk prints them (`./<rel>`), sorted byte-wise
+//!   (`LC_ALL=C sort -z`);
+//! - per-file lines are GNU `sha256sum` output: `<hex>  ./<rel>` — two ASCII
+//!   spaces, no asterisk, LF terminator on every line;
+//! - coreutils text-mode escaping: if the name contains a backslash or
+//!   newline, prefix the line with `\`, double each backslash, render newline
+//!   as backslash + `n`. No other byte is ever escaped;
+//! - outer digest = sha256 over the concatenated line stream.
 //!
 //! Like the shell, the hash covers untracked + gitignored files too: stray
-//! `__pycache__`/GGUF tooling output inside `vendor/` poisons it — never run
-//! python tooling in-tree (worklog session-9 finding).
-//!
-//! SHA-256 here is a dependency-free textbook implementation (FIPS 180-4). Its
-//! correctness is mechanically proven, not assumed: `tests/pin_gate_conformance.rs`
-//! byte-compares the full stream and both outer digests against GNU coreutils,
-//! and the build gate must reproduce `vendor/VENDOR_SHA`, which the shell recipe
-//! itself produced.
-
+//! tooling output inside `vendor/` poisons it — never run python tooling
+//! in-tree (worklog session-9 finding).
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::Path;
 
-// ---------------------------------------------------------------------------
-// SHA-256 (FIPS 180-4), std-only so this module can be shared by build.rs & lib
-// ---------------------------------------------------------------------------
+// SHA-256 (FIPS 180-4)
 
 const K: [u32; 64] = [
     0x428a_2f98,
@@ -145,7 +122,6 @@ pub struct Sha256 {
 }
 
 impl Sha256 {
-    /// Fresh hasher.
     pub fn new() -> Self {
         Sha256 {
             state: H0,
@@ -155,7 +131,6 @@ impl Sha256 {
         }
     }
 
-    /// Absorb `data`.
     pub fn update(&mut self, mut data: &[u8]) {
         self.total_len = self.total_len.wrapping_add(data.len() as u64);
         if self.buf_len > 0 {
@@ -169,8 +144,7 @@ impl Sha256 {
                 self.buf_len = 0;
             }
             if data.is_empty() {
-                // Everything was buffered — do not fall through to the tail,
-                // which would clobber buf_len despite bytes still pending.
+                // Fully buffered; falling through would clobber buf_len.
                 return;
             }
         }
@@ -184,7 +158,6 @@ impl Sha256 {
         self.buf_len = data.len();
     }
 
-    /// Pad, finalize, return the 32-byte digest.
     pub fn finish(mut self) -> [u8; 32] {
         let bit_len = self.total_len.wrapping_mul(8); // captured before padding
         self.update(&[0x80]);
@@ -259,8 +232,7 @@ fn hex_of(digest: &[u8; 32]) -> String {
     s
 }
 
-/// Single-shot SHA-256 helper (unit-test convenience; unused in the
-/// build-script inclusion context).
+/// Single-shot SHA-256 helper (test convenience only).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -268,14 +240,9 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_of(&h.finish())
 }
 
-// ---------------------------------------------------------------------------
-// The cs() recipe, byte-faithful
-// ---------------------------------------------------------------------------
-
-/// The emulated GNU `sha256sum` output stream for `root` — the exact bytes the
-/// shell pipeline `find … | LC_ALL=C sort -z | xargs -0 sha256sum` writes to
-/// stdout (newline-terminated after the last line). Exposed for the committed
-/// conformance test, which byte-compares it against the real shell.
+/// The exact bytes the shell pipeline `find … | LC_ALL=C sort -z | xargs -0
+/// sha256sum` writes to stdout. Exposed so the conformance test can
+/// byte-compare against the real shell.
 pub fn hash_stream(root: &Path) -> io::Result<Vec<u8>> {
     let mut relatives = Vec::new();
     walk(root, &empty_os(), true, &mut relatives)?;
@@ -301,8 +268,7 @@ pub fn hash_stream(root: &Path) -> io::Result<Vec<u8>> {
     Ok(stream)
 }
 
-/// Outer digest: sha256 over the emulated stream — the value `awk '{print $1}'`
-/// prints for the shell pipeline, i.e. the ADR 0001 `content_sha256`.
+/// Outer digest over the stream — the ADR 0001 `content_sha256`.
 pub fn content_hash(root: &Path) -> io::Result<String> {
     let stream = hash_stream(root)?;
     let mut h = Sha256::new();
@@ -310,18 +276,14 @@ pub fn content_hash(root: &Path) -> io::Result<String> {
     Ok(hex_of(&h.finish()))
 }
 
-/// Outcome of a failed pin verification.
 #[derive(Debug)]
 pub enum PinError {
-    /// VENDOR_SHA/lock unreadable or unreadable content.
     Io(io::Error),
-    /// The `content_sha256` key is missing/empty/malformed in VENDOR_SHA.
+    /// `content_sha256` missing/empty/malformed in VENDOR_SHA.
     MissingKey,
-    /// The tree hash does not match the recorded pin.
+    /// Tree hash does not match the recorded pin.
     Mismatch {
-        /// Digest recorded in `vendor/VENDOR_SHA`.
         expected: String,
-        /// Digest recomputed from the tree.
         actual: String,
     },
 }
@@ -352,8 +314,8 @@ impl From<io::Error> for PinError {
     }
 }
 
-/// Verify `vendor_root`'s content hash against the `content_sha256` recorded in
-/// `vendor_sha_path`. `Ok(())` means the tree is pristine (ADR 0001).
+/// Verify the vendor tree's content hash against the recorded
+/// `content_sha256`. `Ok(())` means the tree is pristine (ADR 0001).
 pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinError> {
     let text = fs::read_to_string(vendor_sha_path)?;
     let expected = read_kv_value(&text, "content_sha256").ok_or(PinError::MissingKey)?;
@@ -368,10 +330,9 @@ pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinE
     }
 }
 
-/// Read `key`'s value from a bare `key = value` / `key=value` file, skipping
-/// `#` comment lines and stripping inline `# comment` tails (the lock file has
-/// inline comments; VENDOR_SHA's format contract says it must not, but stripping
-/// is harmless there and makes one parser serve both).
+/// Read `key`'s value from a bare `key = value` file, skipping `#` comment
+/// lines and stripping inline `#` tails (one parser serves both the lock
+/// file, which has inline comments, and VENDOR_SHA).
 pub fn read_kv_value(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
@@ -402,8 +363,6 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-// -- walk -------------------------------------------------------------------
-
 fn empty_os() -> std::ffi::OsString {
     std::ffi::OsString::new()
 }
@@ -420,16 +379,14 @@ fn os_bytes(s: &std::ffi::OsStr) -> &[u8] {
     s.as_bytes()
 }
 
+// Non-Unix is not the canonical gate target; lossy conversion is fine.
 #[cfg(not(unix))]
 fn os_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
-    // Non-Unix fallback: the canonical gate only runs where the shell recipe
-    // exists; lossy conversion is fine for exotic bytes on other platforms.
     std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(not(unix))]
 fn os_bytes(s: &std::ffi::OsStr) -> &[u8] {
-    // Best-effort (see os_from_bytes): non-Unix is not the canonical target.
     s.to_str().unwrap_or_default().as_bytes()
 }
 
@@ -443,8 +400,7 @@ fn join_rel(parent: &std::ffi::OsStr, name: &std::ffi::OsStr) -> std::ffi::OsStr
     os_from_bytes(&bytes)
 }
 
-/// Byte-wise sort — `LC_ALL=C sort -z` over NUL-delimited names (NUL cannot
-/// occur inside a path, so full-record bytewise comparison is equivalent).
+/// `LC_ALL=C sort -z` over NUL-delimited names.
 fn sort_bytewise(v: &mut [std::ffi::OsString]) {
     #[cfg(unix)]
     v.sort_by(|a, b| os_bytes(a).cmp(os_bytes(b)));
@@ -452,10 +408,8 @@ fn sort_bytewise(v: &mut [std::ffi::OsString]) {
     v.sort();
 }
 
-/// Collect relative paths of every `-type f` regular file, pruning exactly the
-/// top-level `.git` and `build` entries. Mirrors GNU find's non-`-L` walk:
-/// `DirEntry::file_type` never traverses symlinks, and symlinks are neither
-/// recursed into nor collected.
+/// `-type f` walk pruning exactly the top-level `.git`/`build` entries
+/// (GNU find non-`-L` semantics: symlinks never recursed or collected).
 fn walk(
     dir: &Path,
     rel: &std::ffi::OsStr,
@@ -465,9 +419,8 @@ fn walk(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        // `-path ./.git -prune -o -path ./build -prune`: only direct children of
-        // the root named exactly `.git`/`build` are pruned, whatever their type.
-        // Nested `sub/.git` files (or dirs!) are visited like anything else.
+        // `-path ./.git -prune -o -path ./build -prune`: only direct children
+        // of the root, whatever their type. Nested `sub/.git` is NOT pruned.
         if is_root && (name == *".git" || name == *"build") {
             continue;
         }
@@ -478,15 +431,12 @@ fn walk(
         } else if file_type.is_file() {
             out.push(child_rel);
         }
-        // symlinks / specials: `-type f` is false for them; skipped.
     }
     Ok(())
 }
 
-/// Append one `<hex>␣␣./<rel>` line, replicating GNU sha256sum's escaping
-/// mode: a `\` prefix on the line when the name contains `\` or `\n`, with `\`
-/// doubled and newline rendered as the two characters `\` `n` inside the name.
-/// The name is emitted exactly as find prints it: `./` + relative path.
+/// One GNU sha256sum line: `<hex>  ./<rel>` with coreutils text-mode
+/// escaping (leading `\`, doubled backslashes, `\n` for newline).
 fn push_sha256sum_line(hex: &str, rel: &std::ffi::OsStr, stream: &mut Vec<u8>) {
     let mut name = vec![b'.', b'/'];
     name.extend_from_slice(os_bytes(rel));
