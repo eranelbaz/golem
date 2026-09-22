@@ -225,9 +225,10 @@ impl Default for Sha256 {
 }
 
 fn hex_of(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for byte in digest {
-        s.push_str(&format!("{byte:02x}"));
+        let _ = write!(s, "{byte:02x}");
     }
     s
 }
@@ -280,11 +281,16 @@ pub fn content_hash(root: &Path) -> io::Result<String> {
 pub enum PinError {
     Io(io::Error),
     /// `content_sha256` missing/empty/malformed in VENDOR_SHA.
-    MissingKey,
+    MissingKey {
+        /// Path of the pin file consulted.
+        pin_file: String,
+    },
     /// Tree hash does not match the recorded pin.
     Mismatch {
         expected: String,
         actual: String,
+        /// Path of the pin file the expected hash came from.
+        pin_file: String,
     },
 }
 
@@ -292,18 +298,27 @@ impl std::fmt::Display for PinError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PinError::Io(e) => write!(f, "I/O error: {e}"),
-            PinError::MissingKey => {
-                write!(
-                    f,
-                    "content_sha256 key missing/empty/malformed in vendor/VENDOR_SHA"
-                )
-            }
-            PinError::Mismatch { expected, actual } => {
-                write!(
-                    f,
-                    "vendor tree drifted (actual {actual} != expected {expected})"
-                )
-            }
+            PinError::MissingKey { pin_file } => write!(
+                f,
+                "content_sha256 key missing/empty/malformed in {pin_file}"
+            ),
+            PinError::Mismatch {
+                expected,
+                actual,
+                pin_file,
+            } => write!(
+                f,
+                "vendor tree drifted (actual {actual} != expected {expected}, pin {pin_file})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PinError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PinError::Io(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -318,15 +333,29 @@ impl From<io::Error> for PinError {
 /// `content_sha256`. `Ok(())` means the tree is pristine (ADR 0001).
 pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinError> {
     let text = fs::read_to_string(vendor_sha_path)?;
-    let expected = read_kv_value(&text, "content_sha256").ok_or(PinError::MissingKey)?;
+    // Canonicalize case: sha256 digests are lowercase by convention, but a
+    // hand-written or foreign-tool pin may be uppercase — compare digests,
+    // not spellings (a case-sensitive compare would fail with a misleading
+    // "drifted" error).
+    let expected = read_kv_value(&text, "content_sha256")
+        .map(|v| v.to_ascii_lowercase())
+        .ok_or_else(|| PinError::MissingKey {
+            pin_file: vendor_sha_path.display().to_string(),
+        })?;
     if !is_sha256_hex(&expected) {
-        return Err(PinError::MissingKey);
+        return Err(PinError::MissingKey {
+            pin_file: vendor_sha_path.display().to_string(),
+        });
     }
     let actual = content_hash(vendor_root)?;
     if actual == expected {
         Ok(())
     } else {
-        Err(PinError::Mismatch { expected, actual })
+        Err(PinError::Mismatch {
+            expected,
+            actual,
+            pin_file: vendor_sha_path.display().to_string(),
+        })
     }
 }
 
@@ -347,6 +376,10 @@ pub fn read_kv_value(text: &str, key: &str) -> Option<String> {
         let Some(after_eq) = after_key.strip_prefix('=') else {
             continue;
         };
+        // Inline `#` tails are stripped (the lock file uses them). Current
+        // keys (hex digests, git commits, rocm versions) can never contain
+        // `#`; if a future key ever could, this truncates silently — reject
+        // instead of extending this parser.
         let value = match after_eq.split_once('#') {
             Some((v, _)) => v,
             None => after_eq,
@@ -401,11 +434,14 @@ fn join_rel(parent: &std::ffi::OsStr, name: &std::ffi::OsStr) -> std::ffi::OsStr
 }
 
 /// `LC_ALL=C sort -z` over NUL-delimited names.
+///
+/// Byte-wise on every target: `OsString: Ord` on Windows orders by the lossy
+/// UTF-16 encoding, which silently disagrees with the `LC_ALL=C` recipe —
+/// never delegate to it. On non-Unix the bytes themselves go through a lossy
+/// conversion (no `OsStrExt` there), so the gate is canonical only on Unix;
+/// the non-Unix ordering at least stays deterministic and total.
 fn sort_bytewise(v: &mut [std::ffi::OsString]) {
-    #[cfg(unix)]
     v.sort_by(|a, b| os_bytes(a).cmp(os_bytes(b)));
-    #[cfg(not(unix))]
-    v.sort();
 }
 
 /// `-type f` walk pruning exactly the top-level `.git`/`build` entries
@@ -487,5 +523,109 @@ ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             sha256_hex(long.as_bytes()),
             "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
         );
+    }
+
+    // Unit tests for the parser entry points the gate trusts
+    // (`read_kv_value`) and `verify_pin` end-to-end.
+    mod parser {
+        use super::*;
+
+        #[test]
+        fn reads_value_and_ignores_comments_and_prefix_confusion() {
+            let text = "# comment\ncontent_sha256 = abc123 # inline tail\n\nother_key = x\n";
+            assert_eq!(read_kv_value(text, "content_sha256"), Some("abc123".into()));
+            assert_eq!(read_kv_value(text, "other_key"), Some("x".into()));
+            // Prefix of the requested key must NOT match: `xcontent_sha256 =`
+            // fails the `=` check and is skipped.
+            let tricky = "xcontent_sha256 = deadbeef\n";
+            assert_eq!(read_kv_value(tricky, "content_sha256"), None);
+        }
+
+        #[test]
+        fn tolerates_crlf_and_spaces() {
+            let text = "content_sha256 =  f00d \r\n";
+            assert_eq!(read_kv_value(text, "content_sha256"), Some("f00d".into()));
+        }
+
+        #[test]
+        fn empty_or_missing_values_are_none() {
+            assert_eq!(read_kv_value("content_sha256 =\n", "content_sha256"), None);
+            assert_eq!(read_kv_value("", "content_sha256"), None);
+        }
+    }
+
+    mod verify_pin_tests {
+        use super::*;
+        use std::path::PathBuf;
+
+        fn tempdir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("golem-pin-gate-unit-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("tempdir");
+            dir
+        }
+
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Mirrors the real layout: the vendor tree and its VENDOR_SHA pin
+        /// are siblings — the pin must sit OUTSIDE the hashed tree, or the
+        /// digest would cover itself.
+        fn setup(tag: &str) -> (PathBuf, PathBuf) {
+            let root = tempdir(tag);
+            fs::create_dir_all(root.join("tree")).unwrap();
+            fs::write(root.join("tree/f.txt"), b"payload").unwrap();
+            let pin = root.join("VENDOR_SHA");
+            (root.join("tree"), pin)
+        }
+
+        #[test]
+        fn ok_on_pristine_tree() {
+            let (tree, pin) = setup("ok");
+            let _g = Guard(tree.parent().unwrap().to_path_buf());
+            let digest = content_hash(&tree).unwrap();
+            fs::write(&pin, format!("content_sha256 = {digest}\n")).unwrap();
+            assert!(verify_pin(&tree, &pin).is_ok());
+        }
+
+        #[test]
+        fn uppercase_pin_is_accepted() {
+            let (tree, pin) = setup("upper");
+            let _g = Guard(tree.parent().unwrap().to_path_buf());
+            let digest = content_hash(&tree).unwrap().to_uppercase();
+            fs::write(&pin, format!("content_sha256 = {digest}\n")).unwrap();
+            assert!(verify_pin(&tree, &pin).is_ok());
+        }
+
+        #[test]
+        fn drifted_tree_is_mismatch_with_paths() {
+            let (tree, pin) = setup("drift");
+            let _g = Guard(tree.parent().unwrap().to_path_buf());
+            let digest = content_hash(&tree).unwrap();
+            fs::write(&pin, format!("content_sha256 = {digest}\n")).unwrap();
+            fs::write(tree.join("f.txt"), b"TAMPERED").unwrap();
+            let err = verify_pin(&tree, &pin).unwrap_err();
+            let PinError::Mismatch { pin_file, .. } = &err else {
+                panic!("expected Mismatch, got {err:?}");
+            };
+            assert!(pin_file.ends_with("VENDOR_SHA"));
+            assert!(err.to_string().contains("drifted"));
+        }
+
+        #[test]
+        fn malformed_and_missing_keys_are_missing_key() {
+            let (tree, pin) = setup("malformed");
+            let _g = Guard(tree.parent().unwrap().to_path_buf());
+            for body in ["", "content_sha256 = nothex", "commit = abc\n"] {
+                fs::write(&pin, body).unwrap();
+                let err = verify_pin(&tree, &pin).unwrap_err();
+                assert!(matches!(err, PinError::MissingKey { .. }), "got {err:?}");
+            }
+        }
     }
 }

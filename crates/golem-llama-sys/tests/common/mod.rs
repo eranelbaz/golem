@@ -89,8 +89,12 @@ fn resolve() -> PathBuf {
 
 /// Download slot directory (the helper creates it before any write).
 fn download_slot() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set — cannot resolve fixture cache");
-    Path::new(&home).join(".cache/golem/test-models")
+    // `home_dir()` (stable 1.85) falls back to passwd entries when `$HOME` is
+    // unset — some CI images and `sudo cargo` contexts lack it.
+    let home = std::env::home_dir()
+        .filter(|p| !p.as_os_str().is_empty())
+        .expect("cannot resolve home directory — cannot resolve fixture cache");
+    home.join(".cache/golem/test-models")
 }
 
 /// Repo-local pre-seed slot (relative to this crate's manifest dir).
@@ -100,11 +104,20 @@ fn preseed_slot() -> PathBuf {
 
 /// Hash-check a candidate in the writable download slot. On hash mismatch:
 /// delete the corrupt file, warn, fall through. `Some(sha256)` on a hit.
+///
+/// A concurrent test process may be deleting this same corrupt file right
+/// now (nextest runs per-test processes in parallel) — a vanished or
+/// vanishing file is treated as a miss, never a panic.
 fn check_download_slot_hit(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
     }
-    let got = sha256_file(path).unwrap_or_else(|e| panic!("cache slot fixture {path:?}: {e}"));
+    let got = match sha256_file(path) {
+        Ok(got) => got,
+        // Raced with a sibling process's delete → treat as a miss.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("cache slot fixture {path:?}: {e}"),
+    };
     if got == FIXTURE_SHA256 {
         return Some(got);
     }

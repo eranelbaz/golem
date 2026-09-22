@@ -5,8 +5,9 @@ use golem_llama_sys::raw;
 
 #[test]
 fn engine_surface_symbols_exist() {
-    // Link-time proof: taking addresses of the generated externs requires them
-    // to exist in the substrate at this pin.
+    // Link-time proof: taking addresses of the generated externs requires
+    // them to exist in the substrate at this pin — the failure mode is a
+    // *link error*, so no runtime assert is possible (or needed) here.
     let fns: &[*const ()] = &[
         raw::llama_model_load_from_file as *const (),
         raw::llama_init_from_model as *const (),
@@ -15,9 +16,7 @@ fn engine_surface_symbols_exist() {
         raw::llama_sampler_chain_init as *const (),
         raw::llama_token_eos as *const (),
     ];
-    for f in fns {
-        assert!(!f.is_null());
-    }
+    let _ = fns.len(); // touching the array keeps every cast intentional
 }
 
 #[test]

@@ -22,13 +22,30 @@ use std::path::{Path, PathBuf};
 
 const BACKEND_ENV: &str = "GOLEM_LLAMA_SYS_BACKEND";
 const SKIP_GATE_ENV: &str = "GOLEM_LLAMA_SYS_SKIP_PIN_GATE";
-const AMDGPU_TARGET: &str = "gfx1100";
+const AMDGPU_TARGET_ENV: &str = "GOLEM_LLAMA_SYS_AMDGPU_TARGET";
+const DEFAULT_AMDGPU_TARGET: &str = "gfx1100";
 const ROCM_HIP_COMPILER: &str = "/opt/rocm/llvm/bin/clang++";
 
 /// Usable-ROCm probe: `auto` selects hip only when both the HIP compiler and
-/// the shared HIP runtime library exist.
+/// the shared HIP runtime library exist AND hipcc is executable — a partial
+/// install (files present, exec bits lost) must fall through to cpu instead
+/// of failing deep inside cmake with a confusing error.
 fn usable_rocm_toolchain() -> bool {
-    Path::new("/opt/rocm/bin/hipcc").exists() && Path::new("/opt/rocm/lib/libamdhip64.so").exists()
+    #[cfg(unix)]
+    fn hipcc_executable() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let path = Path::new("/opt/rocm/bin/hipcc");
+        path.is_file()
+            && path
+                .metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    fn hipcc_executable() -> bool {
+        Path::new("/opt/rocm/bin/hipcc").is_file()
+    }
+    hipcc_executable() && Path::new("/opt/rocm/lib/libamdhip64.so").exists()
 }
 
 /// Resolve the compute backend. Returns the raw env input (`auto|cpu|hip`) and
@@ -57,6 +74,14 @@ fn detect_backend() -> (&'static str, &'static str) {
 }
 
 fn main() {
+    // The link table below is glibc/Linux-shaped (dylib=pthread/dl/m,
+    // libstdc++); fail fast naming the platform instead of a link error.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        panic!(
+            "golem-llama-sys is Linux-only at this pin: the ordered link table \
+             (dylib=stdc++/gomp/pthread/dl/m) has no macOS/Windows derivation"
+        );
+    }
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     // build scripts run with cwd = crate root, but all paths are rooted at
     // CARGO_MANIFEST_DIR explicitly; vendor/ lives two levels up.
@@ -89,6 +114,7 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed={BACKEND_ENV}");
     println!("cargo:rerun-if-env-changed={SKIP_GATE_ENV}");
+    println!("cargo:rerun-if-env-changed={AMDGPU_TARGET_ENV}");
 
     let (raw, resolved) = detect_backend();
     println!("cargo:rustc-env={BACKEND_ENV}={resolved}");
@@ -105,10 +131,29 @@ fn main() {
     .expect("write backend_info.rs");
 
     // (a) Pin gate — before any cmake work: never build a drifted tree.
-    run_pin_gate(&repo_root);
+    let pin_skipped = run_pin_gate(&repo_root);
 
     // (b) Configure + build the substrate for this backend.
-    let binary_dir = build_substrate(&repo_root, resolved, &out_dir);
+    let binary_dir = build_substrate(&repo_root, resolved, &out_dir, pin_skipped);
+
+    // (a') Post-build re-verify: the gate→cmake window is TOCTOU — re-hash so
+    // a tree mutated mid-build never ships silently. Cheap relative to cmake.
+    if !pin_skipped {
+        if let Err(e) = pin_gate::verify_pin(
+            &repo_root.join("vendor/llama.cpp"),
+            &repo_root.join("vendor/VENDOR_SHA"),
+        ) {
+            panic!("pin gate RE-CHECK after the cmake build failed: {e}");
+        }
+    }
+
+    // (f) Pin-gate provenance in the artifacts: a hatch-skipped build is
+    // detectable downstream via `golem_llama_sys::pin_gate_skipped()`
+    // (CI/test asserts this stays false for shipped builds).
+    println!(
+        "cargo:rustc-env=GOLEM_LLAMA_PIN_GATE_SKIPPED={}",
+        if pin_skipped { "1" } else { "0" }
+    );
 
     // (b) OpenMP presence decides the `dylib=gomp` entry of the link table.
     let openmp_enabled = read_openmp_enabled(&binary_dir);
@@ -126,9 +171,17 @@ fn main() {
 /// a loud warning (escape hatch, brief (e)); when the tree is actually clean
 /// the hatch is flagged as unnecessary. Thanks to (d) the hatch never sticks
 /// silently: unset, the next build re-runs the gate.
-fn run_pin_gate(repo_root: &Path) {
+fn run_pin_gate(repo_root: &Path) -> bool {
     let vendor = repo_root.join("vendor/llama.cpp");
     let vendor_sha = repo_root.join("vendor/VENDOR_SHA");
+
+    if !vendor.is_dir() {
+        panic!(
+            "{} is absent — the vendor tree must be materialized before building; \
+             run the vendoring flow per ADR 0001",
+            vendor.display()
+        );
+    }
 
     if env::var(SKIP_GATE_ENV).as_deref() != Ok("1") {
         if let Err(e) = pin_gate::verify_pin(&vendor, &vendor_sha) {
@@ -144,7 +197,7 @@ fn run_pin_gate(repo_root: &Path) {
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| panic!("commit key missing in engine/llama-cpp.lock"));
         println!("pin-ok: {commit}"); // visible with `cargo build -vv`
-        return;
+        return false;
     }
 
     println!(
@@ -163,6 +216,7 @@ fn run_pin_gate(repo_root: &Path) {
              ({e}) — remember to revert: git clean -fdx vendor/llama.cpp && git checkout -- vendor/"
         ),
     }
+    true
 }
 
 /// (b) cmake configure+build of the vendored substrate.
@@ -174,7 +228,7 @@ fn run_pin_gate(repo_root: &Path) {
 /// `cargo clean -p golem-llama-sys`).
 ///
 /// BUILD_SHARED_LIBS=OFF is required: the default is ON on Linux at this pin.
-fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path) -> PathBuf {
+fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped: bool) -> PathBuf {
     let vendor = repo_root.join("vendor/llama.cpp");
     let build_root = out_dir.join(format!("build-{backend}"));
 
@@ -207,11 +261,20 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path) -> PathBuf {
             cfg.define("GGML_HIP", "OFF");
         }
         "hip" => {
+            // Default gfx1100 matches the M1 hardware; overridable per-machine
+            // (rerun-if-env-changed above) so other GPUs need no source edit.
+            let amdgpu_target = env::var(AMDGPU_TARGET_ENV)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_AMDGPU_TARGET.to_string());
             cfg.define("GGML_HIP", "ON")
-                .define("AMDGPU_TARGETS", AMDGPU_TARGET)
+                .define("AMDGPU_TARGETS", amdgpu_target)
                 .define("CMAKE_HIP_COMPILER", ROCM_HIP_COMPILER);
         }
         other => unreachable!("detect_backend only yields cpu|hip, got {other:?}"),
+    }
+    if pin_skipped {
+        println!("cargo:warning={SKIP_GATE_ENV}=1 build: post-build pin re-check suppressed");
     }
     cfg.build();
 
@@ -256,9 +319,15 @@ fn rocm_advisory_check(repo_root: &Path) {
 /// `-I` search paths).
 fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
     let vendor = repo_root.join("vendor/llama.cpp");
+    let hooks_header = manifest_dir.join("headers/golem-hooks.h");
+    let llama_header = vendor.join("include/llama.h");
     let bindings = bindgen::Builder::default()
-        .header(manifest_dir.join("headers/golem-hooks.h").to_str().unwrap())
-        .header(vendor.join("include/llama.h").to_str().unwrap())
+        .header(
+            hooks_header
+                .to_str()
+                .expect("non-UTF-8 path to golem-hooks.h"),
+        )
+        .header(llama_header.to_str().expect("non-UTF-8 path to llama.h"))
         .clang_arg(format!("-I{}", vendor.join("include").display()))
         .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
         .allowlist_function("llama_.*")
