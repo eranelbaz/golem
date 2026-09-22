@@ -65,6 +65,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed={AMDGPU_TARGET_ENV}");
 
     let (raw, resolved) = detect_backend();
+    // links = "llama-cpp" surfaces this downstream as DEP_LLAMA_CPP_BACKEND.
+    println!("cargo:backend={resolved}");
     println!("cargo:rustc-env={BACKEND_ENV}={resolved}");
     println!("cargo:rustc-env=GOLEM_LLAMA_SYS_BACKEND_INPUT={raw}");
 

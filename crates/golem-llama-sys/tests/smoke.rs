@@ -24,8 +24,10 @@ impl Drop for Ctx {
     }
 }
 
-#[test]
-fn greedy_decode_is_deterministic() {
+/// Load the fixture once, then decode BOS → next-token through two
+/// independent contexts over the same model. Returns per-context
+/// (greedy argmax token, full logits vector).
+fn two_context_greedy_decode() -> [(llama_token, Vec<f32>); 2] {
     let path = common::fixture();
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     unsafe {
@@ -71,28 +73,52 @@ fn greedy_decode_is_deterministic() {
 
         let (t1, l1) = run(_ctx_a.0);
         let (t2, l2) = run(_ctx_b.0);
-
-        assert!(
-            !l1.iter().any(|f| f.is_nan()),
-            "NaN logits — poisoned build, not nondeterminism"
-        );
-        if substrate_backend() == Backend::Cpu {
-            assert_eq!(t1, t2, "same input must give same greedy token");
-            assert_eq!(
-                l1, l2,
-                "logits must be bit-identical for identical input/batch"
-            );
-        } else {
-            // HIP reductions may reorder near-tied top-2 logits, so bit
-            // determinism is deliberately not asserted on HIP.
-            eprintln!(
-                "hip decode run: t1={t1} t2={t2} logits_bit_identical={}",
-                l1 == l2
-            );
-        }
-        assert!(
-            (0..n_vocab as i32).contains(&t1),
-            "argmax out of vocab: {t1}"
-        );
+        [(t1, l1), (t2, l2)]
     }
+}
+
+/// A decode must at least be well-formed: no NaN/inf logits, argmax in vocab.
+fn assert_decode_sane(token: llama_token, logits: &[f32]) {
+    assert!(
+        logits.iter().all(|f| f.is_finite()),
+        "non-finite (NaN/inf) logits — poisoned build, not nondeterminism"
+    );
+    assert!(
+        (0..logits.len() as i32).contains(&token),
+        "argmax out of vocab: {token}"
+    );
+}
+
+#[test]
+fn greedy_decode_is_deterministic() {
+    if substrate_backend() != Backend::Cpu {
+        eprintln!(
+            "skipped: bit-identical logits are contracted on the cpu substrate \
+             only — the hip substrate decodes under hip_decode_runs"
+        );
+        return;
+    }
+    let [(t1, l1), (t2, l2)] = two_context_greedy_decode();
+    assert_decode_sane(t1, &l1);
+    assert_decode_sane(t2, &l2);
+    assert_eq!(t1, t2, "same input must give same greedy token");
+    assert_eq!(
+        l1, l2,
+        "logits must be bit-identical for identical input/batch"
+    );
+}
+
+#[test]
+fn hip_decode_runs() {
+    if substrate_backend() != Backend::Hip {
+        eprintln!("skipped: hip_decode_runs only executes on a hip substrate build");
+        return;
+    }
+    let [(t1, l1), (t2, l2)] = two_context_greedy_decode();
+    assert_decode_sane(t1, &l1);
+    assert_decode_sane(t2, &l2);
+    // HIP reductions may reorder near-tied top-2 logits, so bit-identical
+    // logits are deliberately not asserted here; the weaker real contract is
+    // an identical greedy token across the two contexts.
+    assert_eq!(t1, t2, "same input must give same greedy token");
 }

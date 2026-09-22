@@ -4,19 +4,51 @@ use golem_llama_sys::raw;
 
 #[test]
 fn engine_surface_symbols_exist() {
-    let fns: &[*const ()] = &[
-        raw::llama_model_load_from_file as *const (),
-        raw::llama_init_from_model as *const (),
-        raw::llama_decode as *const (),
-        raw::llama_batch_get_one as *const (),
-        raw::llama_sampler_chain_init as *const (),
-        raw::llama_token_eos as *const (),
+    let fns: &[(&str, *const ())] = &[
+        (
+            "llama_model_load_from_file",
+            raw::llama_model_load_from_file as *const (),
+        ),
+        (
+            "llama_init_from_model",
+            raw::llama_init_from_model as *const (),
+        ),
+        ("llama_decode", raw::llama_decode as *const ()),
+        ("llama_batch_get_one", raw::llama_batch_get_one as *const ()),
+        (
+            "llama_sampler_chain_init",
+            raw::llama_sampler_chain_init as *const (),
+        ),
+        ("llama_token_eos", raw::llama_token_eos as *const ()),
     ];
-    let _ = fns.len();
+    for (name, f) in fns {
+        assert!(
+            !f.is_null(),
+            "engine surface symbol {name} resolved to null"
+        );
+    }
+}
+
+/// The golem hook typedefs are bare C fn pointers: `Option<hook>` must stay
+/// thin (pointer-sized via the niche, no tag word) and drop-free so NULL
+/// registration remains ABI-exact.
+fn assert_thin_fn_ptr<T>() {
+    assert_eq!(
+        std::mem::size_of::<T>(),
+        std::mem::size_of::<usize>(),
+        "hook typedef must stay a thin C fn pointer (Option niche), not a fat type"
+    );
+    assert!(
+        !std::mem::needs_drop::<T>(),
+        "hook typedef must not carry a drop path"
+    );
 }
 
 #[test]
 fn hook_abi_types_generated() {
-    let _never_called: raw::golem_ensure_host_resident_fn = None;
-    let _ = _never_called;
+    assert_thin_fn_ptr::<raw::golem_ensure_host_resident_fn>();
+    assert_thin_fn_ptr::<raw::golem_policy_query_fn>();
+    assert_thin_fn_ptr::<raw::golem_notify_access_fn>();
+    let unset: raw::golem_ensure_host_resident_fn = None;
+    assert!(unset.is_none(), "hook slot must represent NULL as None");
 }
