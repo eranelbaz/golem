@@ -1,11 +1,9 @@
-//! ADR 0001 canonical vendor content-hash — a byte-faithful port of the `cs()`
-//! recipe from `scripts/build-substrate.sh`. Included twice on purpose:
-//! `build.rs` (`#[path = "pin_gate.rs"]`) gates every build on the pinned
-//! vendor tree; `lib.rs` (`#[path = "../pin_gate.rs"]`) exposes it for
-//! `tests/pin_gate_conformance.rs`, which byte-compares this implementation
-//! against the real shell. std-only so both inclusion contexts stay clean.
+//! Byte-faithful port of the `cs()` recipe from `scripts/build-substrate.sh`.
+//! Included twice on purpose: `build.rs` gates every build on the pinned
+//! vendor tree; `lib.rs` exposes it for `tests/pin_gate_conformance.rs`.
+//! std-only so both inclusion contexts stay clean.
 //!
-//! Byte-faithfulness contract (GNU find/xargs/coreutils semantics):
+//! Shell recipe replicated exactly:
 //!
 //! ```sh
 //! cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o \
@@ -13,22 +11,14 @@
 //!        | awk '{print $1}'; }
 //! ```
 //!
-//! - `-type f` only; symlinks (incl. broken) / fifos / sockets never followed
-//!   or hashed;
-//! - prune ONLY the top-level `./.git` and `./build` (file or dir either way);
-//!   a nested `sub/.git` file IS hashed;
-//! - names emitted as the walk prints them (`./<rel>`), sorted byte-wise
-//!   (`LC_ALL=C sort -z`);
-//! - per-file lines are GNU `sha256sum` output: `<hex>  ./<rel>` — two ASCII
-//!   spaces, no asterisk, LF terminator on every line;
-//! - coreutils text-mode escaping: if the name contains a backslash or
-//!   newline, prefix the line with `\`, double each backslash, render newline
-//!   as backslash + `n`. No other byte is ever escaped;
+//! - only regular files; symlinks/fifos/sockets never followed or hashed;
+//! - prune ONLY top-level `./.git` and `./build` (nested `sub/.git` is hashed);
+//! - names as `<hex>  ./<rel>` GNU sha256sum lines, byte-wise sorted (`LC_ALL=C sort -z`);
+//! - coreutils text-mode escaping for names containing backslash/newline;
 //! - outer digest = sha256 over the concatenated line stream.
 //!
-//! Like the shell, the hash covers untracked + gitignored files too: stray
-//! tooling output inside `vendor/` poisons it — never run python tooling
-//! in-tree (worklog session-9 finding).
+//! Like the shell, the hash covers untracked + gitignored files: never run
+//! tooling in-tree (worklog session-9 finding).
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::Path;
@@ -144,8 +134,7 @@ impl Sha256 {
                 self.buf_len = 0;
             }
             if data.is_empty() {
-                // Fully buffered; falling through would clobber buf_len.
-                return;
+                return; // fully buffered; falling through would clobber buf_len
             }
         }
         while data.len() >= 64 {
@@ -333,10 +322,7 @@ impl From<io::Error> for PinError {
 /// `content_sha256`. `Ok(())` means the tree is pristine (ADR 0001).
 pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinError> {
     let text = fs::read_to_string(vendor_sha_path)?;
-    // Canonicalize case: sha256 digests are lowercase by convention, but a
-    // hand-written or foreign-tool pin may be uppercase — compare digests,
-    // not spellings (a case-sensitive compare would fail with a misleading
-    // "drifted" error).
+    // Compare digests, not spellings: a foreign pin may be uppercase.
     let expected = read_kv_value(&text, "content_sha256")
         .map(|v| v.to_ascii_lowercase())
         .ok_or_else(|| PinError::MissingKey {
@@ -360,8 +346,7 @@ pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinE
 }
 
 /// Read `key`'s value from a bare `key = value` file, skipping `#` comment
-/// lines and stripping inline `#` tails (one parser serves both the lock
-/// file, which has inline comments, and VENDOR_SHA).
+/// lines and stripping inline `#` tails.
 pub fn read_kv_value(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
@@ -376,10 +361,7 @@ pub fn read_kv_value(text: &str, key: &str) -> Option<String> {
         let Some(after_eq) = after_key.strip_prefix('=') else {
             continue;
         };
-        // Inline `#` tails are stripped (the lock file uses them). Current
-        // keys (hex digests, git commits, rocm versions) can never contain
-        // `#`; if a future key ever could, this truncates silently — reject
-        // instead of extending this parser.
+        // Inline `#` tails are stripped; current keys can never contain `#`.
         let value = match after_eq.split_once('#') {
             Some((v, _)) => v,
             None => after_eq,
@@ -433,13 +415,9 @@ fn join_rel(parent: &std::ffi::OsStr, name: &std::ffi::OsStr) -> std::ffi::OsStr
     os_from_bytes(&bytes)
 }
 
-/// `LC_ALL=C sort -z` over NUL-delimited names.
-///
-/// Byte-wise on every target: `OsString: Ord` on Windows orders by the lossy
-/// UTF-16 encoding, which silently disagrees with the `LC_ALL=C` recipe —
-/// never delegate to it. On non-Unix the bytes themselves go through a lossy
-/// conversion (no `OsStrExt` there), so the gate is canonical only on Unix;
-/// the non-Unix ordering at least stays deterministic and total.
+/// `LC_ALL=C sort -z` — byte-wise; never delegate to `OsString: Ord` (its
+/// Windows UTF-16 ordering silently disagrees with the recipe). Canonical
+/// only on Unix; non-Unix ordering is deterministic but lossy.
 fn sort_bytewise(v: &mut [std::ffi::OsString]) {
     v.sort_by(|a, b| os_bytes(a).cmp(os_bytes(b)));
 }
@@ -455,8 +433,7 @@ fn walk(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        // `-path ./.git -prune -o -path ./build -prune`: only direct children
-        // of the root, whatever their type. Nested `sub/.git` is NOT pruned.
+        // Only direct children of the root; nested `sub/.git` is NOT pruned.
         if is_root && (name == *".git" || name == *"build") {
             continue;
         }

@@ -15,8 +15,6 @@ const AMDGPU_TARGET_ENV: &str = "GOLEM_LLAMA_SYS_AMDGPU_TARGET";
 const DEFAULT_AMDGPU_TARGET: &str = "gfx1100";
 const ROCM_HIP_COMPILER: &str = "/opt/rocm/llvm/bin/clang++";
 
-/// A partial ROCm install (files present, exec bits lost) must fall through
-/// to cpu instead of failing deep inside cmake.
 fn usable_rocm_toolchain() -> bool {
     #[cfg(unix)]
     fn hipcc_executable() -> bool {
@@ -103,7 +101,6 @@ fn main() {
     let pin_skipped = run_pin_gate(&repo_root);
     let binary_dir = build_substrate(&repo_root, resolved, &out_dir, pin_skipped);
 
-    // Re-verify after cmake: the gate→build window is TOCTOU.
     if !pin_skipped {
         if let Err(e) = pin_gate::verify_pin(
             &repo_root.join("vendor/llama.cpp"),
@@ -171,8 +168,7 @@ fn run_pin_gate(repo_root: &Path) -> bool {
 
 fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped: bool) -> PathBuf {
     let vendor = repo_root.join("vendor/llama.cpp");
-    // Per-backend isolation; both dirs grow to multi-GB across backend flips,
-    // so the flip ritual is `cargo clean -p golem-llama-sys`.
+    // Per-backend isolation: flip ritual is `cargo clean -p golem-llama-sys`.
     let build_root = out_dir.join(format!("build-{backend}"));
 
     if backend == "hip" {
@@ -188,7 +184,6 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
     let mut cfg = cmake::Config::new(&vendor);
     cfg.out_dir(&build_root)
         .define("CMAKE_BUILD_TYPE", "Release")
-        // Required — the default is ON on Linux at this pin.
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         .define("LLAMA_BUILD_TESTS", "OFF")
@@ -198,7 +193,7 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_APP", "OFF")
         .define("GGML_BUILD_TESTS", "OFF")
-        .build_target("llama"); // NOT install — that transitively builds common/tools/app
+        .build_target("llama"); // not install — that builds common/tools/app transitively
     match backend {
         "cpu" => {
             cfg.define("GGML_HIP", "OFF");
@@ -249,8 +244,8 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
     let vendor = repo_root.join("vendor/llama.cpp");
     let hooks_header = manifest_dir.join("headers/golem-hooks.h");
     let llama_header = vendor.join("include/llama.h");
-    // size_t kept literal to the header; non_exhaustive Rust enums keep
-    // future llama.cpp enum additions non-breaking.
+    // size_t kept literal to the header; non_exhaustive enums keep future
+    // llama.cpp enum additions non-breaking.
     let bindings = bindgen::Builder::default()
         .header(
             hooks_header
@@ -279,8 +274,6 @@ fn major_minor(version: &str) -> String {
     version.split('.').take(2).collect::<Vec<_>>().join(".")
 }
 
-/// GGML_OPENMP_ENABLED=OFF (or absent) means the link table needs
-/// re-derivation, which we refuse to guess.
 fn read_openmp_enabled(binary_dir: &Path) -> bool {
     let cache_path = binary_dir.join("CMakeCache.txt");
     let cache = fs::read_to_string(&cache_path)
@@ -310,12 +303,6 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
     )
 }
 
-/// Ordered per-backend link directives. Static archives resolve
-/// left-to-right (dependents before dependencies), verified against the
-/// CMake graph at pin 86ebfef2: `llama → ggml → {ggml-cpu, ggml-hip} →
-/// ggml-base`. HIP archives need /opt/rocm/lib on the search path (ROCm
-/// 7.2.4 ships them as .so only); pthread/dl are in libc at glibc ≥ 2.34
-/// but still linked explicitly.
 fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) {
     let archives: &[(&str, &str)] = match backend {
         "cpu" => &[
@@ -328,7 +315,7 @@ fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) 
             ("llama", "src"),
             ("ggml", "ggml/src"),
             ("ggml-cpu", "ggml/src"),
-            ("ggml-hip", "ggml/src/ggml-hip"), // per-target output dir at this pin
+            ("ggml-hip", "ggml/src/ggml-hip"),
             ("ggml-base", "ggml/src"),
         ],
         other => unreachable!("detect_backend only yields cpu|hip, got {other:?}"),
