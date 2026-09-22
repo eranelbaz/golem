@@ -4,6 +4,9 @@ include!(concat!(env!("OUT_DIR"), "/backend_info.rs"));
 #[path = "../pin_gate.rs"]
 pub mod pin_gate;
 
+#[path = "../backend_probe.rs"]
+pub mod backend_probe;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cpu,
