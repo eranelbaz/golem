@@ -1,7 +1,4 @@
-//! Backend-resolution rules: env input wins; auto resolves by ROCm toolchain presence.
-//! The test re-derives "auto" independently of build.rs so the two can disagree.
-
-#![allow(unsafe_code)]
+#![allow(unsafe_code, missing_docs)]
 
 fn auto_rule() -> golem_llama_sys::Backend {
     let usable_rocm = std::path::Path::new("/opt/rocm/bin/hipcc").exists()

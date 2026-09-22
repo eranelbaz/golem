@@ -1,14 +1,8 @@
-//! Byte-faithful port of the ADR 0001 `cs()` content-hash recipe — the full
-//! shell contract lives in `docs/adr/0001-fork-pin.md`; the conformance test
-//! (`tests/pin_gate_conformance.rs`) byte-compares this port against the real
-//! shell. Included by both `build.rs` and `lib.rs`; std-only.
-//!
-//! The hash covers untracked + gitignored files: never run tooling in-tree.
+//! Port of the ADR 0001 `cs()` recipe; never run tooling in-tree —
+//! the hash covers untracked + gitignored files.
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::Path;
-
-// SHA-256 (FIPS 180-4)
 
 const K: [u32; 64] = [
     0x428a_2f98,
@@ -206,7 +200,6 @@ fn hex_of(digest: &[u8; 32]) -> String {
     s
 }
 
-/// Single-shot SHA-256 helper.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -214,8 +207,6 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_of(&h.finish())
 }
 
-/// Exact stdout bytes of the shell pipeline — the conformance test
-/// byte-compares these against the real shell.
 pub fn hash_stream(root: &Path) -> io::Result<Vec<u8>> {
     let mut relatives = Vec::new();
     walk(root, &empty_os(), true, &mut relatives)?;
@@ -298,7 +289,6 @@ impl From<io::Error> for PinError {
 
 pub fn verify_pin(vendor_root: &Path, vendor_sha_path: &Path) -> Result<(), PinError> {
     let text = fs::read_to_string(vendor_sha_path)?;
-    // Compare digests, not spellings: a foreign pin may be uppercase.
     let expected = read_kv_value(&text, "content_sha256")
         .map(|v| v.to_ascii_lowercase())
         .ok_or_else(|| PinError::MissingKey {
@@ -367,7 +357,6 @@ fn os_bytes(s: &std::ffi::OsStr) -> &[u8] {
     s.as_bytes()
 }
 
-// Non-Unix is not the canonical gate target; lossy conversion is fine.
 #[cfg(not(unix))]
 fn os_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
     std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
@@ -388,8 +377,6 @@ fn join_rel(parent: &std::ffi::OsStr, name: &std::ffi::OsStr) -> std::ffi::OsStr
     os_from_bytes(&bytes)
 }
 
-/// `LC_ALL=C sort -z` — byte-wise; never `OsString: Ord` (Windows UTF-16
-/// ordering disagrees with the recipe). Canonical on Unix only.
 fn sort_bytewise(v: &mut [std::ffi::OsString]) {
     v.sort_by(|a, b| os_bytes(a).cmp(os_bytes(b)));
 }
@@ -512,7 +499,7 @@ ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             }
         }
 
-        /// The pin must sit OUTSIDE the hashed tree, or the digest covers itself.
+        /// The pin must sit outside the hashed tree, or the digest covers itself.
         fn setup(tag: &str) -> (PathBuf, PathBuf) {
             let root = tempdir(tag);
             fs::create_dir_all(root.join("tree")).unwrap();

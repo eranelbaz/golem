@@ -1,4 +1,3 @@
-//! Greedy-decode determinism over the pinned substrate.
 #![allow(unsafe_code, missing_docs)]
 
 mod common;
@@ -7,8 +6,7 @@ use golem_llama_sys::raw::*;
 use golem_llama_sys::{Backend, substrate_backend};
 
 /// Drop order matters: contexts must be freed BEFORE the model
-/// (llama_context's destructor dereferences the model; freeing the model
-/// first is UB).
+/// (the context destructor dereferences the model; freeing the model first is UB).
 struct ModelGuard(*mut llama_model);
 impl Drop for ModelGuard {
     fn drop(&mut self) {

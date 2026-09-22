@@ -1,10 +1,4 @@
-//! Byte-compares the Rust pin-gate implementation (`golem_llama_sys::pin_gate`,
-//! the same source `build.rs` gates every build with) against the exact shell
-//! `cs()` recipe from `scripts/build-substrate.sh` / ADR 0001, on a fixture
-//! exercising the recipe's tricky edges: nested vs top-level `.git`/`build`
-//! (prune is top-level-only), backslash/newline/non-UTF-8 filenames
-//! (sha256sum escaping mode + `LC_ALL=C` sort), symlinks, and empty
-//! files/dirs. `#[cfg(unix)]`: the shell recipe is a Unix contract.
+//! Byte-compares `pin_gate` against the shell `cs()` recipe (ADR 0001).
 
 #![cfg(unix)]
 
@@ -127,7 +121,6 @@ fn rust_gate_stream_is_byte_identical_to_shell() {
     let rust_stream = golem_llama_sys::pin_gate::hash_stream(&dir).expect("rust stream");
     let shell = shell_stream(&dir);
 
-    // Report the first differing line, if any.
     if rust_stream != shell {
         for (i, (r, s)) in rust_stream
             .split(|&b| b == b'\n')
@@ -164,9 +157,6 @@ fn rust_gate_outer_digest_agrees_with_shell() {
     );
 }
 
-/// Recorded digest of the shell recipe over this exact fixture. Guards
-/// against lockstep drift where both implementations change together and the
-/// pairwise comparisons keep passing while the recipe's meaning moved.
 #[test]
 fn fixture_digest_matches_recorded_anchor() {
     let dir = unique_fixture_root("anchor");

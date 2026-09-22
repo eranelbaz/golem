@@ -1,7 +1,5 @@
-// golem-hooks.h — Golem policy-hook ABI stub (design tech-design.md §3.4 P1).
-// Crate-local stub while the vendor tree is pristine (`patches = none-yet` in
-// engine/llama-cpp.lock). This exact header moves into ggml/include/ as patch
-// P1 in M2.1; the ABI declared here is frozen now so Rust-side code does not churn.
+// Golem policy-hook ABI. Crate-local stub; moves into ggml/include/ as patch
+// P1 in M2.1 — the ABI is frozen now so Rust-side code does not churn.
 #ifndef GOLEM_HOOKS_H
 #define GOLEM_HOOKS_H
 

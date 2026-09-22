@@ -1,12 +1,6 @@
-//! Live pin-gate hard gate. `build.rs` only runs the gate when cargo re-runs
-//! the build script — and rerun detection is mtime-based, so a content change
-//! that preserves mtimes could skip the gate. This test runs `verify_pin` on
-//! the REAL vendored tree on every `cargo test` / CI run, independent of
-//! cargo's rerun heuristics: a drifted tree fails CI even when the build
-//! script was never re-invoked. It also asserts the gate-provenance flag so a
-//! hatch-skipped build can never hide.
+//! Guards cargo's mtime rerun hole: gate runs on every `cargo test`.
 
-#![cfg(unix)] // the gate recipe is a Unix contract
+#![cfg(unix)]
 
 use golem_llama_sys::pin_gate;
 

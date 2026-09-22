@@ -1,4 +1,4 @@
-//! Build script: ADR 0001 pin gate → cmake substrate → link directives → bindgen.
+//! Build script: pin gate → cmake substrate → link directives → bindgen.
 #[path = "pin_gate.rs"]
 mod pin_gate;
 
@@ -60,7 +60,6 @@ fn main() {
     let repo_root = manifest_dir.join("../..");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    // vendor dir watched recursively; CargoCallbacks covers header changes.
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("vendor/llama.cpp").display()
@@ -164,7 +163,6 @@ fn run_pin_gate(repo_root: &Path) -> bool {
 
 fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped: bool) -> PathBuf {
     let vendor = repo_root.join("vendor/llama.cpp");
-    // Per-backend isolation: flip ritual is `cargo clean -p golem-llama-sys`.
     let build_root = out_dir.join(format!("build-{backend}"));
 
     if backend == "hip" {
@@ -189,7 +187,7 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_APP", "OFF")
         .define("GGML_BUILD_TESTS", "OFF")
-        .build_target("llama"); // not install — that builds common/tools/app transitively
+        .build_target("llama"); // not install: install builds common/tools/app transitively
     match backend {
         "cpu" => {
             cfg.define("GGML_HIP", "OFF");
@@ -239,7 +237,7 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
     let vendor = repo_root.join("vendor/llama.cpp");
     let hooks_header = manifest_dir.join("headers/golem-hooks.h");
     let llama_header = vendor.join("include/llama.h");
-    // size_t kept literal to the header; non_exhaustive enums keep future
+    // size_t literal to the header; non-exhaustive enums keep future
     // llama.cpp enum additions non-breaking.
     let bindings = bindgen::Builder::default()
         .header(

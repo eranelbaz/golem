@@ -1,5 +1,3 @@
-//! Pinned tiny-GGUF fixture resolver shared by this crate's integration tests.
-
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -7,29 +5,34 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-/// The exact file (same sha256) the vendored substrate's own suite pins in
-/// `tests/CMakeLists.txt` at this commit.
 const FIXTURE_URL: &str =
     "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf";
 const FIXTURE_SHA256: &str = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739";
 
-/// Hash-derived filename — never transcribed, so it can't drift from the pin.
 fn fixture_name() -> String {
     format!("stories15M-q4_0-{}.gguf", &FIXTURE_SHA256[..12])
 }
 
-/// One download per process; no concurrent-test re-fetch.
 static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
-/// Resolve the pinned test model: `GOLEM_TEST_MODEL` override, cache slot
-/// (`~/.cache/golem/test-models/`), repo-local `.test-cache/` pre-seed, then
-/// pinned download. Prints `fixture-ok: <sha256> <resolved-path>` on success.
 pub fn fixture() -> PathBuf {
     FIXTURE.get_or_init(resolve).clone()
 }
 
 fn resolve() -> PathBuf {
-    // Explicit override wins outright — but is still hash-verified.
+    if let Some(path) = golem_test_model_override() {
+        return path;
+    }
+    if let Some(path) = cached_download() {
+        return path;
+    }
+    if let Some(path) = preseeded_copy() {
+        return path;
+    }
+    download_and_verify()
+}
+
+fn golem_test_model_override() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("GOLEM_TEST_MODEL") {
         let p = PathBuf::from(p);
         assert!(p.is_file(), "GOLEM_TEST_MODEL={p:?} is not a regular file");
@@ -39,31 +42,46 @@ fn resolve() -> PathBuf {
             "GOLEM_TEST_MODEL={p:?} hash mismatch: got sha256 {got}, want {FIXTURE_SHA256}"
         );
         println!("fixture-ok: {got} {}", p.display());
-        return p;
+        Some(p)
+    } else {
+        None
     }
+}
 
+fn cached_download() -> Option<PathBuf> {
     let cached = download_slot().join(fixture_name());
-    if let Some(got) = check_download_slot_hit(&cached) {
+    if let Some(got) = verified_existing(&cached) {
         println!("fixture-ok: {got} {}", cached.display());
-        return cached;
+        Some(cached)
+    } else {
+        None
     }
+}
 
-    // Pre-seed slot is checked but never written; a corrupt pre-seed warns
-    // and falls through.
+fn preseeded_copy() -> Option<PathBuf> {
     let preseed = preseed_slot().join(fixture_name());
-    if preseed.is_file() {
-        match sha256_file(&preseed) {
-            Ok(got) if got == FIXTURE_SHA256 => {
-                println!("fixture-ok: {got} {}", preseed.display());
-                return preseed;
-            }
-            Ok(got) => eprintln!(
+    if !preseed.is_file() {
+        return None;
+    }
+    match sha256_file(&preseed) {
+        Ok(got) if got == FIXTURE_SHA256 => {
+            println!("fixture-ok: {got} {}", preseed.display());
+            Some(preseed)
+        }
+        Ok(got) => {
+            eprintln!(
                 "warning: corrupt fixture {preseed:?}: got sha256 {got}, want {FIXTURE_SHA256} — ignoring pre-seed"
-            ),
-            Err(e) => eprintln!("warning: unreadable fixture {preseed:?}: {e} — ignoring pre-seed"),
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("warning: unreadable fixture {preseed:?}: {e} — ignoring pre-seed");
+            None
         }
     }
+}
 
+fn download_and_verify() -> PathBuf {
     download();
     let final_path = download_slot().join(fixture_name());
     let got = sha256_file(&final_path)
@@ -87,10 +105,7 @@ fn preseed_slot() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-cache")
 }
 
-/// Hash-check a candidate in the download slot. A vanished file (a sibling
-/// nextest process may be deleting a corrupt copy right now) is a miss,
-/// never a panic. On mismatch: delete, warn, fall through.
-fn check_download_slot_hit(path: &Path) -> Option<String> {
+fn verified_existing(path: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
     }
@@ -125,8 +140,6 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Download to a pid+thread-unique temp file in the same dir (atomic rename),
-/// sha256-verify before renaming into place.
 fn download() {
     let slot = download_slot();
     fs::create_dir_all(&slot).unwrap_or_else(|e| panic!("cannot create cache dir {slot:?}: {e}"));
