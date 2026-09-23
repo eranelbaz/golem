@@ -48,3 +48,4 @@ cmake --build "$BUILD_DIR" --target llama-cli -j"$(nproc)"
 
 [ -x "$BUILD_DIR/bin/llama-cli" ] || { echo "FATAL: build reported success but $BUILD_DIR/bin/llama-cli is missing"; exit 1; }
 echo "BUILD-OK: $BUILD_DIR/bin/llama-cli"
+printf '%s\n' "$pin" > "$BUILD_DIR/substrate-pin.txt"
