@@ -2,12 +2,11 @@
 
 use std::process::Command;
 
-/// Removes the temp dir on drop — cleanup runs even when an assert fails.
 struct Cleanup(std::path::PathBuf);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0); // temp hygiene: best-effort is fine
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

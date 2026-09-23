@@ -5,10 +5,8 @@
 
 use std::io::Write;
 
-/// ggml tensor-type id used in the tensor table. Distinct namespace from the
-/// GGUF metadata value-type tags below: `GGML_TYPE_F32 = 0`, `GGUF_TYPE_F32 = 6`.
+/// ggml tensor-type id — distinct namespace from the GGUF value-type tags below.
 pub const GGML_TYPE_F32: u32 = 0;
-// GGUF metadata value-type tags (ggml/src/gguf.cpp).
 const GGUF_TYPE_U32: u32 = 4;
 const GGUF_TYPE_I32: u32 = 5;
 const GGUF_TYPE_F32: u32 = 6;
@@ -16,7 +14,6 @@ const GGUF_TYPE_STR: u32 = 8;
 const GGUF_TYPE_ARR: u32 = 9;
 const ALIGN: u64 = 32;
 
-/// Metadata value types the generator writes (all owned — no lifetimes).
 pub enum GgufValue {
     U32(u32),
     F32(f32),
@@ -42,7 +39,6 @@ pub struct GgufKv {
     pub value: GgufValue,
 }
 
-/// Tensor-table entry; `dims` is in ggml order (ne[0] innermost).
 pub struct GgufTensorMeta {
     pub name: String,
     pub dims: Vec<u64>,
@@ -55,7 +51,6 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 }
 
 fn put_kv(out: &mut Vec<u8>, kv: &GgufKv) {
-    // key first, then type tag — the order ggml/src/gguf.cpp's reader expects
     put_str(out, &kv.key);
     out.extend_from_slice(&kv.value.tag().to_le_bytes());
     match &kv.value {
@@ -86,12 +81,8 @@ fn put_kv(out: &mut Vec<u8>, kv: &GgufKv) {
     }
 }
 
-/// Write a complete GGUF v3 file: 24-byte header, KV section (key first, then
-/// type tag), tensor table with data-section-relative cumulative padded offsets
-/// starting at 0, an alignment pad, then blob+pad per tensor.
-///
-/// Fails with `ErrorKind::InvalidData` if a tensor's `ggml_type` is not
-/// `GGML_TYPE_F32` or its payload is not exactly `dims.product() * 4` bytes.
+/// Fails with `InvalidData` if `ggml_type != GGML_TYPE_F32` or a payload is not
+/// exactly `dims.product() * 4` bytes.
 pub fn write_gguf(
     w: &mut impl Write,
     kvs: &[GgufKv],
@@ -106,9 +97,6 @@ pub fn write_gguf(
         put_kv(&mut head, kv);
     }
 
-    // Tensor table: offsets are DATA-SECTION-RELATIVE, cumulative, padded
-    // (ggml/src/gguf.cpp starts ctx->offset at the padded table end and
-    // validates each ti.offset against that running counter).
     let mut table = Vec::new();
     let mut offset = 0u64;
     for (t, data) in tensors {
@@ -139,7 +127,6 @@ pub fn write_gguf(
 
     w.write_all(&head)?;
     w.write_all(&table)?;
-    // pad between table and first blob (ggml/src/gguf.cpp seeks to GGML_PAD(tell, ALIGN))
     let table_end = (head.len() + table.len()) as u64;
     let head_pad = align_up(table_end) - table_end;
     w.write_all(&[0u8; 32][..head_pad as usize])?;
@@ -191,8 +178,6 @@ mod tests {
 
     #[test]
     fn kv_record_is_key_then_type() {
-        // The pinned loader reads key first, then type (ggml/src/gguf.cpp,
-        // gguf_init_from_reader): a KV record starts with the u64 key length.
         let b = kv_bytes();
         let mut i = 24;
         let klen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
@@ -208,20 +193,17 @@ mod tests {
 
     #[test]
     fn tensor_data_starts_32_byte_aligned() {
-        // The writer pads between the table and the first blob; anchor at the
-        // computed table end (head + KV section + table, rounded up to 32)
-        // instead of a payload needle scan.
         let b = kv_bytes();
-        let mut i = 24usize; // end of the fixed 24-byte header
+        let mut i = 24usize;
 
         let klen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
-        i += 8 + klen + 4; // key + STR tag
+        i += 8 + klen + 4;
         let vlen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
         i += 8 + vlen;
         let nlen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
         i += 8 + nlen;
         let ndims = u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
-        i += 4 + ndims * 8 + 4 + 8; // dims + ggml_type + offset
+        i += 4 + ndims * 8 + 4 + 8;
         let data_start = align_up(i as u64);
         assert_eq!(data_start % 32, 0, "first blob start not 32-aligned");
         assert!(
@@ -250,7 +232,6 @@ mod tests {
         let mut buf = Vec::new();
         write_gguf(&mut buf, &kvs, &[]).unwrap();
         let b = &buf[..];
-        // first record: keylen(8) key arrtype(4) elemtype(4) nelem(8)
         let keylen = u64::from_le_bytes(b[24..32].try_into().unwrap()) as usize;
         let mut i = 32 + keylen;
         assert_eq!(u32::from_le_bytes(b[i..i + 4].try_into().unwrap()), 9); // ARRAY
@@ -262,8 +243,6 @@ mod tests {
 
     #[test]
     fn every_blob_start_is_32_byte_aligned() {
-        // Multi-tensor: EVERY blob start (data_start + declared table offset)
-        // must be 32-aligned. Offsets come from the parsed table, not a scan.
         let mk = |name: &str, n: u64| {
             let meta = GgufTensorMeta {
                 name: name.into(),
@@ -279,9 +258,8 @@ mod tests {
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 3); // tensors
         assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 0); // kvs
 
-        // walk the tensor table (starts at byte 24 — no KVs, head is 24 bytes)
         let mut i = 24usize;
-        let mut starts = Vec::new(); // (declared offset, payload bytes) per tensor
+        let mut starts = Vec::new();
         for _ in 0..3 {
             let klen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
             i += 8 + klen;
@@ -292,7 +270,7 @@ mod tests {
                 ne *= u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
                 i += 8;
             }
-            i += 4; // ggml_type
+            i += 4;
             let off = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
             i += 8;
             starts.push((off, ne * 4));
@@ -316,7 +294,7 @@ mod tests {
             ggml_type: ty,
         };
         let mut buf = Vec::new();
-        let short = [(meta(GGML_TYPE_F32), vec![0u8; 12])]; // 4 dims => 16 bytes
+        let short = [(meta(GGML_TYPE_F32), vec![0u8; 12])];
         let err = write_gguf(&mut buf, &[], &short).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         let not_f32 = [(meta(1), vec![0u8; 16])];

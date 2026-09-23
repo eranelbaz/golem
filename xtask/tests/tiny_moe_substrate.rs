@@ -65,7 +65,6 @@ fn generated_file_loads_in_pinned_substrate() {
         );
         return;
     };
-    // override binary: the vendored stamp says nothing about its provenance
     if std::env::var_os("GOLEM_SUBSTRATE_LLAMA_CLI").is_some() {
         eprintln!(
             "note: GOLEM_SUBSTRATE_LLAMA_CLI set — vendored pin stamp not checked; \

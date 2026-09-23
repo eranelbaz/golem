@@ -37,9 +37,7 @@ fn d(v: &[u32]) -> Vec<u64> {
     v.iter().map(|&x| u64::from(x)).collect()
 }
 
-/// `xorshift64*` PRNG; the constructor splitmix64-premixes the seed so
-/// every seed yields a nonzero state and adjacent seeds effectively never
-/// collide (unlike the raw `seed | 1` fold).
+/// splitmix64 premix keeps seed 0 valid and adjacent seeds distinct.
 struct Xorshift(u64);
 
 impl Xorshift {
@@ -50,7 +48,6 @@ impl Xorshift {
         Xorshift((z ^ (z >> 31)) | 1)
     }
 
-    /// Uniform sample in `[-1, 1)`.
     fn next_f32(&mut self) -> f32 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -173,7 +170,6 @@ pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
     let nffe = u64::from(dims::N_FF_EXP);
     let nx = u64::from(dims::N_EXPERT);
 
-    // payloads drawn from the shared rng in call order
     let mut tensors: Vec<(GgufTensorMeta, Vec<u8>)> = Vec::new();
     let mut push =
         |tensors: &mut Vec<(GgufTensorMeta, Vec<u8>)>, name: &str, dims: Vec<u64>, fill: Fill| {
@@ -309,9 +305,6 @@ mod tests {
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 3);
         let n_tensors = u64::from_le_bytes(b[8..16].try_into().unwrap());
         assert_eq!(n_tensors, 3 + 9 + 11);
-        // exact total size pinned once (24-byte header + 2346 KV bytes +
-        // 1398-byte table padded to 3776, + 104096 payload bytes; every payload is already
-        // 32-aligned, so all pad bytes are zero)
         assert_eq!(b.len(), 107_872);
     }
 
@@ -331,7 +324,6 @@ mod tests {
             ]
             .map(String::from)
         );
-        // design cross-check only: the §4.2 regex agrees with the hardcoded set
         let re = Regex::new(r"ffn_(up|down|gate|gate_up)_(ch|)exps").unwrap();
         for n in &found {
             assert!(re.is_match(n), "{n} classified expert but fails §4.2 regex");
@@ -364,7 +356,6 @@ mod tests {
 
     #[test]
     fn kv_block_is_parseable_and_complete() {
-        // hand-rolled parser doubles as an independent format check
         let b = gen_bytes();
         let (kvs, tensors) = parse_header(&b);
         let get = |k: &str| {
@@ -425,7 +416,6 @@ mod tests {
             get("tokenizer.ggml.token_type").unwrap(),
             KvVal::ArrI32(expected_types)
         );
-        // ggml dim order: ne[0] innermost
         let names: Vec<_> = tensors.iter().map(|(n, ..)| n.clone()).collect();
         for expected in [
             "token_embd.weight",
@@ -484,7 +474,6 @@ mod tests {
 
     type ParsedTensor = (String, Vec<u64>, u32, Vec<u8>);
 
-    /// Test-side metadata value (mirrors `GgufValue` with equality).
     #[derive(Clone, Debug, PartialEq)]
     enum KvVal {
         U32(u32),
@@ -530,8 +519,6 @@ mod tests {
         }
     }
 
-    /// Parse the kv section + tensor table, consuming every tensor payload and
-    /// asserting each blob is `dims.product() * 4` bytes (all F32).
     fn parse_header(b: &[u8]) -> (Vec<(String, KvVal)>, Vec<ParsedTensor>) {
         let mut c = Cursor::new(b);
         assert_eq!(c.take(4), b"GGUF");

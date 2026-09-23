@@ -17,13 +17,11 @@ fn main() {
     }
 }
 
-/// Single failure path for `gen-tiny-moe`: message to stderr, exit code 2 — never panic.
 fn die(msg: &str) -> ! {
     eprintln!("gen-tiny-moe: {msg}");
     std::process::exit(2);
 }
 
-/// Decimal first, then `0x`-prefixed hex fallback (bare hex is rejected).
 fn parse_seed(s: &str) -> u64 {
     s.parse::<u64>()
         .ok()
@@ -58,8 +56,6 @@ fn gen_tiny_moe(args: Vec<String>) {
     {
         die(&format!("create output dir {}: {e}", dir.display()));
     }
-    // Write the temp sibling first; rename only on success — a failed write never
-    // truncates an existing target.
     let tmp = path.with_extension("gguf.tmp");
     if let Err(e) = write_model(&tmp, seed) {
         let _ = std::fs::remove_file(&tmp);
