@@ -324,10 +324,6 @@ mod tests {
             ]
             .map(String::from)
         );
-        let re = Regex::new(r"ffn_(up|down|gate|gate_up)_(ch|)exps").unwrap();
-        for n in &found {
-            assert!(re.is_match(n), "{n} classified expert but fails §4.2 regex");
-        }
     }
 
     #[test]

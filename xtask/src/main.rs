@@ -1,3 +1,5 @@
+//! Binary entry point for workspace xtask commands.
+#![allow(missing_docs)]
 use std::io::Write;
 
 use xtask::tiny_moe;

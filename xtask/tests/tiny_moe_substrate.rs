@@ -2,15 +2,9 @@
 
 use std::process::Command;
 
-const PIN: &str = "86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9"; // llama.cpp commit, mirrored from engine/llama-cpp.lock
+mod common;
 
-struct Cleanup(std::path::PathBuf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use common::{pinned_commit, temp_dir};
 
 fn build_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/llama.cpp/build")
@@ -35,8 +29,9 @@ fn check_pin_stamp() {
         Ok(s) => {
             let got = s.trim();
             assert!(
-                got == PIN,
-                "substrate-pin.txt records {got:?}, pinned tree is {PIN} — rebuild via scripts/build-substrate.sh"
+                got == pinned_commit(),
+                "substrate-pin.txt records {got:?}, pinned tree is {} — rebuild via scripts/build-substrate.sh",
+                pinned_commit()
             );
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -73,9 +68,8 @@ fn generated_file_loads_in_pinned_substrate() {
     } else {
         check_pin_stamp();
     }
-    let dir = std::env::temp_dir().join(format!("golem-m12-load-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let _cleanup = Cleanup(dir.clone());
+    let _cleanup = temp_dir("m12-load");
+    let dir = _cleanup.0.clone();
     let model = dir.join("tiny-moe.gguf");
     let st = Command::new(env!("CARGO_BIN_EXE_xtask"))
         .args(["gen-tiny-moe", "--out", model.to_str().unwrap()])

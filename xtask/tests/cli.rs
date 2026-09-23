@@ -2,19 +2,15 @@
 
 use std::process::Command;
 
-struct Cleanup(std::path::PathBuf);
+#[allow(dead_code)]
+mod common;
 
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use common::temp_dir;
 
 #[test]
 fn gen_tiny_moe_writes_deterministic_file() {
-    let dir = std::env::temp_dir().join(format!("golem-m12-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let _cleanup = Cleanup(dir.clone());
+    let _cleanup = temp_dir("m12");
+    let dir = _cleanup.0.clone();
     let out = dir.join("tiny-moe.gguf");
     let st = Command::new(env!("CARGO_BIN_EXE_xtask"))
         .args(["gen-tiny-moe", "--out", out.to_str().unwrap()])
