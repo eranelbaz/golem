@@ -253,7 +253,10 @@ fn download() {
         }
         return;
     }
-    clean_fail(&tmp, format!("all fixture URLs failed: {FIXTURE_URLS_BY_PRIORITY:?}"));
+    clean_fail(
+        &tmp,
+        format!("all fixture URLs failed: {FIXTURE_URLS_BY_PRIORITY:?}"),
+    );
 }
 
 fn clean_fail(tmp: &Path, msg: String) -> ! {
