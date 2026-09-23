@@ -28,8 +28,7 @@ impl Drop for Ctx {
     }
 }
 
-/// Field order is the contract: struct fields drop top-to-bottom, so the
-/// contexts are always freed before the model.
+/// Field drop order (top-to-bottom) frees contexts before the model their destructors dereference.
 struct Session {
     ctx_a: Ctx,
     ctx_b: Ctx,
