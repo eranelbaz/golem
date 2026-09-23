@@ -1,4 +1,4 @@
-//! Byte-compares `pin_gate` against the live shell `cs()` recipe (ADR 0001).
+//! Byte-compares `pin_gate` against the live shell `cs()` recipe in scripts/build-substrate.sh.
 
 #![cfg(unix)]
 #![allow(missing_docs)]

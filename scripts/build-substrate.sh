@@ -8,7 +8,7 @@ VENDOR=vendor/llama.cpp
 BUILD_DIR="$VENDOR/build"
 TARGET=gfx1100
 
-# --- pin integrity: never build a drifted tree (ADR 0001 canonical recipe) ---
+# --- pin integrity: never build a drifted tree (canonical recipe, mirrored in crates/golem-llama-sys/tests/common/mod.rs::CANONICAL_CS_CORE) ---
 # The build-output dir is pruned: the canonical hash covers source, not artifacts, so
 # re-runs after a (re)build still match VENDOR_SHA. Pruning changes nothing on a pristine tree.
 # xargs -r: empty input → empty stream (never sha256sum reading stdin as "-").
@@ -16,7 +16,7 @@ cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -type f 
 want=$(sed -n 's/^content_sha256 *= *//p' vendor/VENDOR_SHA)
 [ -n "$want" ] || { echo "FATAL: content_sha256 key missing/empty in vendor/VENDOR_SHA"; exit 1; }
 got=$(cs "$VENDOR")
-[ "$got" = "$want" ] || { echo "FATAL: vendor tree drifted ($got != $want) — re-vendor per ADR 0001"; exit 1; }
+[ "$got" = "$want" ] || { echo "FATAL: vendor tree drifted ($got != $want) — delete vendor/llama.cpp and re-run this script"; exit 1; }
 pin=$(sed -n 's/^commit *= *//p' "$LOCK" | head -n1)
 [ -n "$pin" ] || { echo "FATAL: commit key missing in $LOCK"; exit 1; }
 echo "pin-ok: $pin"

@@ -1,4 +1,4 @@
-# Pinned compute substrate. Schema supersedes design §3.2's template — see docs/adr/0001-fork-pin.md.
+# Pinned compute substrate. Schema supersedes design §3.2's template; the pin gate is enforced by crates/golem-llama-sys/pin_gate.rs and tests/pin_gate_conformance.rs.
 repo = https://github.com/unslothai/llama.cpp
 branch = glm5next/upstream
 commit = 86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9

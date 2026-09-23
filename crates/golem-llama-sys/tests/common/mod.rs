@@ -287,7 +287,7 @@ pub fn cs_recipe_line<'a>(text: &'a str, source: &str) -> &'a str {
         .find(|l| l.contains("cs() {"))
         .unwrap_or_else(|| {
             panic!(
-                "no `cs() {{` recipe line in {source} — the ADR 0001 content-hash recipe moved; restore it or re-anchor this test"
+                "no `cs() {{` recipe line in {source} — the content-hash recipe moved; restore it or re-anchor this test"
             )
         })
 }

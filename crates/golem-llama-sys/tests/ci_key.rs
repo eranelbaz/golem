@@ -43,11 +43,11 @@ fn vendor_pin_workflow_recipe_matches_build_substrate() {
     let script_recipe = core_recipe(cs_recipe_line(&script, "scripts/build-substrate.sh"));
     assert_eq!(
         wf_recipe, script_recipe,
-        "vendor-pin.yml's cs() recipe drifted from scripts/build-substrate.sh's canonical copy (ADR 0001: paste verbatim, do not re-type) — live recipe: {script_recipe:?}"
+        "vendor-pin.yml's cs() recipe drifted from scripts/build-substrate.sh's canonical copy (paste verbatim, do not re-type) — live recipe: {script_recipe:?}"
     );
     assert_eq!(
         wf_recipe, CANONICAL_CS_CORE,
-        "both cs() copies changed shape — re-check ADR 0001 §3 and re-pin this literal to the new canonical recipe"
+        "both cs() copies changed shape — re-pin CANONICAL_CS_CORE (tests/common/mod.rs) to the new canonical recipe"
     );
 }
 

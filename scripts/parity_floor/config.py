@@ -35,7 +35,8 @@ HARNESS_VERSION = 4  # bump on any change to prompts, flag contract, or extracti
 
 
 def pin_sha() -> str:
-    """Content hash of the vendored substrate (ADR 0001 canonical recipe, python form).
+    """Content hash of the vendored substrate (canonical cs() recipe from
+    scripts/build-substrate.sh, python form).
 
     The llama.cpp banner build id is useless as provenance: with no .git inside
     vendor/, cmake walks up and reads the enclosing golem repo's HEAD — banners

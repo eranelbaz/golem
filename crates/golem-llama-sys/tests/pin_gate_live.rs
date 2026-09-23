@@ -20,7 +20,7 @@ fn vendored_tree_matches_recorded_pin() {
         );
     }
     pin_gate::verify_pin(&vendor, &vendor_sha)
-        .expect("vendored tree drifted (or VENDOR_SHA malformed) — re-vendor per ADR 0001");
+        .expect("vendored tree drifted (or VENDOR_SHA malformed) — re-vendor per scripts/build-substrate.sh");
 }
 
 #[test]

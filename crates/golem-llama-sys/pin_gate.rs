@@ -1,4 +1,4 @@
-//! Port of the ADR 0001 `cs()` recipe; never run tooling in-tree —
+//! Port of the canonical `cs()` recipe in scripts/build-substrate.sh; never run tooling in-tree —
 //! the hash covers untracked + gitignored files.
 use std::fs;
 use std::io::{self, BufRead};

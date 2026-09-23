@@ -108,7 +108,7 @@ fn run_pin_gate(repo_root: &Path) -> bool {
     if !vendor.is_dir() {
         panic!(
             "{} is absent — the vendor tree must be materialized before building; \
-             run the vendoring flow per ADR 0001",
+             run scripts/build-substrate.sh",
             vendor.display()
         );
     }
@@ -117,7 +117,7 @@ fn run_pin_gate(repo_root: &Path) -> bool {
         if let Err(e) = pin_gate::verify_pin(&vendor, &vendor_sha) {
             panic!(
                 "pin gate failed: {e}\n\
-                 remediation (re-vendor per ADR 0001):\n\
+                 remediation (re-vendor via scripts/build-substrate.sh):\n\
                  \x20 git clean -fdx vendor/llama.cpp && git checkout -- vendor/"
             );
         }
@@ -131,7 +131,7 @@ fn run_pin_gate(repo_root: &Path) -> bool {
     }
 
     println!(
-        "cargo:warning={SKIP_GATE_ENV}=1: SKIPPING the ADR 0001 vendor pin gate — \
+        "cargo:warning={SKIP_GATE_ENV}=1: SKIPPING the vendor pin gate — \
          never ship or commit a build made with the hatch set"
     );
     match pin_gate::verify_pin(&vendor, &vendor_sha) {

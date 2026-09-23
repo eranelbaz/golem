@@ -102,7 +102,7 @@ def _check_vendor_pin(tree_hash: str) -> None:
         sys.exit(f"FATAL: cannot read/parse {VENDOR_SHA_FILE} (expected '<name>=<sha256>')")
     if tree_hash != pinned_hash:
         sys.exit(f"FATAL: vendor tree drifted ({tree_hash[:12]} != {pinned_hash[:12]}) — "
-                 f"re-vendor per ADR 0001")
+                 f"re-vendor per scripts/build-substrate.sh")
 
 
 def _load_resumable_results(leg_dir: str, config_hash: str, prompt_idx: int | None) -> list:
