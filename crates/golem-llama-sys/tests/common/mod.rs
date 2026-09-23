@@ -31,7 +31,6 @@ pub fn fixture() -> PathBuf {
     path
 }
 
-/// `Some(hex sha256)` when the memoized fixture still matches the pin.
 fn still_valid(path: &Path) -> Option<String> {
     match sha256_file(path) {
         Ok(got) if got == FIXTURE_SHA256 => Some(got),
@@ -272,9 +271,6 @@ fn clean_fail(tmp: &Path, msg: String) -> ! {
     );
 }
 
-// --- repo-text / cs()-recipe conformance helpers, shared by ci_key.rs and
-// pin_gate_conformance.rs so the extraction logic itself cannot drift ---
-
 pub fn repo_text(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -308,7 +304,6 @@ pub fn core_recipe(cs_line: &str) -> &str {
     &tail[..end + END.len()]
 }
 
-/// Shape-validates the `cs()` definition and returns its streaming part.
 pub fn cs_stream_recipe(text: &str, source: &str) -> String {
     let line = cs_recipe_line(text, source);
     let body = line.trim_start().strip_prefix("cs() {").unwrap().trim_end();

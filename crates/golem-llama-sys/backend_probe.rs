@@ -1,4 +1,3 @@
-//! `#[path]`-included by build.rs and src/lib.rs so the probe cannot drift between consumers.
 use std::path::Path;
 
 pub fn usable_rocm_toolchain() -> bool {

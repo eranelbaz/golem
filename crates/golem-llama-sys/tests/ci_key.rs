@@ -1,12 +1,10 @@
-//! Anchors the hand-transcribed `test-models-…` cache key in ci.yml to `FIXTURE_SHA256`.
+#![allow(missing_docs)]
 
 #[allow(dead_code)]
 mod common;
 
 use common::{CANONICAL_CS_CORE, FIXTURE_SHA256, core_recipe, cs_recipe_line, repo_text};
 
-/// Extract the fixture cache key literal from the workflow text.
-/// Panics loudly if the `key: test-models-…` line is missing or reshaped.
 fn fixture_cache_key(workflow: &str) -> &str {
     workflow
         .lines()
@@ -47,7 +45,6 @@ fn vendor_pin_workflow_recipe_matches_build_substrate() {
         wf_recipe, script_recipe,
         "vendor-pin.yml's cs() recipe drifted from scripts/build-substrate.sh's canonical copy (ADR 0001: paste verbatim, do not re-type) — live recipe: {script_recipe:?}"
     );
-    // Guards against both copies drifting jointly off the canonical shape (ADR 0001 §3)
     assert_eq!(
         wf_recipe, CANONICAL_CS_CORE,
         "both cs() copies changed shape — re-check ADR 0001 §3 and re-pin this literal to the new canonical recipe"

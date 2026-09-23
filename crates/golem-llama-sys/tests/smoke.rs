@@ -6,7 +6,6 @@ mod common;
 use golem_llama_sys::raw::*;
 use golem_llama_sys::{Backend, substrate_backend};
 
-/// Fails to compile when a `Backend` variant is added, forcing the skips below to be revisited
 const _BACKEND_GUARDS_EXHAUSTIVE: () = match Backend::Cpu {
     Backend::Cpu => (),
     Backend::Hip => (),
@@ -81,7 +80,6 @@ fn two_context_greedy_decode() -> [(llama_token, Vec<f32>); 2] {
     }
 }
 
-/// A decode must at least be well-formed: no NaN/inf logits, argmax in vocab.
 fn assert_decode_sane(token: llama_token, logits: &[f32]) {
     assert!(
         logits.iter().all(|f| f.is_finite()),
@@ -93,8 +91,7 @@ fn assert_decode_sane(token: llama_token, logits: &[f32]) {
     );
 }
 
-/// Explicit GOLEM_LLAMA_SYS_BACKEND requests always resolve (or fail the build),
-/// so a skip here means the request was unset/auto — surface that at result level.
+// Skip implies the backend request was unset/auto: explicit requests always resolve or fail the build
 fn skip_unless_requested() {
     eprintln!(
         "SKIPPED (GOLEM_LLAMA_SYS_BACKEND={:?}, substrate={:?}): zero assertions executed",
@@ -128,7 +125,7 @@ fn hip_decode_runs() {
     let [(t1, l1), (t2, l2)] = two_context_greedy_decode();
     assert_decode_sane(t1, &l1);
     assert_decode_sane(t2, &l2);
-    // HIP reductions reorder near-ties; argmax is not contractual, only reported
+    // HIP reductions reorder near-ties: argmax is not contractual, so divergence is a note, not a failure
     if t1 != t2 {
         eprintln!(
             "note: hip greedy token differs across contexts (near-tie reorder): t1={t1} t2={t2}"

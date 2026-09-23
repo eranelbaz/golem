@@ -1,6 +1,7 @@
 //! Byte-compares `pin_gate` against the live shell `cs()` recipe (ADR 0001).
 
 #![cfg(unix)]
+#![allow(missing_docs)]
 
 #[allow(dead_code)]
 mod common;
@@ -68,7 +69,6 @@ fn make_fixture(root: &Path) {
     std::os::unix::fs::symlink("data.bin", root.join("link.bin")).expect("symlink (skipped)");
 }
 
-/// The streaming part of the LIVE `cs()` recipe; panics if missing or reshaped.
 fn cs_stream_recipe() -> &'static str {
     static RECIPE: OnceLock<String> = OnceLock::new();
     RECIPE

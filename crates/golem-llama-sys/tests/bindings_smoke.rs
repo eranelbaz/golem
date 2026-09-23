@@ -28,7 +28,6 @@ fn engine_surface_symbols_exist() {
     }
 }
 
-/// Hook typedefs are bare C fn pointers; NULL registration must stay ABI-exact
 fn assert_thin_fn_ptr<T>() {
     assert_eq!(
         std::mem::size_of::<T>(),

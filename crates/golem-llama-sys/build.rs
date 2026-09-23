@@ -1,4 +1,4 @@
-//! Build script: pin gate → cmake substrate → link directives → bindgen.
+#![allow(missing_docs)]
 #[path = "backend_probe.rs"]
 mod backend_probe;
 #[path = "pin_gate.rs"]
@@ -257,8 +257,6 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
     let cache_path = binary_dir.join("CMakeCache.txt");
     let cache = fs::read_to_string(&cache_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", cache_path.display()));
-    // CMakeCache entries are `KEY:TYPE=VALUE`; plain `KEY=VALUE` is accepted
-    // too — anchoring on '=' or ':' so sibling keys can't prefix-collide.
     for line in cache.lines() {
         let Some(rest) = line
             .strip_prefix("GGML_OPENMP_ENABLED=")
@@ -273,7 +271,6 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
         return match value.trim() {
             "ON" => true,
             "OFF" => {
-                // OFF is legal: ggml may be built without OpenMP; the warning is the only signal
                 println!(
                     "cargo:warning=GGML_OPENMP_ENABLED=OFF in {} — the substrate \
                      built without OpenMP; dylib=gomp skipped",
