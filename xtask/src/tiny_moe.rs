@@ -9,51 +9,32 @@ use crate::gguf::{self, GGML_TYPE_F32, GgufKv, GgufTensorMeta, GgufValue};
 
 /// Synthetic model shape constants (design §12.1 / Global Constraints).
 pub mod dims {
-    /// Vocab size.
     pub const N_VOCAB: u32 = 64;
-    /// Embedding width.
     pub const N_EMBD: u32 = 32;
-    /// Attention heads.
     pub const N_HEAD: u32 = 4;
-    /// KV heads (GQA).
     pub const N_HEAD_KV: u32 = 2;
-    /// Head dimension.
     pub const HEAD_DIM: u32 = 8;
-    /// Transformer blocks.
     pub const N_LAYER: u32 = 2;
-    /// Dense (non-MoE) leading blocks.
     pub const N_LAYER_DENSE_LEAD: u32 = 1;
-    /// Routed experts.
     pub const N_EXPERT: u32 = 8;
-    /// Experts routed per token.
     pub const N_EXPERT_USED: u32 = 2;
-    /// Shared experts (none in this model).
     pub const N_EXPERT_SHARED: u32 = 0;
-    /// Dense FF width.
     pub const N_FF: u32 = 32;
-    /// Expert FF width.
     pub const N_FF_EXP: u32 = 16;
-    /// Context length.
     pub const N_CTX: u32 = 256;
-    /// RMSNorm epsilon.
     pub const RMS_EPS: f32 = 1e-5;
-    /// RoPE dimension count.
     pub const ROPE_DIM: u32 = 8;
-    /// RoPE frequency base.
     pub const ROPE_FREQ_BASE: f32 = 10_000.0;
 }
 
 /// Output path for the generated GGUF (overridable via --out).
 pub const DEFAULT_OUT: &str = "data/tiny-moe.gguf";
-/// Default PRNG seed ("golem").
-pub const DEFAULT_SEED: u64 = 0x67_6f_6c_65_6d;
+pub const DEFAULT_SEED: u64 = 0x67_6f_6c_65_6d; // "golem"
 
-/// Combined key+value GQA width: `HEAD_DIM * N_HEAD_KV` (= 16).
 fn n_embd_k_gqa() -> u32 {
     dims::HEAD_DIM * dims::N_HEAD_KV
 }
 
-/// Widen a dim list to `u64` (ggml order, ne[0] innermost).
 fn d(v: &[u32]) -> Vec<u64> {
     v.iter().map(|&x| u64::from(x)).collect()
 }
@@ -83,7 +64,6 @@ impl Xorshift {
     }
 }
 
-/// Every tensor name in file order (23 total: globals, blk.0 dense, blk.1 MoE).
 pub fn tensor_names() -> Vec<String> {
     let mut names = vec![
         "token_embd.weight".to_owned(),
@@ -124,14 +104,12 @@ pub fn tensor_names() -> Vec<String> {
     names
 }
 
-/// True iff the §4.2 regex `ffn_(up|down|gate|gate_up)_(ch|)exps` matches.
 pub fn is_expert_tensor(name: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"ffn_(up|down|gate|gate_up)_(ch|)exps").unwrap())
         .is_match(name)
 }
 
-/// The 64-piece shared tokenizer vocabulary (also asserted by the tests).
 fn vec_of_64_tokens() -> Vec<String> {
     let mut tokens: Vec<String> = ["<unk>", "<s>", "</s>", "▁hello", "▁world", "<0x0A>"]
         .iter()
@@ -144,7 +122,6 @@ fn vec_of_64_tokens() -> Vec<String> {
     tokens
 }
 
-/// Write the full deterministic tiny-moe GGUF file.
 pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
     let mut rng = Xorshift::new(seed);
     let u = |v: u32| GgufValue::U32(v);
@@ -198,7 +175,7 @@ pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
     let nffe = u64::from(dims::N_FF_EXP);
     let nx = u64::from(dims::N_EXPERT);
 
-    // (name, dims, payload kind); payload drawn from the shared rng in order.
+    // payloads drawn from the shared rng in call order
     let mut tensors: Vec<(GgufTensorMeta, Vec<u8>)> = Vec::new();
     let mut push =
         |tensors: &mut Vec<(GgufTensorMeta, Vec<u8>)>, name: &str, dims: Vec<u64>, fill: Fill| {
@@ -303,18 +280,13 @@ pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
     gguf::write_gguf(out, &kvs, &tensors)
 }
 
-/// Payload fill kind for a synthetic tensor.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fill {
-    /// All `1.0` (norm weights).
     Ones,
-    /// All `0.0` (biases).
     Zeros,
-    /// Uniform `[-1, 1)` samples from the shared PRNG.
     Random,
 }
 
-/// Convenience KV constructor.
 fn kv(key: &str, value: GgufValue) -> GgufKv {
     GgufKv {
         key: key.to_owned(),
@@ -512,23 +484,16 @@ mod tests {
         assert!(tensors.iter().all(|(_, _, t, _)| *t == GGML_TYPE_F32));
     }
 
-    /// Parsed tensor: (name, dims, ggml_type, payload bytes).
     type ParsedTensor = (String, Vec<u64>, u32, Vec<u8>);
 
     /// Test-side metadata value (mirrors `GgufValue` with equality).
     #[derive(Clone, Debug, PartialEq)]
     enum KvVal {
-        /// Unsigned 32-bit integer.
         U32(u32),
-        /// Single-precision float.
         F32(f32),
-        /// UTF-8 string.
         Str(String),
-        /// Array of i32.
         ArrI32(Vec<i32>),
-        /// Array of f32.
         ArrF32(Vec<f32>),
-        /// Array of strings.
         ArrStr(Vec<String>),
     }
 

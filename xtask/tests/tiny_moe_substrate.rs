@@ -17,9 +17,7 @@ fn build_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/llama.cpp/build")
 }
 
-/// Env override wins; a set-but-missing path is fatal (no silent fallback).
-/// Otherwise: the canonical vendored build dir, if built.
-fn substrate_cli() -> Option<std::path::PathBuf> {
+fn vendored_or_override_cli() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("GOLEM_SUBSTRATE_LLAMA_CLI") {
         let p = std::path::PathBuf::from(p);
         assert!(
@@ -32,8 +30,6 @@ fn substrate_cli() -> Option<std::path::PathBuf> {
     rel.is_file().then_some(rel)
 }
 
-/// Pin stamp proves the canonical vendored build came from the pinned tree.
-/// Mismatch is fatal; an absent stamp (pre-stamp build) only notes and proceeds.
 fn check_pin_stamp() {
     let stamp = build_dir().join("substrate-pin.txt");
     match std::fs::read_to_string(&stamp) {
@@ -56,7 +52,7 @@ fn check_pin_stamp() {
 
 #[test]
 fn generated_file_loads_in_pinned_substrate() {
-    let Some(cli) = substrate_cli() else {
+    let Some(cli) = vendored_or_override_cli() else {
         if std::env::var("GOLEM_REQUIRE_SUBSTRATE").is_ok_and(|v| v == "1") {
             panic!(
                 "GOLEM_REQUIRE_SUBSTRATE=1 but no substrate llama-cli — run scripts/build-substrate.sh or set GOLEM_SUBSTRATE_LLAMA_CLI"

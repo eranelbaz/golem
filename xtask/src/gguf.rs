@@ -18,17 +18,11 @@ const ALIGN: u64 = 32;
 
 /// Metadata value types the generator writes (all owned — no lifetimes).
 pub enum GgufValue {
-    /// Unsigned 32-bit integer.
     U32(u32),
-    /// Single-precision float.
     F32(f32),
-    /// UTF-8 string.
     Str(String),
-    /// Array of 32-bit signed integers.
     ArrI32(Vec<i32>),
-    /// Array of single-precision floats.
     ArrF32(Vec<f32>),
-    /// Array of UTF-8 strings.
     ArrStr(Vec<String>),
 }
 
@@ -43,21 +37,15 @@ impl GgufValue {
     }
 }
 
-/// One metadata key/value record.
 pub struct GgufKv {
-    /// Key, written first in the record.
     pub key: String,
-    /// Typed value.
     pub value: GgufValue,
 }
 
 /// Tensor-table entry; `dims` is in ggml order (ne[0] innermost).
 pub struct GgufTensorMeta {
-    /// Tensor name.
     pub name: String,
-    /// Dimensions, ggml order (ne[0] innermost).
     pub dims: Vec<u64>,
-    /// ggml tensor type — only F32 (0) is produced here.
     pub ggml_type: u32,
 }
 
@@ -179,7 +167,6 @@ mod tests {
             key: "general.architecture".into(),
             value: GgufValue::Str("glm4moe".into()),
         }];
-        // dims [4] => 4 f32 = 16 bytes of payload
         let tensors = vec![(
             GgufTensorMeta {
                 name: "output_norm.weight".into(),
