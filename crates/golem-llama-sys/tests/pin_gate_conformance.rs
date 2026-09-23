@@ -77,7 +77,12 @@ fn make_fixture(root: &Path) {
 fn cs_stream_recipe() -> &'static str {
     static RECIPE: OnceLock<String> = OnceLock::new();
     RECIPE
-        .get_or_init(|| common::cs_stream_recipe(&common::repo_text("scripts/build-substrate.sh"), "scripts/build-substrate.sh"))
+        .get_or_init(|| {
+            common::cs_stream_recipe(
+                &common::repo_text("scripts/build-substrate.sh"),
+                "scripts/build-substrate.sh",
+            )
+        })
         .as_str()
 }
 
@@ -85,7 +90,8 @@ fn cs_stream_recipe() -> &'static str {
 fn recipe_body_is_verbatim() {
     let recipe = cs_stream_recipe();
     assert_eq!(
-        recipe, common::CANONICAL_CS_CORE,
+        recipe,
+        common::CANONICAL_CS_CORE,
         "live recipe lost its canonical shape: {recipe:?}"
     );
 }

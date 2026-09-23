@@ -6,7 +6,7 @@
 #[allow(dead_code)] // only the consts are consumed here
 mod common;
 
-use common::{core_recipe, cs_recipe_line, repo_text, CANONICAL_CS_CORE, FIXTURE_SHA256};
+use common::{CANONICAL_CS_CORE, FIXTURE_SHA256, core_recipe, cs_recipe_line, repo_text};
 
 /// Extract the fixture cache key literal from the workflow text.
 /// Panics loudly if the `key: test-models-…` line is missing or reshaped.
