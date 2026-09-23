@@ -1,10 +1,15 @@
-//! Byte-compares `pin_gate` against the shell `cs()` recipe (ADR 0001).
+//! Byte-compares `pin_gate` against the live shell `cs()` recipe (ADR 0001).
 
 #![cfg(unix)]
+#![allow(missing_docs)]
+
+#[allow(dead_code)]
+mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -64,21 +69,33 @@ fn make_fixture(root: &Path) {
     std::os::unix::fs::symlink("data.bin", root.join("link.bin")).expect("symlink (skipped)");
 }
 
-/// Verbatim from `scripts/build-substrate.sh` (ADR 0001: paste, do not re-type).
-const CS_BODY: &str = "find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 \
-                       | LC_ALL=C sort -z | xargs -0 sha256sum";
+fn cs_stream_recipe() -> &'static str {
+    static RECIPE: OnceLock<String> = OnceLock::new();
+    RECIPE
+        .get_or_init(|| {
+            common::cs_stream_recipe(
+                &common::repo_text("scripts/build-substrate.sh"),
+                "scripts/build-substrate.sh",
+            )
+        })
+        .as_str()
+}
 
 #[test]
 fn recipe_body_is_verbatim() {
-    assert!(CS_BODY.starts_with("find . -path ./.git -prune"));
-    assert!(CS_BODY.ends_with("xargs -0 sha256sum"));
-    assert!(!CS_BODY.contains('\n'));
+    let recipe = cs_stream_recipe();
+    assert_eq!(
+        recipe,
+        common::CANONICAL_CS_CORE,
+        "live recipe lost its canonical shape: {recipe:?}"
+    );
 }
 
 fn shell_stream(dir: &Path) -> Vec<u8> {
+    let recipe = cs_stream_recipe();
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!("cd \"$1\" && {CS_BODY}"))
+        .arg(format!("cd \"$1\" && {recipe}"))
         .arg("cs")
         .arg(dir)
         .output()
@@ -92,10 +109,11 @@ fn shell_stream(dir: &Path) -> Vec<u8> {
 }
 
 fn shell_outer_digest(dir: &Path) -> String {
+    let recipe = cs_stream_recipe();
     let out = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "cd \"$1\" && {CS_BODY} | sha256sum | awk '{{print $1}}'"
+            "cd \"$1\" && {recipe} | sha256sum | awk '{{print $1}}'"
         ))
         .arg("cs")
         .arg(dir)
@@ -110,6 +128,30 @@ fn shell_outer_digest(dir: &Path) -> String {
         .expect("utf8")
         .trim()
         .to_string()
+}
+
+#[test]
+fn empty_tree_streams_and_digests_agree_with_shell() {
+    let dir = unique_fixture_root("empty");
+    let _guard = FixtureGuard(dir.clone());
+
+    let rust_stream = golem_llama_sys::pin_gate::hash_stream(&dir).expect("rust stream");
+    assert!(
+        rust_stream.is_empty(),
+        "rust gate emitted output for an empty tree"
+    );
+    assert_eq!(
+        rust_stream,
+        shell_stream(&dir),
+        "empty tree: shell stream must be empty too (xargs -r — no `…  -` stdin-hash line)"
+    );
+
+    let rust_digest = golem_llama_sys::pin_gate::content_hash(&dir).expect("rust digest");
+    assert_eq!(
+        rust_digest,
+        shell_outer_digest(&dir),
+        "empty tree: outer digests diverge"
+    );
 }
 
 #[test]

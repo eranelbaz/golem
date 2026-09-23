@@ -4,10 +4,22 @@ include!(concat!(env!("OUT_DIR"), "/backend_info.rs"));
 #[path = "../pin_gate.rs"]
 pub mod pin_gate;
 
+#[path = "../backend_probe.rs"]
+pub mod backend_probe;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cpu,
     Hip,
+}
+
+impl Backend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Backend::Cpu => "cpu",
+            Backend::Hip => "hip",
+        }
+    }
 }
 
 pub fn substrate_backend() -> Backend {

@@ -5,9 +5,11 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-const FIXTURE_URL: &str =
-    "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf";
-const FIXTURE_SHA256: &str = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739";
+const FIXTURE_URLS_BY_PRIORITY: [&str; 2] = [
+    "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf",
+    "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf",
+];
+pub const FIXTURE_SHA256: &str = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739";
 
 fn fixture_name() -> String {
     format!("stories15M-q4_0-{}.gguf", &FIXTURE_SHA256[..12])
@@ -16,7 +18,31 @@ fn fixture_name() -> String {
 static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn fixture() -> PathBuf {
-    FIXTURE.get_or_init(resolve).clone()
+    if let Some(path) = FIXTURE.get() {
+        if let Some(sha) = verify_memoized_hash(path) {
+            println!("fixture-ok: {sha} {}", path.display());
+            return path.clone();
+        }
+    }
+    let path = resolve();
+    let _ = FIXTURE.set(path.clone());
+    path
+}
+
+fn verify_memoized_hash(path: &Path) -> Option<String> {
+    match sha256_file(path) {
+        Ok(got) if got == FIXTURE_SHA256 => Some(got),
+        Ok(got) => {
+            eprintln!(
+                "warning: memoized fixture {path:?} changed under us: got sha256 {got}, want {FIXTURE_SHA256} — re-resolving"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("warning: memoized fixture {path:?} unreadable: {e} — re-resolving");
+            None
+        }
+    }
 }
 
 fn resolve() -> PathBuf {
@@ -117,12 +143,44 @@ fn verified_existing(path: &Path) -> Option<String> {
     if got == FIXTURE_SHA256 {
         return Some(got);
     }
-    fs::remove_file(path)
-        .unwrap_or_else(|e| eprintln!("warning: could not remove corrupt {path:?}: {e}"));
-    eprintln!(
-        "warning: deleted corrupt fixture {path:?}: got sha256 {got}, want {FIXTURE_SHA256} — falling through to download"
-    );
+    replace_corrupt_if_still_corrupt(path, &got);
     None
+}
+
+fn replace_corrupt_if_still_corrupt(path: &Path, got: &str) {
+    match sha256_file(path) {
+        Ok(now) if now != got => {
+            eprintln!(
+                "warning: corrupt fixture {path:?} changed under us ({got} → {now}) — another writer got there first, keeping it"
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: corrupt fixture {path:?} unreadable on re-check: {e} — falling through to download"
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.corrupt.tmp",
+        fixture_name(),
+        std::process::id(),
+        format_args!("{:?}", std::thread::current().id())
+    ));
+    let replaced = fs::File::create(&tmp).and_then(|f| {
+        drop(f);
+        fs::rename(&tmp, path)
+    });
+    match replaced {
+        Ok(()) => eprintln!(
+            "warning: replaced corrupt fixture {path:?}: got sha256 {got}, want {FIXTURE_SHA256} — falling through to download"
+        ),
+        Err(e) => eprintln!(
+            "warning: could not replace corrupt {path:?}: {e} — falling through to download"
+        ),
+    }
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -149,42 +207,56 @@ fn download() {
         std::process::id(),
         format_args!("{:?}", std::thread::current().id())
     ));
-    eprintln!("downloading pinned fixture to {tmp:?}");
-    let status = std::process::Command::new("curl")
-        .args([
-            "-fL",
-            "--retry",
-            "3",
-            "--retry-delay",
-            "2",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "300",
-            "-o",
-        ])
-        .arg(&tmp)
-        .arg(FIXTURE_URL)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn curl for {FIXTURE_URL}: {e}"));
-    if !status.success() {
-        clean_fail(&tmp, format!("curl exited {status} for {FIXTURE_URL}"));
+    for url in FIXTURE_URLS_BY_PRIORITY {
+        eprintln!("downloading pinned fixture from {url} to {tmp:?}");
+        let status = std::process::Command::new("curl")
+            .args([
+                "-fL",
+                "--retry",
+                "3",
+                "--retry-delay",
+                "2",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "300",
+                "-o",
+            ])
+            .arg(&tmp)
+            .arg(url)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to spawn curl for {url}: {e}"));
+        if !status.success() {
+            let _ = fs::remove_file(&tmp);
+            eprintln!("warning: curl exited {status} for {url} — trying next mirror");
+            continue;
+        }
+        let got = match sha256_file(&tmp) {
+            Ok(got) => got,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                eprintln!(
+                    "warning: downloaded temp file unreadable from {url}: {e} — trying next mirror"
+                );
+                continue;
+            }
+        };
+        if got != FIXTURE_SHA256 {
+            let _ = fs::remove_file(&tmp);
+            eprintln!(
+                "warning: downloaded {url} hash mismatch: got sha256 {got}, want {FIXTURE_SHA256} — trying next mirror"
+            );
+            continue;
+        }
+        if let Err(e) = fs::rename(&tmp, slot.join(fixture_name())) {
+            clean_fail(&tmp, format!("atomic rename into {slot:?} failed: {e}"));
+        }
+        return;
     }
-    let got = match sha256_file(&tmp) {
-        Ok(got) => got,
-        Err(e) => clean_fail(&tmp, format!("downloaded temp file unreadable: {e}")),
-    };
-    if got != FIXTURE_SHA256 {
-        clean_fail(
-            &tmp,
-            format!(
-                "downloaded {FIXTURE_URL} hash mismatch: got sha256 {got}, want {FIXTURE_SHA256}"
-            ),
-        );
-    }
-    if let Err(e) = fs::rename(&tmp, slot.join(fixture_name())) {
-        clean_fail(&tmp, format!("atomic rename into {slot:?} failed: {e}"));
-    }
+    clean_fail(
+        &tmp,
+        format!("all fixture URLs failed: {FIXTURE_URLS_BY_PRIORITY:?}"),
+    );
 }
 
 fn clean_fail(tmp: &Path, msg: String) -> ! {
@@ -197,4 +269,54 @@ fn clean_fail(tmp: &Path, msg: String) -> ! {
         download_slot().join(&name).display(),
         preseed_slot().join(&name).display(),
     );
+}
+
+pub fn repo_text(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("{rel} not found — conformance anchors to the live repo: {e}"));
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+pub const CANONICAL_CS_CORE: &str = "find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum";
+
+pub fn cs_recipe_line<'a>(text: &'a str, source: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.contains("cs() {"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no `cs() {{` recipe line in {source} — the ADR 0001 content-hash recipe moved; restore it or re-anchor this test"
+            )
+        })
+}
+
+pub fn core_recipe(cs_line: &str) -> &str {
+    const END: &str = "xargs -0 -r sha256sum";
+    let start = cs_line
+        .find("find .")
+        .unwrap_or_else(|| panic!("cs() line has no `find .` pipeline start: {cs_line:?}"));
+    let tail = &cs_line[start..];
+    let end = tail
+        .find(END)
+        .unwrap_or_else(|| panic!("cs() line has no `{END}` pipeline end: {cs_line:?}"));
+    &tail[..end + END.len()]
+}
+
+pub fn cs_stream_recipe(text: &str, source: &str) -> String {
+    let line = cs_recipe_line(text, source);
+    let body = line.trim_start().strip_prefix("cs() {").unwrap().trim_end();
+    let body = body
+        .strip_suffix('}')
+        .expect("cs() must be a single-line `cs() {{ ...; }}` definition");
+    let body = body.trim_end().strip_suffix(';').unwrap_or(body);
+    let body = body
+        .trim()
+        .strip_prefix("cd \"$1\" && ")
+        .expect("cs() must begin with `cd \"$1\" && `");
+    let stream = body
+        .strip_suffix("| sha256sum | awk '{print $1}'")
+        .expect("cs() must end with the `| sha256sum | awk '{{print $1}}'` outer-hash fold");
+    stream.trim_end().to_string()
 }

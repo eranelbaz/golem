@@ -4,9 +4,16 @@ on:
     branches: [main]
   pull_request:
 
+# Triggers above cannot double-run (push is main-only, PRs fire only
+# pull_request); this group cancels superseded PR runs but never a main build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       GOLEM_LLAMA_SYS_BACKEND: cpu
     steps:

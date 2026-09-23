@@ -1,4 +1,6 @@
-//! Build script: pin gate → cmake substrate → link directives → bindgen.
+#![allow(missing_docs)]
+#[path = "backend_probe.rs"]
+mod backend_probe;
 #[path = "pin_gate.rs"]
 mod pin_gate;
 
@@ -12,30 +14,12 @@ const AMDGPU_TARGET_ENV: &str = "GOLEM_LLAMA_SYS_AMDGPU_TARGET";
 const DEFAULT_AMDGPU_TARGET: &str = "gfx1100";
 const ROCM_HIP_COMPILER: &str = "/opt/rocm/llvm/bin/clang++";
 
-fn usable_rocm_toolchain() -> bool {
-    #[cfg(unix)]
-    fn hipcc_executable() -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        let path = Path::new("/opt/rocm/bin/hipcc");
-        path.is_file()
-            && path
-                .metadata()
-                .map(|m| m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    fn hipcc_executable() -> bool {
-        Path::new("/opt/rocm/bin/hipcc").is_file()
-    }
-    hipcc_executable() && Path::new("/opt/rocm/lib/libamdhip64.so").exists()
-}
-
 fn detect_backend() -> (&'static str, &'static str) {
     match env::var(BACKEND_ENV).as_deref() {
         Ok("cpu") => ("cpu", "cpu"),
         Ok("hip") => ("hip", "hip"),
         Ok("auto") | Err(env::VarError::NotPresent) => {
-            let hip = usable_rocm_toolchain();
+            let hip = backend_probe::usable_rocm_toolchain();
             ("auto", if hip { "hip" } else { "cpu" })
         }
         Ok(other) => panic!(
@@ -81,6 +65,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed={AMDGPU_TARGET_ENV}");
 
     let (raw, resolved) = detect_backend();
+    // links = "llama-cpp" surfaces this downstream as DEP_LLAMA_CPP_BACKEND.
+    println!("cargo:backend={resolved}");
     println!("cargo:rustc-env={BACKEND_ENV}={resolved}");
     println!("cargo:rustc-env=GOLEM_LLAMA_SYS_BACKEND_INPUT={raw}");
 
@@ -272,23 +258,32 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
     let cache = fs::read_to_string(&cache_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", cache_path.display()));
     for line in cache.lines() {
-        if let Some(rest) = line.strip_prefix("GGML_OPENMP_ENABLED") {
-            let Some((_type, value)) = rest.split_once('=') else {
-                continue;
-            };
-            return match value.trim() {
-                "ON" => true,
-                "OFF" => panic!(
-                    "GGML_OPENMP_ENABLED=OFF at this pin — the ordered link table \
-                     (dylib=gomp) needs re-derivation"
-                ),
-                other => panic!(
-                    "unexpected GGML_OPENMP_ENABLED value {other:?} in {} — \
-                     the link table needs re-derivation",
+        let Some(rest) = line
+            .strip_prefix("GGML_OPENMP_ENABLED=")
+            .or_else(|| line.strip_prefix("GGML_OPENMP_ENABLED:"))
+        else {
+            continue;
+        };
+        let value = match rest.split_once('=') {
+            Some((_type, value)) => value,
+            None => rest,
+        };
+        return match value.trim() {
+            "ON" => true,
+            "OFF" => {
+                println!(
+                    "cargo:warning=GGML_OPENMP_ENABLED=OFF in {} — the substrate \
+                     built without OpenMP; dylib=gomp skipped",
                     cache_path.display()
-                ),
-            };
-        }
+                );
+                false
+            }
+            other => panic!(
+                "unexpected GGML_OPENMP_ENABLED value {other:?} in {} — \
+                 the link table needs re-derivation",
+                cache_path.display()
+            ),
+        };
     }
     panic!(
         "GGML_OPENMP_ENABLED not found in {} — the link table needs re-derivation",

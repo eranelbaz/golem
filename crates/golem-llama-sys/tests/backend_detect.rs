@@ -1,9 +1,7 @@
 #![allow(unsafe_code, missing_docs)]
 
 fn auto_rule() -> golem_llama_sys::Backend {
-    let usable_rocm = std::path::Path::new("/opt/rocm/bin/hipcc").exists()
-        && std::path::Path::new("/opt/rocm/lib/libamdhip64.so").exists();
-    if usable_rocm {
+    if golem_llama_sys::backend_probe::usable_rocm_toolchain() {
         golem_llama_sys::Backend::Hip
     } else {
         golem_llama_sys::Backend::Cpu
