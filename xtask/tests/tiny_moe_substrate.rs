@@ -2,14 +2,13 @@
 
 use std::process::Command;
 
-const PIN: &str = "86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9";
+const PIN: &str = "86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9"; // llama.cpp commit, mirrored from engine/llama-cpp.lock
 
-/// Removes the temp dir on drop — cleanup runs even when an assert fails.
 struct Cleanup(std::path::PathBuf);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0); // temp hygiene: best-effort is fine
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -66,9 +65,7 @@ fn generated_file_loads_in_pinned_substrate() {
         );
         return;
     };
-    // Override binary: the vendored pin stamp says nothing about it — skip the
-    // stamp check and put provenance on the operator (a stale vendored build's
-    // stamp failure would otherwise accuse the wrong binary).
+    // override binary: the vendored stamp says nothing about its provenance
     if std::env::var_os("GOLEM_SUBSTRATE_LLAMA_CLI").is_some() {
         eprintln!(
             "note: GOLEM_SUBSTRATE_LLAMA_CLI set — vendored pin stamp not checked; \

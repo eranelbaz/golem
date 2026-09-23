@@ -7,7 +7,6 @@ use regex::Regex;
 
 use crate::gguf::{self, GGML_TYPE_F32, GgufKv, GgufTensorMeta, GgufValue};
 
-/// Synthetic model shape constants (design §12.1 / Global Constraints).
 pub mod dims {
     pub const N_VOCAB: u32 = 64;
     pub const N_EMBD: u32 = 32;
@@ -27,7 +26,6 @@ pub mod dims {
     pub const ROPE_FREQ_BASE: f32 = 10_000.0;
 }
 
-/// Output path for the generated GGUF (overridable via --out).
 pub const DEFAULT_OUT: &str = "data/tiny-moe.gguf";
 pub const DEFAULT_SEED: u64 = 0x67_6f_6c_65_6d; // "golem"
 
