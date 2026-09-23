@@ -1,6 +1,3 @@
-//! Workspace automation: `gen-tiny-moe` (M1.2), parity runner (M1.4),
-//! bench matrix (M5.3).
-
 use std::io::Write;
 
 use xtask::tiny_moe;
