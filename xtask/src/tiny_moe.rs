@@ -45,7 +45,7 @@ pub mod dims {
 
 /// Output path for the generated GGUF (overridable via --out).
 pub const DEFAULT_OUT: &str = "data/tiny-moe.gguf";
-/// Default PRNG seed ("golem"). Seed 0 is remapped to 1.
+/// Default PRNG seed ("golem").
 pub const DEFAULT_SEED: u64 = 0x67_6f_6c_65_6d;
 
 /// Combined key+value GQA width: `HEAD_DIM * N_HEAD_KV` (= 16).
@@ -58,10 +58,19 @@ fn d(v: &[u32]) -> Vec<u64> {
     v.iter().map(|&x| u64::from(x)).collect()
 }
 
-/// `xorshift64*` PRNG; state must be nonzero (`seed | 1` at construction).
+/// `xorshift64*` PRNG; the constructor splitmix64-premixes the seed so
+/// every seed yields a nonzero state and adjacent seeds effectively never
+/// collide (unlike the raw `seed | 1` fold).
 struct Xorshift(u64);
 
 impl Xorshift {
+    fn new(seed: u64) -> Self {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        Xorshift((z ^ (z >> 31)) | 1)
+    }
+
     /// Uniform sample in `[-1, 1)`.
     fn next_f32(&mut self) -> f32 {
         let mut x = self.0;
@@ -137,7 +146,7 @@ fn vec_of_64_tokens() -> Vec<String> {
 
 /// Write the full deterministic tiny-moe GGUF file.
 pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
-    let mut rng = Xorshift(seed | 1);
+    let mut rng = Xorshift::new(seed);
     let u = |v: u32| GgufValue::U32(v);
     let f = |v: f32| GgufValue::F32(v);
     let s = |v: &str| GgufValue::Str(v.to_owned());
@@ -329,11 +338,8 @@ mod tests {
         assert_eq!(&b[0..4], b"GGUF");
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 3);
         let n_tensors = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        // global: token_embd, output_norm, output = 3
-        // layer0 dense: attn_norm, q, k, v, attn_output, post_attention_norm, ffn_gate, ffn_up, ffn_down = 9
-        // layer1 moe:   6 attn-ish + gate_inp + exp_probs_b + 3 exps = 11
         assert_eq!(n_tensors, 3 + 9 + 11);
-        // truncation guard: exact total size pinned once (24-byte header + 2346 KV bytes +
+        // exact total size pinned once (24-byte header + 2346 KV bytes +
         // 1398-byte table padded to 3776, + 104096 payload bytes; every payload is already
         // 32-aligned, so all pad bytes are zero)
         assert_eq!(b.len(), 107_872);
@@ -343,9 +349,7 @@ mod tests {
     fn expert_tensors_are_exactly_layer_1_exps() {
         let (_, tensors) = parse_header(&gen_bytes());
         let names: Vec<String> = tensors.iter().map(|(n, ..)| n.clone()).collect();
-        // the parsed file's tensor table must equal tensor_names() exactly (full ordered equality)
         assert_eq!(names, tensor_names());
-        // only layer 1 is MoE ⇒ exactly these 3 expert tensors (set-equality, order-free)
         let mut found: Vec<String> = names.into_iter().filter(|n| is_expert_tensor(n)).collect();
         found.sort();
         assert_eq!(
@@ -368,21 +372,29 @@ mod tests {
     fn deterministic_given_seed() {
         use sha2::{Digest, Sha256};
         let a = gen_bytes();
-        let b = gen_bytes(); // same seed, fresh call
+        let b = gen_bytes();
         let mut ha = Sha256::new();
         ha.update(&a);
         let mut hb = Sha256::new();
         hb.update(&b);
         assert_eq!(ha.finalize(), hb.finalize());
-        // and a different seed differs
         let mut c = Vec::new();
         generate(&mut c, DEFAULT_SEED + 1).unwrap();
         assert_ne!(&a[..], &c[..]);
     }
 
     #[test]
+    fn adjacent_seeds_diverge() {
+        let mut a = Vec::new();
+        generate(&mut a, 2).unwrap();
+        let mut b = Vec::new();
+        generate(&mut b, 3).unwrap();
+        assert_ne!(&a[..], &b[..]);
+    }
+
+    #[test]
     fn kv_block_is_parseable_and_complete() {
-        // Hand-rolled reader over the produced file (also our independent format check):
+        // hand-rolled parser doubles as an independent format check
         let b = gen_bytes();
         let (kvs, tensors) = parse_header(&b);
         let get = |k: &str| {
@@ -443,7 +455,7 @@ mod tests {
             get("tokenizer.ggml.token_type").unwrap(),
             KvVal::ArrI32(expected_types)
         );
-        // tensor table sanity: exact name set and dims (ggml order: ne[0] innermost)
+        // ggml dim order: ne[0] innermost
         let names: Vec<_> = tensors.iter().map(|(n, ..)| n.clone()).collect();
         for expected in [
             "token_embd.weight",
@@ -488,7 +500,6 @@ mod tests {
             .find(|(n, ..)| n == "token_embd.weight")
             .unwrap();
         assert_eq!(tok.1, &[32, 64]);
-        // payload spot-check: output_norm.weight decodes to [1.0; 32]
         let (_, _, _, bytes) = tensors
             .iter()
             .find(|(n, ..)| n == "output_norm.weight")
@@ -498,11 +509,8 @@ mod tests {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(vals, vec![1.0f32; 32]);
-        // every tensor is F32
-        assert!(tensors.iter().all(|(_, _, t, _)| *t == 0));
+        assert!(tensors.iter().all(|(_, _, t, _)| *t == GGML_TYPE_F32));
     }
-
-    // ---- test-only GGUF reader ----
 
     /// Parsed tensor: (name, dims, ggml_type, payload bytes).
     type ParsedTensor = (String, Vec<u64>, u32, Vec<u8>);
@@ -600,7 +608,7 @@ mod tests {
             let ggml_type = c.u32();
             let offset = c.u64();
             let n: u64 = dims.iter().product();
-            let start = 3776 + offset as usize; // data section starts after header+kv+aligned table
+            let start = 3776 + offset as usize; // header + KV + padded table end
             let end = start + n as usize * 4;
             assert!(end <= b.len(), "tensor {name} payload out of range");
             tensors.push((name, dims, ggml_type, b[start..end].to_vec()));
