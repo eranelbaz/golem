@@ -1,6 +1,4 @@
-//! Usable-ROCm-toolchain probe, `#[path]`-included by build.rs and src/lib.rs
-//! (re-exported to tests/backend_detect.rs) — one probe, so the two
-//! consumers cannot drift.
+//! `#[path]`-included by build.rs and src/lib.rs so the probe cannot drift between consumers.
 use std::path::Path;
 
 pub fn usable_rocm_toolchain() -> bool {

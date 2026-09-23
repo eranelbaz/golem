@@ -1,5 +1,4 @@
-//! Byte-compares `pin_gate` against the live shell `cs()` recipe, extracted
-//! from `scripts/build-substrate.sh` at test time (ADR 0001).
+//! Byte-compares `pin_gate` against the live shell `cs()` recipe (ADR 0001).
 
 #![cfg(unix)]
 
@@ -69,11 +68,7 @@ fn make_fixture(root: &Path) {
     std::os::unix::fs::symlink("data.bin", root.join("link.bin")).expect("symlink (skipped)");
 }
 
-/// The streaming part of the LIVE `cs()` recipe from `scripts/build-substrate.sh`,
-/// extracted and shape-validated by the shared helper in tests/common (the
-/// outer-hash fold is applied by the shell_* helpers here). Panics loudly if
-/// the recipe is missing or reshaped — an embedded copy would reintroduce the
-/// silent-drift this test exists to prevent.
+/// The streaming part of the LIVE `cs()` recipe; panics if missing or reshaped.
 fn cs_stream_recipe() -> &'static str {
     static RECIPE: OnceLock<String> = OnceLock::new();
     RECIPE

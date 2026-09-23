@@ -1,9 +1,6 @@
-//! CI cache-key conformance: the `test-models-…` cache key literal in
-//! `.github/workflows/ci.yml` is hand-transcribed — this test anchors it to
-//! `FIXTURE_SHA256` so the workflow and the fixture hash cannot silently
-//! drift apart.
+//! Anchors the hand-transcribed `test-models-…` cache key in ci.yml to `FIXTURE_SHA256`.
 
-#[allow(dead_code)] // only the consts are consumed here
+#[allow(dead_code)]
 mod common;
 
 use common::{CANONICAL_CS_CORE, FIXTURE_SHA256, core_recipe, cs_recipe_line, repo_text};
@@ -50,8 +47,7 @@ fn vendor_pin_workflow_recipe_matches_build_substrate() {
         wf_recipe, script_recipe,
         "vendor-pin.yml's cs() recipe drifted from scripts/build-substrate.sh's canonical copy (ADR 0001: paste verbatim, do not re-type) — live recipe: {script_recipe:?}"
     );
-    // Guard against both copies drifting together off the canonical form: the
-    // build-pruned, NUL-delimited, C-locale shape is load-bearing (ADR 0001 §3).
+    // Guards against both copies drifting jointly off the canonical shape (ADR 0001 §3)
     assert_eq!(
         wf_recipe, CANONICAL_CS_CORE,
         "both cs() copies changed shape — re-check ADR 0001 §3 and re-pin this literal to the new canonical recipe"

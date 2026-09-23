@@ -5,8 +5,7 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-// Canonical first, mirror second, tried in order — identity is the hash,
-// never the URL.
+// Canonical first, mirror second — identity is the hash, never the URL
 const FIXTURE_URLS: [&str; 2] = [
     "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf",
     "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf",
@@ -21,8 +20,7 @@ static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn fixture() -> PathBuf {
     if let Some(path) = FIXTURE.get() {
-        // Hash-verify on every use, not just first resolution — the cached
-        // file can be corrupted or replaced while the process runs.
+        // Hash-verify on every use: the cached file can change mid-process
         if let Some(sha) = still_valid(path) {
             println!("fixture-ok: {sha} {}", path.display());
             return path.clone();
@@ -152,13 +150,7 @@ fn verified_existing(path: &Path) -> Option<String> {
     None
 }
 
-/// Corrupt-cache repair. The observed-bad hash is re-checked immediately
-/// before replacement: if another process re-populated the slot in the meantime
-/// (hash now differs), the slot is left alone. Replacing still has a
-/// benign TOCTOU tail — a good copy landing after the re-check is clobbered —
-/// but every consumer re-verifies and falls through to download, so the slot
-/// self-heals; the win over a plain `remove_file` is that the slot always
-/// holds a regular file and a known-bad file is never deleted on a guess.
+/// Benign TOCTOU tail: consumers re-verify and fall through to download; a known-bad file is never deleted on a guess.
 fn replace_corrupt(path: &Path, got: &str) {
     match sha256_file(path) {
         Ok(now) if now != got => {
@@ -316,9 +308,7 @@ pub fn core_recipe(cs_line: &str) -> &str {
     &tail[..end + END.len()]
 }
 
-/// Strict extraction of the streaming part of a `cs() { cd "$1" && …; }`
-/// definition: shape-validates the cd prefix and the outer-hash fold, and
-/// returns everything between them.
+/// Shape-validates the `cs()` definition and returns its streaming part.
 pub fn cs_stream_recipe(text: &str, source: &str) -> String {
     let line = cs_recipe_line(text, source);
     let body = line.trim_start().strip_prefix("cs() {").unwrap().trim_end();

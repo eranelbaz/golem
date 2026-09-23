@@ -22,16 +22,13 @@ fn engine_surface_symbols_exist() {
         ("llama_token_eos", raw::llama_token_eos as *const ()),
     ];
     for (name, f) in fns {
-        // Referencing the extern symbols forces link-time resolution; the
-        // null check is belt-and-braces only (fn addresses are never null).
+        // Reference forces link-time resolution; the null check is belt-and-braces only
         let _ = name;
         assert!(!f.is_null(), "engine surface symbol {name} unresolved");
     }
 }
 
-/// The golem hook typedefs are bare C fn pointers: `Option<hook>` must stay
-/// thin (pointer-sized via the niche, no tag word) and drop-free so NULL
-/// registration remains ABI-exact.
+/// Hook typedefs are bare C fn pointers; NULL registration must stay ABI-exact
 fn assert_thin_fn_ptr<T>() {
     assert_eq!(
         std::mem::size_of::<T>(),

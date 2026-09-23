@@ -6,9 +6,7 @@ mod common;
 use golem_llama_sys::raw::*;
 use golem_llama_sys::{Backend, substrate_backend};
 
-/// Compile-time exhaustiveness guard: matching every `Backend` variant with
-/// no wildcard arm fails to compile when a variant is added, forcing the
-/// backend-guarded skips below to be revisited.
+/// Fails to compile when a `Backend` variant is added, forcing the skips below to be revisited
 const _BACKEND_GUARDS_EXHAUSTIVE: () = match Backend::Cpu {
     Backend::Cpu => (),
     Backend::Hip => (),
@@ -33,9 +31,6 @@ impl Drop for Ctx {
     }
 }
 
-/// Load the fixture once, then decode BOS → next-token through two
-/// independent contexts over the same model. Returns per-context
-/// (greedy argmax token, full logits vector).
 fn two_context_greedy_decode() -> [(llama_token, Vec<f32>); 2] {
     let path = common::fixture();
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
@@ -98,10 +93,8 @@ fn assert_decode_sane(token: llama_token, logits: &[f32]) {
     );
 }
 
-/// A skipped backend test is green-with-zero-coverage by design; build.rs
-/// guarantees an explicit GOLEM_LLAMA_SYS_BACKEND request always resolves to
-/// that substrate (or fails the build), so a skip here is only possible when
-/// the request was unset/auto/other — make that visible at result level.
+/// Explicit GOLEM_LLAMA_SYS_BACKEND requests always resolve (or fail the build),
+/// so a skip here means the request was unset/auto — surface that at result level.
 fn skip_unless_requested() {
     eprintln!(
         "SKIPPED (GOLEM_LLAMA_SYS_BACKEND={:?}, substrate={:?}): zero assertions executed",
@@ -135,9 +128,7 @@ fn hip_decode_runs() {
     let [(t1, l1), (t2, l2)] = two_context_greedy_decode();
     assert_decode_sane(t1, &l1);
     assert_decode_sane(t2, &l2);
-    // HIP reductions may reorder near-tied logits, so neither bit-identical
-    // logits nor even an identical greedy argmax are contractual here — a
-    // near-tie can flip the argmax. Token agreement is reported, not asserted.
+    // HIP reductions reorder near-ties; argmax is not contractual, only reported
     if t1 != t2 {
         eprintln!(
             "note: hip greedy token differs across contexts (near-tie reorder): t1={t1} t2={t2}"
