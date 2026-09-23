@@ -227,12 +227,10 @@ mod tests {
         let b = kv_bytes();
         let mut i = 24usize; // end of the fixed 24-byte header
 
-        // single KV record: keylen+key, type tag, strlen+value
         let klen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
         i += 8 + klen + 4; // key + STR tag
         let vlen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
         i += 8 + vlen;
-        // single tensor-table entry: namelen+name, ndims, dims, ggml_type, offset
         let nlen = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize;
         i += 8 + nlen;
         let ndims = u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
@@ -247,13 +245,11 @@ mod tests {
             &b[data_start as usize..data_start as usize + 4],
             &1.0f32.to_le_bytes()[..]
         );
-        // the file ends exactly at the padded blob (16-byte payload padded to 32)
         assert_eq!(b.len() as u64, data_start + 32);
     }
 
     #[test]
     fn arr_kv_types_round_trip_layout() {
-        // GGUF metadata type tags: U32=4, I32=5, F32=6, STRING=8, ARRAY=9.
         let kvs = [
             GgufKv {
                 key: "tokenizer.ggml.token_type".into(),
@@ -322,13 +318,11 @@ mod tests {
             assert_eq!(&b[start as usize..start as usize + 4], &[0xABu8; 4][..]);
             end = end.max(start + len);
         }
-        // the file ends exactly at the padded last blob
         assert_eq!(b.len() as u64, align_up(end));
     }
 
     #[test]
     fn rejects_bad_tensor_payload() {
-        // The writer validates ggml_type and payload length before emitting.
         let meta = |ty: u32| GgufTensorMeta {
             name: "x.weight".into(),
             dims: vec![4],

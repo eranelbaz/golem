@@ -1,6 +1,5 @@
 //! Workspace automation: `gen-tiny-moe` (M1.2), parity runner (M1.4),
-//! bench matrix (M5.3). Scaffold (task B1).
-// Lib+bin split: `pub mod gguf;` / `pub mod tiny_moe;` live in `xtask/src/lib.rs`; the bin calls the lib.
+//! bench matrix (M5.3).
 
 use std::io::Write;
 
