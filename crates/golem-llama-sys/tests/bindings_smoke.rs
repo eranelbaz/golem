@@ -22,8 +22,6 @@ fn engine_surface_symbols_exist() {
         ("llama_token_eos", raw::llama_token_eos as *const ()),
     ];
     for (name, f) in fns {
-        // Reference forces link-time resolution; the null check is belt-and-braces only
-        let _ = name;
         assert!(!f.is_null(), "engine surface symbol {name} unresolved");
     }
 }

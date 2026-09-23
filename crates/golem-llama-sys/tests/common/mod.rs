@@ -5,8 +5,7 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-// Canonical first, mirror second — identity is the hash, never the URL
-const FIXTURE_URLS: [&str; 2] = [
+const FIXTURE_URLS_BY_PRIORITY: [&str; 2] = [
     "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf",
     "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf",
 ];
@@ -20,8 +19,7 @@ static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn fixture() -> PathBuf {
     if let Some(path) = FIXTURE.get() {
-        // Hash-verify on every use: the cached file can change mid-process
-        if let Some(sha) = still_valid(path) {
+        if let Some(sha) = verify_memoized_hash(path) {
             println!("fixture-ok: {sha} {}", path.display());
             return path.clone();
         }
@@ -31,7 +29,7 @@ pub fn fixture() -> PathBuf {
     path
 }
 
-fn still_valid(path: &Path) -> Option<String> {
+fn verify_memoized_hash(path: &Path) -> Option<String> {
     match sha256_file(path) {
         Ok(got) if got == FIXTURE_SHA256 => Some(got),
         Ok(got) => {
@@ -145,12 +143,11 @@ fn verified_existing(path: &Path) -> Option<String> {
     if got == FIXTURE_SHA256 {
         return Some(got);
     }
-    replace_corrupt(path, &got);
+    replace_corrupt_if_still_corrupt(path, &got);
     None
 }
 
-/// Benign TOCTOU tail: consumers re-verify and fall through to download; a known-bad file is never deleted on a guess.
-fn replace_corrupt(path: &Path, got: &str) {
+fn replace_corrupt_if_still_corrupt(path: &Path, got: &str) {
     match sha256_file(path) {
         Ok(now) if now != got => {
             eprintln!(
@@ -210,7 +207,7 @@ fn download() {
         std::process::id(),
         format_args!("{:?}", std::thread::current().id())
     ));
-    for url in FIXTURE_URLS {
+    for url in FIXTURE_URLS_BY_PRIORITY {
         eprintln!("downloading pinned fixture from {url} to {tmp:?}");
         let status = std::process::Command::new("curl")
             .args([
@@ -256,7 +253,7 @@ fn download() {
         }
         return;
     }
-    clean_fail(&tmp, format!("all fixture URLs failed: {FIXTURE_URLS:?}"));
+    clean_fail(&tmp, format!("all fixture URLs failed: {FIXTURE_URLS_BY_PRIORITY:?}"));
 }
 
 fn clean_fail(tmp: &Path, msg: String) -> ! {
