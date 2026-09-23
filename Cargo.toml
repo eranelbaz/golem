@@ -32,3 +32,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 crc32c = "0.6"
 sysinfo = "0.33"
+regex = "1"
