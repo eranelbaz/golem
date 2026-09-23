@@ -13,6 +13,15 @@ pub enum Backend {
     Hip,
 }
 
+impl Backend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Backend::Cpu => "cpu",
+            Backend::Hip => "hip",
+        }
+    }
+}
+
 pub fn substrate_backend() -> Backend {
     BACKEND
 }

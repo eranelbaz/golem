@@ -273,6 +273,12 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
         return match value.trim() {
             "ON" => true,
             "OFF" => {
+                // Deliberate relaxation (was a hard panic): OFF means the
+                // substrate's ggml built without OpenMP, so no gomp symbols
+                // exist and `dylib=gomp` must be skipped to keep the link
+                // resolvable. The trade-off: a build host missing libgomp
+                // silently yields an OpenMP-less substrate — the warning
+                // below is the only signal.
                 println!(
                     "cargo:warning=GGML_OPENMP_ENABLED=OFF in {} — the substrate \
                      built without OpenMP; dylib=gomp skipped",

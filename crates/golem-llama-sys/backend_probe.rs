@@ -1,5 +1,5 @@
-//! Usable-ROCm-toolchain probe, `#[path]`-shared by build.rs (backend
-//! auto-detect) and tests/backend_detect.rs — one probe, so the two
+//! Usable-ROCm-toolchain probe, `#[path]`-included by build.rs and src/lib.rs
+//! (re-exported to tests/backend_detect.rs) — one probe, so the two
 //! consumers cannot drift.
 use std::path::Path;
 

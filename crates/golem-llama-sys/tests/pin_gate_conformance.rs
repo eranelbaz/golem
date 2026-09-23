@@ -3,6 +3,9 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,61 +69,25 @@ fn make_fixture(root: &Path) {
     std::os::unix::fs::symlink("data.bin", root.join("link.bin")).expect("symlink (skipped)");
 }
 
-/// Extract the streaming part of the LIVE `cs()` recipe from
-/// `scripts/build-substrate.sh`: the pipeline between the leading
-/// `cd "$1" && ` and the trailing `| sha256sum | awk '{print $1}'`
-/// outer-hash fold (the fold is applied by the shell_* helpers here).
-/// Panics loudly if the recipe is missing or reshaped — an embedded copy
-/// would reintroduce the silent-drift this test exists to prevent.
+/// The streaming part of the LIVE `cs()` recipe from `scripts/build-substrate.sh`,
+/// extracted and shape-validated by the shared helper in tests/common (the
+/// outer-hash fold is applied by the shell_* helpers here). Panics loudly if
+/// the recipe is missing or reshaped — an embedded copy would reintroduce the
+/// silent-drift this test exists to prevent.
 fn cs_stream_recipe() -> &'static str {
     static RECIPE: OnceLock<String> = OnceLock::new();
     RECIPE
-        .get_or_init(|| {
-            let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../scripts/build-substrate.sh")
-                .canonicalize()
-                .expect(
-                    "scripts/build-substrate.sh not found — conformance anchors to the live script",
-                );
-            let text = fs::read_to_string(&script).expect("read build-substrate.sh");
-            let line = text
-                .lines()
-                .find(|l| l.trim_start().starts_with("cs() {"))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "cs() definition not found in {} — restore it or re-anchor this test",
-                        script.display()
-                    )
-                });
-            let body = line.trim_start().strip_prefix("cs() {").unwrap().trim_end();
-            let body = body
-                .strip_suffix('}')
-                .expect("cs() must be a single-line `cs() { ...; }` definition");
-            let body = body.trim_end().strip_suffix(';').unwrap_or(body);
-            let body = body
-                .trim()
-                .strip_prefix("cd \"$1\" && ")
-                .expect("cs() must begin with `cd \"$1\" && `");
-            let stream = body
-                .strip_suffix("| sha256sum | awk '{print $1}'")
-                .expect("cs() must end with the `| sha256sum | awk '{print $1}'` outer-hash fold");
-            stream.trim_end().to_string()
-        })
+        .get_or_init(|| common::cs_stream_recipe(&common::repo_text("scripts/build-substrate.sh"), "scripts/build-substrate.sh"))
         .as_str()
 }
 
 #[test]
 fn recipe_body_is_verbatim() {
     let recipe = cs_stream_recipe();
-    assert!(
-        recipe.starts_with("find . -path ./.git -prune"),
+    assert_eq!(
+        recipe, common::CANONICAL_CS_CORE,
         "live recipe lost its canonical shape: {recipe:?}"
     );
-    assert!(
-        recipe.ends_with("xargs -0 -r sha256sum"),
-        "live recipe must not run sha256sum on an empty stream (-r): {recipe:?}"
-    );
-    assert!(!recipe.contains('\n'));
 }
 
 fn shell_stream(dir: &Path) -> Vec<u8> {

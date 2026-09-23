@@ -152,12 +152,27 @@ fn verified_existing(path: &Path) -> Option<String> {
     None
 }
 
-/// Corrupt-cache repair without racing concurrent test processes: a plain
-/// `remove_file` can delete a good copy another process just renamed into
-/// place. Write a unique empty temp and rename it over the bad file instead —
-/// the slot always holds a regular file, and a losing racer's placeholder just
-/// fails the next verifier and falls through to download.
+/// Corrupt-cache repair. The observed-bad hash is re-checked immediately
+/// before replacement: if another process re-populated the slot in the meantime
+/// (hash now differs), the slot is left alone. Replacing still has a
+/// benign TOCTOU tail — a good copy landing after the re-check is clobbered —
+/// but every consumer re-verifies and falls through to download, so the slot
+/// self-heals; the win over a plain `remove_file` is that the slot always
+/// holds a regular file and a known-bad file is never deleted on a guess.
 fn replace_corrupt(path: &Path, got: &str) {
+    match sha256_file(path) {
+        Ok(now) if now != got => {
+            eprintln!(
+                "warning: corrupt fixture {path:?} changed under us ({got} → {now}) — another writer got there first, keeping it"
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("warning: corrupt fixture {path:?} unreadable on re-check: {e} — falling through to download");
+            return;
+        }
+        Ok(_) => {}
+    }
     let tmp = path.with_file_name(format!(
         ".{}.{}.{}.corrupt.tmp",
         fixture_name(),
@@ -261,4 +276,61 @@ fn clean_fail(tmp: &Path, msg: String) -> ! {
         download_slot().join(&name).display(),
         preseed_slot().join(&name).display(),
     );
+}
+
+// --- repo-text / cs()-recipe conformance helpers, shared by ci_key.rs and
+// pin_gate_conformance.rs so the extraction logic itself cannot drift ---
+
+pub fn repo_text(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("{rel} not found — conformance anchors to the live repo: {e}"));
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+pub const CANONICAL_CS_CORE: &str =
+    "find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum";
+
+pub fn cs_recipe_line<'a>(text: &'a str, source: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.contains("cs() {"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no `cs() {{` recipe line in {source} — the ADR 0001 content-hash recipe moved; restore it or re-anchor this test"
+            )
+        })
+}
+
+pub fn core_recipe(cs_line: &str) -> &str {
+    const END: &str = "xargs -0 -r sha256sum";
+    let start = cs_line
+        .find("find .")
+        .unwrap_or_else(|| panic!("cs() line has no `find .` pipeline start: {cs_line:?}"));
+    let tail = &cs_line[start..];
+    let end = tail
+        .find(END)
+        .unwrap_or_else(|| panic!("cs() line has no `{END}` pipeline end: {cs_line:?}"));
+    &tail[..end + END.len()]
+}
+
+/// Strict extraction of the streaming part of a `cs() { cd "$1" && …; }`
+/// definition: shape-validates the cd prefix and the outer-hash fold, and
+/// returns everything between them.
+pub fn cs_stream_recipe(text: &str, source: &str) -> String {
+    let line = cs_recipe_line(text, source);
+    let body = line.trim_start().strip_prefix("cs() {").unwrap().trim_end();
+    let body = body
+        .strip_suffix('}')
+        .expect("cs() must be a single-line `cs() {{ ...; }}` definition");
+    let body = body.trim_end().strip_suffix(';').unwrap_or(body);
+    let body = body
+        .trim()
+        .strip_prefix("cd \"$1\" && ")
+        .expect("cs() must begin with `cd \"$1\" && `");
+    let stream = body
+        .strip_suffix("| sha256sum | awk '{print $1}'")
+        .expect("cs() must end with the `| sha256sum | awk '{{print $1}}'` outer-hash fold");
+    stream.trim_end().to_string()
 }

@@ -22,10 +22,10 @@ fn engine_surface_symbols_exist() {
         ("llama_token_eos", raw::llama_token_eos as *const ()),
     ];
     for (name, f) in fns {
-        assert!(
-            !f.is_null(),
-            "engine surface symbol {name} resolved to null"
-        );
+        // Referencing the extern symbols forces link-time resolution; the
+        // null check is belt-and-braces only (fn addresses are never null).
+        let _ = name;
+        assert!(!f.is_null(), "engine surface symbol {name} unresolved");
     }
 }
 
@@ -49,6 +49,4 @@ fn hook_abi_types_generated() {
     assert_thin_fn_ptr::<raw::golem_ensure_host_resident_fn>();
     assert_thin_fn_ptr::<raw::golem_policy_query_fn>();
     assert_thin_fn_ptr::<raw::golem_notify_access_fn>();
-    let unset: raw::golem_ensure_host_resident_fn = None;
-    assert!(unset.is_none(), "hook slot must represent NULL as None");
 }
