@@ -8,8 +8,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+golem-gguf = { path = "../crates/golem-gguf" }
 regex.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
 [lints]
 workspace = true

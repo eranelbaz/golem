@@ -1,6 +1,7 @@
 //! Synthetic 2-layer / 8-expert glm4moe GGUF (design §12.1).
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -8,7 +9,7 @@ use regex::Regex;
 use crate::gguf::{self, GGML_TYPE_F32, GgufKv, GgufTensorMeta, GgufValue};
 
 pub mod dims {
-    pub const N_VOCAB: u32 = 64;
+    pub const N_VOCAB: u32 = 320;
     pub const N_EMBD: u32 = 32;
     pub const N_HEAD: u32 = 4;
     pub const N_HEAD_KV: u32 = 2;
@@ -28,6 +29,29 @@ pub mod dims {
 
 pub const DEFAULT_OUT: &str = "data/tiny-moe.gguf";
 pub const DEFAULT_SEED: u64 = 0x67_6f_6c_65_6d; // "golem"
+
+/// Single source of truth for the test fixture: generates the vocab-versioned
+/// tiny-moe model into `.test-cache/` (never in git) and returns its path.
+/// Both crates' integration tests resolve the fixture through this.
+pub fn cached_fixture() -> PathBuf {
+    let cache = repo_root().join(".test-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let p = cache.join("tiny-moe-320.gguf");
+    if !p.exists() {
+        let tmp = cache.join(format!("tiny-moe-320-{}.gguf.tmp", std::process::id()));
+        let f = std::fs::File::create(&tmp).unwrap();
+        generate(&mut std::io::BufWriter::new(f), DEFAULT_SEED).unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()
+        .unwrap()
+}
 
 fn n_embd_k_gqa() -> u32 {
     dims::HEAD_DIM * dims::N_HEAD_KV
@@ -105,23 +129,39 @@ pub fn is_expert_tensor(name: &str) -> bool {
         .is_match(name)
 }
 
-fn vec_of_64_tokens() -> Vec<String> {
-    let mut tokens: Vec<String> = ["<unk>", "<s>", "</s>", "▁hello", "▁world", "<0x0A>"]
+fn token_table() -> Vec<(String, i32, f32)> {
+    let mut texts: Vec<String> = ["<unk>", "<s>", "</s>", "▁hello", "▁world", "<eoln>"]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
     for i in 0..58 {
         let letter = char::from(b'a' + (i % 26) as u8);
-        tokens.push(format!("▁{letter}{}", i / 26));
+        texts.push(format!("▁{letter}{}", i / 26));
     }
-    tokens
+    let types = [2, 3, 3].into_iter().chain(std::iter::repeat(1));
+    let mut table: Vec<(String, i32, f32)> = texts
+        .into_iter()
+        .zip(types)
+        .map(|(text, ttype)| (text, ttype, 0.0))
+        .collect();
+    // Token texts must be unique: llama.cpp SPM load hard-aborts (GGML_ASSERT
+    // id_to_token.size() == token_to_id.size()) when token_to_id collapses a
+    // duplicate, and byte_to_token resolves "<0xXX>" by text. The old id-5
+    // "<0x0A>" duplicated the BYTE token at 64+10 and aborted every real load;
+    // "<eoln>" keeps the slot newline-flavored without touching the byte block.
+    for b in 0..=u8::MAX {
+        table.push((format!("<0x{b:02X}>"), 6, 0.0));
+    }
+    table
 }
 
-pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
+/// Returns the byte offset of the GGUF tensor-data section.
+pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<u64> {
     let mut rng = Xorshift::new(seed);
     let u = |v: u32| GgufValue::U32(v);
     let f = |v: f32| GgufValue::F32(v);
     let s = |v: &str| GgufValue::Str(v.to_owned());
+    let toks = token_table();
     let kvs = vec![
         kv("general.architecture", s("glm4moe")),
         kv("general.name", s("tiny-moe")),
@@ -148,19 +188,15 @@ pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
         kv("tokenizer.ggml.model", s("llama")),
         kv(
             "tokenizer.ggml.tokens",
-            GgufValue::ArrStr(vec_of_64_tokens()),
+            GgufValue::ArrStr(toks.iter().map(|(t, _, _)| t.clone()).collect()),
         ),
         kv(
             "tokenizer.ggml.scores",
-            GgufValue::ArrF32(vec![0.0; dims::N_VOCAB as usize]),
+            GgufValue::ArrF32(toks.iter().map(|(_, _, score)| *score).collect()),
         ),
         kv(
             "tokenizer.ggml.token_type",
-            GgufValue::ArrI32({
-                let mut t = vec![2, 3, 3];
-                t.resize(dims::N_VOCAB as usize, 1);
-                t
-            }),
+            GgufValue::ArrI32(toks.iter().map(|(_, ttype, _)| *ttype).collect()),
         ),
     ];
 
@@ -201,11 +237,16 @@ pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
     push(
         &mut tensors,
         "token_embd.weight",
-        d(&[32, 64]),
+        d(&[32, dims::N_VOCAB]),
         Fill::Random,
     );
     push(&mut tensors, "output_norm.weight", d(&[32]), Fill::Ones);
-    push(&mut tensors, "output.weight", d(&[32, 64]), Fill::Random);
+    push(
+        &mut tensors,
+        "output.weight",
+        d(&[32, dims::N_VOCAB]),
+        Fill::Random,
+    );
     for l in 0..dims::N_LAYER {
         let blk = format!("blk.{l}.");
         push(
@@ -292,25 +333,39 @@ fn kv(key: &str, value: GgufValue) -> GgufKv {
 mod tests {
     use super::*;
 
-    fn gen_bytes() -> Vec<u8> {
+    fn gen_bytes() -> (Vec<u8>, u64) {
         let mut buf = Vec::new();
-        generate(&mut buf, DEFAULT_SEED).unwrap();
-        buf
+        let data_start = generate(&mut buf, DEFAULT_SEED).unwrap();
+        (buf, data_start)
     }
 
     #[test]
     fn magic_and_shape_metadata() {
-        let b = gen_bytes();
+        let (b, _) = gen_bytes();
         assert_eq!(&b[0..4], b"GGUF");
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 3);
         let n_tensors = u64::from_le_bytes(b[8..16].try_into().unwrap());
         assert_eq!(n_tensors, 3 + 9 + 11);
-        assert_eq!(b.len(), 107_872);
+        assert_eq!(b.len(), 179_040); // 64 + 256 byte-fallback tokens (+ vocab-shaped tensor growth)
+    }
+
+    #[test]
+    fn byte_fallback_tokens_are_appended_byte_typed() {
+        let toks = token_table();
+        assert_eq!(toks.len(), 320);
+        assert_eq!(toks[64].0, "<0x00>");
+        assert_eq!(toks[255 + 64].0, "<0xFF>");
+        for (i, (text, ttype, _)) in toks.iter().enumerate().skip(64) {
+            assert_eq!(text, &format!("<0x{:02X}>", i - 64));
+            assert_eq!(*ttype, 6);
+        }
+        assert_eq!(toks.iter().position(|t| t.0 == "▁hello"), Some(3));
     }
 
     #[test]
     fn expert_tensors_are_exactly_layer_1_exps() {
-        let (_, tensors) = parse_header(&gen_bytes());
+        let (b, data_start) = gen_bytes();
+        let (_, tensors) = parse_header(&b, data_start);
         let names: Vec<String> = tensors.iter().map(|(n, ..)| n.clone()).collect();
         assert_eq!(names, tensor_names());
         let mut found: Vec<String> = names.into_iter().filter(|n| is_expert_tensor(n)).collect();
@@ -329,8 +384,8 @@ mod tests {
     #[test]
     fn deterministic_given_seed() {
         use sha2::{Digest, Sha256};
-        let a = gen_bytes();
-        let b = gen_bytes();
+        let (a, _) = gen_bytes();
+        let (b, _) = gen_bytes();
         let mut ha = Sha256::new();
         ha.update(&a);
         let mut hb = Sha256::new();
@@ -352,8 +407,8 @@ mod tests {
 
     #[test]
     fn kv_block_is_parseable_and_complete() {
-        let b = gen_bytes();
-        let (kvs, tensors) = parse_header(&b);
+        let (b, data_start) = gen_bytes();
+        let (kvs, tensors) = parse_header(&b, data_start);
         let get = |k: &str| {
             kvs.iter()
                 .find(|(key, _)| *key == k)
@@ -395,19 +450,22 @@ mod tests {
         assert_eq!(get("glm4moe.context_length").unwrap(), KvVal::U32(256));
         assert_eq!(get("tokenizer.ggml.model").unwrap(), "llama");
         match get("tokenizer.ggml.tokens").unwrap() {
-            KvVal::ArrStr(v) => assert_eq!(v.len(), 64),
+            KvVal::ArrStr(v) => assert_eq!(v.len(), 320),
             _ => panic!(),
         }
         assert_eq!(
             get("tokenizer.ggml.tokens").unwrap(),
-            KvVal::ArrStr(vec_of_64_tokens())
+            KvVal::ArrStr(token_table().into_iter().map(|(t, _, _)| t).collect())
         );
         assert_eq!(
             get("tokenizer.ggml.scores").unwrap(),
-            KvVal::ArrF32(vec![0.0; 64])
+            KvVal::ArrF32(vec![0.0; 320])
         );
-        let mut expected_types = vec![2i32, 3, 3];
-        expected_types.resize(64, 1);
+        let expected_types: Vec<i32> = [2, 3, 3]
+            .into_iter()
+            .chain(std::iter::repeat_n(1, 61))
+            .chain(std::iter::repeat_n(6, 256))
+            .collect();
         assert_eq!(
             get("tokenizer.ggml.token_type").unwrap(),
             KvVal::ArrI32(expected_types)
@@ -455,7 +513,7 @@ mod tests {
             .iter()
             .find(|(n, ..)| n == "token_embd.weight")
             .unwrap();
-        assert_eq!(tok.1, &[32, 64]);
+        assert_eq!(tok.1, &[32, 320]);
         let (_, _, _, bytes) = tensors
             .iter()
             .find(|(n, ..)| n == "output_norm.weight")
@@ -515,7 +573,7 @@ mod tests {
         }
     }
 
-    fn parse_header(b: &[u8]) -> (Vec<(String, KvVal)>, Vec<ParsedTensor>) {
+    fn parse_header(b: &[u8], data_start: u64) -> (Vec<(String, KvVal)>, Vec<ParsedTensor>) {
         let mut c = Cursor::new(b);
         assert_eq!(c.take(4), b"GGUF");
         assert_eq!(c.u32(), 3);
@@ -554,7 +612,7 @@ mod tests {
             let ggml_type = c.u32();
             let offset = c.u64();
             let n: u64 = dims.iter().product();
-            let start = 3776 + offset as usize; // header + KV + padded table end
+            let start = data_start as usize + offset as usize;
             let end = start + n as usize * 4;
             assert!(end <= b.len(), "tensor {name} payload out of range");
             tensors.push((name, dims, ggml_type, b[start..end].to_vec()));

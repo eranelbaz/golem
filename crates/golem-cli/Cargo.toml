@@ -11,5 +11,12 @@ publish = false
 name = "golem"
 path = "src/main.rs"
 
+[dependencies]
+clap = { workspace = true }
+golem-engine = { path = "../golem-engine" }
+
+[dev-dependencies]
+xtask = { path = "../../xtask" }
+
 [lints]
 workspace = true
