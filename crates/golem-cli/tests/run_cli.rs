@@ -1,9 +1,6 @@
 //! End-to-end: `golem run --greedy tiny-moe.gguf --prompt hello` completes.
 //! Shares the tiny-moe fixture via the same .test-cache convention.
-mod common; // mirrors golem-engine/tests/common (path resolution only —
-// generation itself lives in the shared xtask dev-dep). Kept as a
-// 10-line copy: engine tests/ modules are not importable across
-// crates and a test-util crate for one fn isn't justified.
+mod common; // path resolution copy: engine tests/ modules aren't importable across crates
 
 #[test]
 fn run_greedy_one_shot_completes() {

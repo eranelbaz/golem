@@ -39,7 +39,7 @@ mod tests {
         assert_eq!(c.n_ctx, 256);
         assert_eq!(c.batch_tokens, 512);
         assert_eq!(c.n_predict, 64);
-        assert_eq!(c.threads, 1); // §7.2: decode-threads default 1
+        assert_eq!(c.threads, 1);
         assert_eq!(c.model_path, PathBuf::new());
     }
 }

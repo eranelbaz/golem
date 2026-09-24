@@ -30,27 +30,13 @@ pub fn run(args: Vec<String>) {
 }
 
 fn scaffold_json(model: &str, arch: &str) -> String {
+    // serde_json escapes the interpolated values; the fixed key order keeps
+    // the pinned report line stable.
     format!(
-        "{{\"harness\":\"t2-parity\",\"status\":\"scaffold\",\"model\":\"{}\",\"arch\":\"{}\",\"note\":\"native leg arrives with M1.4 (token-ID comparison with logit-gap epsilon, M0.5 session 10)\"}}",
-        json_escape(model),
-        json_escape(arch),
+        "{{\"harness\":\"t2-parity\",\"status\":\"scaffold\",\"model\":{},\"arch\":{},\"note\":\"native leg arrives with M1.4 (token-ID comparison with logit-gap epsilon, M0.5 session 10)\"}}",
+        serde_json::to_string(model).unwrap(),
+        serde_json::to_string(arch).unwrap(),
     )
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn die(msg: &str) -> ! {
@@ -77,7 +63,9 @@ mod tests {
     }
 
     #[test]
-    fn json_escape_quotes_and_backslashes() {
-        assert_eq!(json_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    fn scaffold_json_escapes_hostile_values() {
+        let v: serde_json::Value = serde_json::from_str(&scaffold_json("a\"b\\c\nd", "glm4moe"))
+            .expect("escaped line must stay valid JSON");
+        assert_eq!(v["model"], "a\"b\\c\nd");
     }
 }

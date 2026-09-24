@@ -217,7 +217,7 @@ mod tests {
             name: format!("blk.{layer}.ffn_{suffix}_exps.weight"),
             n_dims: 3,
             ne,
-            ggml_type: 0, // F32
+            ggml_type: 0,
         }
     }
 

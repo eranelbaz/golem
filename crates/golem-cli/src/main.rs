@@ -1,13 +1,10 @@
 //! `golem` CLI entry point (tech design §9): run, serve, list, stop, plan, pull.
-//!
-//! Task M1.3 adds the first subcommand (`run`); the rest arrive with their
-//! board tasks. Bare `golem` (no subcommand) prints the version.
+//! Bare `golem` (no subcommand) prints the version.
 
 use clap::{Parser, Subcommand};
 
 mod run;
 
-/// `golem` command-line entry point.
 #[derive(Parser)]
 #[command(
     name = "golem",
@@ -19,13 +16,12 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// The `golem` subcommands (only `run` exists so far).
 #[derive(Subcommand)]
 enum Command {
     /// Run a local GGUF model (greedy sampling this milestone).
     Run {
-        /// Use greedy sampling — the only sampler this milestone; the flag is
-        /// kept so later samplers slot in without a breaking change.
+        /// The only sampler this milestone; the flag is kept so later samplers
+        /// slot in without a breaking change.
         #[arg(long, required = true)]
         greedy: bool,
         #[command(flatten)]

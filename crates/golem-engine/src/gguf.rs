@@ -95,8 +95,15 @@ fn read_payload(r: &mut impl Read, tag: u32) -> Result<GgufValue, EngineError> {
         TYPE_BOOL => Ok(GgufValue::Bool(read_u8(r)? != 0)),
         TYPE_STR => Ok(GgufValue::Str(read_string(r)?)),
         // Array: element type u32, element count u64, then the elements.
+        // Nested arrays are rejected, matching gguf.h — nothing writes them and
+        // unbounded recursion on hostile input would overflow the stack.
         TYPE_ARRAY => {
             let elem_tag = read_u32(r)?;
+            if elem_tag == TYPE_ARRAY {
+                return Err(EngineError::InvalidModel(
+                    "nested GGUF arrays are not supported".into(),
+                ));
+            }
             let n = read_u64(r)?;
             let mut elems = Vec::new();
             for _ in 0..n {
@@ -364,6 +371,23 @@ mod tests {
         assert_eq!(t.name, "blk.0.attn_q.weight");
         assert_eq!(t.n_dims, 3);
         assert_eq!(&t.ne[..3], &[2, 3, 1]);
+    }
+
+    #[test]
+    fn rejects_nested_arrays() {
+        // array<u32, [array<u32, [7]>]>: outer tag 9, elem tag 9, count 1,
+        // then the inner array (elem tag 4, count 1, value 7).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        assert!(matches!(
+            read_value(&mut &bytes[..]),
+            Err(EngineError::InvalidModel(_))
+        ));
     }
 
     #[test]

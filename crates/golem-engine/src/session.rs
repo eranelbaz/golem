@@ -4,7 +4,6 @@
 //! the single-slot greedy decode loop (`Session::chat_turn`).
 #![allow(unsafe_code)]
 
-use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::sync::Once;
 
@@ -34,7 +33,8 @@ impl Model {
         if p.is_null() {
             None
         } else {
-            // SAFETY: llama.cpp returns a pointer to a NUL-terminated static buffer.
+            // SAFETY: llama.cpp returns a pointer to a NUL-terminated buffer
+            // owned by the model, valid for the model's lifetime.
             Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
         }
     }
@@ -373,10 +373,31 @@ impl Session {
     /// greedily generates until EOG, `n_ctx - 1` positions, or `n_predict`
     /// tokens (`n_predict == 0` samples and generates nothing: the turn is
     /// prefill-only and returns 0). Piece bytes stream through `emit` as they
-    /// complete UTF-8 characters (verbatim — no space stripping). Returns
+    /// complete UTF-8 characters (verbatim — no space stripping); buffered
+    /// residue is flushed through `emit` even when the turn fails. Returns
     /// tokens generated.
     pub fn chat_turn(
         &mut self,
+        messages: &[ChatTurn<'_>],
+        emit: &mut dyn FnMut(&str),
+    ) -> Result<u32, EngineError> {
+        let mut pending = Vec::new();
+        match self.chat_turn_inner(&mut pending, messages, emit) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                let mut tail = String::new();
+                flush_utf8_tail(&mut pending, &mut tail);
+                if !tail.is_empty() {
+                    emit(&tail);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn chat_turn_inner(
+        &mut self,
+        pending: &mut Vec<u8>,
         messages: &[ChatTurn<'_>],
         emit: &mut dyn FnMut(&str),
     ) -> Result<u32, EngineError> {
@@ -384,7 +405,7 @@ impl Session {
         // SAFETY: template and msgs CStrings are alive for the duration of the call.
         let rendered = unsafe { apply_template(&self.template, &msgs, true)? };
 
-        // Full-transcript re-prefill: every turn is stateless w.r.t. prior turns.
+        // Stateless per turn: full-transcript re-prefill.
         let ctx = self.loaded.ctx();
         // SAFETY: llama_get_memory returns the context's live memory handle; the
         // context is idle between turns, the documented llama_memory_clear use.
@@ -396,7 +417,6 @@ impl Session {
         // SAFETY: vocab is live; rendered is valid for its byte length.
         let prompt = unsafe { tokenize_prompt(vocab, &rendered, true, true)? };
         if prompt.is_empty() {
-            // Nothing to prefill; llama_decode would run on an empty batch.
             return Err(EngineError::Tokenize(0));
         }
         self.last_prompt_tokens = prompt.clone();
@@ -412,8 +432,6 @@ impl Session {
             return Err(EngineError::Decode(1));
         }
 
-        // One batch per turn: reused for prefill chunks (n_tokens reset per chunk)
-        // and generation steps (n_tokens = 1); freed by Drop.
         let mut batch = Batch::init(chunk_cap as i32, 0, 1);
         let mut n_past: usize = 0;
         let mut last_chunk_len = 0;
@@ -451,8 +469,6 @@ impl Session {
             last_chunk_len = len;
         }
 
-        // No generation requested: the turn is prefill-only. The UTF-8 pending
-        // buffer was never touched this turn, so there is no tail to flush.
         if self.config.n_predict == 0 {
             return Ok(0);
         }
@@ -460,7 +476,6 @@ impl Session {
         // Greedy sampler chain; the chain owns the greedy sampler and frees it.
         let sampler = Sampler::greedy();
 
-        // Bootstrap: sample from the prefill's final-token logits.
         // SAFETY: sampler chain and ctx are live; the final decode emitted logits
         // for slot last_chunk_len - 1.
         let mut tok = unsafe {
@@ -476,7 +491,7 @@ impl Session {
             }
             // SAFETY: vocab is live; tok is a valid token id from the sampler.
             let piece = unsafe { token_piece(vocab, tok) };
-            emit_valid_prefix(&mut scratch, &piece);
+            emit_valid_prefix(pending, &mut scratch, &piece);
             if !scratch.is_empty() {
                 emit(&scratch);
                 scratch.clear();
@@ -504,7 +519,7 @@ impl Session {
         }
         // Turn end: flush whatever bytes remain buffered (n_predict can cut a
         // multi-byte character in half — lossy-drain that residue).
-        flush_utf8_tail(&mut scratch);
+        flush_utf8_tail(pending, &mut scratch);
         if !scratch.is_empty() {
             emit(&scratch);
         }
@@ -549,14 +564,6 @@ impl Drop for Sampler {
     }
 }
 
-// Bytes of a not-yet-complete UTF-8 character, carried across `emit_valid_prefix`
-// calls. Sound for the engine: `Session` is !`Send` (raw pointers), so a turn's
-// calls are sequential on one thread, and each turn flushes the buffer empty
-// before returning (`flush_utf8_tail`).
-thread_local! {
-    static PENDING_UTF8: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
-}
-
 /// Appends `bytes` to the pending byte buffer and emits — into `out` — the
 /// longest valid UTF-8 prefix; an incomplete trailing sequence stays pending
 /// until more bytes arrive (`std::str::from_utf8`: `valid_up_to` for the flush
@@ -564,47 +571,41 @@ thread_local! {
 /// U+FFFD (`from_utf8_lossy` semantics). Byte-buffered because Task 0's
 /// byte-fallback vocab legitimately splits multi-byte characters across pieces;
 /// per-piece lossy conversion would corrupt them.
-fn emit_valid_prefix(out: &mut String, bytes: &[u8]) {
-    PENDING_UTF8.with(|cell| {
-        let mut pending = cell.take();
-        pending.extend_from_slice(bytes);
-        loop {
-            match std::str::from_utf8(&pending) {
-                Ok(valid) => {
-                    out.push_str(valid);
-                    pending.clear();
-                    break;
-                }
-                Err(e) => {
-                    let ok = e.valid_up_to();
-                    // Guaranteed valid: from_utf8 error positions are char boundaries.
-                    out.push_str(std::str::from_utf8(&pending[..ok]).unwrap());
-                    pending.drain(..ok);
-                    match e.error_len() {
-                        None => break, // incomplete sequence — wait for more bytes
-                        Some(bad) => {
-                            out.push('\u{FFFD}');
-                            pending.drain(..bad);
-                        }
+fn emit_valid_prefix(pending: &mut Vec<u8>, out: &mut String, bytes: &[u8]) {
+    pending.extend_from_slice(bytes);
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(valid) => {
+                out.push_str(valid);
+                pending.clear();
+                break;
+            }
+            Err(e) => {
+                let ok = e.valid_up_to();
+                // Guaranteed valid: from_utf8 error positions are char boundaries.
+                out.push_str(std::str::from_utf8(&pending[..ok]).unwrap());
+                pending.drain(..ok);
+                match e.error_len() {
+                    None => break, // incomplete sequence — wait for more bytes
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        pending.drain(..bad);
                     }
                 }
             }
         }
-        cell.set(pending);
-    });
+    }
 }
 
 /// Turn-end flush: complete any character pending on a real boundary, then
 /// lossily drain the residue (a multi-byte character truncated mid-sequence
 /// can never complete).
-fn flush_utf8_tail(out: &mut String) {
-    emit_valid_prefix(out, &[]);
-    PENDING_UTF8.with(|cell| {
-        let rest = cell.take();
-        if !rest.is_empty() {
-            out.push_str(&String::from_utf8_lossy(&rest));
-        }
-    });
+fn flush_utf8_tail(pending: &mut Vec<u8>, out: &mut String) {
+    emit_valid_prefix(pending, out, &[]);
+    if !pending.is_empty() {
+        out.push_str(&String::from_utf8_lossy(pending));
+        pending.clear();
+    }
 }
 
 /// Writes one slot of the malloc'd batch buffer: token, position, single-sequence
@@ -780,10 +781,11 @@ mod tests {
 
     #[test]
     fn utf8_emitter_splits_only_on_char_boundaries() {
+        let mut pending = Vec::new();
         let mut out = String::new();
-        emit_valid_prefix(&mut out, &[0xE4, 0xBD]); // incomplete 3-byte char
+        emit_valid_prefix(&mut pending, &mut out, &[0xE4, 0xBD]); // incomplete 3-byte char
         assert!(out.is_empty());
-        emit_valid_prefix(&mut out, &[0xA0]);
+        emit_valid_prefix(&mut pending, &mut out, &[0xA0]);
         assert_eq!(out, "\u{4f60}"); // 你 — assembled across two pieces
     }
 }

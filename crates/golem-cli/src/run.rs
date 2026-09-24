@@ -27,8 +27,9 @@ pub struct RunArgs {
 
 /// Runs one greedy `run` invocation: loads the model, then either prints a
 /// single completion (`--prompt`) or serves per-line single-turn conversations
-/// on stdin until EOF. Returns `Err` only for load/init failures (process
-/// unusable); per-turn REPL errors are printed and the loop continues.
+/// on stdin until EOF. Returns `Err` for load/init failures and one-shot
+/// decode errors (process unusable); per-turn REPL errors are printed and the
+/// loop continues.
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     let config = EngineConfig {
         model_path: args.model.clone(),
@@ -44,7 +45,6 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// One-shot mode: a single user turn, assistant output on stdout.
 fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
     session.chat_turn(
         &[ChatTurn {
@@ -53,21 +53,16 @@ fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
         }],
         &mut emit_stdout,
     )?;
-    // Terminate the streamed completion so stdout stays line-oriented.
     println!();
     Ok(())
 }
 
-/// REPL mode: each stdin line is an independent single-turn conversation.
-/// The `golem> ` prompt goes to stderr so stdout stays parseable; per-turn
-/// errors print and continue (one bad line must not kill the session).
 fn repl(session: &mut Session) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
         eprint!("golem> ");
         let _ = std::io::stderr().flush();
-        // Read failure (not EOF) makes every future read fail too: fatal.
         let line = match lines.next() {
             Some(Ok(line)) => line,
             Some(Err(e)) => return Err(e.into()),
@@ -87,8 +82,6 @@ fn repl(session: &mut Session) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Streams one decoded piece to stdout, flushing so streamed text is visible
-/// before the next `golem> ` prompt is written.
 fn emit_stdout(piece: &str) {
     print!("{piece}");
     let _ = std::io::stdout().flush();

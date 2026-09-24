@@ -225,6 +225,12 @@ fn skip_value(r: &mut impl Read, tag: u32) -> Result<(), String> {
         }
         GGUF_TYPE_ARR => {
             let elem_tag = read_le_u32(r)?;
+            if elem_tag == GGUF_TYPE_ARR {
+                // Nested arrays are rejected, matching gguf.h and the engine
+                // reader — unbounded recursion on hostile input would overflow
+                // the stack.
+                return Err("nested GGUF arrays are not supported".into());
+            }
             let n = read_le_u64(r)?;
             for _ in 0..n {
                 skip_value(r, elem_tag)?;
@@ -479,6 +485,24 @@ mod tests {
         let p = write_temp_model("happy", &buf);
         assert_eq!(read_arch(&p).unwrap(), "glm4moe");
         cleanup(&p);
+    }
+
+    #[test]
+    fn skip_value_rejects_nested_arrays() {
+        // array<u32, [array<u32, [7]>]>: outer tag 9, elem tag 9, count 1,
+        // then the inner array (elem tag 4, count 1, value 7).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        assert!(
+            skip_value(&mut &bytes[..], GGUF_TYPE_ARR)
+                .unwrap_err()
+                .contains("nested")
+        );
     }
 
     #[test]

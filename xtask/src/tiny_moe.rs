@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(toks[255 + 64].0, "<0xFF>");
         for (i, (text, ttype, _)) in toks.iter().enumerate().skip(64) {
             assert_eq!(text, &format!("<0x{:02X}>", i - 64));
-            assert_eq!(*ttype, 6); // BYTE
+            assert_eq!(*ttype, 6);
         }
         assert_eq!(toks.iter().position(|t| t.0 == "▁hello"), Some(3));
     }

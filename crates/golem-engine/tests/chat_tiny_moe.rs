@@ -23,9 +23,8 @@ fn chat_completes_on_tiny_moe() {
         .chat_turn(&turns, &mut |piece| out.push_str(piece))
         .unwrap();
 
-    // If the greedy chain samples EOG immediately (empty output), switch the
-    // smoke prompt between the reserved tokens (▁hello → ▁world → "hello
-    // world") and record it in As-executed notes — do not weaken the assertion.
+    // If EOG samples immediately (empty output), rotate the smoke prompt across
+    // the reserved tokens — do not weaken the assertion.
     assert!(n > 0 && !out.is_empty(), "greedy chat produced no output");
     assert!(n <= 8, "generated {n} tokens, n_predict = 8");
 
