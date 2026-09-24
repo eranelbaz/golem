@@ -7,5 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+golem-llama-sys = { path = "../golem-llama-sys" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+xtask = { path = "../../xtask" }
+
 [lints]
 workspace = true
