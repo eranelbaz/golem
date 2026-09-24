@@ -14,6 +14,10 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 golem-engine = { path = "../golem-engine" }
+golem-llama-sys = { path = "../golem-llama-sys" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 xtask = { path = "../../xtask" }

@@ -18,7 +18,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a local GGUF model (greedy sampling this milestone).
+    /// Run a local GGUF model (greedy sampling this milestone); `--parity-dump
+    /// <FILE>` emits a T2 parity dump (JSONL) instead of streaming text.
     Run {
         /// The only sampler this milestone; the flag is kept so later samplers
         /// slot in without a breaking change.
