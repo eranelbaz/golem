@@ -6,3 +6,4 @@ pub mod config;
 pub mod error;
 pub mod gguf;
 pub mod sanity;
+pub mod session;
