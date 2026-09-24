@@ -312,8 +312,9 @@ fn ffi_messages(messages: &[ChatTurn<'_>]) -> Result<Vec<ChatMessageFFI>, Engine
         .iter()
         .map(|m| {
             Ok(ChatMessageFFI {
-                role: CString::new(m.role)
-                    .map_err(|_| EngineError::InvalidModel("chat message role contains NUL".into()))?,
+                role: CString::new(m.role).map_err(|_| {
+                    EngineError::InvalidModel("chat message role contains NUL".into())
+                })?,
                 content: CString::new(m.content).map_err(|_| {
                     EngineError::InvalidModel("chat message content contains NUL".into())
                 })?,
@@ -342,8 +343,7 @@ impl Session {
             .chat_template()
             .unwrap_or_else(|| FALLBACK_CHAT_TEMPLATE.to_owned());
         // Interior NUL would truncate the template at the FFI boundary: unusable.
-        let template =
-            CString::new(template_src).map_err(|_| EngineError::TemplateUnavailable)?;
+        let template = CString::new(template_src).map_err(|_| EngineError::TemplateUnavailable)?;
 
         let probe = ffi_messages(&[ChatTurn {
             role: "user",
@@ -428,7 +428,13 @@ impl Session {
                     // sample bootstraps generation; intermediate tokens never need it.
                     // SAFETY: i < len <= chunk_cap slots allocated by Batch::init.
                     unsafe {
-                        fill_slot(b, i, t, (n_past + i) as raw::llama_pos, is_final_chunk && i + 1 == len);
+                        fill_slot(
+                            b,
+                            i,
+                            t,
+                            (n_past + i) as raw::llama_pos,
+                            is_final_chunk && i + 1 == len,
+                        );
                     }
                 }
                 b.n_tokens = len as i32;
@@ -449,8 +455,9 @@ impl Session {
         // Bootstrap: sample from the prefill's final-token logits.
         // SAFETY: sampler chain and ctx are live; the final decode emitted logits
         // for slot last_chunk_len - 1.
-        let mut tok =
-            unsafe { raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), (last_chunk_len - 1) as i32) };
+        let mut tok = unsafe {
+            raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), (last_chunk_len - 1) as i32)
+        };
 
         let mut generated: u32 = 0;
         let mut scratch = String::new();
@@ -598,7 +605,13 @@ fn flush_utf8_tail(out: &mut String) {
 ///
 /// # Safety
 /// `i` must be below the `n_tokens` the `Batch` was initialized with.
-unsafe fn fill_slot(b: &mut raw::llama_batch, i: usize, token: i32, pos: raw::llama_pos, wants_logits: bool) {
+unsafe fn fill_slot(
+    b: &mut raw::llama_batch,
+    i: usize,
+    token: i32,
+    pos: raw::llama_pos,
+    wants_logits: bool,
+) {
     // SAFETY: caller guarantees i is below the allocated n_tokens; each field of
     // slot i is written once, before any decode observes it.
     unsafe {
@@ -635,7 +648,14 @@ unsafe fn apply_template(
     // the documented sizing call (returns the total number of bytes needed,
     // negative on detection/apply failure).
     let n = unsafe {
-        raw::llama_chat_apply_template(tmpl.as_ptr(), chat.as_ptr(), n_msg, add_ass, std::ptr::null_mut(), 0)
+        raw::llama_chat_apply_template(
+            tmpl.as_ptr(),
+            chat.as_ptr(),
+            n_msg,
+            add_ass,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if n < 0 {
         return Err(EngineError::TemplateApply(n));
@@ -643,7 +663,14 @@ unsafe fn apply_template(
     let mut buf = vec![0u8; usize::try_from(n).unwrap_or(0) + 1];
     // SAFETY: buf is n+1 zeroed bytes and length n matches the sizing result.
     let written = unsafe {
-        raw::llama_chat_apply_template(tmpl.as_ptr(), chat.as_ptr(), n_msg, add_ass, buf.as_mut_ptr().cast(), n)
+        raw::llama_chat_apply_template(
+            tmpl.as_ptr(),
+            chat.as_ptr(),
+            n_msg,
+            add_ass,
+            buf.as_mut_ptr().cast(),
+            n,
+        )
     };
     if written < 0 {
         return Err(EngineError::TemplateApply(written));
@@ -712,9 +739,8 @@ unsafe fn tokenize_prompt(
 /// a valid token id.
 unsafe fn token_piece(vocab: *const raw::llama_vocab, token: raw::llama_token) -> Vec<u8> {
     // SAFETY: null/0 buffer only sizes; nothing is written through the null pointer.
-    let needed = unsafe {
-        raw::llama_token_to_piece(vocab, token, std::ptr::null_mut(), 0, 0, false)
-    };
+    let needed =
+        unsafe { raw::llama_token_to_piece(vocab, token, std::ptr::null_mut(), 0, 0, false) };
     let n = needed.unsigned_abs() as usize;
     if n == 0 {
         return Vec::new();

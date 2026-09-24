@@ -7,12 +7,21 @@ use golem_engine::session::{ChatTurn, Session};
 
 #[test]
 fn chat_completes_on_tiny_moe() {
-    let cfg = EngineConfig { model_path: common::tiny_moe_path(), n_predict: 8, ..Default::default() };
+    let cfg = EngineConfig {
+        model_path: common::tiny_moe_path(),
+        n_predict: 8,
+        ..Default::default()
+    };
     let mut session = Session::new(&cfg).unwrap();
 
     let mut out = String::new();
-    let turns = [ChatTurn { role: "user", content: "hello" }];
-    let n = session.chat_turn(&turns, &mut |piece| out.push_str(piece)).unwrap();
+    let turns = [ChatTurn {
+        role: "user",
+        content: "hello",
+    }];
+    let n = session
+        .chat_turn(&turns, &mut |piece| out.push_str(piece))
+        .unwrap();
 
     // If the greedy chain samples EOG immediately (empty output), switch the
     // smoke prompt between the reserved tokens (▁hello → ▁world → "hello
@@ -21,12 +30,21 @@ fn chat_completes_on_tiny_moe() {
     assert!(n <= 8, "generated {n} tokens, n_predict = 8");
 
     let bos = session.last_prompt_tokens()[0];
-    assert_eq!(session.last_prompt_tokens().iter().filter(|&&t| t == bos).count(), 1,
-        "exactly one BOS expected (add_special=true + BOS-less fallback template)");
+    assert_eq!(
+        session
+            .last_prompt_tokens()
+            .iter()
+            .filter(|&&t| t == bos)
+            .count(),
+        1,
+        "exactly one BOS expected (add_special=true + BOS-less fallback template)"
+    );
 
     let mut session2 = Session::new(&cfg).unwrap();
     let mut out2 = String::new();
-    let n2 = session2.chat_turn(&turns, &mut |p| out2.push_str(p)).unwrap();
+    let n2 = session2
+        .chat_turn(&turns, &mut |p| out2.push_str(p))
+        .unwrap();
     assert_eq!((n, out), (n2, out2), "greedy decode must be deterministic");
 }
 
@@ -40,7 +58,13 @@ fn prompt_longer_than_ctx_is_rejected_loudly() {
     };
     let mut session = Session::new(&cfg).unwrap();
     let long = "hello ".repeat(200);
-    let turns = [ChatTurn { role: "user", content: long.as_str() }];
+    let turns = [ChatTurn {
+        role: "user",
+        content: long.as_str(),
+    }];
     let r = session.chat_turn(&turns, &mut |_| {});
-    assert!(r.is_err(), "oversized prompt must fail loudly, not truncate silently");
+    assert!(
+        r.is_err(),
+        "oversized prompt must fail loudly, not truncate silently"
+    );
 }
