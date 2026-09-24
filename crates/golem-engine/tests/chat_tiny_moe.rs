@@ -68,3 +68,27 @@ fn prompt_longer_than_ctx_is_rejected_loudly() {
         "oversized prompt must fail loudly, not truncate silently"
     );
 }
+
+#[test]
+fn zero_n_predict_prefills_without_generating() {
+    let cfg = EngineConfig {
+        model_path: common::tiny_moe_path(),
+        n_predict: 0,
+        ..Default::default()
+    };
+    let mut session = Session::new(&cfg).unwrap();
+    let mut out = String::new();
+    let turns = [ChatTurn {
+        role: "user",
+        content: "hello",
+    }];
+    let n = session
+        .chat_turn(&turns, &mut |piece| out.push_str(piece))
+        .unwrap();
+    assert_eq!(n, 0, "n_predict = 0 must generate no tokens");
+    assert!(out.is_empty(), "n_predict = 0 must not emit pieces");
+    assert!(
+        !session.last_prompt_tokens().is_empty(),
+        "prefill still tokenizes the prompt"
+    );
+}

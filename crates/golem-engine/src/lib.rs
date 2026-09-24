@@ -1,6 +1,5 @@
 //! Model loading, decode loop, and llama.h glue (tech design section 7).
 
-
 pub mod config;
 pub mod error;
 pub mod gguf;

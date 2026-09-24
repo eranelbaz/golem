@@ -27,7 +27,6 @@ impl Model {
     }
 
     /// Embedded chat template, `None` when the model ships none.
-    #[allow(dead_code)] // consumed by Task 5's chat_turn
     pub(crate) fn chat_template(&self) -> Option<String> {
         // SAFETY: self.ptr is a live llama_model from llama_model_load_from_file;
         // null name selects the default template (vendor/llama.cpp/include/llama.h).
@@ -77,7 +76,8 @@ impl Drop for Context {
     }
 }
 
-/// RAII guard around `llama_batch_init`/`llama_batch_free`, reused by Task 5's chat_turn.
+/// RAII guard around `llama_batch_init`/`llama_batch_free`, shared by
+/// `Session::chat_turn`.
 pub(crate) struct Batch {
     inner: raw::llama_batch,
 }
@@ -100,7 +100,7 @@ impl Drop for Batch {
     }
 }
 
-/// A loaded model plus a ready context, usable for `chat_turn` (Task 5).
+/// A loaded model plus a ready context, usable for `Session::chat_turn`.
 pub struct LoadedModel {
     // Load-bearing field order: fields drop top-to-bottom, and the context must be
     // freed (llama_free) *before* the model it dereferences (llama_model_free) —
@@ -371,8 +371,10 @@ impl Session {
     /// Runs one chat turn: renders `messages` with the session template,
     /// clears the KV cache, re-prefills the full transcript in chunks, then
     /// greedily generates until EOG, `n_ctx - 1` positions, or `n_predict`
-    /// tokens. Piece bytes stream through `emit` as they complete UTF-8
-    /// characters (verbatim — no space stripping). Returns tokens generated.
+    /// tokens (`n_predict == 0` samples and generates nothing: the turn is
+    /// prefill-only and returns 0). Piece bytes stream through `emit` as they
+    /// complete UTF-8 characters (verbatim — no space stripping). Returns
+    /// tokens generated.
     pub fn chat_turn(
         &mut self,
         messages: &[ChatTurn<'_>],
@@ -447,6 +449,12 @@ impl Session {
             }
             n_past += len;
             last_chunk_len = len;
+        }
+
+        // No generation requested: the turn is prefill-only. The UTF-8 pending
+        // buffer was never touched this turn, so there is no tail to flush.
+        if self.config.n_predict == 0 {
+            return Ok(0);
         }
 
         // Greedy sampler chain; the chain owns the greedy sampler and frees it.

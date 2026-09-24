@@ -18,10 +18,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub prompt: Option<String>,
     /// Maximum tokens to generate per completion (engine §7.2 default: 64).
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
     pub n_predict: u32,
     /// Context size in KV cache slots (engine §7.2 default: 256).
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(2..))]
     pub ctx: u32,
 }
 
