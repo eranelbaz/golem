@@ -240,6 +240,36 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         // overrides pin expert tensors to the CPU buffer type by handle; the
         // loader compares overrides against exactly this pointer.
         .allowlist_function("ggml_backend_cpu_buffer_type")
+        // T1 op-parity leg (M1.4 Task 4): the minimal ggml FFI surface for
+        // golem-engine/src/parity_op.rs (design §13: raw ggml FFI is confined
+        // to that module, so the bindings stay as narrow as possible).
+        // Context lifecycle:
+        .allowlist_function("ggml_init")
+        .allowlist_function("ggml_free")
+        // Synthetic tensor creation + data access (shapes [k, m, n_expert],
+        // [k, 1, n_ids], [1, n_ids] i32 — mul_mat_id requires 2d/3d tensors):
+        .allowlist_function("ggml_new_tensor_2d")
+        .allowlist_function("ggml_new_tensor_3d")
+        .allowlist_function("ggml_get_data")
+        .allowlist_function("ggml_get_data_f32")
+        .allowlist_function("ggml_nbytes")
+        // The op itself plus graph build + CPU compute:
+        .allowlist_function("ggml_mul_mat_id")
+        .allowlist_function("ggml_new_graph")
+        .allowlist_function("ggml_build_forward_expand")
+        .allowlist_function("ggml_graph_compute_with_ctx")
+        // Q8_0 variant quantizer:
+        .allowlist_function("ggml_quantize_chunk")
+        // Types used (or pinned for stability) by the parity_op.rs FFI:
+        // the opaque handle trio, the init params struct, and the two enums
+        // referenced by the leg (tensor dtype / graph-compute status).
+        // ggml_threadpool is deliberately absent — the leg passes a plain
+        // n_threads int to ggml_graph_compute_with_ctx.
+        .allowlist_type("ggml_context")
+        .allowlist_type("ggml_tensor")
+        .allowlist_type("ggml_cgraph")
+        .allowlist_type("ggml_init_params")
+        .allowlist_type("ggml_status")
         .allowlist_type("llama_.*")
         .allowlist_type("golem_.*")
         .allowlist_var("LLAMA_.*")

@@ -2,6 +2,7 @@
 //! Bare `golem` (no subcommand) prints the version.
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 mod run;
 
@@ -28,6 +29,18 @@ enum Command {
         #[command(flatten)]
         args: run::RunArgs,
     },
+    /// Compute the T1 op-parity leg (M1.4): run `ggml_mul_mat_id` over
+    /// synthetic expert tensors and write a checksum-per-expert-id JSONL dump.
+    /// Fully synthetic — no model file is read.
+    ParityOp {
+        /// Where to write the op dump (JSONL, written atomically).
+        #[arg(long, value_name = "FILE")]
+        dump: PathBuf,
+        /// Expert-weight encoding for the leg: `fp32` or the Q8_0-quantized
+        /// variant (same weights, ggml-quantized; compute stays f32).
+        #[arg(long, value_parser = ["fp32", "q8_0"], default_value = "fp32")]
+        quant: String,
+    },
 }
 
 fn main() {
@@ -38,6 +51,22 @@ fn main() {
             Ok(())
         }
         Some(Command::Run { args, .. }) => run::run(&args),
+        Some(Command::ParityOp { dump, quant }) => {
+            let quant = match quant.as_str() {
+                "fp32" => golem_engine::Quant::Fp32,
+                "q8_0" => golem_engine::Quant::Q8_0,
+                other => unreachable!("clap value_parser restricts quant, got {other:?}"),
+            };
+            golem_engine::run_op_leg(&dump, quant)
+                .map(|_| {
+                    eprintln!(
+                        "op dump: {} ids -> {}",
+                        golem_engine::parity_op::OP_N_IDS,
+                        dump.display()
+                    );
+                })
+                .map_err(Into::into)
+        }
     };
     if let Err(e) = status {
         eprintln!("error: {e}");

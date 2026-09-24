@@ -30,6 +30,11 @@ pub enum EngineError {
     /// llama_decode returned nonzero (positive: no KV slot / aborted; negative: fatal).
     #[error("llama_decode failed with code {0}")]
     Decode(i32),
+    /// T1 op-parity leg (M1.4): raw ggml failure — `ggml_init` returned null,
+    /// a tensor allocation failed, or the graph compute reported a
+    /// non-success [`ggml_status`].
+    #[error("ggml op-parity leg failed: {0}")]
+    OpCompute(String),
     /// Filesystem failure.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
