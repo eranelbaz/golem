@@ -2,4 +2,5 @@
 #![allow(missing_docs)]
 pub mod gguf;
 pub mod parity;
+pub mod parity_compare;
 pub mod tiny_moe;
