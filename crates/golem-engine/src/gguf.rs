@@ -283,7 +283,6 @@ pub fn read_metadata(path: &Path) -> Result<GgufMetadata, EngineError> {
 
 /// Shared in-memory metadata builder for engine tests.
 #[cfg(test)]
-#[allow(dead_code)] // consumed by sanity-check tests in the next task
 pub(crate) mod test_gguf {
     use super::*;
 
