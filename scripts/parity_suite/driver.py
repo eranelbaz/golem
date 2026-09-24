@@ -68,9 +68,16 @@ def t1_args(bin_path: str, dump_path: str, quant: str) -> list[str]:
     return [bin_path, "parity-op", "--dump", dump_path, "--quant", quant]
 
 
-def t2_args(bin_path: str, model: str, prompt: str, dump_path: str) -> list[str]:
-    return [bin_path, "run", "--greedy", model, "--prompt", prompt,
+def t2_args(bin_path: str, model: str, prompt: str, dump_path: str,
+            threads: int | None = None) -> list[str]:
+    """One T2 leg invocation. `threads` (the Task 7 calibration knob) maps to
+    `golem run --threads N` → EngineConfig.threads; None passes no flag, so
+    the leg runs at the engine default."""
+    args = [bin_path, "run", "--greedy", model, "--prompt", prompt,
             "--parity-dump", dump_path]
+    if threads is not None:
+        args += ["--threads", str(threads)]
+    return args
 
 
 def resolve_comparator(explicit: str | None) -> list[str]:
@@ -220,7 +227,8 @@ def build_report(state: dict) -> dict:
         "quant": state.get("quant"),
         "skip_hip": state.get("skip_hip", False),
         "params": {"epsilon": state.get("epsilon"), "threshold_pct": state.get("threshold_pct"),
-                   "bound": state.get("bound")},
+                   "bound": state.get("bound"),
+                   "threads_a": state.get("threads_a"), "threads_b": state.get("threads_b")},
         "model": state.get("model"),
         "legs": legs,
         "t1": state.get("t1"),
@@ -259,12 +267,28 @@ def _run_leg(state: dict, outdir: str, logdir: str, name: str,
     write_report(state, outdir)
 
 
+def _check_threads(threads_a: int | None, threads_b: int | None) -> None:
+    """The knobs must be engine-plausible before any leg starts (golem run
+    itself rejects `--threads 0`; failing here keeps the failure message
+    beside the knob that caused it)."""
+    for knob, threads in (("threads-a", threads_a), ("threads-b", threads_b)):
+        if threads is not None and threads < 1:
+            sys.exit(f"FATAL: --{knob} must be >= 1, got {threads}")
+
+
 def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant: str,
               skip_hip: bool, timeout_s: int, xtask: str | None,
-              epsilon: float, threshold_pct: float, bound: float) -> int:
+              epsilon: float, threshold_pct: float, bound: float,
+              threads_a: int | None = None, threads_b: int | None = None) -> int:
     """Full suite: provenance gate → T1 legs → T2 legs (8 prompts × legs) →
     per-pair compare → merged report. Returns 0 iff every leg succeeded and
-    both merged T1/T2 sections pass."""
+    both merged T1/T2 sections pass.
+
+    `threads_a` / `threads_b` are the Task 7 calibration knobs: per-leg T2
+    decode-thread counts (leg A = cpu, leg B = hip). None (the default) runs
+    the leg with no `--threads` flag at the engine default; together they
+    express the reference-vs-reference matrix (e.g. cpu-t16 vs cpu-t4)."""
+    _check_threads(threads_a, threads_b)
     tree_hash = pin_sha()
     check_vendor_pin(tree_hash)
     check_lock_pin(tree_hash)
@@ -293,6 +317,7 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
             "comparator": comparator_mode,
             "quant": quant, "skip_hip": skip_hip,
             "epsilon": epsilon, "threshold_pct": threshold_pct, "bound": bound,
+            "threads_a": threads_a, "threads_b": threads_b,
             "model": None, "t1": None, "t2": None, "per_prompt": [],
             "legs": {backend: {"bin": bins[backend], "t1": [], "t2": []}
                      for backend in backends},
@@ -311,7 +336,11 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
                      t1_args(bins[backend], dump_path, quant), timeout_s, backend)
             t1_dumps[backend] = dump_path
 
-        # T2 legs: one dump per (backend, prompt); same prompt text on both legs.
+        # T2 legs: one dump per (backend, prompt); same prompt text on both
+        # legs. The calibration knobs set each leg's decode threads (leg A =
+        # cpu → threads_a, leg B = hip → threads_b); T1 legs never get one
+        # (parity-op has no threads surface). With --skip-hip only leg A runs.
+        leg_threads = {"cpu": threads_a, "hip": threads_b}
         t2_dumps: dict[str, list[str]] = {}
         for backend in backends:
             t2_dumps[backend] = []
@@ -319,7 +348,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
                 dump_path = os.path.join(outdir, f"t2-{backend}-{idx}.jsonl")
                 state["legs"][backend]["t2"].append(os.path.basename(dump_path))
                 _run_leg(state, outdir, logdir, f"t2-{backend}-{idx}",
-                         t2_args(bins[backend], model, prompt, dump_path), timeout_s, backend)
+                         t2_args(bins[backend], model, prompt, dump_path,
+                                 leg_threads[backend]), timeout_s, backend)
                 t2_dumps[backend].append(dump_path)
 
         state["model"] = dump_header_identity(t2_dumps["cpu"] + t2_dumps.get("hip", []))

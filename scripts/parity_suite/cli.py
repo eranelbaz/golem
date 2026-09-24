@@ -41,6 +41,12 @@ def main(argv: list[str] | None = None) -> int:
                      help="T2 required match-rate percentage")
     run.add_argument("--bound", type=float, default=DEFAULT_BOUND,
                      help="T1 max-abs checksum bound")
+    run.add_argument("--threads-a", type=int, default=None,
+                     help="decode threads for the cpu (leg A) T2 golem invocations "
+                          "(golem run --threads); default: no flag, engine default")
+    run.add_argument("--threads-b", type=int, default=None,
+                     help="decode threads for the hip (leg B) T2 golem invocations "
+                          "(golem run --threads); default: no flag, engine default")
     ns = ap.parse_args(argv)
     if ns.selftest:
         return selftest()
@@ -50,7 +56,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_suite(cpu_bin=ns.cpu_bin, hip_bin=ns.hip_bin, model=ns.model,
                          outdir=ns.out, quant=ns.quant, skip_hip=ns.skip_hip,
                          timeout_s=ns.timeout, xtask=ns.xtask, epsilon=ns.epsilon,
-                         threshold_pct=ns.threshold, bound=ns.bound)
+                         threshold_pct=ns.threshold, bound=ns.bound,
+                         threads_a=ns.threads_a, threads_b=ns.threads_b)
     ap.print_help()
     return 2
 

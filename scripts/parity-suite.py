@@ -7,6 +7,7 @@ Commands:
   run --cpu-bin <path> --hip-bin <path> --model <path> --out DIR
       [--quant fp32|q8_0] [--skip-hip] [--timeout S] [--xtask BIN]
       [--epsilon E] [--threshold PCT] [--bound B]
+      [--threads-a N] [--threads-b N]
   --selftest
 """
 import os

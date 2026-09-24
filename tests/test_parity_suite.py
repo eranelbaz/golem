@@ -152,9 +152,12 @@ else:
     model = open(args[args.index("--greedy") + 1], "rb").read()
     sha = hashlib.sha256(model).hexdigest()
     out, prompt = value("--parity-dump"), value("--prompt")
+    # Record the pass-through `--threads` value (Task 7 calibration knob) so
+    # tests can assert exactly which flag each leg received; None = flag absent.
+    threads = args[args.index("--threads") + 1] if "--threads" in args else None
     header = {"format": "golem-parity-dump", "version": 1, "model_sha256": sha,
               "model_bytes": len(model), "backend": backend, "offload": backend == "hip",
-              "prompt_tokens": len(prompt.split()), "n_predict": 3}
+              "prompt_tokens": len(prompt.split()), "n_predict": 3, "threads": threads}
     body = "".join(json.dumps({"position": p, "token": p + 1, "top1": 2.0, "top2": 0.5}) + "\\n"
                    for p in range(3))
 with open(out, "w") as f:
@@ -201,10 +204,42 @@ def test_run_mode_end_to_end_passes_with_stub_binaries(tmp_path):
     assert [v["verdict"] for v in report["per_prompt"]] == ["exact"] * 8
     assert report["legs"]["cpu"]["bin"] == "golem-cpu"
     assert report["legs"]["hip"]["bin"] == "golem-hip"
+    # Threads knobs unset → no injection at all (engine default on both legs).
+    assert report["params"]["threads_a"] is None and report["params"]["threads_b"] is None
+    header = _dump_header(tmp_path / "out" / "t2-cpu-0.jsonl")
+    assert header["threads"] is None, "no --threads flag may reach the leg"
     # Scrub: neither the stub paths nor the out dir may reach report or stdout.
     raw_report = (tmp_path / "out" / "report.json").read_text()
     for artifact in (raw_report, proc.stdout):
         assert str(tmp_path) not in artifact
+
+
+def _dump_header(path) -> dict:
+    return json.loads(open(path).readline())
+
+
+def test_run_mode_passes_threads_through_to_t2_legs(tmp_path):
+    """--threads-a/--threads-b map onto `golem run --threads N` per leg
+    (leg A = cpu, leg B = hip) and land in report params; T1 legs never
+    receive a threads flag (parity-op has no threads surface)."""
+    proc, report = _run_suite(tmp_path, ["--threads-a", "16", "--threads-b", "4"])
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert report["status"] == "complete" and report["pass"] is True
+    assert report["params"]["threads_a"] == 16 and report["params"]["threads_b"] == 4
+    out = tmp_path / "out"
+    for idx in range(8):
+        assert _dump_header(out / f"t2-cpu-{idx}.jsonl")["threads"] == "16"
+        assert _dump_header(out / f"t2-hip-{idx}.jsonl")["threads"] == "4"
+    for backend in ("cpu", "hip"):
+        t1_header = _dump_header(out / f"t1-{backend}-fp32.jsonl")
+        assert "threads" not in t1_header, "T1 legs must not carry a threads flag"
+
+
+def test_run_mode_rejects_non_positive_threads_before_any_leg(tmp_path):
+    proc, report = _run_suite(tmp_path, ["--threads-a", "0"])
+    assert proc.returncode == 1
+    assert report is None, "validation fails before the out dir is created"
+    assert "--threads-a" in proc.stderr and "FATAL" in proc.stderr
 
 
 def test_run_mode_skip_hip_self_compares_cpu(tmp_path):
