@@ -13,6 +13,7 @@ use golem_llama_sys::{Backend, substrate_backend};
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::gguf;
+use crate::parity::{self, ParityStep};
 use crate::sanity;
 
 /// Owned `llama_model` handle; `Drop` calls `llama_model_free`.
@@ -382,7 +383,7 @@ impl Session {
         emit: &mut dyn FnMut(&str),
     ) -> Result<u32, EngineError> {
         let mut pending = Vec::new();
-        match self.chat_turn_inner(&mut pending, messages, emit) {
+        match self.chat_turn_inner(&mut pending, messages, emit, None) {
             Ok(n) => Ok(n),
             Err(e) => {
                 let mut tail = String::new();
@@ -395,11 +396,31 @@ impl Session {
         }
     }
 
+    /// Runs one chat turn exactly like [`Session::chat_turn`] (same
+    /// `config.n_predict`, same greedy sampler chain) but discards text output
+    /// and instead records one [`ParityStep`] per `llama_sampler_sample` call
+    /// into `steps` (cleared first): the sampler's token choice plus the two
+    /// largest logits of the row it was sampled from. `position` is the
+    /// 0-based generation-step index, not `llama_pos`; a trailing EOG sample is
+    /// recorded but not counted in the returned token count. Returns tokens
+    /// generated.
+    pub fn chat_turn_parity(
+        &mut self,
+        messages: &[ChatTurn<'_>],
+        steps: &mut Vec<ParityStep>,
+    ) -> Result<u32, EngineError> {
+        steps.clear();
+        let mut pending = Vec::new();
+        let mut sink = |_: &str| {};
+        self.chat_turn_inner(&mut pending, messages, &mut sink, Some(steps))
+    }
+
     fn chat_turn_inner(
         &mut self,
         pending: &mut Vec<u8>,
         messages: &[ChatTurn<'_>],
         emit: &mut dyn FnMut(&str),
+        mut steps: Option<&mut Vec<ParityStep>>,
     ) -> Result<u32, EngineError> {
         let msgs = ffi_messages(messages)?;
         // SAFETY: template and msgs CStrings are alive for the duration of the call.
@@ -473,6 +494,11 @@ impl Session {
             return Ok(0);
         }
 
+        // Parity recording needs the logits row length, which is the vocab size
+        // (validated non-negative by the load-time decode self-check probe).
+        let n_vocab = usize::try_from(unsafe { raw::llama_vocab_n_tokens(vocab) })
+            .map_err(|_| EngineError::InvalidModel("vocab size is negative".to_owned()))?;
+
         // Greedy sampler chain; the chain owns the greedy sampler and frees it.
         let sampler = Sampler::greedy();
 
@@ -481,6 +507,22 @@ impl Session {
         let mut tok = unsafe {
             raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), (last_chunk_len - 1) as i32)
         };
+        if let Some(steps) = steps.as_mut() {
+            // Generation step 0: the bootstrap sample off the final prompt-token
+            // logits. The token is the sampler's output; fetch the same row's
+            // top-2 alongside (pure read — no decode behavior change).
+            // SAFETY: the successful final-chunk decode emitted logits for slot
+            // last_chunk_len - 1; n_vocab is that row's length.
+            let (top1, top2) = unsafe {
+                parity::top2_logits_ith(ctx.as_ptr(), (last_chunk_len - 1) as i32, n_vocab)
+            };
+            steps.push(ParityStep {
+                position: 0,
+                token: tok,
+                top1,
+                top2,
+            });
+        }
 
         let mut generated: u32 = 0;
         let mut scratch = String::new();
@@ -516,6 +558,18 @@ impl Session {
             n_past += 1;
             // SAFETY: sampler chain and ctx are live; the decode emitted logits for slot 0.
             tok = unsafe { raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), 0) };
+            if let Some(steps) = steps.as_mut() {
+                // `generated` counts prior non-EOG samples, which is exactly the
+                // 0-based index of the sample just taken.
+                // SAFETY: the successful single-token decode emitted logits for slot 0.
+                let (top1, top2) = unsafe { parity::top2_logits_ith(ctx.as_ptr(), 0, n_vocab) };
+                steps.push(ParityStep {
+                    position: generated,
+                    token: tok,
+                    top1,
+                    top2,
+                });
+            }
         }
         // Turn end: flush whatever bytes remain buffered (n_predict can cut a
         // multi-byte character in half — lossy-drain that residue).
