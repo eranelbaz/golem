@@ -27,6 +27,28 @@ pub struct RunArgs {
     /// Context size in KV cache slots (engine §7.2 default: 256).
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(2..))]
     pub ctx: u32,
+    /// Decode threads (engine §7.2 default: 1). The M1.4 calibration matrix
+    /// runs reference-vs-reference legs at differing thread counts
+    /// (cpu-t16 vs cpu-t4), so the suite driver injects this flag per leg.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    pub threads: u32,
+    /// Model layers to offload to the GPU (`EngineConfig::n_gpu_layers`):
+    /// 0 keeps the whole model on CPU (the CI-leg default); the hardware HIP
+    /// parity leg uses 99. Without this knob a "hip"-labeled binary would
+    /// silently run on CPU.
+    #[arg(long, default_value_t = 0)]
+    pub n_gpu_layers: u32,
+    /// Force Flash Attention on (`EngineConfig::flash_attn_on` —
+    /// `LLAMA_FLASH_ATTN_TYPE_ENABLED`); without it llama.cpp's AUTO default
+    /// applies. Hardware parity legs run `fa = on` on both backends.
+    #[arg(long)]
+    pub flash_attn: bool,
+    /// Expert (MoE) FFN weights of the first N layers pinned to CPU buffers
+    /// (`EngineConfig::cpu_moe_layers` — the public-API equivalent of the
+    /// vendor's `-ncmoe N`; unset keeps the llama.cpp default). The hardware
+    /// HIP leg combines this with `--n-gpu-layers` to reproduce `-ncmoe 45`.
+    #[arg(long, value_parser = clap::value_parser!(u32))]
+    pub cpu_moe_layers: Option<u32>,
     /// Write a T2 parity dump (JSONL: line-1 header, then one record per
     /// generation step) to this file instead of streaming the completion;
     /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
@@ -35,18 +57,32 @@ pub struct RunArgs {
     pub parity_dump: Option<PathBuf>,
 }
 
+impl RunArgs {
+    /// Maps the CLI surface onto `EngineConfig` (flag name ↔ config field):
+    /// `--ctx` → `n_ctx`, `--threads` → `threads`, `--n-gpu-layers` →
+    /// `n_gpu_layers`, `--flash-attn` → `flash_attn_on`, `--cpu-moe-layers`
+    /// → `cpu_moe_layers`. Everything else stays at the engine default.
+    pub fn to_config(&self) -> EngineConfig {
+        EngineConfig {
+            model_path: self.model.clone(),
+            n_ctx: self.ctx,
+            n_predict: self.n_predict,
+            threads: self.threads,
+            n_gpu_layers: self.n_gpu_layers,
+            flash_attn_on: self.flash_attn,
+            cpu_moe_layers: self.cpu_moe_layers,
+            ..EngineConfig::default()
+        }
+    }
+}
+
 /// Runs one greedy `run` invocation: loads the model, then either prints a
 /// single completion (`--prompt`) or serves per-line single-turn conversations
 /// on stdin until EOF. Returns `Err` for load/init failures and one-shot
 /// decode errors (process unusable); per-turn REPL errors are printed and the
 /// loop continues.
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
-    let config = EngineConfig {
-        model_path: args.model.clone(),
-        n_ctx: args.ctx,
-        n_predict: args.n_predict,
-        ..EngineConfig::default()
-    };
+    let config = args.to_config();
     let mut session = Session::new(&config)?;
 
     match (&args.prompt, &args.parity_dump) {
@@ -238,6 +274,7 @@ fn emit_stdout(piece: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{Args as _, FromArgMatches as _};
     use golem_engine::ParityStep;
 
     /// Known digest of `b"hello parity\n"` (computed with python3 hashlib).
@@ -424,6 +461,87 @@ mod tests {
         assert_eq!(sha, SHA_CHUNKED);
         assert_eq!(bytes, 2_621_440);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Parses a `run` flag tail through the real clap definition (augment the
+    /// subcommand's args onto a bare command), so the tests pin the exact
+    /// flag spellings users and the suite driver rely on.
+    fn parse_run_args(argv: &[&str]) -> RunArgs {
+        let matches = RunArgs::augment_args(clap::Command::new("run"))
+            .try_get_matches_from(argv)
+            .expect("test argv must parse");
+        RunArgs::from_arg_matches(&matches).expect("matches fit RunArgs")
+    }
+
+    #[test]
+    fn run_args_default_to_the_cpu_only_config() {
+        let config = parse_run_args(&["run", "model.gguf"]).to_config();
+        assert_eq!(config.model_path, PathBuf::from("model.gguf"));
+        assert_eq!(config.n_ctx, 256);
+        assert_eq!(config.n_predict, 64);
+        assert_eq!(config.threads, 1, "engine §7.2 default");
+        assert_eq!(config.n_gpu_layers, 0, "default offloads nothing");
+        assert!(
+            !config.flash_attn_on,
+            "default leaves flash attention at AUTO"
+        );
+        assert_eq!(
+            config.cpu_moe_layers, None,
+            "default writes no buft overrides"
+        );
+    }
+
+    #[test]
+    fn run_args_map_offload_and_threads_flags_into_config() {
+        // The Task 7 hardware HIP leg: n_gpu_layers=99, fa=ON, -ncmoe 45, t16.
+        let args = parse_run_args(&[
+            "run",
+            "model.gguf",
+            "--threads",
+            "16",
+            "--n-gpu-layers",
+            "99",
+            "--flash-attn",
+            "--cpu-moe-layers",
+            "45",
+        ]);
+        assert_eq!(args.n_predict, 64, "n_predict default untouched");
+        let config = args.to_config();
+        assert_eq!(config.threads, 16);
+        assert_eq!(config.n_gpu_layers, 99);
+        assert!(config.flash_attn_on);
+        assert_eq!(config.cpu_moe_layers, Some(45));
+    }
+
+    #[test]
+    fn run_args_flags_are_independent() {
+        // Each knob maps on its own — e.g. the t16-vs-t4 calibration legs
+        // change only threads, the mislabeled-leg probe changes only layers.
+        let config = parse_run_args(&["run", "m.gguf", "--threads", "4"]).to_config();
+        assert_eq!(config.threads, 4);
+        assert_eq!(config.n_gpu_layers, 0);
+        assert!(!config.flash_attn_on);
+        assert_eq!(config.cpu_moe_layers, None);
+
+        let config = parse_run_args(&["run", "m.gguf", "--n-gpu-layers", "7"]).to_config();
+        assert_eq!(config.threads, 1);
+        assert_eq!(config.n_gpu_layers, 7);
+        assert!(!config.flash_attn_on);
+        assert_eq!(config.cpu_moe_layers, None);
+
+        let config = parse_run_args(&["run", "m.gguf", "--flash-attn"]).to_config();
+        assert!(config.flash_attn_on);
+        assert_eq!(config.n_gpu_layers, 0);
+        assert_eq!(config.cpu_moe_layers, None);
+    }
+
+    #[test]
+    fn run_args_reject_zero_threads_and_layers_boundary_values() {
+        // `--threads 0` would make llama_decode run with no threads.
+        let err = RunArgs::augment_args(clap::Command::new("run"))
+            .try_get_matches_from(["run", "m.gguf", "--threads", "0"])
+            .expect_err("threads must be >= 1");
+        assert!(err.kind() == clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
