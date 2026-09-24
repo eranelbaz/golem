@@ -3,16 +3,33 @@
 //! Scope: models only the metadata value types the tiny-moe generator writes
 //! (U32/F32/Str scalars and I32/F32/Str arrays) — not a general GGUF serializer.
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufReader, Read, Write};
+use std::path::Path;
 
 /// ggml tensor-type id — distinct namespace from the GGUF value-type tags below.
 pub const GGML_TYPE_F32: u32 = 0;
+// GGUF v3 value-type tags (ggml/include/gguf.h): 0=u8 1=i8 2=u16 3=i16 4=u32
+// 5=i32 6=f32 7=bool 8=str 9=array 10=u64 11=i64 12=f64.
+const GGUF_TYPE_U8: u32 = 0;
+const GGUF_TYPE_I8: u32 = 1;
+const GGUF_TYPE_U16: u32 = 2;
+const GGUF_TYPE_I16: u32 = 3;
 const GGUF_TYPE_U32: u32 = 4;
 const GGUF_TYPE_I32: u32 = 5;
 const GGUF_TYPE_F32: u32 = 6;
+const GGUF_TYPE_BOOL: u32 = 7;
 const GGUF_TYPE_STR: u32 = 8;
 const GGUF_TYPE_ARR: u32 = 9;
+const GGUF_TYPE_U64: u32 = 10;
+const GGUF_TYPE_I64: u32 = 11;
+const GGUF_TYPE_F64: u32 = 12;
 const ALIGN: u64 = 32;
+const GGUF_MAGIC: [u8; 4] = *b"GGUF";
+
+/// Upper bound per `read_exact` call in [`read_bytes`], so a forged length
+/// cannot drive a huge single allocation before the short read is detected.
+const READ_CHUNK: usize = 64 * 1024;
 
 pub enum GgufValue {
     U32(u32),
@@ -143,6 +160,122 @@ pub fn write_gguf(
 
 fn align_up(v: u64) -> u64 {
     v.div_ceil(ALIGN) * ALIGN
+}
+
+fn short_read(e: std::io::Error) -> String {
+    format!("truncated GGUF metadata: {e}")
+}
+
+fn read_le_u32(r: &mut impl Read) -> Result<u32, String> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b).map_err(short_read)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_le_u64(r: &mut impl Read) -> Result<u64, String> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b).map_err(short_read)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// Reads `len` bytes in bounded chunks; allocation grows only as bytes are
+/// actually read, so a forged length fails at EOF before consuming memory.
+fn read_bytes(r: &mut impl Read, len: u64) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(READ_CHUNK as u64) as usize;
+        let start = out.len();
+        out.resize(start + chunk, 0);
+        r.read_exact(&mut out[start..]).map_err(short_read)?;
+        remaining -= chunk as u64;
+    }
+    Ok(out)
+}
+
+/// GGUF string encoding: u64 length prefix + UTF-8 bytes.
+fn read_string(r: &mut impl Read) -> Result<String, String> {
+    let len = read_le_u64(r)?;
+    let bytes = read_bytes(r, len)?;
+    String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8 in GGUF string: {e}"))
+}
+
+/// Reads and discards `len` bytes in bounded chunks.
+fn discard(r: &mut impl Read, len: u64) -> Result<(), String> {
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(READ_CHUNK as u64) as usize;
+        r.read_exact(&mut buf[..chunk]).map_err(short_read)?;
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
+/// Consumes one KV value payload of type `tag` without materializing it.
+fn skip_value(r: &mut impl Read, tag: u32) -> Result<(), String> {
+    match tag {
+        GGUF_TYPE_U8 | GGUF_TYPE_I8 | GGUF_TYPE_BOOL => discard(r, 1),
+        GGUF_TYPE_U16 | GGUF_TYPE_I16 => discard(r, 2),
+        GGUF_TYPE_U32 | GGUF_TYPE_I32 | GGUF_TYPE_F32 => discard(r, 4),
+        GGUF_TYPE_U64 | GGUF_TYPE_I64 | GGUF_TYPE_F64 => discard(r, 8),
+        GGUF_TYPE_STR => {
+            let len = read_le_u64(r)?;
+            discard(r, len)
+        }
+        GGUF_TYPE_ARR => {
+            let elem_tag = read_le_u32(r)?;
+            let n = read_le_u64(r)?;
+            for _ in 0..n {
+                skip_value(r, elem_tag)?;
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown GGUF value type tag {other}")),
+    }
+}
+
+/// Reads the `general.architecture` string KV from a GGUF v3 file without
+/// touching tensor data. Errors (as `String`) on bad magic, unsupported
+/// version, truncation, an unknown type tag, or a missing/non-string
+/// architecture KV. Substrate-free twin of golem-engine's reader: xtask
+/// cannot link golem-engine (it drags the substrate static-lib into every
+/// xtask build).
+pub fn read_arch(path: &Path) -> Result<String, String> {
+    const ARCH_KEY: &str = "general.architecture";
+    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut r = BufReader::new(file);
+
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic).map_err(short_read)?;
+    if magic != GGUF_MAGIC {
+        return Err(format!(
+            "bad magic {:?} (expected \"GGUF\")",
+            String::from_utf8_lossy(&magic)
+        ));
+    }
+    let version = read_le_u32(&mut r)?;
+    if version != 3 {
+        return Err(format!("unsupported GGUF version {version} (expected 3)"));
+    }
+    // GGUF v3 header order: n_tensors precedes n_kv (ggml/include/gguf.h).
+    let _n_tensors = read_le_u64(&mut r)?;
+    let n_kv = read_le_u64(&mut r)?;
+
+    for _ in 0..n_kv {
+        let key = read_string(&mut r)?;
+        let tag = read_le_u32(&mut r)?;
+        if key == ARCH_KEY {
+            if tag != GGUF_TYPE_STR {
+                return Err(format!(
+                    "{ARCH_KEY}: expected string value (type tag 8), got {tag}"
+                ));
+            }
+            return read_string(&mut r);
+        }
+        skip_value(&mut r, tag)?;
+    }
+    Err(format!("missing {ARCH_KEY} KV"))
 }
 
 #[cfg(test)]
@@ -300,5 +433,106 @@ mod tests {
         let not_f32 = [(meta(1), vec![0u8; 16])];
         let err = write_gguf(&mut buf, &[], &not_f32).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    fn write_temp_model(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("golem-xtask-gguf-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("m.gguf");
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn arch_only_bytes() -> Vec<u8> {
+        let kvs = vec![GgufKv {
+            key: "general.architecture".into(),
+            value: GgufValue::Str("glm4moe".into()),
+        }];
+        let mut buf = Vec::new();
+        write_gguf(&mut buf, &kvs, &[]).unwrap();
+        buf
+    }
+
+    fn cleanup(p: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn read_arch_finds_arch_after_other_kvs_and_arrays() {
+        let kvs = vec![
+            GgufKv {
+                key: "general.name".into(),
+                value: GgufValue::Str("tiny".into()),
+            },
+            GgufKv {
+                key: "tokenizer.ggml.token_type".into(),
+                value: GgufValue::ArrI32(vec![1, 2, 3]),
+            },
+            GgufKv {
+                key: "general.architecture".into(),
+                value: GgufValue::Str("glm4moe".into()),
+            },
+        ];
+        let mut buf = Vec::new();
+        write_gguf(&mut buf, &kvs, &[]).unwrap();
+        let p = write_temp_model("happy", &buf);
+        assert_eq!(read_arch(&p).unwrap(), "glm4moe");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn read_arch_rejects_bad_magic() {
+        let p = write_temp_model("badmagic", b"NOPE");
+        let err = read_arch(&p).unwrap_err();
+        assert!(err.contains("bad magic"), "{err}");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn read_arch_rejects_wrong_version() {
+        let mut b = arch_only_bytes();
+        b[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let p = write_temp_model("badver", &b);
+        let err = read_arch(&p).unwrap_err();
+        assert!(err.contains("version 2"), "{err}");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn read_arch_missing_arch_kv_is_err() {
+        let kvs = vec![GgufKv {
+            key: "general.name".into(),
+            value: GgufValue::Str("tiny".into()),
+        }];
+        let mut buf = Vec::new();
+        write_gguf(&mut buf, &kvs, &[]).unwrap();
+        let p = write_temp_model("noarch", &buf);
+        let err = read_arch(&p).unwrap_err();
+        assert!(err.contains("missing general.architecture"), "{err}");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn read_arch_rejects_non_string_arch() {
+        let kvs = vec![GgufKv {
+            key: "general.architecture".into(),
+            value: GgufValue::U32(7),
+        }];
+        let mut buf = Vec::new();
+        write_gguf(&mut buf, &kvs, &[]).unwrap();
+        let p = write_temp_model("archtype", &buf);
+        let err = read_arch(&p).unwrap_err();
+        assert!(err.contains("expected string"), "{err}");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn read_arch_rejects_truncated_file() {
+        let b = arch_only_bytes();
+        let p = write_temp_model("trunc", &b[..b.len() / 2]);
+        let err = read_arch(&p).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
+        cleanup(&p);
     }
 }

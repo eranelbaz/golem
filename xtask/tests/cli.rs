@@ -46,6 +46,43 @@ fn unknown_command_still_exits_2() {
 }
 
 #[test]
+fn parity_scaffold_reports_arch_and_json() {
+    let gguf = common::temp_dir("parity-model");
+    let model = gguf.0.join("m.gguf");
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["gen-tiny-moe", "--out"])
+        .arg(&model)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["parity", "--model"])
+        .arg(&model)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["harness"], "t2-parity");
+    assert_eq!(v["status"], "scaffold");
+    assert_eq!(v["arch"], "glm4moe");
+}
+
+#[test]
+fn parity_rejects_bad_model_with_exit_2() {
+    let dir = common::temp_dir("parity-bad");
+    let model = dir.0.join("bad.gguf");
+    std::fs::write(&model, b"NOPE").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["parity", "--model"])
+        .arg(&model)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
 fn bad_flag_exits_2() {
     let cases: [&[&str]; 2] = [
         &["gen-tiny-moe", "--bogus"],
