@@ -236,6 +236,10 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
         .allowlist_function("llama_.*")
         .allowlist_function("golem_.*")
+        // GPU-offload plumbing (M1.4 Task 3): the `-ncmoe`-equivalent buft
+        // overrides pin expert tensors to the CPU buffer type by handle; the
+        // loader compares overrides against exactly this pointer.
+        .allowlist_function("ggml_backend_cpu_buffer_type")
         .allowlist_type("llama_.*")
         .allowlist_type("golem_.*")
         .allowlist_var("LLAMA_.*")

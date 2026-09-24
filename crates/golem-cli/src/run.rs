@@ -90,6 +90,7 @@ fn one_shot_parity(
     let mut steps = Vec::new();
     session.chat_turn_parity(&messages, &mut steps)?;
     let prompt_tokens = u64::try_from(session.last_prompt_tokens().len()).unwrap_or(u64::MAX);
+    let offloaded = session.offloaded();
 
     // Hash the model file after the turn: the engine has already proven the
     // file loads, and multi-GiB hashing is worth skipping on failed runs.
@@ -100,6 +101,7 @@ fn one_shot_parity(
         model_sha256: &model_sha256,
         model_bytes,
         backend: substrate_backend().as_str(),
+        offload: offloaded,
         prompt_tokens,
         n_predict,
     };
@@ -113,9 +115,10 @@ fn one_shot_parity(
 }
 
 /// Line 1 of a parity dump. Field order is the serialization order and part of
-/// the frozen dump contract (the header is deliberately not key-sorted). The
-/// `offload` flag joins after `backend` once `EngineConfig` gains GPU-offload
-/// fields (M1.4 Task 3); until then it is omitted.
+/// the frozen dump contract (the header is deliberately not key-sorted).
+/// `offload` records the session's offload intent (`n_gpu_layers > 0`) so a
+/// "hip"-labeled leg that never asked for device execution is detectable
+/// alongside the substrate `backend` field.
 #[derive(Serialize)]
 struct ParityDumpHeader<'a> {
     format: &'static str,
@@ -123,6 +126,7 @@ struct ParityDumpHeader<'a> {
     model_sha256: &'a str,
     model_bytes: u64,
     backend: &'a str,
+    offload: bool,
     prompt_tokens: u64,
     n_predict: u32,
 }
@@ -242,13 +246,19 @@ mod tests {
     /// chunk boundary twice, pinning the streamed-read behavior.
     const SHA_CHUNKED: &str = "15012bb905af98147b23c43561f60131e7d820a874008fc5454ca85df7d7a067";
 
-    fn test_header<'a>(sha: &'a str, bytes: u64, backend: &'a str) -> ParityDumpHeader<'a> {
+    fn test_header<'a>(
+        sha: &'a str,
+        bytes: u64,
+        backend: &'a str,
+        offload: bool,
+    ) -> ParityDumpHeader<'a> {
         ParityDumpHeader {
             format: "golem-parity-dump",
             version: 1,
             model_sha256: sha,
             model_bytes: bytes,
             backend,
+            offload,
             prompt_tokens: 7,
             n_predict: 64,
         }
@@ -290,7 +300,7 @@ mod tests {
 
     #[test]
     fn parity_dump_is_valid_jsonl() {
-        let body = render_parity_dump(&test_header(SHA_SMALL, 1234, "cpu"), &test_steps());
+        let body = render_parity_dump(&test_header(SHA_SMALL, 1234, "cpu", false), &test_steps());
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 4, "1 header + 1 line per step");
 
@@ -300,6 +310,7 @@ mod tests {
         assert_eq!(h["model_sha256"], SHA_SMALL);
         assert_eq!(h["model_bytes"], 1234);
         assert_eq!(h["backend"], "cpu");
+        assert_eq!(h["offload"], false);
         assert_eq!(h["prompt_tokens"], 7);
         assert_eq!(h["n_predict"], 64);
 
@@ -321,7 +332,7 @@ mod tests {
     fn parity_dump_field_order_is_frozen() {
         // The dump contract fixes byte-level field order (diffable legs,
         // deterministic artifacts); serde struct order = serialization order.
-        let body = render_parity_dump(&test_header(SHA_SMALL, 1234, "cpu"), &test_steps());
+        let body = render_parity_dump(&test_header(SHA_SMALL, 1234, "cpu", false), &test_steps());
 
         let header = body.lines().next().unwrap();
         assert!(header.starts_with("{\"format\":\"golem-parity-dump\",\"version\":1,"));
@@ -330,12 +341,19 @@ mod tests {
             idx("\"model_sha256\"", header),
             idx("\"model_bytes\"", header),
         );
-        let (backend, prompt, npredict) = (
+        let (backend, offload, prompt, npredict) = (
             idx("\"backend\"", header),
+            idx("\"offload\"", header),
             idx("\"prompt_tokens\"", header),
             idx("\"n_predict\"", header),
         );
-        assert!(sha < bytes && bytes < backend && backend < prompt && prompt < npredict);
+        assert!(
+            sha < bytes
+                && bytes < backend
+                && backend < offload
+                && offload < prompt
+                && prompt < npredict
+        );
 
         // Step records are also key-sorted: position < token < top1 < top2.
         let step = body.lines().nth(1).unwrap();
@@ -352,9 +370,18 @@ mod tests {
     #[test]
     fn parity_dump_header_records_backend() {
         for backend in ["cpu", "hip"] {
-            let body = render_parity_dump(&test_header(SHA_SMALL, 1, backend), &[]);
+            let body = render_parity_dump(&test_header(SHA_SMALL, 1, backend, false), &[]);
             let header = body.lines().next().unwrap();
             assert!(header.contains(&format!("\"backend\":\"{backend}\"")));
+        }
+    }
+
+    #[test]
+    fn parity_dump_header_records_offload_flag() {
+        for offload in [false, true] {
+            let body = render_parity_dump(&test_header(SHA_SMALL, 1, "cpu", offload), &[]);
+            let header = body.lines().next().unwrap();
+            assert!(header.contains(&format!("\"offload\":{offload}")));
         }
     }
 
@@ -367,7 +394,7 @@ mod tests {
         std::fs::write(&model, b"weights").unwrap();
 
         let (sha, bytes) = model_identity(&model).unwrap();
-        let body = render_parity_dump(&test_header(&sha, bytes, "cpu"), &test_steps());
+        let body = render_parity_dump(&test_header(&sha, bytes, "cpu", false), &test_steps());
         assert!(!body.contains("secret-model-name"));
         assert!(!body.contains(".gguf"));
         assert!(!body.contains(dir.to_str().unwrap()));
