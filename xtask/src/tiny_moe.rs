@@ -106,7 +106,7 @@ pub fn is_expert_tensor(name: &str) -> bool {
 }
 
 fn token_table() -> Vec<(String, i32, f32)> {
-    let mut texts: Vec<String> = ["<unk>", "<s>", "</s>", "▁hello", "▁world", "<0x0A>"]
+    let mut texts: Vec<String> = ["<unk>", "<s>", "</s>", "▁hello", "▁world", "<eoln>"]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
@@ -120,7 +120,11 @@ fn token_table() -> Vec<(String, i32, f32)> {
         .zip(types)
         .map(|(text, ttype)| (text, ttype, 0.0))
         .collect();
-    // id 5 <0x0A> stays NORMAL; the appended BYTE <0x0A> duplicate is harmless (SPM token_to_id is last-wins; byte_to_token resolves through it).
+    // Token texts must be unique: llama.cpp SPM load hard-aborts (GGML_ASSERT
+    // id_to_token.size() == token_to_id.size()) when token_to_id collapses a
+    // duplicate, and byte_to_token resolves "<0xXX>" by text. The old id-5
+    // "<0x0A>" duplicated the BYTE token at 64+10 and aborted every real load;
+    // "<eoln>" keeps the slot newline-flavored without touching the byte block.
     for b in 0..=u8::MAX {
         table.push((format!("<0x{b:02X}>"), 6, 0.0));
     }
