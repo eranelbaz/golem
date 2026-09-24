@@ -19,7 +19,8 @@
 //! declaration order, and the declaration order below is the frozen report
 //! contract. Backend mismatch (cpu vs hip) is recorded in the report, never
 //! failed; cross-dump guards (format/version, prompt_tokens, step count,
-//! id set, quant/dims) are usage-class errors — exit 2.
+//! step-position alignment, per-dump position contiguity from 0, id set,
+//! quant/dims) are usage-class errors — exit 2.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -58,6 +59,28 @@ pub enum CompareError {
         /// Step count of leg B.
         b: usize,
     },
+    /// T2 guard: at some step index the two dumps record different
+    /// `position` values. The comparison walks both step lists by index, so
+    /// mis-aligned dumps would compare unrelated generation steps.
+    PositionMismatch {
+        /// 0-based step index where the positions disagree.
+        index: usize,
+        /// Position recorded by leg A at that index.
+        a: u32,
+        /// Position recorded by leg B at that index.
+        b: u32,
+    },
+    /// T2 guard: a dump's step positions are not contiguous from 0 (the dump
+    /// contract records every generation step, 0-based, in dump order; gaps
+    /// or a non-zero start would silently mis-align the index pairing).
+    NonContiguousPositions {
+        /// 1-based dump line of the first offending step record.
+        line: usize,
+        /// The position the next step must carry (its 0-based index).
+        expected: u32,
+        /// The position the step actually recorded.
+        actual: u32,
+    },
     /// T1 guard: the two op dumps cover different expert-id sets.
     IdSetMismatch {
         /// Ids present only in leg A (ascending).
@@ -95,6 +118,23 @@ impl std::fmt::Display for CompareError {
             }
             CompareError::StepCountMismatch { a, b } => {
                 write!(f, "guard: step-count mismatch: {a} vs {b}")
+            }
+            CompareError::PositionMismatch { index, a, b } => {
+                write!(
+                    f,
+                    "guard: step-position mismatch at index {index}: {a} vs {b}"
+                )
+            }
+            CompareError::NonContiguousPositions {
+                line,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "dump line {line}: step position {actual} is not contiguous \
+                     (expected {expected})"
+                )
             }
             CompareError::IdSetMismatch { only_a, only_b } => {
                 write!(
@@ -338,6 +378,17 @@ pub fn parse_t2_dump(text: &str) -> Result<ParityDump, CompareError> {
             line: lineno,
             detail: format!("bad step record: {e}"),
         })?;
+        // Contiguity guard: step N of a dump must record position N. A gap
+        // or non-zero start means the leg lost or reordered steps — such a
+        // dump must never reach the index-based pairing.
+        let expected = steps.len() as u32;
+        if step.position != expected {
+            return Err(CompareError::NonContiguousPositions {
+                line: lineno,
+                expected,
+                actual: step.position,
+            });
+        }
         steps.push(step);
     }
     Ok(ParityDump {
@@ -395,8 +446,10 @@ pub fn parse_t1_dump(text: &str) -> Result<OpDump, CompareError> {
 /// and renders the deterministic report.
 ///
 /// Guards (exit-2-class): per pair, `prompt_tokens` and step count must
-/// agree. The verdict per pair is decided at its first divergence;
-/// subsequent positions only increment `post_split_positions`.
+/// agree, and both step lists must record the same `position` at every
+/// index (the pairing is by index). The verdict per pair is decided at its
+/// first divergence; subsequent positions only increment
+/// `post_split_positions`.
 pub fn compare_t2(
     pairs: &[T2Pair],
     epsilon: f64,
@@ -436,9 +489,18 @@ pub fn compare_t2(
         }
         // First-divergence verdict: decide at the first token divergence;
         // every position after it only counts toward post_split, never the
-        // match rate (cascade rule).
+        // match rate (cascade rule). The position-alignment guard runs at
+        // every index — including post-split ones: alignment is a usage
+        // property of the pair, not part of any verdict.
         let mut first: Option<Divergence> = None;
-        for (sa, sb) in pair.a.steps.iter().zip(pair.b.steps.iter()) {
+        for (index, (sa, sb)) in pair.a.steps.iter().zip(pair.b.steps.iter()).enumerate() {
+            if sa.position != sb.position {
+                return Err(CompareError::PositionMismatch {
+                    index,
+                    a: sa.position,
+                    b: sb.position,
+                });
+            }
             if first.is_some() {
                 post_split_positions += 1;
                 continue;
@@ -1101,6 +1163,96 @@ mod tests {
         assert_eq!(
             compare_t2(&[pair(a, b)], EPS, 100.0),
             Err(CompareError::StepCountMismatch { a: 2, b: 1 })
+        );
+    }
+
+    #[test]
+    fn guard_position_mismatch_is_usage_error() {
+        // Both legs record two steps, but at index 1 the recorded positions
+        // disagree — the index pairing would compare unrelated steps.
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.5)]);
+        let b = t2("hip", 1, &[(0, 1, 1.0, 0.5), (2, 2, 1.0, 0.5)]);
+        assert_eq!(
+            compare_t2(&[pair(a, b)], EPS, 100.0),
+            Err(CompareError::PositionMismatch {
+                index: 1,
+                a: 1,
+                b: 2
+            })
+        );
+    }
+
+    #[test]
+    fn guard_position_mismatch_fires_even_after_first_divergence() {
+        // Position 0 diverges (tolerated), position 1 is mis-aligned: the
+        // guard must still fire — alignment is a usage error, not a verdict
+        // the first divergence could absorb.
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.875), (1, 3, 1.0, 0.5)]);
+        let b = t2("hip", 1, &[(0, 2, 1.0, 0.5), (5, 3, 1.0, 0.5)]);
+        assert_eq!(
+            compare_t2(&[pair(a, b)], EPS, 100.0),
+            Err(CompareError::PositionMismatch {
+                index: 1,
+                a: 1,
+                b: 5
+            })
+        );
+    }
+
+    #[test]
+    fn guard_non_contiguous_positions_surfaces_as_exit2_through_files() {
+        // Through execute(): a dump whose steps are not contiguous from 0 is
+        // rejected at parse time — exit-2-class, before any pairing happens.
+        let dir = scratch_dir("t2-pos");
+        let cli = Cli::T2 {
+            a: write_dump(&dir, "a.jsonl", &t2_dump("cpu", 4, &[(0, 5, 1.0, 0.5)])),
+            b: write_dump(&dir, "b.jsonl", &t2_dump("hip", 4, &[(7, 5, 1.0, 0.5)])),
+            epsilon: 0.01,
+            threshold_pct: 100.0,
+        };
+        let err = execute(&cli).expect_err("contiguity guard must fail");
+        assert!(err.contains("not contiguous"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_t2_rejects_positions_not_starting_at_zero() {
+        let text = t2_dump("cpu", 1, &[(1, 1, 1.0, 0.5), (2, 2, 1.0, 0.5)]);
+        assert_eq!(
+            parse_t2_dump(&text),
+            Err(CompareError::NonContiguousPositions {
+                line: 2,
+                expected: 0,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_t2_rejects_gap_in_step_positions() {
+        let text = t2_dump("cpu", 1, &[(0, 1, 1.0, 0.5), (2, 2, 1.0, 0.5)]);
+        assert_eq!(
+            parse_t2_dump(&text),
+            Err(CompareError::NonContiguousPositions {
+                line: 3,
+                expected: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_t2_accepts_contiguous_positions_from_zero() {
+        let text = t2_dump(
+            "cpu",
+            1,
+            &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.5), (2, 3, 1.0, 0.5)],
+        );
+        assert_eq!(
+            parse_t2_dump(&text)
+                .expect("contiguous dump must parse")
+                .steps
+                .len(),
+            3
         );
     }
 
