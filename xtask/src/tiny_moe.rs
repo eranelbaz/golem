@@ -1,6 +1,7 @@
 //! Synthetic 2-layer / 8-expert glm4moe GGUF (design §12.1).
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -28,6 +29,29 @@ pub mod dims {
 
 pub const DEFAULT_OUT: &str = "data/tiny-moe.gguf";
 pub const DEFAULT_SEED: u64 = 0x67_6f_6c_65_6d; // "golem"
+
+/// Single source of truth for the test fixture: generates the vocab-versioned
+/// tiny-moe model into `.test-cache/` (never in git) and returns its path.
+/// Both crates' integration tests resolve the fixture through this.
+pub fn cached_fixture() -> PathBuf {
+    let cache = repo_root().join(".test-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let p = cache.join("tiny-moe-320.gguf");
+    if !p.exists() {
+        let tmp = cache.join(format!("tiny-moe-320-{}.gguf.tmp", std::process::id()));
+        let f = std::fs::File::create(&tmp).unwrap();
+        generate(&mut std::io::BufWriter::new(f), DEFAULT_SEED).unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()
+        .unwrap()
+}
 
 fn n_embd_k_gqa() -> u32 {
     dims::HEAD_DIM * dims::N_HEAD_KV
@@ -131,7 +155,8 @@ fn token_table() -> Vec<(String, i32, f32)> {
     table
 }
 
-pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<()> {
+/// Returns the byte offset of the GGUF tensor-data section.
+pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<u64> {
     let mut rng = Xorshift::new(seed);
     let u = |v: u32| GgufValue::U32(v);
     let f = |v: f32| GgufValue::F32(v);
@@ -308,15 +333,15 @@ fn kv(key: &str, value: GgufValue) -> GgufKv {
 mod tests {
     use super::*;
 
-    fn gen_bytes() -> Vec<u8> {
+    fn gen_bytes() -> (Vec<u8>, u64) {
         let mut buf = Vec::new();
-        generate(&mut buf, DEFAULT_SEED).unwrap();
-        buf
+        let data_start = generate(&mut buf, DEFAULT_SEED).unwrap();
+        (buf, data_start)
     }
 
     #[test]
     fn magic_and_shape_metadata() {
-        let b = gen_bytes();
+        let (b, _) = gen_bytes();
         assert_eq!(&b[0..4], b"GGUF");
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 3);
         let n_tensors = u64::from_le_bytes(b[8..16].try_into().unwrap());
@@ -339,7 +364,8 @@ mod tests {
 
     #[test]
     fn expert_tensors_are_exactly_layer_1_exps() {
-        let (_, tensors) = parse_header(&gen_bytes());
+        let (b, data_start) = gen_bytes();
+        let (_, tensors) = parse_header(&b, data_start);
         let names: Vec<String> = tensors.iter().map(|(n, ..)| n.clone()).collect();
         assert_eq!(names, tensor_names());
         let mut found: Vec<String> = names.into_iter().filter(|n| is_expert_tensor(n)).collect();
@@ -358,8 +384,8 @@ mod tests {
     #[test]
     fn deterministic_given_seed() {
         use sha2::{Digest, Sha256};
-        let a = gen_bytes();
-        let b = gen_bytes();
+        let (a, _) = gen_bytes();
+        let (b, _) = gen_bytes();
         let mut ha = Sha256::new();
         ha.update(&a);
         let mut hb = Sha256::new();
@@ -381,8 +407,8 @@ mod tests {
 
     #[test]
     fn kv_block_is_parseable_and_complete() {
-        let b = gen_bytes();
-        let (kvs, tensors) = parse_header(&b);
+        let (b, data_start) = gen_bytes();
+        let (kvs, tensors) = parse_header(&b, data_start);
         let get = |k: &str| {
             kvs.iter()
                 .find(|(key, _)| *key == k)
@@ -547,7 +573,7 @@ mod tests {
         }
     }
 
-    fn parse_header(b: &[u8]) -> (Vec<(String, KvVal)>, Vec<ParsedTensor>) {
+    fn parse_header(b: &[u8], data_start: u64) -> (Vec<(String, KvVal)>, Vec<ParsedTensor>) {
         let mut c = Cursor::new(b);
         assert_eq!(c.take(4), b"GGUF");
         assert_eq!(c.u32(), 3);
@@ -586,7 +612,7 @@ mod tests {
             let ggml_type = c.u32();
             let offset = c.u64();
             let n: u64 = dims.iter().product();
-            let start = 9408 + offset as usize; // header + KV + padded table end
+            let start = data_start as usize + offset as usize;
             let end = start + n as usize * 4;
             assert!(end <= b.len(), "tensor {name} payload out of range");
             tensors.push((name, dims, ggml_type, b[start..end].to_vec()));

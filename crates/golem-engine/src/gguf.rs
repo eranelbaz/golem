@@ -8,92 +8,31 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
+use golem_gguf as raw_gguf;
+use golem_gguf::TYPE_ARRAY;
+
 use crate::error::EngineError;
 
-// GGUF v3 value-type tags (ggml/include/gguf.h): 9 = array, 12 = f64.
-const TYPE_U8: u32 = 0;
-const TYPE_I8: u32 = 1;
-const TYPE_U16: u32 = 2;
-const TYPE_I16: u32 = 3;
-const TYPE_U32: u32 = 4;
-const TYPE_I32: u32 = 5;
-const TYPE_F32: u32 = 6;
-const TYPE_BOOL: u32 = 7;
-const TYPE_STR: u32 = 8;
-const TYPE_ARRAY: u32 = 9;
-const TYPE_U64: u32 = 10;
-const TYPE_I64: u32 = 11;
-const TYPE_F64: u32 = 12;
-
-const GGUF_MAGIC: [u8; 4] = *b"GGUF";
-
-/// Upper bound per `read_exact` call in [`read_bytes`], so a bogus length
-/// cannot drive a huge single allocation before the short read is detected.
-const READ_CHUNK: usize = 64 * 1024;
-
-fn short_read(e: std::io::Error) -> EngineError {
-    EngineError::InvalidModel(format!("truncated GGUF metadata: {e}"))
-}
-
-fn read_u8(r: &mut impl Read) -> Result<u8, EngineError> {
-    let mut b = [0u8; 1];
-    r.read_exact(&mut b).map_err(short_read)?;
-    Ok(b[0])
-}
-
-fn read_u16(r: &mut impl Read) -> Result<u16, EngineError> {
-    let mut b = [0u8; 2];
-    r.read_exact(&mut b).map_err(short_read)?;
-    Ok(u16::from_le_bytes(b))
-}
-
-fn read_u32(r: &mut impl Read) -> Result<u32, EngineError> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b).map_err(short_read)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn read_u64(r: &mut impl Read) -> Result<u64, EngineError> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b).map_err(short_read)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-/// Reads `len` bytes in bounded chunks; allocation grows only as bytes are
-/// actually read, so a forged length fails at EOF before consuming memory.
-fn read_bytes(r: &mut impl Read, len: u64) -> Result<Vec<u8>, EngineError> {
-    let mut out = Vec::new();
-    let mut remaining = len;
-    while remaining > 0 {
-        let chunk = remaining.min(READ_CHUNK as u64) as usize;
-        let start = out.len();
-        out.resize(start + chunk, 0);
-        r.read_exact(&mut out[start..]).map_err(short_read)?;
-        remaining -= chunk as u64;
+impl From<raw_gguf::Error> for EngineError {
+    fn from(e: raw_gguf::Error) -> Self {
+        EngineError::InvalidModel(e.0)
     }
-    Ok(out)
 }
 
-/// u64 length prefix + UTF-8 bytes (GGUF string encoding).
-fn read_string(r: &mut impl Read) -> Result<String, EngineError> {
-    let len = read_u64(r)?;
-    let bytes = read_bytes(r, len)?;
-    String::from_utf8(bytes)
-        .map_err(|e| EngineError::InvalidModel(format!("invalid UTF-8 in GGUF string: {e}")))
-}
+use raw_gguf::{read_header, read_string, read_u8, read_u16, read_u32, read_u64};
 
 /// Reads a value payload for an already-consumed type tag.
 fn read_payload(r: &mut impl Read, tag: u32) -> Result<GgufValue, EngineError> {
     match tag {
-        TYPE_U8 => Ok(GgufValue::U8(read_u8(r)?)),
-        TYPE_I8 => Ok(GgufValue::I8(read_u8(r)? as i8)),
-        TYPE_U16 => Ok(GgufValue::U16(read_u16(r)?)),
-        TYPE_I16 => Ok(GgufValue::I16(read_u16(r)? as i16)),
-        TYPE_U32 => Ok(GgufValue::U32(read_u32(r)?)),
-        TYPE_I32 => Ok(GgufValue::I32(read_u32(r)? as i32)),
-        TYPE_F32 => Ok(GgufValue::F32(f32::from_bits(read_u32(r)?))),
-        TYPE_BOOL => Ok(GgufValue::Bool(read_u8(r)? != 0)),
-        TYPE_STR => Ok(GgufValue::Str(read_string(r)?)),
+        raw_gguf::TYPE_U8 => Ok(GgufValue::U8(read_u8(r)?)),
+        raw_gguf::TYPE_I8 => Ok(GgufValue::I8(read_u8(r)? as i8)),
+        raw_gguf::TYPE_U16 => Ok(GgufValue::U16(read_u16(r)?)),
+        raw_gguf::TYPE_I16 => Ok(GgufValue::I16(read_u16(r)? as i16)),
+        raw_gguf::TYPE_U32 => Ok(GgufValue::U32(read_u32(r)?)),
+        raw_gguf::TYPE_I32 => Ok(GgufValue::I32(read_u32(r)? as i32)),
+        raw_gguf::TYPE_F32 => Ok(GgufValue::F32(f32::from_bits(read_u32(r)?))),
+        raw_gguf::TYPE_BOOL => Ok(GgufValue::Bool(read_u8(r)? != 0)),
+        raw_gguf::TYPE_STR => Ok(GgufValue::Str(read_string(r)?)),
         // Array: element type u32, element count u64, then the elements.
         // Nested arrays are rejected, matching gguf.h — nothing writes them and
         // unbounded recursion on hostile input would overflow the stack.
@@ -111,9 +50,9 @@ fn read_payload(r: &mut impl Read, tag: u32) -> Result<GgufValue, EngineError> {
             }
             Ok(GgufValue::Array(elems))
         }
-        TYPE_U64 => Ok(GgufValue::U64(read_u64(r)?)),
-        TYPE_I64 => Ok(GgufValue::I64(read_u64(r)? as i64)),
-        TYPE_F64 => Ok(GgufValue::F64(f64::from_bits(read_u64(r)?))),
+        raw_gguf::TYPE_U64 => Ok(GgufValue::U64(read_u64(r)?)),
+        raw_gguf::TYPE_I64 => Ok(GgufValue::I64(read_u64(r)? as i64)),
+        raw_gguf::TYPE_F64 => Ok(GgufValue::F64(f64::from_bits(read_u64(r)?))),
         other => Err(EngineError::InvalidModel(format!(
             "unknown GGUF value type tag {other}"
         ))),
@@ -251,23 +190,7 @@ pub fn read_metadata(path: &Path) -> Result<GgufMetadata, EngineError> {
     let file = File::open(path)?;
     let mut r = BufReader::new(file);
 
-    let mut magic = [0u8; 4];
-    r.read_exact(&mut magic).map_err(short_read)?;
-    if magic != GGUF_MAGIC {
-        return Err(EngineError::InvalidModel(format!(
-            "bad magic {:?} (expected \"GGUF\")",
-            String::from_utf8_lossy(&magic)
-        )));
-    }
-    let version = read_u32(&mut r)?;
-    if version != 3 {
-        return Err(EngineError::InvalidModel(format!(
-            "unsupported GGUF version {version} (expected 3)"
-        )));
-    }
-    // GGUF v3 header order: n_tensors precedes n_kv (ggml/include/gguf.h).
-    let n_tensors = read_u64(&mut r)?;
-    let n_kv = read_u64(&mut r)?;
+    let (version, n_tensors, n_kv) = read_header(&mut r)?;
 
     let mut kvs = Vec::new();
     for _ in 0..n_kv {

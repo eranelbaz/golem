@@ -4,32 +4,18 @@
 //! (U32/F32/Str scalars and I32/F32/Str arrays) — not a general GGUF serializer.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::path::Path;
 
-/// ggml tensor-type id — distinct namespace from the GGUF value-type tags below.
+/// ggml tensor-type id — distinct namespace from the GGUF value-type tags in golem-gguf.
 pub const GGML_TYPE_F32: u32 = 0;
-// GGUF v3 value-type tags (ggml/include/gguf.h): 0=u8 1=i8 2=u16 3=i16 4=u32
-// 5=i32 6=f32 7=bool 8=str 9=array 10=u64 11=i64 12=f64.
-const GGUF_TYPE_U8: u32 = 0;
-const GGUF_TYPE_I8: u32 = 1;
-const GGUF_TYPE_U16: u32 = 2;
-const GGUF_TYPE_I16: u32 = 3;
+// GGUF v3 value-type tags written by this generator.
 const GGUF_TYPE_U32: u32 = 4;
 const GGUF_TYPE_I32: u32 = 5;
 const GGUF_TYPE_F32: u32 = 6;
-const GGUF_TYPE_BOOL: u32 = 7;
 const GGUF_TYPE_STR: u32 = 8;
 const GGUF_TYPE_ARR: u32 = 9;
-const GGUF_TYPE_U64: u32 = 10;
-const GGUF_TYPE_I64: u32 = 11;
-const GGUF_TYPE_F64: u32 = 12;
 const ALIGN: u64 = 32;
-const GGUF_MAGIC: [u8; 4] = *b"GGUF";
-
-/// Upper bound per `read_exact` call in [`read_bytes`], so a forged length
-/// cannot drive a huge single allocation before the short read is detected.
-const READ_CHUNK: usize = 64 * 1024;
 
 pub enum GgufValue {
     U32(u32),
@@ -98,13 +84,14 @@ fn put_kv(out: &mut Vec<u8>, kv: &GgufKv) {
     }
 }
 
+/// Returns the byte offset of the tensor-data section (aligned table end).
 /// Fails with `InvalidData` if `ggml_type != GGML_TYPE_F32` or a payload is not
 /// exactly `dims.product() * 4` bytes.
 pub fn write_gguf(
     w: &mut impl Write,
     kvs: &[GgufKv],
     tensors: &[(GgufTensorMeta, Vec<u8>)],
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let mut head = Vec::new();
     head.extend_from_slice(b"GGUF");
     head.extend_from_slice(&3u32.to_le_bytes());
@@ -146,8 +133,9 @@ pub fn write_gguf(
     w.write_all(&table)?;
     let table_end = (head.len() + table.len()) as u64;
     let head_pad = align_up(table_end) - table_end;
+    let data_start = table_end + head_pad;
     w.write_all(&[0u8; 32][..head_pad as usize])?;
-    let mut pos = table_end + head_pad;
+    let mut pos = data_start;
     for (_, data) in tensors {
         w.write_all(data)?;
         pos += data.len() as u64;
@@ -155,131 +143,40 @@ pub fn write_gguf(
         pos += blob_pad;
         w.write_all(&[0u8; 32][..blob_pad as usize])?;
     }
-    w.flush()
+    w.flush()?;
+    Ok(data_start)
 }
 
 fn align_up(v: u64) -> u64 {
     v.div_ceil(ALIGN) * ALIGN
 }
 
-fn short_read(e: std::io::Error) -> String {
-    format!("truncated GGUF metadata: {e}")
-}
-
-fn read_le_u32(r: &mut impl Read) -> Result<u32, String> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b).map_err(short_read)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn read_le_u64(r: &mut impl Read) -> Result<u64, String> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b).map_err(short_read)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-/// Reads `len` bytes in bounded chunks; allocation grows only as bytes are
-/// actually read, so a forged length fails at EOF before consuming memory.
-fn read_bytes(r: &mut impl Read, len: u64) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let mut remaining = len;
-    while remaining > 0 {
-        let chunk = remaining.min(READ_CHUNK as u64) as usize;
-        let start = out.len();
-        out.resize(start + chunk, 0);
-        r.read_exact(&mut out[start..]).map_err(short_read)?;
-        remaining -= chunk as u64;
-    }
-    Ok(out)
-}
-
-/// GGUF string encoding: u64 length prefix + UTF-8 bytes.
-fn read_string(r: &mut impl Read) -> Result<String, String> {
-    let len = read_le_u64(r)?;
-    let bytes = read_bytes(r, len)?;
-    String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8 in GGUF string: {e}"))
-}
-
-/// Reads and discards `len` bytes in bounded chunks.
-fn discard(r: &mut impl Read, len: u64) -> Result<(), String> {
-    let mut buf = vec![0u8; READ_CHUNK];
-    let mut remaining = len;
-    while remaining > 0 {
-        let chunk = remaining.min(READ_CHUNK as u64) as usize;
-        r.read_exact(&mut buf[..chunk]).map_err(short_read)?;
-        remaining -= chunk as u64;
-    }
-    Ok(())
-}
-
-/// Consumes one KV value payload of type `tag` without materializing it.
-fn skip_value(r: &mut impl Read, tag: u32) -> Result<(), String> {
-    match tag {
-        GGUF_TYPE_U8 | GGUF_TYPE_I8 | GGUF_TYPE_BOOL => discard(r, 1),
-        GGUF_TYPE_U16 | GGUF_TYPE_I16 => discard(r, 2),
-        GGUF_TYPE_U32 | GGUF_TYPE_I32 | GGUF_TYPE_F32 => discard(r, 4),
-        GGUF_TYPE_U64 | GGUF_TYPE_I64 | GGUF_TYPE_F64 => discard(r, 8),
-        GGUF_TYPE_STR => {
-            let len = read_le_u64(r)?;
-            discard(r, len)
-        }
-        GGUF_TYPE_ARR => {
-            let elem_tag = read_le_u32(r)?;
-            if elem_tag == GGUF_TYPE_ARR {
-                // Nested arrays are rejected, matching gguf.h and the engine
-                // reader — unbounded recursion on hostile input would overflow
-                // the stack.
-                return Err("nested GGUF arrays are not supported".into());
-            }
-            let n = read_le_u64(r)?;
-            for _ in 0..n {
-                skip_value(r, elem_tag)?;
-            }
-            Ok(())
-        }
-        other => Err(format!("unknown GGUF value type tag {other}")),
-    }
-}
-
 /// Reads the `general.architecture` string KV from a GGUF v3 file without
 /// touching tensor data. Errors (as `String`) on bad magic, unsupported
 /// version, truncation, an unknown type tag, or a missing/non-string
-/// architecture KV. Substrate-free twin of golem-engine's reader: xtask
-/// cannot link golem-engine (it drags the substrate static-lib into every
-/// xtask build).
+/// architecture KV. Low-level decoding is shared with golem-engine via the
+/// substrate-free `golem-gguf` crate.
 pub fn read_arch(path: &Path) -> Result<String, String> {
+    use golem_gguf as gg;
+
     const ARCH_KEY: &str = "general.architecture";
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut r = BufReader::new(file);
 
-    let mut magic = [0u8; 4];
-    r.read_exact(&mut magic).map_err(short_read)?;
-    if magic != GGUF_MAGIC {
-        return Err(format!(
-            "bad magic {:?} (expected \"GGUF\")",
-            String::from_utf8_lossy(&magic)
-        ));
-    }
-    let version = read_le_u32(&mut r)?;
-    if version != 3 {
-        return Err(format!("unsupported GGUF version {version} (expected 3)"));
-    }
-    // GGUF v3 header order: n_tensors precedes n_kv (ggml/include/gguf.h).
-    let _n_tensors = read_le_u64(&mut r)?;
-    let n_kv = read_le_u64(&mut r)?;
+    let (_, _n_tensors, n_kv) = gg::read_header(&mut r).map_err(|e| e.0)?;
 
     for _ in 0..n_kv {
-        let key = read_string(&mut r)?;
-        let tag = read_le_u32(&mut r)?;
+        let key = gg::read_string(&mut r).map_err(|e| e.0)?;
+        let tag = gg::read_u32(&mut r).map_err(|e| e.0)?;
         if key == ARCH_KEY {
-            if tag != GGUF_TYPE_STR {
+            if tag != gg::TYPE_STR {
                 return Err(format!(
                     "{ARCH_KEY}: expected string value (type tag 8), got {tag}"
                 ));
             }
-            return read_string(&mut r);
+            return gg::read_string(&mut r).map_err(|e| e.0);
         }
-        skip_value(&mut r, tag)?;
+        gg::skip_value(&mut r, tag).map_err(|e| e.0)?;
     }
     Err(format!("missing {ARCH_KEY} KV"))
 }
@@ -485,24 +382,6 @@ mod tests {
         let p = write_temp_model("happy", &buf);
         assert_eq!(read_arch(&p).unwrap(), "glm4moe");
         cleanup(&p);
-    }
-
-    #[test]
-    fn skip_value_rejects_nested_arrays() {
-        // array<u32, [array<u32, [7]>]>: outer tag 9, elem tag 9, count 1,
-        // then the inner array (elem tag 4, count 1, value 7).
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&9u32.to_le_bytes());
-        bytes.extend_from_slice(&9u32.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&4u32.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&7u32.to_le_bytes());
-        assert!(
-            skip_value(&mut &bytes[..], GGUF_TYPE_ARR)
-                .unwrap_err()
-                .contains("nested")
-        );
     }
 
     #[test]

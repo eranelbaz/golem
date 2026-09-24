@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+golem-gguf = { path = "../golem-gguf" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 thiserror = { workspace = true }
 

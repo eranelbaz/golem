@@ -265,10 +265,15 @@ dependencies = [
 name = "golem-engine"
 version = "0.1.0"
 dependencies = [
+ "golem-gguf",
  "golem-llama-sys",
  "thiserror",
  "xtask",
 ]
+
+[[package]]
+name = "golem-gguf"
+version = "0.1.0"
 
 [[package]]
 name = "golem-llama-sys"
@@ -596,6 +601,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "golem-gguf",
  "regex",
  "serde_json",
  "sha2",
