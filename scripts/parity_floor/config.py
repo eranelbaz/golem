@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 
 DEFAULT_MODEL = os.environ.get(
     "GOLEM_M05_MODEL",
@@ -52,6 +53,19 @@ def pin_sha() -> str:
         with open(os.path.join(VENDOR_DIR, p), "rb") as f:
             inner.update(f"{hashlib.sha256(f.read()).hexdigest()}  ./{p}\n".encode())
     return inner.hexdigest()
+
+
+def check_vendor_pin(tree_hash: str) -> None:
+    """Die unless tree_hash equals the pin recorded in vendor/VENDOR_SHA
+    ('content_sha256=<hex>' first line)."""
+    try:
+        with open(VENDOR_SHA_FILE) as pin_file:
+            pinned_hash = pin_file.readline().split("=", 1)[1].strip()
+    except (OSError, IndexError):
+        sys.exit(f"FATAL: cannot read/parse {VENDOR_SHA_FILE} (expected '<name>=<sha256>')")
+    if tree_hash != pinned_hash:
+        sys.exit(f"FATAL: vendor tree drifted ({tree_hash[:12]} != {pinned_hash[:12]}) — "
+                 f"re-vendor per scripts/build-substrate.sh")
 
 
 def leg_args(bin_path: str, model: str, prompt: str, hip: bool,
