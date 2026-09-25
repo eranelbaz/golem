@@ -50,7 +50,10 @@ def run_prompt(args: list[str], timeout_s: int) -> tuple[int, str, str, float]:
 
 
 def _kill_process_group(proc: subprocess.Popen, timeout_s: int) -> tuple[int, str, str]:
-    os.killpg(proc.pid, signal.SIGKILL)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # leg exited between timeout and kill; communicate below reaps it
     try:
         stdout, stderr = proc.communicate(timeout=10)
     except subprocess.TimeoutExpired:

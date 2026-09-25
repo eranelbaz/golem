@@ -7,11 +7,7 @@ import os
 import re
 import sys
 
-DEFAULT_MODEL = os.environ.get(
-    "GOLEM_M05_MODEL",
-    "/home/eranelbaz/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL/"
-    "GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
-)
+DEFAULT_MODEL = os.environ.get("GOLEM_M05_MODEL")  # no committed machine-local default
 VENDOR_DIR = "vendor/llama.cpp"
 VENDOR_SHA_FILE = "vendor/VENDOR_SHA"
 DEFAULT_OUTDIR = os.environ.get("GOLEM_M05_WORK", ".m0-work/m05")

@@ -59,9 +59,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--cpu-moe", type=int, default=DEFAULT_CPU_MOE,
                      help="--cpu-moe-layers for the GPU (hip) T2 leg only "
                           "(the -ncmoe equivalent; baseline method: 45)")
-    run.add_argument("--no-flash-attn", dest="flash_attn", action="store_false",
-                     help="do not force flash attention on T2 legs "
-                          "(default: --flash-attn on both hardware legs)")
+    run.add_argument("--no-flash-attn-a", dest="flash_attn_a", action="store_false",
+                     help="flash attention off for the cpu (leg A) T2 leg only "
+                          "(fa on-vs-off falsification)")
+    run.add_argument("--no-flash-attn-b", dest="flash_attn_b", action="store_false",
+                     help="flash attention off for the hip (leg B) T2 leg only "
+                          "(fa on-vs-off falsification)")
     ns = ap.parse_args(argv)
     if ns.selftest:
         return selftest()
@@ -74,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
                          threshold_pct=ns.threshold, bound=ns.bound,
                          threads_a=ns.threads_a, threads_b=ns.threads_b,
                          n_predict=ns.n_predict, gpu_layers=ns.gpu_layers,
-                         cpu_moe=ns.cpu_moe, flash_attn=ns.flash_attn,
+                         cpu_moe=ns.cpu_moe, flash_attn_a=ns.flash_attn_a,
+                         flash_attn_b=ns.flash_attn_b,
                          gpu_dev_bound=ns.gpu_dev_bound)
     ap.print_help()
     return 2

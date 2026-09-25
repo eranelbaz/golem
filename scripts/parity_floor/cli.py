@@ -18,7 +18,8 @@ def main() -> int:
     rl = sub.add_parser("run-leg")
     rl.add_argument("--bin", required=True)
     rl.add_argument("--name", required=True)
-    rl.add_argument("--model", default=DEFAULT_MODEL)
+    rl.add_argument("--model", default=DEFAULT_MODEL,
+                    help="GGUF model file (default: $GOLEM_M05_MODEL; required if unset)")
     rl.add_argument("--hip", action="store_true")
     rl.add_argument("--threads", type=int, default=None)
     rl.add_argument("--prompts", type=int, default=None, help="run only prompt index N")
@@ -33,6 +34,8 @@ def main() -> int:
     if ns.selftest:
         return selftest()
     if ns.cmd == "run-leg":
+        if not ns.model:
+            sys.exit("FATAL: --model required (or set GOLEM_M05_MODEL)")
         return run_leg(ns.bin, ns.name, ns.model, ns.hip, ns.threads,
                        ns.prompts, ns.n, ns.timeout, ns.out)
     if ns.cmd == "compare":

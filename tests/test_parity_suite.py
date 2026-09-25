@@ -292,7 +292,20 @@ def test_run_mode_hardware_leg_flags_reach_t2_legs(tmp_path):
     assert report["params"]["n_predict"] == 96
     assert report["params"]["gpu_layers"] == 99
     assert report["params"]["cpu_moe"] == 45
-    assert report["params"]["flash_attn"] is True
+    assert report["params"]["flash_attn_a"] is True
+    assert report["params"]["flash_attn_b"] is True
+
+
+def test_run_mode_per_leg_flash_attn_knobs(tmp_path):
+    """fa on-vs-off falsification: --no-flash-attn-a / --no-flash-attn-b must
+    land on their own leg only."""
+    proc, report = _run_suite(tmp_path, ["--no-flash-attn-a"])
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    out = tmp_path / "out"
+    assert _dump_header(out / "t2-cpu-0.jsonl")["flash_attn"] is False
+    assert _dump_header(out / "t2-hip-0.jsonl")["flash_attn"] is True
+    assert report["params"]["flash_attn_a"] is False
+    assert report["params"]["flash_attn_b"] is True
 
 
 def test_run_mode_skip_hip_applies_no_gpu_knobs(tmp_path):

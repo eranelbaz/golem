@@ -25,6 +25,10 @@ from parity_floor.locking import acquire_lock, release_lock
 from parity_floor.runner import run_prompt
 
 SUITE_VERSION = 1
+# The merged acceptance rule, recorded in every report so top-level `pass`
+# is never misread as the token rule (T2 token pass may be false while the
+# bounded GPU-leg criterion carries the suite).
+PASS_BASIS = "t1.pass AND (t2.pass OR t2.gpu_leg_pass IS TRUE)"
 DEFAULT_OUTDIR = os.environ.get("GOLEM_M14_WORK", ".m1-work/parity-suite")
 DEFAULT_QUANT = "fp32"
 DEFAULT_TIMEOUT_S = 3600
@@ -70,6 +74,15 @@ def _check_bin(role: str, path: str) -> None:
         sys.exit(f"FATAL: {role} binary not executable: {path}")
 
 
+def _fatal_with_report(state: dict, outdir: str, message: str) -> None:
+    """Die loudly but leave a `failed` checkpoint on disk — a fatal after the
+    first write_report must never strand report.json at status `running`."""
+    state["status"] = "failed"
+    state["error"] = message
+    write_report(state, outdir)
+    sys.exit(f"FATAL: {message}")
+
+
 def t1_args(bin_path: str, dump_path: str, quant: str) -> list[str]:
     return [bin_path, "parity-op", "--dump", dump_path, "--quant", quant]
 
@@ -84,6 +97,7 @@ def t2_args(bin_path: str, model: str, prompt: str, dump_path: str,
     forced on for hardware legs on both backends; `gpu_layers`/`cpu_moe`
     (the `-ngl 99`/`-ncmoe 45` equivalents) go to the GPU leg only — the
     CPU reference leg must stay fully on CPU."""
+    # chisle: per-leg booleans decided by the caller; this shim stays one flag.
     args = [bin_path, "run", "--greedy", model, "--prompt", prompt,
             "--parity-dump", dump_path, "--n-predict", str(n_predict)]
     if flash_attn:
@@ -109,9 +123,10 @@ def resolve_comparator(explicit: str | None) -> list[str]:
                       os.path.join(root, "target", "release", "xtask")):
         if os.path.exists(candidate) and os.access(candidate, os.X_OK):
             return [candidate]
+    cargo = (os.environ.get("CARGO") or "").strip() or "cargo"
     print("SUITE: no prebuilt xtask binary found — falling back to cargo run "
           "(may compile)", flush=True)
-    return [os.environ.get("CARGO", "cargo"), "run", "-q", "-p", "xtask", "--"]
+    return [cargo, "run", "-q", "-p", "xtask", "--"]
 
 
 def run_comparator(prefix: list[str], argv_tail: list[str], timeout_s: int) -> dict:
@@ -128,6 +143,17 @@ def run_comparator(prefix: list[str], argv_tail: list[str], timeout_s: int) -> d
         return json.loads(lines[-1])
     except json.JSONDecodeError as err:
         sys.exit(f"FATAL: parity-compare report line is not JSON ({err})")
+
+
+def _compare_or_die(state: dict, outdir: str, prefix: list[str],
+                    argv_tail: list[str], timeout_s: int) -> dict:
+    """run_comparator, but post-checkpoint fatals leave a `failed` report
+    behind instead of stranding report.json at status `running`."""
+    try:
+        return run_comparator(prefix, argv_tail, timeout_s)
+    except SystemExit as failure:
+        _fatal_with_report(state, outdir, str(failure).removeprefix("FATAL: "))
+        raise  # unreachable
 
 
 def _dump_header(dump_path: str) -> dict:
@@ -244,6 +270,7 @@ def build_report(state: dict) -> dict:
         "version": SUITE_VERSION,
         "status": state.get("status", "running"),
         "pass": state.get("pass"),
+        "pass_basis": PASS_BASIS,
         "provenance": {
             "pin_sha": state.get("pin_sha"),
             "backend_env_input": {BACKEND_ENV_VAR: state.get("backend_env_input", "unset")},
@@ -255,7 +282,9 @@ def build_report(state: dict) -> dict:
                    "bound": state.get("bound"),
                    "threads_a": state.get("threads_a"), "threads_b": state.get("threads_b"),
                    "n_predict": state.get("n_predict"), "gpu_layers": state.get("gpu_layers"),
-                   "cpu_moe": state.get("cpu_moe"), "flash_attn": state.get("flash_attn"),
+                   "cpu_moe": state.get("cpu_moe"),
+                   "flash_attn_a": state.get("flash_attn_a"),
+                   "flash_attn_b": state.get("flash_attn_b"),
                    "gpu_dev_bound": state.get("gpu_dev_bound")},
         "model": state.get("model"),
         "legs": legs,
@@ -275,22 +304,37 @@ def write_report(state: dict, outdir: str) -> None:
     atomic_write(os.path.join(outdir, "report.json"), body)
 
 
+def recheck_provenance(bin_path: str) -> str:
+    """Re-verify vendor pin, build-lock pin, and binary at leg start (spec:
+    provenance is checked at *every* leg, not once per suite — a vendor or
+    binary swap between legs must be caught, not averaged in)."""
+    tree_hash = pin_sha()
+    check_vendor_pin(tree_hash)
+    check_lock_pin(tree_hash)
+    _check_bin("leg", bin_path)
+    return tree_hash
+
+
 def _run_leg(state: dict, outdir: str, logdir: str, name: str,
              args: list[str], timeout_s: int, expected_backend: str) -> None:
-    """One leg subprocess: run under the per-leg timeout (process-group kill
-    via parity_floor.run_prompt), persist its output log, verify the dump
-    header's backend label, checkpoint the report. Any failure is fatal."""
+    """One leg subprocess: re-verify provenance, run under the per-leg timeout
+    (process-group kill via parity_floor.run_prompt), persist its output log,
+    verify the dump header's backend label, checkpoint the report."""
+    recheck_provenance(args[0])
     rc, stdout, stderr, wall_s = run_prompt(args, timeout_s)
     atomic_write(os.path.join(logdir, f"{name}.log"), (stdout or "") + (stderr or ""))
     if rc != 0:
-        state["status"] = "failed"
-        state["error"] = f"leg {name} rc={rc} (log: {name}.log)"
-        write_report(state, outdir)
-        reason = " (timed out)" if rc == -9 else ""
-        sys.exit(f"FATAL: leg={name} rc={rc}{reason} — log saved to logs/{name}.log")
+        reason = f"leg {name} rc={rc} (log: {name}.log)"
+        if rc == -9:
+            reason += " (timed out)"
+        _fatal_with_report(state, outdir, reason)
+        return  # unreachable; keeps flow obvious
     dump_path = args[args.index("--dump") + 1] if "--dump" in args else \
         args[args.index("--parity-dump") + 1]
-    verify_dump_backend(dump_path, expected_backend)
+    try:
+        verify_dump_backend(dump_path, expected_backend)
+    except SystemExit as failure:
+        _fatal_with_report(state, outdir, str(failure).removeprefix("FATAL: "))
     print(f"SUITE: leg={name} rc=0 wall_s={wall_s:.1f}", flush=True)
     write_report(state, outdir)
 
@@ -309,7 +353,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
               epsilon: float, threshold_pct: float, bound: float,
               threads_a: int | None = None, threads_b: int | None = None,
               n_predict: int = DEFAULT_N_PREDICT, gpu_layers: int = DEFAULT_GPU_LAYERS,
-              cpu_moe: int = DEFAULT_CPU_MOE, flash_attn: bool = True,
+              cpu_moe: int = DEFAULT_CPU_MOE, flash_attn_a: bool = True,
+              flash_attn_b: bool = True,
               gpu_dev_bound: float | None = None) -> int:
     """Full suite: provenance gate → T1 legs → T2 legs (8 prompts × legs) →
     per-pair compare → merged report. Returns 0 iff every leg succeeded,
@@ -321,7 +366,9 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
     decode-thread counts (leg A = cpu, leg B = hip). None (the default) runs
     the leg with no `--threads` flag at the engine default; together they
     express the reference-vs-reference matrix (e.g. cpu-t16 vs cpu-t4).
-    `gpu_layers`/`cpu_moe` go to the GPU (hip) leg only."""
+    `gpu_layers`/`cpu_moe` go to the GPU (hip) leg only. `flash_attn_a` /
+    `flash_attn_b` are per-leg flash-attention switches (fa=on-vs-off
+    falsification, M1 escalation)."""
     _check_threads(threads_a, threads_b)
     tree_hash = pin_sha()
     check_vendor_pin(tree_hash)
@@ -353,7 +400,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
             "epsilon": epsilon, "threshold_pct": threshold_pct, "bound": bound,
             "threads_a": threads_a, "threads_b": threads_b,
             "n_predict": n_predict, "gpu_layers": gpu_layers, "cpu_moe": cpu_moe,
-            "flash_attn": flash_attn, "gpu_dev_bound": gpu_dev_bound,
+            "flash_attn_a": flash_attn_a, "flash_attn_b": flash_attn_b,
+            "gpu_dev_bound": gpu_dev_bound,
             "model": None, "t1": None, "t2": None, "per_prompt": [],
             "legs": {backend: {"bin": bins[backend], "t1": [], "t2": []}
                      for backend in backends},
@@ -379,6 +427,7 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
         leg_threads = {"cpu": threads_a, "hip": threads_b}
         leg_gpu = {"cpu": None, "hip": None if skip_hip else gpu_layers}
         leg_moe = {"cpu": None, "hip": None if skip_hip else cpu_moe}
+        leg_fa = {"cpu": flash_attn_a, "hip": flash_attn_b}
         t2_dumps: dict[str, list[str]] = {}
         for backend in backends:
             t2_dumps[backend] = []
@@ -389,16 +438,20 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
                          t2_args(bins[backend], model, prompt, dump_path,
                                  leg_threads[backend], n_predict=n_predict,
                                  gpu_layers=leg_gpu[backend], cpu_moe=leg_moe[backend],
-                                 flash_attn=flash_attn), timeout_s, backend)
+                                 flash_attn=leg_fa[backend]), timeout_s, backend)
                 t2_dumps[backend].append(dump_path)
 
-        state["model"] = dump_header_identity(t2_dumps["cpu"] + t2_dumps.get("hip", []))
+        try:
+            state["model"] = dump_header_identity(t2_dumps["cpu"] + t2_dumps.get("hip", []))
+        except SystemExit as failure:
+            _fatal_with_report(state, outdir, str(failure).removeprefix("FATAL: "))
         write_report(state, outdir)
         print(f"SUITE: model sha256={state['model']['sha256'][:12]} "
               f"bytes={state['model']['bytes']}", flush=True)
 
         # Compare: T1 once, then T2 per prompt pair (incremental report).
-        t1_report = run_comparator(
+        t1_report = _compare_or_die(
+            state, outdir,
             comparator_prefix,
             ["parity-compare", "t1", "--a", t1_dumps["cpu"],
              "--b", t1_dumps[b_backend],
@@ -416,7 +469,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
                             "--epsilon", repr(epsilon), "--threshold", repr(threshold_pct)]
             if gpu_dev_bound is not None:
                 compare_args += ["--gpu-dev-bound", repr(gpu_dev_bound)]
-            pair_reports.append(run_comparator(comparator_prefix, compare_args, timeout_s))
+            pair_reports.append(_compare_or_die(state, outdir, comparator_prefix,
+                                                compare_args, timeout_s))
             state["t2"] = merged_t2(pair_reports, epsilon, threshold_pct,
                                     gpu_dev_bound=gpu_dev_bound)
             state["per_prompt"] = per_prompt_verdicts(pair_reports)
