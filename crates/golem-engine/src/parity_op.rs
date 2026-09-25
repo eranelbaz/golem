@@ -331,6 +331,11 @@ fn compute_checksums(quant: Quant) -> Result<(Vec<f64>, String), EngineError> {
     // SAFETY: ctx is live; the graph (metadata + node array) is allocated
     // from the context metadata pool.
     let graph = unsafe { raw::ggml_new_graph(ctx) };
+    if graph.is_null() {
+        return Err(EngineError::OpCompute(
+            "ggml_new_graph returned null (context metadata pool exhausted)".into(),
+        ));
+    }
     // SAFETY: graph is live and out is a ctx-owned tensor.
     unsafe { raw::ggml_build_forward_expand(graph, out) };
     // SAFETY: backend and graph are live; every graph input is

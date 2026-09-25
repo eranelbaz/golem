@@ -250,18 +250,16 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         // Context lifecycle:
         .allowlist_function("ggml_init")
         .allowlist_function("ggml_free")
-        // Synthetic tensor creation + data access (shapes [k, m, n_expert],
+        // Synthetic tensor creation (shapes [k, m, n_expert],
         // [k, 1, n_ids], [1, n_ids] i32 — mul_mat_id requires 2d/3d tensors):
         .allowlist_function("ggml_new_tensor_2d")
         .allowlist_function("ggml_new_tensor_3d")
-        .allowlist_function("ggml_get_data")
-        .allowlist_function("ggml_get_data_f32")
         .allowlist_function("ggml_nbytes")
-        // The op itself plus graph build + CPU compute:
+        // The op itself plus graph build; compute goes through the backend
+        // registry below (Task 4a), so no CPU-only compute entry is bound.
         .allowlist_function("ggml_mul_mat_id")
         .allowlist_function("ggml_new_graph")
         .allowlist_function("ggml_build_forward_expand")
-        .allowlist_function("ggml_graph_compute_with_ctx")
         // Backend-registry compute (M1.4 Task 4a): the op must run on the
         // HIP device when the binary is HIP-linked, so compute goes through
         // the device registry instead of the CPU-only path above.
@@ -280,10 +278,10 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         // Q8_0 variant quantizer:
         .allowlist_function("ggml_quantize_chunk")
         // Types used (or pinned for stability) by the parity_op.rs FFI:
-        // the opaque handle trio, the init params struct, and the two enums
-        // referenced by the leg (tensor dtype / graph-compute status).
-        // ggml_threadpool is deliberately absent — the leg passes a plain
-        // n_threads int to ggml_graph_compute_with_ctx.
+        // the opaque handle trio, the init params struct, and the graph-
+        // compute status enum (ggml_type arrives transitively via the
+        // ggml_new_tensor_* signatures). ggml_threadpool is deliberately
+        // absent — the leg pins threads via ggml_backend_cpu_set_n_threads.
         .allowlist_type("ggml_context")
         .allowlist_type("ggml_tensor")
         .allowlist_type("ggml_cgraph")
