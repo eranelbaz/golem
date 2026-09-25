@@ -252,6 +252,15 @@ pub struct T2Report {
     /// Backends of the compared legs, `[a, b]` order (the CLI compares one
     /// pair, so this is that pair's provenance). Mismatch is recorded, not failed.
     pub backends: Vec<String>,
+    /// Max `|top1_a - top1_b|` over compared positions (pre-first-divergence
+    /// per pair; cascade positions excluded). The GPU-kernel numerics bound
+    /// evidence for the M1 escalation (plan §OPEN Step B).
+    pub max_logit_dev: f64,
+    /// Optional GPU-kernel deviation bound (CLI `--gpu-dev-bound`).
+    pub gpu_dev_bound: Option<f64>,
+    /// `Some(max_logit_dev <= gpu_dev_bound)` when the bound is set. The
+    /// GPU-leg acceptance criterion; `pass` stays the token rule, untouched.
+    pub gpu_leg_pass: Option<bool>,
 }
 
 /// Deterministic T1 report; declaration order is the frozen report contract.
@@ -481,7 +490,15 @@ pub fn compare_t2(
     pairs: &[T2Pair],
     epsilon: f64,
     threshold_pct: f64,
+    gpu_dev_bound: Option<f64>,
 ) -> Result<T2Report, CompareError> {
+    if let Some(b) = gpu_dev_bound {
+        if !b.is_finite() || b < 0.0 {
+            return Err(CompareError::Usage(format!(
+                "gpu-dev-bound must be finite and >= 0, got {b}"
+            )));
+        }
+    }
     if !epsilon.is_finite() || epsilon < 0.0 {
         return Err(CompareError::Usage(format!(
             "epsilon must be finite and >= 0, got {epsilon}"
@@ -500,6 +517,7 @@ pub fn compare_t2(
     let mut diverged = 0u32;
     let mut divergences = Vec::new();
     let mut post_split_positions = 0u64;
+    let mut max_logit_dev = 0.0f64;
     for pair in pairs {
         // Cross-dump guards: the pair must describe the same prompt run.
         if pair.a.prompt_tokens != pair.b.prompt_tokens {
@@ -532,6 +550,7 @@ pub fn compare_t2(
                 post_split_positions += 1;
                 continue;
             }
+            max_logit_dev = max_logit_dev.max((f64::from(sa.top1) - f64::from(sb.top1)).abs());
             if sa.token == sb.token {
                 continue;
             }
@@ -565,7 +584,7 @@ pub fn compare_t2(
     let match_rate_pct = f64::from(exact) * 100.0 / f64::from(prompts);
     Ok(T2Report {
         harness: "t2-parity",
-        version: 1,
+        version: 2,
         epsilon,
         threshold_pct,
         prompts,
@@ -577,6 +596,9 @@ pub fn compare_t2(
         divergences,
         post_split_positions,
         backends: vec![pairs[0].a.backend.clone(), pairs[0].b.backend.clone()],
+        max_logit_dev,
+        gpu_dev_bound,
+        gpu_leg_pass: gpu_dev_bound.map(|b| max_logit_dev <= b),
     })
 }
 
@@ -649,6 +671,8 @@ pub enum Cli {
         epsilon: f64,
         /// Required match-rate percentage.
         threshold_pct: f64,
+        /// Optional GPU-kernel deviation bound.
+        gpu_dev_bound: Option<f64>,
     },
     /// `parity-compare t1 --a <OPDUMP> --b <OPDUMP> --bound B`.
     T1 {
@@ -671,6 +695,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut b: Option<PathBuf> = None;
     let mut epsilon: Option<f64> = None;
     let mut threshold_pct: Option<f64> = None;
+    let mut gpu_dev_bound: Option<f64> = None;
     let mut bound: Option<f64> = None;
     match leg.as_str() {
         "t2" => {
@@ -685,6 +710,12 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
                         threshold_pct =
                             Some(parse_f64(value(it.next(), "--threshold")?, "--threshold")?);
                     }
+                    "--gpu-dev-bound" => {
+                        gpu_dev_bound = Some(parse_f64(
+                            value(it.next(), "--gpu-dev-bound")?,
+                            "--gpu-dev-bound",
+                        )?);
+                    }
                     other => {
                         return Err(format!("unknown parity-compare t2 flag: {other}; {USAGE}"));
                     }
@@ -695,6 +726,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
                 b: b.ok_or("--b <DUMP> is required")?,
                 epsilon: epsilon.ok_or("--epsilon E is required")?,
                 threshold_pct: threshold_pct.ok_or("--threshold PCT is required")?,
+                gpu_dev_bound,
             })
         }
         "t1" => {
@@ -746,11 +778,17 @@ pub fn execute(cli: &Cli) -> Result<String, String> {
             b,
             epsilon,
             threshold_pct,
+            gpu_dev_bound,
         } => {
             let da = read_t2(a)?;
             let db = read_t2(b)?;
-            let report = compare_t2(&[T2Pair { a: da, b: db }], *epsilon, *threshold_pct)
-                .map_err(|e| e.to_string())?;
+            let report = compare_t2(
+                &[T2Pair { a: da, b: db }],
+                *epsilon,
+                *threshold_pct,
+                *gpu_dev_bound,
+            )
+            .map_err(|e| e.to_string())?;
             serde_json::to_string(&report).map_err(|e| format!("report serialization failed: {e}"))
         }
         Cli::T1 { a, b, bound } => {
@@ -981,7 +1019,7 @@ mod tests {
         for bad in [-1.0, 100.5, f64::NAN] {
             assert!(
                 matches!(
-                    compare_t2(std::slice::from_ref(&p), EPS, bad),
+                    compare_t2(std::slice::from_ref(&p), EPS, bad, None),
                     Err(CompareError::Usage(_))
                 ),
                 "threshold {bad} must be rejected"
@@ -1038,9 +1076,9 @@ mod tests {
     fn identical_dumps_are_exact_and_pass() {
         let spec = [(0u32, 5i32, 1.0f32, 0.5f32), (1, 6, 2.0, 0.25)];
         let p = pair(t2("cpu", 9, &spec), t2("hip", 9, &spec));
-        let r = compare_t2(&[p], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[p], EPS, 100.0, None).expect("compare");
         assert_eq!(r.harness, "t2-parity");
-        assert_eq!(r.version, 1);
+        assert_eq!(r.version, 2);
         assert_eq!((r.prompts, r.exact, r.tolerated, r.diverged), (1, 1, 0, 0));
         assert_eq!(r.match_rate_pct, 100.0);
         assert!(r.pass);
@@ -1073,7 +1111,7 @@ mod tests {
                 (3, 42, 1.0, 0.0), // gap_b 1.0
             ],
         );
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
         assert_eq!((r.exact, r.tolerated, r.diverged), (0, 1, 0));
         assert_eq!(r.divergences.len(), 1);
         let d = &r.divergences[0];
@@ -1087,10 +1125,48 @@ mod tests {
     }
 
     #[test]
+    fn max_logit_dev_tracks_compared_positions_only() {
+        // Pre-split top1 diffs: 0.5 at position 0, 0.25 at position 1 (the
+        // divergence); the huge 21.0 post-split diff must be excluded.
+        let a = t2(
+            "cpu",
+            1,
+            &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.875), (2, 9, 30.0, 0.0)],
+        );
+        let b = t2(
+            "hip",
+            1,
+            &[(0, 1, 0.5, 0.25), (1, 7, 0.75, 0.5), (2, 8, 9.0, 0.0)],
+        );
+        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        assert!((r.max_logit_dev - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gpu_dev_bound_sets_gpu_leg_pass_without_touching_token_pass() {
+        // Diverged token stream (beyond eps), but bounded logit deviation 0.5.
+        let mk = || {
+            let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
+            let b = t2("hip", 1, &[(0, 2, 0.5, 0.0)]);
+            pair(a, b)
+        };
+        let r = compare_t2(&[mk()], EPS, 100.0, Some(0.5)).expect("compare");
+        assert!(!r.pass, "token pass must stay false");
+        assert_eq!(r.gpu_dev_bound, Some(0.5));
+        assert_eq!(r.gpu_leg_pass, Some(true));
+
+        let r2 = compare_t2(&[mk()], EPS, 100.0, Some(0.25)).expect("compare");
+        assert_eq!(r2.gpu_leg_pass, Some(false));
+        let r3 = compare_t2(&[mk()], EPS, 100.0, None).expect("compare");
+        assert_eq!(r3.gpu_leg_pass, None);
+        assert!((r3.max_logit_dev - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
     fn tolerated_asymmetry_gap_a_below_gap_b_above() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.875)]); // gap_a 0.125 < eps
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.5)]); // gap_b 0.5 >= eps
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
         assert_eq!((r.tolerated, r.diverged), (1, 0));
         assert!(r.divergences[0].tolerated);
     }
@@ -1099,7 +1175,7 @@ mod tests {
     fn tolerated_asymmetry_mirrored() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]); // gap_a 0.5 >= eps
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.875)]); // gap_b 0.125 < eps
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
         assert_eq!((r.tolerated, r.diverged), (1, 0));
         assert!(r.divergences[0].tolerated);
     }
@@ -1108,7 +1184,7 @@ mod tests {
     fn gap_equal_epsilon_diverges_strict_less_than() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.75)]); // gap_a 0.25 == eps
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.75)]); // gap_b 0.25 == eps
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
         assert_eq!((r.exact, r.tolerated, r.diverged), (0, 0, 1));
         assert!(!r.divergences[0].tolerated);
         assert!(!r.pass);
@@ -1125,7 +1201,7 @@ mod tests {
             ],
         );
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.0), (1, 4, 1.0, 0.5)]);
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
         assert_eq!(r.diverged, 1);
         assert_eq!(r.divergences[0].position, 0);
         assert_eq!(r.post_split_positions, 1);
@@ -1163,7 +1239,7 @@ mod tests {
                 (7, 9, 1.0, 0.5),
             ],
         );
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
         assert_eq!(r.post_split_positions, 7);
         assert_eq!(r.divergences.len(), 1);
         assert_eq!((r.exact, r.tolerated, r.diverged), (0, 1, 0));
@@ -1184,12 +1260,12 @@ mod tests {
             t2("hip", 2, &[(0, 2, 1.0, 0.5)]),
         );
         let pairs = vec![exact_pair, diverged_pair];
-        let r = compare_t2(&pairs, EPS, 50.0).expect("compare");
+        let r = compare_t2(&pairs, EPS, 50.0, None).expect("compare");
         assert_eq!((r.prompts, r.exact, r.diverged), (2, 1, 1));
         assert_eq!(r.match_rate_pct, 50.0);
         assert!(!r.pass, "diverged > 0 must fail regardless of match rate");
         // Even a 0% threshold cannot rescue a diverged prompt.
-        let r = compare_t2(&pairs, EPS, 0.0).expect("compare");
+        let r = compare_t2(&pairs, EPS, 0.0, None).expect("compare");
         assert!(!r.pass);
         // All-exact at 100% threshold passes.
         let r = compare_t2(
@@ -1205,6 +1281,7 @@ mod tests {
             ],
             EPS,
             100.0,
+            None,
         )
         .expect("compare");
         assert!(r.pass);
@@ -1217,7 +1294,7 @@ mod tests {
             t2("cpu", 1, &[(0, 1, 1.0, 0.875)]),
             t2("hip", 1, &[(0, 2, 1.0, 0.5)]),
         );
-        let r = compare_t2(&[tolerated_pair], EPS, 100.0).expect("compare");
+        let r = compare_t2(&[tolerated_pair], EPS, 100.0, None).expect("compare");
         assert_eq!(r.diverged, 0);
         assert_eq!(r.match_rate_pct, 0.0);
         assert!(!r.pass, "match_rate below threshold must fail");
@@ -1230,7 +1307,7 @@ mod tests {
         let a = t2("cpu", 11, &[(0, 1, 1.0, 0.5)]);
         let b = t2("hip", 12, &[(0, 1, 1.0, 0.5)]);
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0),
+            compare_t2(&[pair(a, b)], EPS, 100.0, None),
             Err(CompareError::PromptTokensMismatch { a: 11, b: 12 })
         );
     }
@@ -1240,7 +1317,7 @@ mod tests {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.5)]);
         let b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0),
+            compare_t2(&[pair(a, b)], EPS, 100.0, None),
             Err(CompareError::StepCountMismatch { a: 2, b: 1 })
         );
     }
@@ -1252,7 +1329,7 @@ mod tests {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.5)]);
         let b = t2("hip", 1, &[(0, 1, 1.0, 0.5), (2, 2, 1.0, 0.5)]);
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0),
+            compare_t2(&[pair(a, b)], EPS, 100.0, None),
             Err(CompareError::PositionMismatch {
                 index: 1,
                 a: 1,
@@ -1269,7 +1346,7 @@ mod tests {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.875), (1, 3, 1.0, 0.5)]);
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.5), (5, 3, 1.0, 0.5)]);
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0),
+            compare_t2(&[pair(a, b)], EPS, 100.0, None),
             Err(CompareError::PositionMismatch {
                 index: 1,
                 a: 1,
@@ -1288,6 +1365,7 @@ mod tests {
             b: write_dump(&dir, "b.jsonl", &t2_dump("hip", 4, &[(7, 5, 1.0, 0.5)])),
             epsilon: 0.01,
             threshold_pct: 100.0,
+            gpu_dev_bound: None,
         };
         let err = execute(&cli).expect_err("contiguity guard must fail");
         assert!(err.contains("not contiguous"), "got: {err}");
@@ -1342,19 +1420,19 @@ mod tests {
             t2("hip", 1, &[(0, 1, 1.0, 0.5)]),
         );
         assert!(matches!(
-            compare_t2(std::slice::from_ref(&p), -1.0, 100.0),
+            compare_t2(std::slice::from_ref(&p), -1.0, 100.0, None),
             Err(CompareError::Usage(_))
         ));
         assert!(matches!(
-            compare_t2(std::slice::from_ref(&p), f64::NAN, 100.0),
+            compare_t2(std::slice::from_ref(&p), f64::NAN, 100.0, None),
             Err(CompareError::Usage(_))
         ));
         assert!(matches!(
-            compare_t2(std::slice::from_ref(&p), EPS, f64::INFINITY),
+            compare_t2(std::slice::from_ref(&p), EPS, f64::INFINITY, None),
             Err(CompareError::Usage(_))
         ));
         assert!(matches!(
-            compare_t2(&[], EPS, 100.0),
+            compare_t2(&[], EPS, 100.0, None),
             Err(CompareError::Usage(_))
         ));
     }
@@ -1429,7 +1507,8 @@ mod tests {
     fn backend_mismatch_is_recorded_never_failed() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
         let b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0).expect("backend mismatch must not fail");
+        let r =
+            compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("backend mismatch must not fail");
         assert_eq!(r.backends, vec!["cpu", "hip"]);
         assert!(r.pass);
         let a = op("cpu", "fp32", &[(0, 1.0)]);
@@ -1465,6 +1544,7 @@ mod tests {
                 b: PathBuf::from("b.jsonl"),
                 epsilon: 1e-2,
                 threshold_pct: 100.0,
+                gpu_dev_bound: None,
             }
         );
     }
@@ -1554,16 +1634,18 @@ mod tests {
             b: write_dump(&dir, "b.jsonl", &text),
             epsilon: 0.01,
             threshold_pct: 100.0,
+            gpu_dev_bound: None,
         };
         let line = execute(&cli).expect("execute must succeed");
         // The full frozen line, byte-exact — declaration order + ryu floats.
         assert_eq!(
             line,
-            "{\"harness\":\"t2-parity\",\"version\":1,\"epsilon\":0.01,\
+            "{\"harness\":\"t2-parity\",\"version\":2,\"epsilon\":0.01,\
              \"threshold_pct\":100.0,\"prompts\":1,\"exact\":1,\"tolerated\":0,\
              \"diverged\":0,\"match_rate_pct\":100.0,\"pass\":true,\
              \"divergences\":[],\"post_split_positions\":0,\
-             \"backends\":[\"cpu\",\"cpu\"]}"
+             \"backends\":[\"cpu\",\"cpu\"],\"max_logit_dev\":0.0,\
+             \"gpu_dev_bound\":null,\"gpu_leg_pass\":null}"
         );
     }
 
@@ -1579,6 +1661,7 @@ mod tests {
             b: write_dump(&dir, "b.jsonl", &b),
             epsilon: 0.25,
             threshold_pct: 100.0,
+            gpu_dev_bound: None,
         };
         let line = execute(&cli).expect("execute must succeed");
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1643,6 +1726,7 @@ mod tests {
             b: write_dump(&dir, "b.jsonl", &t2_dump("hip", 5, &[(0, 5, 1.0, 0.5)])),
             epsilon: 0.01,
             threshold_pct: 100.0,
+            gpu_dev_bound: None,
         };
         let err = execute(&cli).expect_err("prompt_tokens guard must fail");
         assert!(err.contains("prompt_tokens mismatch"), "got: {err}");

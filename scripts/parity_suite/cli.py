@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
                      help="T2 required match-rate percentage")
     run.add_argument("--bound", type=float, default=DEFAULT_BOUND,
                      help="T1 max-abs checksum bound")
+    run.add_argument("--gpu-dev-bound", type=float, default=None,
+                     help="GPU-kernel logit-deviation bound for T2 acceptance "
+                          "(plan §OPEN Step B; default: unset, token rule only)")
     run.add_argument("--threads-a", type=int, default=None,
                      help="decode threads for the cpu (leg A) T2 golem invocations "
                           "(golem run --threads); default: no flag, engine default")
@@ -71,7 +74,8 @@ def main(argv: list[str] | None = None) -> int:
                          threshold_pct=ns.threshold, bound=ns.bound,
                          threads_a=ns.threads_a, threads_b=ns.threads_b,
                          n_predict=ns.n_predict, gpu_layers=ns.gpu_layers,
-                         cpu_moe=ns.cpu_moe, flash_attn=ns.flash_attn)
+                         cpu_moe=ns.cpu_moe, flash_attn=ns.flash_attn,
+                         gpu_dev_bound=ns.gpu_dev_bound)
     ap.print_help()
     return 2
 

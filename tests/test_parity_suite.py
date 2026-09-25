@@ -89,12 +89,14 @@ def test_dump_header_identity_rejects_model_mismatch(tmp_path):
         dump_header_identity([str(a), str(b)])
 
 
-def _pair_report(exact=0, tolerated=0, diverged=0, post_split=0, divergences=None):
-    return {"harness": "t2-parity", "version": 1, "epsilon": 0.01, "threshold_pct": 100.0,
+def _pair_report(exact=0, tolerated=0, diverged=0, post_split=0, divergences=None,
+                 max_logit_dev=0.0):
+    return {"harness": "t2-parity", "version": 2, "epsilon": 0.01, "threshold_pct": 100.0,
             "prompts": 1, "exact": exact, "tolerated": tolerated, "diverged": diverged,
             "match_rate_pct": 100.0 * exact, "pass": diverged == 0 and exact == 1,
             "divergences": divergences or [], "post_split_positions": post_split,
-            "backends": ["cpu", "hip"]}
+            "backends": ["cpu", "hip"], "max_logit_dev": max_logit_dev,
+            "gpu_dev_bound": None, "gpu_leg_pass": None}
 
 
 def test_merged_t2_aggregates_and_applies_pass_rule():
@@ -110,6 +112,25 @@ def test_merged_t2_aggregates_and_applies_pass_rule():
     assert merged["divergences"][0]["prompt"] == 1, "divergences carry their prompt index"
     assert merged["post_split_positions"] == 2
     assert merged["backends"] == ["cpu", "hip"]
+    assert merged["gpu_dev_bound"] is None
+    assert merged["gpu_leg_pass"] is None
+    assert merged["max_logit_dev"] == 0.0
+
+
+def test_merged_t2_gpu_dev_bound():
+    diverged = _pair_report(diverged=1, max_logit_dev=0.35,
+                            divergences=[{"position": 0, "a_token": 1, "b_token": 2,
+                                          "gap_a": 0.5, "gap_b": 0.5, "tolerated": False}])
+    merged = merged_t2([diverged], epsilon=0.01, threshold_pct=99.5,
+                       gpu_dev_bound=0.5)
+    assert merged["pass"] is False, "token pass stays the token rule"
+    assert merged["gpu_dev_bound"] == 0.5
+    assert merged["max_logit_dev"] == 0.35
+    assert merged["gpu_leg_pass"] is True, "bounded deviation passes the GPU leg"
+
+    over = merged_t2([_pair_report(diverged=1, max_logit_dev=0.6)],
+                     epsilon=0.01, threshold_pct=99.5, gpu_dev_bound=0.5)
+    assert over["gpu_leg_pass"] is False
 
 
 def test_per_prompt_verdicts():

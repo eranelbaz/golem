@@ -176,9 +176,13 @@ def merged_t1(t1_report: dict) -> dict:
     return t1_report
 
 
-def merged_t2(pair_reports: list[dict], epsilon: float, threshold_pct: float) -> dict:
-    """Merge per-pair comparator reports into one T2 section under the frozen
-    pass rule: zero diverged prompts AND match_rate_pct >= threshold_pct."""
+def merged_t2(pair_reports: list[dict], epsilon: float, threshold_pct: float,
+              gpu_dev_bound: float | None = None) -> dict:
+    """Merge per-pair comparator reports into one T2 section. `pass` stays
+    the frozen token rule (zero diverged prompts AND match_rate_pct >=
+    threshold_pct); the optional GPU-kernel deviation bound (M1 escalation,
+    plan §OPEN Step B) adds `gpu_leg_pass` — max_logit_dev over compared
+    positions within the bound — without touching `pass`."""
     exact = sum(r["exact"] for r in pair_reports)
     tolerated = sum(r["tolerated"] for r in pair_reports)
     diverged = sum(r["diverged"] for r in pair_reports)
@@ -186,9 +190,10 @@ def merged_t2(pair_reports: list[dict], epsilon: float, threshold_pct: float) ->
     match_rate_pct = 100.0 * exact / prompts if prompts else 0.0
     divergences = [{"prompt": idx, **d}
                    for idx, r in enumerate(pair_reports) for d in r["divergences"]]
+    max_logit_dev = max((r["max_logit_dev"] for r in pair_reports), default=0.0)
     return {
         "harness": "t2-parity",
-        "version": 1,
+        "version": 2,
         "epsilon": epsilon,
         "threshold_pct": threshold_pct,
         "prompts": prompts,
@@ -200,6 +205,9 @@ def merged_t2(pair_reports: list[dict], epsilon: float, threshold_pct: float) ->
         "divergences": divergences,
         "post_split_positions": sum(r["post_split_positions"] for r in pair_reports),
         "backends": pair_reports[0]["backends"] if pair_reports else [],
+        "max_logit_dev": max_logit_dev,
+        "gpu_dev_bound": gpu_dev_bound,
+        "gpu_leg_pass": (max_logit_dev <= gpu_dev_bound) if gpu_dev_bound is not None else None,
     }
 
 
@@ -247,7 +255,8 @@ def build_report(state: dict) -> dict:
                    "bound": state.get("bound"),
                    "threads_a": state.get("threads_a"), "threads_b": state.get("threads_b"),
                    "n_predict": state.get("n_predict"), "gpu_layers": state.get("gpu_layers"),
-                   "cpu_moe": state.get("cpu_moe"), "flash_attn": state.get("flash_attn")},
+                   "cpu_moe": state.get("cpu_moe"), "flash_attn": state.get("flash_attn"),
+                   "gpu_dev_bound": state.get("gpu_dev_bound")},
         "model": state.get("model"),
         "legs": legs,
         "t1": state.get("t1"),
@@ -300,10 +309,13 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
               epsilon: float, threshold_pct: float, bound: float,
               threads_a: int | None = None, threads_b: int | None = None,
               n_predict: int = DEFAULT_N_PREDICT, gpu_layers: int = DEFAULT_GPU_LAYERS,
-              cpu_moe: int = DEFAULT_CPU_MOE, flash_attn: bool = True) -> int:
+              cpu_moe: int = DEFAULT_CPU_MOE, flash_attn: bool = True,
+              gpu_dev_bound: float | None = None) -> int:
     """Full suite: provenance gate → T1 legs → T2 legs (8 prompts × legs) →
-    per-pair compare → merged report. Returns 0 iff every leg succeeded and
-    both merged T1/T2 sections pass.
+    per-pair compare → merged report. Returns 0 iff every leg succeeded,
+    T1 passes, and T2 passes under the token rule or — when `gpu_dev_bound`
+    is set — under the bounded GPU-kernel deviation criterion (plan §OPEN
+    Step B: GPU-leg acceptance = deviation bound; token rate still recorded).
 
     `threads_a` / `threads_b` are the Task 7 calibration knobs: per-leg T2
     decode-thread counts (leg A = cpu, leg B = hip). None (the default) runs
@@ -341,7 +353,7 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
             "epsilon": epsilon, "threshold_pct": threshold_pct, "bound": bound,
             "threads_a": threads_a, "threads_b": threads_b,
             "n_predict": n_predict, "gpu_layers": gpu_layers, "cpu_moe": cpu_moe,
-            "flash_attn": flash_attn,
+            "flash_attn": flash_attn, "gpu_dev_bound": gpu_dev_bound,
             "model": None, "t1": None, "t2": None, "per_prompt": [],
             "legs": {backend: {"bin": bins[backend], "t1": [], "t2": []}
                      for backend in backends},
@@ -399,25 +411,28 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
 
         pair_reports = []
         for idx in range(len(PROMPTS)):
-            pair_reports.append(run_comparator(
-                comparator_prefix,
-                ["parity-compare", "t2", "--a", t2_dumps["cpu"][idx],
-                 "--b", t2_dumps[b_backend][idx],
-                 "--epsilon", repr(epsilon), "--threshold", repr(threshold_pct)],
-                timeout_s))
-            state["t2"] = merged_t2(pair_reports, epsilon, threshold_pct)
+            compare_args = ["parity-compare", "t2", "--a", t2_dumps["cpu"][idx],
+                            "--b", t2_dumps[b_backend][idx],
+                            "--epsilon", repr(epsilon), "--threshold", repr(threshold_pct)]
+            if gpu_dev_bound is not None:
+                compare_args += ["--gpu-dev-bound", repr(gpu_dev_bound)]
+            pair_reports.append(run_comparator(comparator_prefix, compare_args, timeout_s))
+            state["t2"] = merged_t2(pair_reports, epsilon, threshold_pct,
+                                    gpu_dev_bound=gpu_dev_bound)
             state["per_prompt"] = per_prompt_verdicts(pair_reports)
             write_report(state, outdir)
             print(f"SUITE: compare=t2-{idx} "
                   f"verdict={state['per_prompt'][idx]['verdict']}", flush=True)
 
         state["status"] = "complete"
-        state["pass"] = bool(state["t1"]["pass"] and state["t2"]["pass"])
-        write_report(state, outdir)
         t2 = state["t2"]
+        state["pass"] = bool(state["t1"]["pass"]
+                             and (t2["pass"] or t2["gpu_leg_pass"] is True))
+        write_report(state, outdir)
         print(f"SUITE: t2 prompts={t2['prompts']} exact={t2['exact']} "
               f"tolerated={t2['tolerated']} diverged={t2['diverged']} "
-              f"match_rate_pct={t2['match_rate_pct']}", flush=True)
+              f"match_rate_pct={t2['match_rate_pct']} "
+              f"max_logit_dev={t2['max_logit_dev']}", flush=True)
         print(f"SUITE: {'PASS' if state['pass'] else 'FAIL'} "
               f"(report written: report.json)", flush=True)
         return 0 if state["pass"] else 1
