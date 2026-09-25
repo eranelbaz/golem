@@ -227,7 +227,7 @@ pub struct Divergence {
 pub struct T2Report {
     /// Always `"t2-parity"`.
     pub harness: &'static str,
-    /// Report schema version (1).
+    /// Report schema version (2 — v2 adds max_logit_dev/gpu_dev_bound/gpu_leg_pass).
     pub version: u32,
     /// Epsilon used for the tolerance rule.
     pub epsilon: f64,
@@ -388,14 +388,20 @@ pub fn parse_t2_dump(text: &str) -> Result<ParityDump, CompareError> {
             line: lineno,
             detail: format!("bad step record: {e}"),
         })?;
-        // Logit sanity: the engine guarantees top1 >= top2. (Finiteness needs
-        // no guard: serde_json rejects non-finite literals at parse time.) A
-        // negative gap would auto-tolerate any divergence under the epsilon
-        // rule, so a dump violating the ordering must never reach the compare.
-        if step.top1 < step.top2 {
+        // Logit sanity: the engine guarantees top1 >= top2. Non-finite logits
+        // are guarded explicitly: `1e39` parses as f64 and narrows to f32 inf
+        // (serde_json only rejects inf/NaN *literals*), which would drive
+        // max_logit_dev to inf and serialize as null — breaking the frozen
+        // contract silently instead of failing loudly here. A negative gap
+        // would auto-tolerate any divergence under the epsilon rule, so a
+        // dump violating the ordering must never reach the compare.
+        if !step.top1.is_finite() || !step.top2.is_finite() || step.top1 < step.top2 {
             return Err(CompareError::Parse {
                 line: lineno,
-                detail: format!("step {} has top1 < top2", step.position),
+                detail: format!(
+                    "step {} has non-finite logits or top1 < top2",
+                    step.position
+                ),
             });
         }
         // Contiguity guard: step N of a dump must record position N. A gap
@@ -1351,6 +1357,22 @@ mod tests {
                 index: 1,
                 a: 1,
                 b: 5
+            })
+        );
+    }
+
+    #[test]
+    fn parse_t2_rejects_non_finite_logits() {
+        // `1e39` narrows to f32 inf: must die at parse, not serialize a null
+        // max_logit_dev into the frozen report contract. (Raw JSON literal —
+        // a `1e39` f32 literal in Rust is a compile error.)
+        let mut text = t2_dump("cpu", 1, &[(0, 1, 5.5, 0.5)]);
+        text = text.replace("\"top1\":5.5", "\"top1\":1e39");
+        assert_eq!(
+            parse_t2_dump(&text),
+            Err(CompareError::Parse {
+                line: 2,
+                detail: "step 0 has non-finite logits or top1 < top2".into(),
             })
         );
     }
