@@ -22,7 +22,7 @@
     "hardware_flags": "btrfs fails concurrent O_DIRECT reads with EIO (t2+); ext4 clean; single-stream always clean → M3.1 per-replica O_DIRECT probe + buffered fallback"
   },
   "parity": {
-    "method": "8-prompt greedy (-temp 0, seed 42, n 96, b 512) generation-text comparison; all match rates are percent (0-100), matching harness report match_rate; HIP(-ngl 99 -ncmoe 45 -fa on -t 16) vs CPU(-t 16 primary, -t 4 secondary), same pinned build; CPU substrate built with GGML_CPU_REPACK=OFF (repack ON requires a single ~106 GiB CPU_REPACK allocation, impossible on 93 GiB RAM); token-ID-level comparison arrives with the native runtime harness",
+    "method": "8-prompt greedy token-ID comparison with logit-gap epsilon (native golem harness, M1.4): golem-cli --parity-dump per leg, xtask parity-compare, first-divergence verdict, epsilon 1e-2 strict-< (tolerated iff min(gap_a,gap_b) < epsilon), cascade excluded via post_split; HIP(-ngl 99 -ncmoe 45 -fa on -t 16) vs CPU(-t 16); n_predict 96; CPU substrate built with GGML_CPU_REPACK=OFF (repack ON requires a single ~106 GiB CPU_REPACK allocation, impossible on 93 GiB RAM); pin_sha verified at leg start (vendor tree content hash)",
     "prompts": 8,
     "noise_floor_match_pct": 100.0,
     "noise_floor_legs": {"t32_vs_t16": {"match_rate_pct": 0.0, "prefix_words": null, "note": "superseded t32 legs, aborted before compare ran — prefix detail not recorded"},
@@ -34,6 +34,20 @@
     "parity_vs_t4_prefix_words": [49, 25, 33, 31, 34, 27, null, null],
     "preamble_only": false,
     "t2_threshold_pct": 100.0,
-    "pass": false
+    "pass": false,
+    "m14_harness": {
+      "harness": "parity-suite v1 + xtask parity-compare v1 (commit 3260229 lineage)",
+      "pin_sha": "812b9b4a7848e34a76c8d444e244fa787f6adb0a586e85a7317477a53ea9f794",
+      "model_sha256_prefix": "00dceaf3ed08",
+      "t1_op": {
+        "fp32": {"max_abs": 1.582503318786621e-05, "bound": 1e-2, "pass": true, "devices": ["cpu", "rocm0"]},
+        "q8_0": {"max_abs": 0.0323858056217432, "bound": 0.1, "pass": true, "devices": ["cpu", "rocm0"], "note": "GPU MMQ vs CPU kernel accumulation-order numerics; frozen tripwire bound 1e-1"}
+      },
+      "calibration": {"legs": "cpu-t16 vs cpu-t4", "match": "8/8 exact, zero divergences", "result": "no-op", "epsilon": 1e-2},
+      "t2": {"offload_evidence": "hip T2 dump headers record backend=hip offload=true", "epsilon": 1e-2, "threshold_pct": 100.0,
+             "exact": 2, "tolerated": 0, "diverged": 6, "match_rate_pct": 25.0, "pass": false,
+             "first_divergence_positions": [37, 25, 31, 1, 22, null, null, 4],
+             "note": "real GPU-vs-CPU numerics: gaps 0.04-0.35 far above epsilon; CPU reference self-stable (calibration exact); matches the M0.4 llama-cli text-method 25.0% — honest FAIL, epsilon NOT loosened (no-op calibration forbids it)"}
+    }
   }
 }
