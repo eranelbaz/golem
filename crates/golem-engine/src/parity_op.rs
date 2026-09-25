@@ -192,9 +192,12 @@ fn compute_checksums(quant: Quant) -> Result<(Vec<f64>, String), EngineError> {
         )));
     }
     let _backend = GgmlBackend(backend);
-    if device == "cpu" {
-        // SAFETY: backend is a live CPU backend (device name "cpu"); the
-        // frozen thread count pins the per-row accumulation order.
+    // SAFETY: dev is a live registry device.
+    if unsafe { raw::ggml_backend_dev_type(dev) }
+        == raw::ggml_backend_dev_type::GGML_BACKEND_DEVICE_TYPE_CPU
+    {
+        // SAFETY: backend is a live CPU backend; the frozen thread count
+        // pins the per-row accumulation order.
         unsafe { raw::ggml_backend_cpu_set_n_threads(backend, N_THREADS) };
     }
 
