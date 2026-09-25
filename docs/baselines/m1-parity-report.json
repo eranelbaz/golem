@@ -49,9 +49,10 @@
     "n_predict": 96,
     "threads_a": 16,
     "threads_b": 16,
-    "threshold_pct": 99.5
+    "threshold_pct": 100.0
   },
   "pass": true,
+  "pass_basis": "t1.pass AND (t2.pass OR t2.gpu_leg_pass IS TRUE)",
   "per_prompt": [
     {
       "first_divergence": {
@@ -233,7 +234,7 @@
     "pass": false,
     "post_split_positions": 450,
     "prompts": 8,
-    "threshold_pct": 99.5,
+    "threshold_pct": 100.0,
     "tolerated": 0,
     "version": 2
   },
