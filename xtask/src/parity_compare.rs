@@ -19,8 +19,9 @@
 //! declaration order, and the declaration order below is the frozen report
 //! contract. Backend mismatch (cpu vs hip) is recorded in the report, never
 //! failed; cross-dump guards (format/version, prompt_tokens, step count,
-//! step-position alignment, per-dump position contiguity from 0, id set,
-//! quant/dims) are usage-class errors — exit 2.
+//! step-position alignment, per-dump position contiguity from 0, per-step
+//! logit ordering (top1 ≥ top2), non-empty dumps, id set, quant/dims)
+//! are usage-class errors — exit 2.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -378,6 +379,16 @@ pub fn parse_t2_dump(text: &str) -> Result<ParityDump, CompareError> {
             line: lineno,
             detail: format!("bad step record: {e}"),
         })?;
+        // Logit sanity: the engine guarantees top1 >= top2. (Finiteness needs
+        // no guard: serde_json rejects non-finite literals at parse time.) A
+        // negative gap would auto-tolerate any divergence under the epsilon
+        // rule, so a dump violating the ordering must never reach the compare.
+        if step.top1 < step.top2 {
+            return Err(CompareError::Parse {
+                line: lineno,
+                detail: format!("step {} has top1 < top2", step.position),
+            });
+        }
         // Contiguity guard: step N of a dump must record position N. A gap
         // or non-zero start means the leg lost or reordered steps — such a
         // dump must never reach the index-based pairing.
@@ -390,6 +401,14 @@ pub fn parse_t2_dump(text: &str) -> Result<ParityDump, CompareError> {
             });
         }
         steps.push(step);
+    }
+    // An empty dump compares nothing and would pass at 100% — a leg that
+    // recorded zero steps is a failed leg, not a perfect one.
+    if steps.is_empty() {
+        return Err(CompareError::Format {
+            expected: T2_FORMAT,
+            detail: "dump records no steps".to_owned(),
+        });
     }
     Ok(ParityDump {
         backend,
@@ -432,6 +451,14 @@ pub fn parse_t1_dump(text: &str) -> Result<OpDump, CompareError> {
             });
         }
     }
+    // Same empty-dump footgun as T2: zero id rows would compare as
+    // max_abs = 0.0 and pass.
+    if checksums.is_empty() {
+        return Err(CompareError::Format {
+            expected: T1_FORMAT,
+            detail: "dump records no checksum rows".to_owned(),
+        });
+    }
     Ok(OpDump {
         backend,
         quant,
@@ -460,9 +487,9 @@ pub fn compare_t2(
             "epsilon must be finite and >= 0, got {epsilon}"
         )));
     }
-    if !threshold_pct.is_finite() {
+    if !threshold_pct.is_finite() || !(0.0..=100.0).contains(&threshold_pct) {
         return Err(CompareError::Usage(format!(
-            "threshold must be finite, got {threshold_pct}"
+            "threshold must be finite and within 0..=100, got {threshold_pct}"
         )));
     }
     if pairs.is_empty() {
@@ -908,6 +935,58 @@ mod tests {
             parse_t2_dump(""),
             Err(CompareError::Parse { line: 1, .. })
         ));
+    }
+
+    #[test]
+    fn parse_t2_rejects_header_only_dump_with_no_steps() {
+        let text = t2_dump("cpu", 1, &[]);
+        assert_eq!(
+            parse_t2_dump(&text),
+            Err(CompareError::Format {
+                expected: T2_FORMAT,
+                detail: "dump records no steps".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_t2_rejects_top1_below_top2() {
+        // A negative gap would auto-tolerate any divergence under the
+        // epsilon rule, so a corrupted leg must never reach the compare.
+        let text = t2_dump("cpu", 1, &[(0, 1, 0.5, 1.0)]);
+        assert!(matches!(
+            parse_t2_dump(&text),
+            Err(CompareError::Parse { line: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn parse_t1_rejects_header_only_dump_with_no_checksum_rows() {
+        let text = t1_dump("cpu", "fp32", &[]);
+        assert_eq!(
+            parse_t1_dump(&text),
+            Err(CompareError::Format {
+                expected: T1_FORMAT,
+                detail: "dump records no checksum rows".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn compare_t2_rejects_threshold_outside_zero_to_hundred() {
+        let p = pair(
+            t2("cpu", 1, &[(0, 1, 1.0, 0.5)]),
+            t2("cpu", 1, &[(0, 1, 1.0, 0.5)]),
+        );
+        for bad in [-1.0, 100.5, f64::NAN] {
+            assert!(
+                matches!(
+                    compare_t2(std::slice::from_ref(&p), EPS, bad),
+                    Err(CompareError::Usage(_))
+                ),
+                "threshold {bad} must be rejected"
+            );
+        }
     }
 
     #[test]

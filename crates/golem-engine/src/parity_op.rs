@@ -12,12 +12,12 @@
 //! and cross-substrate legs differ only by floating-point implementation.
 #![allow(unsafe_code)]
 
-use std::io::Write;
 use std::path::Path;
 
 use golem_llama_sys::{raw, substrate_backend};
 use serde::Serialize;
 
+use crate::atomic::write_atomic;
 use crate::error::EngineError;
 
 /// Rows per expert weight matrix (dump header `m`).
@@ -114,19 +114,35 @@ impl Drop for GgmlContext {
     }
 }
 
-/// Runs the T1 op-parity leg: computes the synthetic MUL_MAT_ID checksums on
-/// the linked substrate and writes the op-dump JSONL to `out` atomically
-/// (temp file + rename; readers see old or new, never partial). Reads no
-/// model file and no user input — the leg is fully synthetic.
+/// Runs the T1 op-parity leg: computes the synthetic MUL_MAT_ID checksums
+/// and writes the op-dump JSONL to `out` atomically (temp file + rename;
+/// readers see old or new, never partial). Reads no model file and no user
+/// input — the leg is fully synthetic.
+///
+/// Until Task 4a lands, compute is always scheduled on the CPU backend
+/// (`ggml_graph_compute_with_ctx`), even in a HIP-linked binary; the dump
+/// header records that executing device explicitly so a cross-leg T1
+/// comparison can never mistake a CPU result for a device result.
 pub fn run_op_leg(out: &Path, quant: Quant) -> Result<(), EngineError> {
     let checksums = compute_checksums(quant)?;
-    let dump = render_op_dump(substrate_backend().as_str(), quant, &checksums);
+    let dump = render_op_dump(
+        substrate_backend().as_str(),
+        EXECUTING_DEVICE,
+        quant,
+        &checksums,
+    );
     write_atomic(out, &dump)?;
     Ok(())
 }
 
-/// Computes the per-id checksums on the linked substrate via raw ggml FFI:
-/// one tiny context, three synthetic tensors, a forward graph, CPU compute.
+/// The backend that actually executes the op graph. `ggml_graph_compute_with_ctx`
+/// dispatches to CPU threads unconditionally at this pin; Task 4a replaces this
+/// constant with the scheduling device from the ggml backend registry.
+const EXECUTING_DEVICE: &str = "cpu";
+
+/// Computes the per-id checksums via raw ggml FFI: one tiny context, three
+/// synthetic tensors, a forward graph, CPU-backend compute (see
+/// `EXECUTING_DEVICE`).
 fn compute_checksums(quant: Quant) -> Result<Vec<f64>, EngineError> {
     let weight_type = match quant {
         Quant::Fp32 => raw::ggml_type::GGML_TYPE_F32,
@@ -280,6 +296,9 @@ struct OpDumpHeader<'a> {
     format: &'static str,
     version: u32,
     backend: &'a str,
+    /// Backend that executed the op graph (see `EXECUTING_DEVICE`) — may
+    /// differ from the build `backend` until Task 4a.
+    device: &'a str,
     m: i64,
     k: i64,
     n_expert: i64,
@@ -298,11 +317,12 @@ struct OpDumpRow {
 /// Renders the dump body: line-1 header, then one record per expert id in
 /// ascending id order, each a compact single-line JSON object in the frozen
 /// field order.
-fn render_op_dump(backend: &str, quant: Quant, checksums: &[f64]) -> String {
+fn render_op_dump(backend: &str, device: &str, quant: Quant, checksums: &[f64]) -> String {
     let header = OpDumpHeader {
         format: "golem-parity-op",
         version: 1,
         backend,
+        device,
         m: OP_M,
         k: OP_K,
         n_expert: OP_N_EXPERT,
@@ -323,24 +343,6 @@ fn render_op_dump(backend: &str, quant: Quant, checksums: &[f64]) -> String {
         out.push('\n');
     }
     out
-}
-
-/// Writes `contents` to `path` atomically: temp file in the target's
-/// directory (same filesystem, so rename cannot degrade to a copy), then
-/// rename over the target.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "op dump path has no file name",
-        )
-    })?;
-    let tmp = path.with_file_name(format!("{}.tmp", name.to_string_lossy()));
-    if let Err(e) = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(contents.as_bytes())) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -379,7 +381,7 @@ mod tests {
     /// The frozen header line, byte-exact.
     fn expected_header(quant: Quant) -> String {
         format!(
-            "{{\"format\":\"golem-parity-op\",\"version\":1,\"backend\":\"{}\",\"m\":256,\
+            "{{\"format\":\"golem-parity-op\",\"version\":1,\"backend\":\"{}\",\"device\":\"cpu\",\"m\":256,\
              \"k\":128,\"n_expert\":8,\"n_ids\":64,\"seed\":1234,\"quant\":\"{}\"}}",
             substrate_backend().as_str(),
             quant.as_str(),

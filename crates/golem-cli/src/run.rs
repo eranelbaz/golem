@@ -6,6 +6,7 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use golem_engine::ParityStep;
+use golem_engine::atomic::write_atomic;
 use golem_engine::config::EngineConfig;
 use golem_engine::session::{ChatTurn, Session};
 use golem_llama_sys::substrate_backend;
@@ -221,24 +222,6 @@ fn model_identity(path: &Path) -> std::io::Result<(String, u64)> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     Ok((hex, total))
-}
-
-/// Writes `contents` to `path` atomically: temp file in the target's directory
-/// (same filesystem, so rename cannot degrade to a copy), then rename over the
-/// target — readers see the old or the new file, never a partial one.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "parity dump path has no file name",
-        )
-    })?;
-    let tmp = path.with_file_name(format!("{}.tmp", name.to_string_lossy()));
-    if let Err(e) = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(contents.as_bytes())) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, path)
 }
 
 fn repl(session: &mut Session) -> Result<(), Box<dyn Error>> {
@@ -542,20 +525,5 @@ mod tests {
             .try_get_matches_from(["run", "m.gguf", "--threads", "0"])
             .expect_err("threads must be >= 1");
         assert!(err.kind() == clap::error::ErrorKind::ValueValidation);
-    }
-
-    #[test]
-    fn atomic_write_replaces_target_without_tmp_leftovers() {
-        let dir = scratch_dir("atomic");
-        let target = dir.join("dump.jsonl");
-        std::fs::write(&target, "STALE").unwrap();
-        write_atomic(&target, "NEW-CONTENT").unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW-CONTENT");
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            1,
-            "no tmp residue"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
