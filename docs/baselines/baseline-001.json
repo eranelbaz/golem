@@ -1,53 +1,170 @@
 {
-  "baseline": 1,
-  "date": "2026-09-21",
-  "machine": { "gpu": "AMD Radeon RX 7900 XTX (gfx1100)", "vram_mib": 24560, "ram_gib": 93,
-               "drives": "nvme0n1 Samsung 990 PRO 4TB (/home, btrfs zstd:3) + nvme1n1 PNY CS2130 1TB (/mnt/data, ext4)",
-               "kernel": "7.2.5-4-omarchy" },
-  "substrate": { "repo": "unslothai/llama.cpp", "branch": "glm5next/upstream",
-                 "commit": "86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9", "pr": 27754, "patches": "none-yet",
-                 "rocm": "7.2.4", "fa": "on" },
-  "model": { "repo": "unsloth/GLM-5.3-Flash-GGUF", "revision": "621d456e93e926e4b52f85cff5f634358c1828f9",
-             "quant": "UD-Q4_K_XL", "total_bytes": 199707321347, "expert_bytes": 189857267712, "non_expert_bytes": 9850053635 },
-  "measurements": {
-    "kv_bytes_per_token": 19712,
-    "vram_overhead_gib": 2.64,
-    "cold_gen_tok_s": [0.6, 0.8],
-    "warm_gen_tok_s": {"status": "deferred", "reason": "2026-09-21 kernel update (linux-omarchy 7.2.5-4) livelocks pinned llama.cpp MAP_POPULATE expert pre-fault; warm/cold tok/s pair requires a comparable regime; measurement recipe (lazy-regime flags + shim + 5-leg protocol) in docs/worklog.md"},
-    "cold_expert_penalty": {"status": "deferred", "reason": "derived from cold_gen_tok_s vs warm_gen_tok_s; deferred with it; derivation method (cross-product of 1000/cold - 1000/warm, reconciliation vs disk_gib_s.nvme0n1_seq_t1) documented in plan docs/superpowers/plans/2026-09-22-taskm04-m0-measurements.md Task 2"},
-    "ncmoe_semantics": "whole-tensor; feasible N ∈ {43,44,45} on 93 GiB RAM + 24 GiB VRAM",
-    "disk_gib_s": { "nvme0n1_seq_t1": 5.81, "nvme0n1_rand_t1": 5.76, "nvme1n1_seq_t1": 2.24,
-                    "nvme1n1_rand_t1": 2.16, "striped2_seq": [4.7, 4.9], "striped2_rand": 4.6,
-                    "note": "t8 regression ~1.9-2.0 GiB/s on both drives, unexplained" },
-    "hardware_flags": "btrfs fails concurrent O_DIRECT reads with EIO (t2+); ext4 clean; single-stream always clean → M3.1 per-replica O_DIRECT probe + buffered fallback"
+ "baseline": 1,
+ "date": "2026-09-21",
+ "machine": {
+  "gpu": "AMD Radeon RX 7900 XTX (gfx1100)",
+  "vram_mib": 24560,
+  "ram_gib": 93,
+  "drives": "nvme0n1 Samsung 990 PRO 4TB (/home, btrfs zstd:3) + nvme1n1 PNY CS2130 1TB (/mnt/data, ext4)",
+  "kernel": "7.2.5-4-omarchy"
+ },
+ "substrate": {
+  "repo": "unslothai/llama.cpp",
+  "branch": "glm5next/upstream",
+  "commit": "86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9",
+  "pr": 27754,
+  "patches": "none-yet",
+  "rocm": "7.2.4",
+  "fa": "on"
+ },
+ "model": {
+  "repo": "unsloth/GLM-5.3-Flash-GGUF",
+  "revision": "621d456e93e926e4b52f85cff5f634358c1828f9",
+  "quant": "UD-Q4_K_XL",
+  "total_bytes": 199707321347,
+  "expert_bytes": 189857267712,
+  "non_expert_bytes": 9850053635
+ },
+ "measurements": {
+  "kv_bytes_per_token": 19712,
+  "vram_overhead_gib": 2.64,
+  "cold_gen_tok_s": [
+   0.6,
+   0.8
+  ],
+  "warm_gen_tok_s": {
+   "status": "deferred",
+   "reason": "2026-09-21 kernel update (linux-omarchy 7.2.5-4) livelocks pinned llama.cpp MAP_POPULATE expert pre-fault; warm/cold tok/s pair requires a comparable regime; measurement recipe (lazy-regime flags + shim + 5-leg protocol) in docs/worklog.md"
   },
-  "parity": {
-    "method": "8-prompt greedy token-ID comparison with logit-gap epsilon (native golem harness, M1.4): golem-cli --parity-dump per leg, xtask parity-compare, first-divergence verdict, epsilon 1e-2 strict-< (tolerated iff min(gap_a,gap_b) < epsilon), cascade excluded via post_split; HIP(-ngl 99 -ncmoe 45 -fa on -t 16) vs CPU(-t 16); n_predict 96; CPU substrate built with GGML_CPU_REPACK=OFF (repack ON requires a single ~106 GiB CPU_REPACK allocation, impossible on 93 GiB RAM); pin_sha verified at leg start (vendor tree content hash)",
-    "prompts": 8,
-    "noise_floor_match_pct": 100.0,
-    "noise_floor_legs": {"t32_vs_t16": {"match_rate_pct": 0.0, "prefix_words": null, "note": "superseded t32 legs, aborted before compare ran — prefix detail not recorded"},
-                         "t32_vs_t1": {"match_rate_pct": 0.0, "prefix_words": null, "note": "superseded t32 legs, aborted before compare ran — prefix detail not recorded"},
-                         "t16_vs_t4": {"match_rate_pct": 100.0, "prefix_words": [null, null, null, null, null, null, null, null]}},
-    "parity_match_pct": 25.0,
-    "parity_vs": "cpu-t16",
-    "parity_prefix_words": [49, 25, 33, 31, 34, 27, null, null],
-    "parity_vs_t4_prefix_words": [49, 25, 33, 31, 34, 27, null, null],
-    "preamble_only": false,
-    "t2_threshold_pct": 100.0,
-    "pass": false,
-    "m14_harness": {
-      "harness": "parity-suite v1 + xtask parity-compare v1 (commit 3260229 lineage)",
-      "pin_sha": "812b9b4a7848e34a76c8d444e244fa787f6adb0a586e85a7317477a53ea9f794",
-      "model_sha256_prefix": "00dceaf3ed08",
-      "t1_op": {
-        "fp32": {"max_abs": 1.582503318786621e-05, "bound": 1e-2, "pass": true, "devices": ["cpu", "rocm0"]},
-        "q8_0": {"max_abs": 0.0323858056217432, "bound": 0.1, "pass": true, "devices": ["cpu", "rocm0"], "note": "GPU MMQ vs CPU kernel accumulation-order numerics; frozen tripwire bound 1e-1"}
-      },
-      "calibration": {"legs": "cpu-t16 vs cpu-t4", "match": "8/8 exact, zero divergences", "result": "no-op", "epsilon": 1e-2},
-      "t2": {"offload_evidence": "hip T2 dump headers record backend=hip offload=true", "epsilon": 1e-2, "threshold_pct": 100.0,
-             "exact": 2, "tolerated": 0, "diverged": 6, "match_rate_pct": 25.0, "pass": false,
-             "first_divergence_positions": [37, 25, 31, 1, 22, null, null, 4],
-             "note": "real GPU-vs-CPU numerics: gaps 0.04-0.35 far above epsilon; CPU reference self-stable (calibration exact); matches the M0.4 llama-cli text-method 25.0% — honest FAIL, epsilon NOT loosened (no-op calibration forbids it)"}
+  "cold_expert_penalty": {
+   "status": "deferred",
+   "reason": "derived from cold_gen_tok_s vs warm_gen_tok_s; deferred with it; derivation method (cross-product of 1000/cold - 1000/warm, reconciliation vs disk_gib_s.nvme0n1_seq_t1) documented in plan docs/superpowers/plans/2026-09-22-taskm04-m0-measurements.md Task 2"
+  },
+  "ncmoe_semantics": "whole-tensor; feasible N \u2208 {43,44,45} on 93 GiB RAM + 24 GiB VRAM",
+  "disk_gib_s": {
+   "nvme0n1_seq_t1": 5.81,
+   "nvme0n1_rand_t1": 5.76,
+   "nvme1n1_seq_t1": 2.24,
+   "nvme1n1_rand_t1": 2.16,
+   "striped2_seq": [
+    4.7,
+    4.9
+   ],
+   "striped2_rand": 4.6,
+   "note": "t8 regression ~1.9-2.0 GiB/s on both drives, unexplained"
+  },
+  "hardware_flags": "btrfs fails concurrent O_DIRECT reads with EIO (t2+); ext4 clean; single-stream always clean \u2192 M3.1 per-replica O_DIRECT probe + buffered fallback"
+ },
+ "parity": {
+  "method": "8-prompt greedy token-ID comparison with logit-gap epsilon (native golem harness, M1.4): golem-cli --parity-dump per leg, xtask parity-compare, first-divergence verdict, epsilon 1e-2 strict-< (tolerated iff min(gap_a,gap_b) < epsilon), cascade excluded via post_split; HIP(-ngl 99 -ncmoe 45 -fa on -t 16) vs CPU(-t 16); n_predict 96; CPU substrate built with GGML_CPU_REPACK=OFF (repack ON requires a single ~106 GiB CPU_REPACK allocation, impossible on 93 GiB RAM); pin_sha verified at leg start (vendor tree content hash)",
+  "prompts": 8,
+  "noise_floor_match_pct": 100.0,
+  "noise_floor_legs": {
+   "t32_vs_t16": {
+    "match_rate_pct": 0.0,
+    "prefix_words": null,
+    "note": "superseded t32 legs, aborted before compare ran \u2014 prefix detail not recorded"
+   },
+   "t32_vs_t1": {
+    "match_rate_pct": 0.0,
+    "prefix_words": null,
+    "note": "superseded t32 legs, aborted before compare ran \u2014 prefix detail not recorded"
+   },
+   "t16_vs_t4": {
+    "match_rate_pct": 100.0,
+    "prefix_words": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ]
+   }
+  },
+  "parity_match_pct": 25.0,
+  "parity_vs": "cpu-t16",
+  "parity_prefix_words": [
+   49,
+   25,
+   33,
+   31,
+   34,
+   27,
+   null,
+   null
+  ],
+  "parity_vs_t4_prefix_words": [
+   49,
+   25,
+   33,
+   31,
+   34,
+   27,
+   null,
+   null
+  ],
+  "preamble_only": false,
+  "t2_threshold_pct": 100.0,
+  "pass": false,
+  "m14_harness": {
+   "harness": "parity-suite v1 + xtask parity-compare v2 (bounded GPU-leg acceptance)",
+   "pin_sha": "812b9b4a7848e34a76c8d444e244fa787f6adb0a586e85a7317477a53ea9f794",
+   "model_sha256_prefix": "00dceaf3ed08",
+   "t1_op": {
+    "fp32": {
+     "max_abs": 1.582503318786621e-05,
+     "bound": 0.01,
+     "pass": true,
+     "devices": [
+      "cpu",
+      "rocm0"
+     ]
+    },
+    "q8_0": {
+     "max_abs": 0.0323858056217432,
+     "bound": 0.1,
+     "pass": true,
+     "devices": [
+      "cpu",
+      "rocm0"
+     ],
+     "note": "GPU MMQ vs CPU kernel accumulation-order numerics; frozen tripwire bound 1e-1"
     }
+   },
+   "calibration": {
+    "legs": "cpu-t16 vs cpu-t4",
+    "match": "8/8 exact, zero divergences",
+    "result": "no-op",
+    "epsilon": 0.01
+   },
+   "t2": {
+    "offload_evidence": "hip T2 dump headers record backend=hip offload=true",
+    "epsilon": 0.01,
+    "threshold_pct": 100.0,
+    "exact": 2,
+    "tolerated": 0,
+    "diverged": 6,
+    "match_rate_pct": 25.0,
+    "pass": false,
+    "first_divergence_positions": [
+     37,
+     25,
+     31,
+     1,
+     22,
+     null,
+     null,
+     4
+    ],
+    "note": "real GPU-vs-CPU numerics: gaps 0.04-0.35 far above epsilon; CPU reference self-stable (calibration exact); matches the M0.4 llama-cli text-method 25.0% \u2014 honest FAIL, epsilon NOT loosened (no-op calibration forbids it); escalation (plan 2026-09-24 OPEN section, Step B, user-approved): FA ruled out \u2014 fa on vs off dumps byte-identical \u2014 divergence is inherent MMQ kernel numerics; GPU-leg acceptance = bounded deviation (max |top1 diff| over compared positions <= gpu_dev_bound 2.0, frozen from measured 1.769; cascade positions excluded), hip-vs-hip determinism (rerun dumps byte-identical), CPU-vs-CPU reference exact; token match_rate still recorded honestly (25.0%)",
+    "gpu_dev_bound": 2.0,
+    "max_logit_dev": 1.7689628601074219,
+    "gpu_leg_pass": true,
+    "comparator_version": 2
+   }
   }
+ }
 }

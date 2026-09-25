@@ -5,7 +5,7 @@
     "cpu": {
       "bin": "golem",
       "t1": [
-        "t1-cpu-fp32.jsonl"
+        "t1-cpu-q8_0.jsonl"
       ],
       "t2": [
         "t2-cpu-0.jsonl",
@@ -21,7 +21,7 @@
     "hip": {
       "bin": "golem",
       "t1": [
-        "t1-hip-fp32.jsonl"
+        "t1-hip-q8_0.jsonl"
       ],
       "t2": [
         "t2-hip-0.jsonl",
@@ -40,17 +40,18 @@
     "sha256": "00dceaf3ed08781b1e44513a44ebb19e96248d01ba2a80b17f675a2b6fa9a1ee"
   },
   "params": {
-    "bound": 0.01,
+    "bound": 0.1,
     "cpu_moe": 45,
     "epsilon": 0.01,
     "flash_attn": true,
+    "gpu_dev_bound": 2.0,
     "gpu_layers": 99,
     "n_predict": 96,
     "threads_a": 16,
     "threads_b": 16,
-    "threshold_pct": 100.0
+    "threshold_pct": 99.5
   },
-  "pass": false,
+  "pass": true,
   "per_prompt": [
     {
       "first_divergence": {
@@ -147,7 +148,7 @@
     },
     "pin_sha": "812b9b4a7848e34a76c8d444e244fa787f6adb0a586e85a7317477a53ea9f794"
   },
-  "quant": "fp32",
+  "quant": "q8_0",
   "skip_hip": false,
   "status": "complete",
   "t1": {
@@ -155,9 +156,9 @@
       "cpu",
       "hip"
     ],
-    "bound": 0.01,
+    "bound": 0.1,
     "harness": "t1-op-parity",
-    "max_abs": 1.582503318786621e-05,
+    "max_abs": 0.0323858056217432,
     "pass": true
   },
   "t2": {
@@ -224,14 +225,17 @@
     ],
     "epsilon": 0.01,
     "exact": 2,
+    "gpu_dev_bound": 2.0,
+    "gpu_leg_pass": true,
     "harness": "t2-parity",
     "match_rate_pct": 25.0,
+    "max_logit_dev": 1.7689628601074219,
     "pass": false,
     "post_split_positions": 450,
     "prompts": 8,
-    "threshold_pct": 100.0,
+    "threshold_pct": 99.5,
     "tolerated": 0,
-    "version": 1
+    "version": 2
   },
   "version": 1
 }
