@@ -31,6 +31,12 @@ DEFAULT_TIMEOUT_S = 3600
 DEFAULT_EPSILON = 1e-2
 DEFAULT_THRESHOLD_PCT = 100.0
 DEFAULT_BOUND = 1e-2
+# Task-7 hardware-leg knobs (baseline-001 method): 96-token generations,
+# whole-model GPU offload with the first 45 layers' expert FFNs pinned to
+# CPU buffers (the public-API equivalent of -ncmoe 45).
+DEFAULT_N_PREDICT = 96
+DEFAULT_GPU_LAYERS = 99
+DEFAULT_CPU_MOE = 45
 LOCK_FILE = "engine/llama-cpp.lock"
 BACKEND_ENV_VAR = "GOLEM_LLAMA_SYS_BACKEND"
 
@@ -69,14 +75,25 @@ def t1_args(bin_path: str, dump_path: str, quant: str) -> list[str]:
 
 
 def t2_args(bin_path: str, model: str, prompt: str, dump_path: str,
-            threads: int | None = None) -> list[str]:
-    """One T2 leg invocation. `threads` (the Task 7 calibration knob) maps to
-    `golem run --threads N` → EngineConfig.threads; None passes no flag, so
-    the leg runs at the engine default."""
+            threads: int | None = None, n_predict: int = DEFAULT_N_PREDICT,
+            gpu_layers: int | None = None, cpu_moe: int | None = None,
+            flash_attn: bool = True) -> list[str]:
+    """One T2 leg invocation. Task-7 hardware-leg knobs: `threads` (the
+    calibration knob) maps to `golem run --threads`; `n_predict` is the
+    frozen generation length (96, the baseline method); `flash_attn` is
+    forced on for hardware legs on both backends; `gpu_layers`/`cpu_moe`
+    (the `-ngl 99`/`-ncmoe 45` equivalents) go to the GPU leg only — the
+    CPU reference leg must stay fully on CPU."""
     args = [bin_path, "run", "--greedy", model, "--prompt", prompt,
-            "--parity-dump", dump_path]
+            "--parity-dump", dump_path, "--n-predict", str(n_predict)]
+    if flash_attn:
+        args.append("--flash-attn")
     if threads is not None:
         args += ["--threads", str(threads)]
+    if gpu_layers is not None:
+        args += ["--n-gpu-layers", str(gpu_layers)]
+    if cpu_moe is not None:
+        args += ["--cpu-moe-layers", str(cpu_moe)]
     return args
 
 
@@ -228,7 +245,9 @@ def build_report(state: dict) -> dict:
         "skip_hip": state.get("skip_hip", False),
         "params": {"epsilon": state.get("epsilon"), "threshold_pct": state.get("threshold_pct"),
                    "bound": state.get("bound"),
-                   "threads_a": state.get("threads_a"), "threads_b": state.get("threads_b")},
+                   "threads_a": state.get("threads_a"), "threads_b": state.get("threads_b"),
+                   "n_predict": state.get("n_predict"), "gpu_layers": state.get("gpu_layers"),
+                   "cpu_moe": state.get("cpu_moe"), "flash_attn": state.get("flash_attn")},
         "model": state.get("model"),
         "legs": legs,
         "t1": state.get("t1"),
@@ -279,7 +298,9 @@ def _check_threads(threads_a: int | None, threads_b: int | None) -> None:
 def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant: str,
               skip_hip: bool, timeout_s: int, xtask: str | None,
               epsilon: float, threshold_pct: float, bound: float,
-              threads_a: int | None = None, threads_b: int | None = None) -> int:
+              threads_a: int | None = None, threads_b: int | None = None,
+              n_predict: int = DEFAULT_N_PREDICT, gpu_layers: int = DEFAULT_GPU_LAYERS,
+              cpu_moe: int = DEFAULT_CPU_MOE, flash_attn: bool = True) -> int:
     """Full suite: provenance gate → T1 legs → T2 legs (8 prompts × legs) →
     per-pair compare → merged report. Returns 0 iff every leg succeeded and
     both merged T1/T2 sections pass.
@@ -287,7 +308,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
     `threads_a` / `threads_b` are the Task 7 calibration knobs: per-leg T2
     decode-thread counts (leg A = cpu, leg B = hip). None (the default) runs
     the leg with no `--threads` flag at the engine default; together they
-    express the reference-vs-reference matrix (e.g. cpu-t16 vs cpu-t4)."""
+    express the reference-vs-reference matrix (e.g. cpu-t16 vs cpu-t4).
+    `gpu_layers`/`cpu_moe` go to the GPU (hip) leg only."""
     _check_threads(threads_a, threads_b)
     tree_hash = pin_sha()
     check_vendor_pin(tree_hash)
@@ -318,6 +340,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
             "quant": quant, "skip_hip": skip_hip,
             "epsilon": epsilon, "threshold_pct": threshold_pct, "bound": bound,
             "threads_a": threads_a, "threads_b": threads_b,
+            "n_predict": n_predict, "gpu_layers": gpu_layers, "cpu_moe": cpu_moe,
+            "flash_attn": flash_attn,
             "model": None, "t1": None, "t2": None, "per_prompt": [],
             "legs": {backend: {"bin": bins[backend], "t1": [], "t2": []}
                      for backend in backends},
@@ -341,6 +365,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
         # cpu → threads_a, leg B = hip → threads_b); T1 legs never get one
         # (parity-op has no threads surface). With --skip-hip only leg A runs.
         leg_threads = {"cpu": threads_a, "hip": threads_b}
+        leg_gpu = {"cpu": None, "hip": None if skip_hip else gpu_layers}
+        leg_moe = {"cpu": None, "hip": None if skip_hip else cpu_moe}
         t2_dumps: dict[str, list[str]] = {}
         for backend in backends:
             t2_dumps[backend] = []
@@ -349,7 +375,9 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
                 state["legs"][backend]["t2"].append(os.path.basename(dump_path))
                 _run_leg(state, outdir, logdir, f"t2-{backend}-{idx}",
                          t2_args(bins[backend], model, prompt, dump_path,
-                                 leg_threads[backend]), timeout_s, backend)
+                                 leg_threads[backend], n_predict=n_predict,
+                                 gpu_layers=leg_gpu[backend], cpu_moe=leg_moe[backend],
+                                 flash_attn=flash_attn), timeout_s, backend)
                 t2_dumps[backend].append(dump_path)
 
         state["model"] = dump_header_identity(t2_dumps["cpu"] + t2_dumps.get("hip", []))

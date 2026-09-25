@@ -155,9 +155,14 @@ else:
     # Record the pass-through `--threads` value (Task 7 calibration knob) so
     # tests can assert exactly which flag each leg received; None = flag absent.
     threads = args[args.index("--threads") + 1] if "--threads" in args else None
+    npredict = value("--n-predict") if "--n-predict" in args else None
     header = {"format": "golem-parity-dump", "version": 1, "model_sha256": sha,
               "model_bytes": len(model), "backend": backend, "offload": backend == "hip",
-              "prompt_tokens": len(prompt.split()), "n_predict": 3, "threads": threads}
+              "prompt_tokens": len(prompt.split()), "n_predict": npredict,
+              "threads": threads,
+              "gpu_layers": value("--n-gpu-layers") if "--n-gpu-layers" in args else None,
+              "cpu_moe": value("--cpu-moe-layers") if "--cpu-moe-layers" in args else None,
+              "flash_attn": "--flash-attn" in args}
     body = "".join(json.dumps({"position": p, "token": p + 1, "top1": 2.0, "top2": 0.5}) + "\\n"
                    for p in range(3))
 with open(out, "w") as f:
@@ -240,6 +245,42 @@ def test_run_mode_rejects_non_positive_threads_before_any_leg(tmp_path):
     assert proc.returncode == 1
     assert report is None, "validation fails before the out dir is created"
     assert "--threads-a" in proc.stderr and "FATAL" in proc.stderr
+
+
+def test_run_mode_hardware_leg_flags_reach_t2_legs(tmp_path):
+    """Task-7 hardware-leg contract: both T2 legs generate n_predict=96 with
+    flash-attn forced on; only the GPU (hip) leg receives the offload knobs
+    (--n-gpu-layers 99 --cpu-moe-layers 45, the -ncmoe equivalent). T1 legs
+    are synthetic and must never receive T2 flags."""
+    proc, report = _run_suite(tmp_path, [])
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    out = tmp_path / "out"
+    for backend in ("cpu", "hip"):
+        for idx in range(8):
+            h = _dump_header(out / f"t2-{backend}-{idx}.jsonl")
+            assert h["n_predict"] == "96", "hardware legs generate 96 tokens"
+            assert h["flash_attn"] is True, "fa=on on both hardware legs"
+    hip_h = _dump_header(out / "t2-hip-0.jsonl")
+    cpu_h = _dump_header(out / "t2-cpu-0.jsonl")
+    assert hip_h["gpu_layers"] == "99" and hip_h["cpu_moe"] == "45"
+    assert cpu_h["gpu_layers"] is None and cpu_h["cpu_moe"] is None, \
+        "the CPU reference leg must stay fully on CPU"
+    for backend in ("cpu", "hip"):
+        t1_header = _dump_header(out / f"t1-{backend}-fp32.jsonl")
+        assert "flash_attn" not in t1_header and "n_predict" not in t1_header
+    assert report["params"]["n_predict"] == 96
+    assert report["params"]["gpu_layers"] == 99
+    assert report["params"]["cpu_moe"] == 45
+    assert report["params"]["flash_attn"] is True
+
+
+def test_run_mode_skip_hip_applies_no_gpu_knobs(tmp_path):
+    """--skip-hip self-comparison is CPU-vs-CPU: no leg may receive the
+    offload knobs."""
+    proc, report = _run_suite(tmp_path, ["--skip-hip"])
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    h = _dump_header(tmp_path / "out" / "t2-cpu-0.jsonl")
+    assert h["gpu_layers"] is None and h["cpu_moe"] is None
 
 
 def test_run_mode_skip_hip_self_compares_cpu(tmp_path):

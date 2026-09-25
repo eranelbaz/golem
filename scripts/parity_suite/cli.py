@@ -4,7 +4,8 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .driver import (DEFAULT_BOUND, DEFAULT_EPSILON, DEFAULT_OUTDIR, DEFAULT_QUANT,
+from .driver import (DEFAULT_BOUND, DEFAULT_CPU_MOE, DEFAULT_EPSILON, DEFAULT_GPU_LAYERS,
+                     DEFAULT_N_PREDICT, DEFAULT_OUTDIR, DEFAULT_QUANT,
                      DEFAULT_THRESHOLD_PCT, DEFAULT_TIMEOUT_S, run_suite)
 from .selftest import selftest
 
@@ -47,6 +48,17 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--threads-b", type=int, default=None,
                      help="decode threads for the hip (leg B) T2 golem invocations "
                           "(golem run --threads); default: no flag, engine default")
+    run.add_argument("--n-predict", type=int, default=DEFAULT_N_PREDICT,
+                     help="generation length for T2 legs (baseline method: 96)")
+    run.add_argument("--gpu-layers", type=int, default=DEFAULT_GPU_LAYERS,
+                     help="--n-gpu-layers for the GPU (hip) T2 leg only "
+                          "(baseline method: 99 = whole model)")
+    run.add_argument("--cpu-moe", type=int, default=DEFAULT_CPU_MOE,
+                     help="--cpu-moe-layers for the GPU (hip) T2 leg only "
+                          "(the -ncmoe equivalent; baseline method: 45)")
+    run.add_argument("--no-flash-attn", dest="flash_attn", action="store_false",
+                     help="do not force flash attention on T2 legs "
+                          "(default: --flash-attn on both hardware legs)")
     ns = ap.parse_args(argv)
     if ns.selftest:
         return selftest()
@@ -57,7 +69,9 @@ def main(argv: list[str] | None = None) -> int:
                          outdir=ns.out, quant=ns.quant, skip_hip=ns.skip_hip,
                          timeout_s=ns.timeout, xtask=ns.xtask, epsilon=ns.epsilon,
                          threshold_pct=ns.threshold, bound=ns.bound,
-                         threads_a=ns.threads_a, threads_b=ns.threads_b)
+                         threads_a=ns.threads_a, threads_b=ns.threads_b,
+                         n_predict=ns.n_predict, gpu_layers=ns.gpu_layers,
+                         cpu_moe=ns.cpu_moe, flash_attn=ns.flash_attn)
     ap.print_help()
     return 2
 
