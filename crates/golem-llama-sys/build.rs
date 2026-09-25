@@ -258,6 +258,20 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         .allowlist_function("ggml_new_graph")
         .allowlist_function("ggml_build_forward_expand")
         .allowlist_function("ggml_graph_compute_with_ctx")
+        // Backend-registry compute (M1.4 Task 4a): the op must run on the
+        // HIP device when the binary is HIP-linked, so compute goes through
+        // the device registry instead of the CPU-only path above.
+        .allowlist_function("ggml_backend_dev_by_type")
+        .allowlist_function("ggml_backend_dev_name")
+        .allowlist_function("ggml_backend_dev_init")
+        .allowlist_function("ggml_backend_dev_buffer_type")
+        .allowlist_function("ggml_backend_free")
+        .allowlist_function("ggml_backend_alloc_ctx_tensors_from_buft")
+        .allowlist_function("ggml_backend_buffer_free")
+        .allowlist_function("ggml_backend_tensor_set")
+        .allowlist_function("ggml_backend_tensor_get")
+        .allowlist_function("ggml_backend_graph_compute")
+        .allowlist_function("ggml_backend_cpu_set_n_threads")
         // Q8_0 variant quantizer:
         .allowlist_function("ggml_quantize_chunk")
         // Types used (or pinned for stability) by the parity_op.rs FFI:
@@ -270,6 +284,12 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         .allowlist_type("ggml_cgraph")
         .allowlist_type("ggml_init_params")
         .allowlist_type("ggml_status")
+        // Opaque backend-registry handles + device-type enum (Task 4a):
+        .allowlist_type("ggml_backend")
+        .allowlist_type("ggml_backend_dev")
+        .allowlist_type("ggml_backend_buffer")
+        .allowlist_type("ggml_backend_buffer_type")
+        .allowlist_type("ggml_backend_dev_type")
         .allowlist_type("llama_.*")
         .allowlist_type("golem_.*")
         .allowlist_var("LLAMA_.*")
