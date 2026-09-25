@@ -173,6 +173,10 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_APP", "OFF")
         .define("GGML_BUILD_TESTS", "OFF")
+        // Session-10: repack ON converts Q4_0 weights through a single
+        // ~106 GiB host allocation — infeasible on 93 GiB RAM. Both
+        // substrate builds disable it (matches the baseline-001 recipe).
+        .define("GGML_CPU_REPACK", "OFF")
         .build_target("llama"); // not install: install builds common/tools/app transitively
     match backend {
         "cpu" => {
