@@ -30,7 +30,7 @@ fn fixture() -> Policy {
         experts_per_layer: 128,
         vram_experts_max: 32,
         vram_experts_min: 8,
-        ram_slots: 128,
+        ram_slots: 160, // headroom: 2 hot rotations + uniform tail ≈ 122 — dwell-gated page-ins need eviction supply
         ram_experts_min: 8,
         ..Default::default()
     };
@@ -58,6 +58,8 @@ impl Executor {
             p.apply_transition(accessed, Tier::Ram, true, step);
         }
         let mut ram = (0..p.len()).filter(|&k| p.residency(k, Tier::Ram)).count();
+        // consume order: evict before promote — promoting into a full device
+        // budget is the failure mode P2 must avoid (M2.3 inherits this sequence)
         for e in out.ram_evict_order.iter() {
             if ram <= p.config().ram_slots {
                 break;
@@ -65,6 +67,14 @@ impl Executor {
             if p.residency(e.key, Tier::Ram) {
                 p.apply_transition(e.key, Tier::Ram, false, step);
                 ram -= 1;
+            }
+        }
+        for e in out.vram_evict_order.iter() {
+            if self.misbehave {
+                break; // injected fault: skip VRAM evictions
+            }
+            if p.residency(e.key, Tier::Vram) {
+                p.apply_transition(e.key, Tier::Vram, false, step);
             }
         }
         for e in out.vram_order.iter() {
@@ -80,14 +90,6 @@ impl Executor {
                 }
                 p.apply_transition(e.key, Tier::Vram, true, step);
                 self.last_promote[e.key] = step;
-            }
-        }
-        if self.misbehave {
-            return;
-        }
-        for e in out.vram_evict_order.iter() {
-            if p.residency(e.key, Tier::Vram) {
-                p.apply_transition(e.key, Tier::Vram, false, step);
             }
         }
     }
@@ -162,7 +164,7 @@ fn floor_resident_no_thrash_budget_held_across_seeds() {
         let seed = 0x9E3779B97F4A7C15 ^ i;
         let (violations, max_vram, max_ram) = run_trace(seed, false);
         assert!(violations.is_empty(), "seed {seed:#x}: {violations:?}");
-        assert!(max_vram <= 32 && max_ram <= 128);
+        assert!(max_vram <= 32 && max_ram <= 160);
     }
 }
 

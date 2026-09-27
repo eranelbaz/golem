@@ -242,6 +242,10 @@ impl Policy {
             Tier::Vram => TIER_VRAM,
         };
         let st = &mut self.states[key];
+        let bit_set = st.tiers & bit != 0;
+        if bit_set == present {
+            return; // no-op: dwell clock keeps running
+        }
         if present {
             st.tiers |= bit;
         } else {
@@ -297,8 +301,16 @@ impl Policy {
                 });
             }
         }
-        for e in vram_order.iter_mut().take(cfg.vram_experts_min) {
-            e.floor_pinned = true;
+        let mut vram_floor = 0usize;
+        for e in &mut vram_order {
+            if vram_floor == cfg.vram_experts_min {
+                break;
+            }
+            // decision 3: floors pin residents — candidates don't consume quota
+            if resident(e.key, TIER_VRAM) {
+                e.floor_pinned = true;
+                vram_floor += 1;
+            }
         }
 
         let in_order: Vec<usize> = vram_order.iter().map(|e| e.key).collect();
@@ -332,6 +344,10 @@ impl Policy {
             }
             if ram_floor < cfg.ram_experts_min {
                 ram_floor += 1;
+                continue;
+            }
+            // decision 5: min-dwell gates RAM eviction too
+            if !dwell_ok(k) {
                 continue;
             }
             ram_evict_order.push(PolicyEntry {
