@@ -8,7 +8,8 @@ Integrity rules (the harness must never manufacture a clean result):
   - compare refuses legs that are not ok=8/8 with identical -n and non-empty texts
 """
 from .config import (DEFAULT_MODEL, DEFAULT_OUTDIR, HARNESS_VERSION, PROMPTS,
-                     VENDOR_DIR, VENDOR_SHA_FILE, config_sha, leg_args, pin_sha)
+                     VENDOR_DIR, VENDOR_SHA_FILE, check_vendor_pin, config_sha,
+                     leg_args, pin_sha)
 from .extract import (extract_generation, extract_text, match_count,
                       parse_run_output, prefix_words)
 from .files import atomic_write, prompt_paths, write_leg_json
@@ -19,7 +20,8 @@ from .selftest import selftest
 
 __all__ = [
     "DEFAULT_MODEL", "DEFAULT_OUTDIR", "HARNESS_VERSION", "PROMPTS",
-    "VENDOR_DIR", "VENDOR_SHA_FILE", "config_sha", "leg_args", "pin_sha",
+    "VENDOR_DIR", "VENDOR_SHA_FILE", "check_vendor_pin", "config_sha",
+    "leg_args", "pin_sha",
     "extract_generation", "extract_text", "match_count", "parse_run_output",
     "prefix_words", "atomic_write", "prompt_paths", "write_leg_json",
     "acquire_lock", "preflight", "release_lock",

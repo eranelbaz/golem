@@ -15,6 +15,17 @@ pub struct EngineConfig {
     pub n_predict: u32,
     /// Decode threads (tech design §7.2: default 1).
     pub threads: u32,
+    /// Model layers to offload to the GPU (`llama_model_params::n_gpu_layers`,
+    /// llama.h): 0 keeps the whole model on CPU — the CI-leg default.
+    pub n_gpu_layers: u32,
+    /// Force Flash Attention (`LLAMA_FLASH_ATTN_TYPE_ENABLED` on the context
+    /// params); `false` leaves llama.cpp's `AUTO` default untouched.
+    pub flash_attn_on: bool,
+    /// Expert (MoE) FFN weights of the first N layers pinned to CPU buffers via
+    /// `tensor_buft_overrides` — the public-API equivalent of the vendor's
+    /// `-ncmoe N` flag (a common/arg.cpp path unreachable through libllama at
+    /// this pin). `None` keeps the llama.cpp default (no overrides).
+    pub cpu_moe_layers: Option<u32>,
 }
 
 impl Default for EngineConfig {
@@ -25,6 +36,9 @@ impl Default for EngineConfig {
             batch_tokens: 512,
             n_predict: 64,
             threads: 1,
+            n_gpu_layers: 0,
+            flash_attn_on: false,
+            cpu_moe_layers: None,
         }
     }
 }
@@ -41,5 +55,11 @@ mod tests {
         assert_eq!(c.n_predict, 64);
         assert_eq!(c.threads, 1);
         assert_eq!(c.model_path, PathBuf::new());
+        assert_eq!(
+            c.n_gpu_layers, 0,
+            "default offloads nothing (CI leg unchanged)"
+        );
+        assert!(!c.flash_attn_on, "default leaves flash attention at AUTO");
+        assert_eq!(c.cpu_moe_layers, None, "default writes no buft overrides");
     }
 }

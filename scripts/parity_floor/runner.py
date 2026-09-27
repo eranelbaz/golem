@@ -10,7 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from .config import GEN_RE, HARNESS_VERSION, PROMPTS, VENDOR_SHA_FILE, config_sha, leg_args, pin_sha
+from .config import GEN_RE, HARNESS_VERSION, PROMPTS, config_sha, check_vendor_pin, leg_args, pin_sha
 from .extract import extract_generation, extract_text, parse_run_output
 from .files import atomic_write, prompt_paths, write_leg_json
 from .locking import preflight, acquire_lock, release_lock
@@ -50,13 +50,19 @@ def run_prompt(args: list[str], timeout_s: int) -> tuple[int, str, str, float]:
 
 
 def _kill_process_group(proc: subprocess.Popen, timeout_s: int) -> tuple[int, str, str]:
-    os.killpg(proc.pid, signal.SIGKILL)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # leg exited between timeout and kill; communicate below reaps it
     try:
         stdout, stderr = proc.communicate(timeout=10)
     except subprocess.TimeoutExpired:
         # a grandchild outside the process group still holds the pipes: abandon them
-        proc.kill()
-        proc.wait(timeout=5)
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+            proc.poll()  # reap if it died in the interim; else abandon it
         stdout, stderr = "", ""
     stderr = (stderr or "") + f"\nTIMEOUT after {timeout_s}s (partial output preserved)"
     return -9, stdout, stderr
@@ -92,17 +98,6 @@ def cached_result(leg_dir: str, prompt_idx: int, config_hash: str, tree_hash: st
     return {"idx": prompt_idx, "rc": 0, "cached": True, "gen_s": sidecar.get("gen_s"),
             "pin_sha": sidecar.get("pin_sha"), "build_id": sidecar.get("build_id"),
             "wall_s": None, "text": text, "fa_warnings": sidecar.get("fa_warnings", [])}
-
-
-def _check_vendor_pin(tree_hash: str) -> None:
-    try:
-        with open(VENDOR_SHA_FILE) as pin_file:
-            pinned_hash = pin_file.readline().split("=", 1)[1].strip()
-    except (OSError, IndexError):
-        sys.exit(f"FATAL: cannot read/parse {VENDOR_SHA_FILE} (expected '<name>=<sha256>')")
-    if tree_hash != pinned_hash:
-        sys.exit(f"FATAL: vendor tree drifted ({tree_hash[:12]} != {pinned_hash[:12]}) — "
-                 f"re-vendor per scripts/build-substrate.sh")
 
 
 def _load_resumable_results(leg_dir: str, config_hash: str, prompt_idx: int | None) -> list:
@@ -198,7 +193,7 @@ def run_leg(bin_path: str, name: str, model: str, hip: bool, threads: int | None
         os.makedirs(ctx.leg_dir, exist_ok=True)
         config_hash = ctx.config_hash()
         tree_hash = pin_sha()
-        _check_vendor_pin(tree_hash)
+        check_vendor_pin(tree_hash)
 
         leg_meta = {"leg": name, "bin": bin_path, "model": model, "hip": hip,
                     "threads": threads, "n_tokens": n_tokens, "args_sha": config_hash,

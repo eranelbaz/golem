@@ -258,6 +258,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "golem-engine",
+ "golem-llama-sys",
+ "serde",
+ "serde_json",
+ "sha2",
  "xtask",
 ]
 
@@ -267,6 +271,8 @@ version = "0.1.0"
 dependencies = [
  "golem-gguf",
  "golem-llama-sys",
+ "serde",
+ "serde_json",
  "thiserror",
  "xtask",
 ]
@@ -603,6 +609,7 @@ version = "0.1.0"
 dependencies = [
  "golem-gguf",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
 ]

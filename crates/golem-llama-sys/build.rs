@@ -173,6 +173,10 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_APP", "OFF")
         .define("GGML_BUILD_TESTS", "OFF")
+        // Session-10: repack ON converts Q4_0 weights through a single
+        // ~106 GiB host allocation — infeasible on 93 GiB RAM. Both
+        // substrate builds disable it (matches the baseline-001 recipe).
+        .define("GGML_CPU_REPACK", "OFF")
         .build_target("llama"); // not install: install builds common/tools/app transitively
     match backend {
         "cpu" => {
@@ -236,6 +240,59 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
         .allowlist_function("llama_.*")
         .allowlist_function("golem_.*")
+        // GPU-offload plumbing (M1.4 Task 3): the `-ncmoe`-equivalent buft
+        // overrides pin expert tensors to the CPU buffer type by handle; the
+        // loader compares overrides against exactly this pointer.
+        .allowlist_function("ggml_backend_cpu_buffer_type")
+        // T1 op-parity leg (M1.4 Task 4): the minimal ggml FFI surface for
+        // golem-engine/src/parity_op.rs (design §13: raw ggml FFI is confined
+        // to that module, so the bindings stay as narrow as possible).
+        // Context lifecycle:
+        .allowlist_function("ggml_init")
+        .allowlist_function("ggml_free")
+        // Synthetic tensor creation (shapes [k, m, n_expert],
+        // [k, 1, n_ids], [1, n_ids] i32 — mul_mat_id requires 2d/3d tensors):
+        .allowlist_function("ggml_new_tensor_2d")
+        .allowlist_function("ggml_new_tensor_3d")
+        .allowlist_function("ggml_nbytes")
+        // The op itself plus graph build; compute goes through the backend
+        // registry below (Task 4a), so no CPU-only compute entry is bound.
+        .allowlist_function("ggml_mul_mat_id")
+        .allowlist_function("ggml_new_graph")
+        .allowlist_function("ggml_build_forward_expand")
+        // Backend-registry compute (M1.4 Task 4a): the op must run on the
+        // HIP device when the binary is HIP-linked, so compute goes through
+        // the device registry instead of the CPU-only path above.
+        .allowlist_function("ggml_backend_dev_by_type")
+        .allowlist_function("ggml_backend_dev_type")
+        .allowlist_function("ggml_backend_dev_name")
+        .allowlist_function("ggml_backend_dev_init")
+        .allowlist_function("ggml_backend_dev_buffer_type")
+        .allowlist_function("ggml_backend_free")
+        .allowlist_function("ggml_backend_alloc_ctx_tensors_from_buft")
+        .allowlist_function("ggml_backend_buffer_free")
+        .allowlist_function("ggml_backend_tensor_set")
+        .allowlist_function("ggml_backend_tensor_get")
+        .allowlist_function("ggml_backend_graph_compute")
+        .allowlist_function("ggml_backend_cpu_set_n_threads")
+        // Q8_0 variant quantizer:
+        .allowlist_function("ggml_quantize_chunk")
+        // Types used (or pinned for stability) by the parity_op.rs FFI:
+        // the opaque handle trio, the init params struct, and the graph-
+        // compute status enum (ggml_type arrives transitively via the
+        // ggml_new_tensor_* signatures). ggml_threadpool is deliberately
+        // absent — the leg pins threads via ggml_backend_cpu_set_n_threads.
+        .allowlist_type("ggml_context")
+        .allowlist_type("ggml_tensor")
+        .allowlist_type("ggml_cgraph")
+        .allowlist_type("ggml_init_params")
+        .allowlist_type("ggml_status")
+        // Opaque backend-registry handles + device-type enum (Task 4a):
+        .allowlist_type("ggml_backend")
+        .allowlist_type("ggml_backend_dev")
+        .allowlist_type("ggml_backend_buffer")
+        .allowlist_type("ggml_backend_buffer_type")
+        .allowlist_type("ggml_backend_dev_type")
         .allowlist_type("llama_.*")
         .allowlist_type("golem_.*")
         .allowlist_var("LLAMA_.*")

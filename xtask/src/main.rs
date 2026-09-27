@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 use std::io::Write;
 
-use xtask::{parity, tiny_moe};
+use xtask::{parity, parity_compare, tiny_moe};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -10,6 +10,7 @@ fn main() {
         None | Some("hello") => println!("xtask: workspace automation entry point"),
         Some("gen-tiny-moe") => gen_tiny_moe(args.collect()),
         Some("parity") => parity::run(args.collect()),
+        Some("parity-compare") => parity_compare::run(args.collect()),
         Some(other) => {
             eprintln!("unknown xtask command: {other}");
             std::process::exit(2);

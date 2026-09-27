@@ -15,6 +15,7 @@ vendor/llama.cpp/build/
 
 # Local scratch
 .m0-work/
+.m1-work/
 *.local.toml
 
 # Agent tooling scratch
@@ -30,3 +31,7 @@ docs/tech-design.md
 docs/product-spec.md
 docs/adr/
 docs/baselines/m0-exit-review.md
+
+# Split substrate build trees (Task 7)
+/target-cpu/
+/target-hip/
