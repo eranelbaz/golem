@@ -5,7 +5,7 @@
 //! `pass()` output exactly as P2/P3 would; `misbehave = true` skips VRAM
 //! evictions so the property harness proves it detects violations.
 
-use golem_placement::{Policy, PolicyOutput, PlacementConfig, Tier};
+use golem_placement::{PlacementConfig, Policy, PolicyOutput, Tier};
 
 struct XorShift(u64);
 
@@ -46,7 +46,14 @@ struct Executor {
 }
 
 impl Executor {
-    fn apply(&mut self, p: &mut Policy, accessed: usize, step: u64, out: &PolicyOutput, violations: &mut Vec<String>) {
+    fn apply(
+        &mut self,
+        p: &mut Policy,
+        accessed: usize,
+        step: u64,
+        out: &PolicyOutput,
+        violations: &mut Vec<String>,
+    ) {
         if !p.residency(accessed, Tier::Ram) {
             p.apply_transition(accessed, Tier::Ram, true, step);
         }

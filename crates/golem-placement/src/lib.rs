@@ -158,9 +158,7 @@ impl Policy {
         vram_budget_bytes: u64,
         ram_budget_bytes: u64,
     ) -> Result<Self, Infeasible> {
-        let vram_req = (cfg.vram_experts_min as u64)
-            .checked_mul(max_bytes_per_expert)
-            .unwrap_or(u64::MAX);
+        let vram_req = (cfg.vram_experts_min as u64).saturating_mul(max_bytes_per_expert);
         if vram_req > vram_budget_bytes {
             return Err(Infeasible {
                 tier: Tier::Vram,
@@ -169,9 +167,7 @@ impl Policy {
                 max_bytes_per_expert,
             });
         }
-        let ram_req = (cfg.ram_experts_min as u64)
-            .checked_mul(max_bytes_per_expert)
-            .unwrap_or(u64::MAX);
+        let ram_req = (cfg.ram_experts_min as u64).saturating_mul(max_bytes_per_expert);
         if ram_req > ram_budget_bytes {
             return Err(Infeasible {
                 tier: Tier::Ram,
@@ -280,7 +276,9 @@ impl Policy {
         rank.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
 
         let resident = |k: usize, bit: u8| self.states[k].tiers & bit != 0;
-        let dwell_ok = |k: usize| step.saturating_sub(self.states[k].last_transition_step) > cfg.min_dwell_steps;
+        let dwell_ok = |k: usize| {
+            step.saturating_sub(self.states[k].last_transition_step) > cfg.min_dwell_steps
+        };
 
         let mut vram_order: Vec<PolicyEntry> = Vec::with_capacity(cfg.vram_experts_max);
         for &(_, k) in &rank {
@@ -299,13 +297,8 @@ impl Policy {
                 });
             }
         }
-        let mut vram_floor = 0;
-        for e in &mut vram_order {
-            if vram_floor == cfg.vram_experts_min {
-                break;
-            }
+        for e in vram_order.iter_mut().take(cfg.vram_experts_min) {
             e.floor_pinned = true;
-            vram_floor += 1;
         }
 
         let in_order: Vec<usize> = vram_order.iter().map(|e| e.key).collect();
@@ -673,7 +666,10 @@ mod tests {
         p.apply_transition(1, Tier::Vram, true, 1);
         p.on_access(2, 9999); // top ram score → ram floor pin
         let out = p.pass(10_000);
-        assert!(out.ram_evict_order.iter().all(|e| e.key != 1), "vram-resident excluded");
+        assert!(
+            out.ram_evict_order.iter().all(|e| e.key != 1),
+            "vram-resident excluded"
+        );
         assert!(
             out.ram_evict_order.iter().all(|e| e.key != 2),
             "ram floor-pinned excluded"
