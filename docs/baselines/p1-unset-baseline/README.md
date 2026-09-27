@@ -9,8 +9,9 @@ against this dump). Frozen from an **unpatched** vendor tree.
 - **Command:**
 
   ```bash
-  GOLEM_LLAMA_SYS_BACKEND=cpu cargo build -p golem-cli
   cargo run -p xtask -- gen-tiny-moe --out /tmp/tiny-moe.gguf
+  GOLEM_LLAMA_SYS_BACKEND=cpu cargo build -p golem-cli
+  mkdir -p docs/baselines/p1-unset-baseline
   GOLEM_LLAMA_SYS_BACKEND=cpu target/debug/golem run --greedy /tmp/tiny-moe.gguf \
     --prompt "Hello" --n-predict 16 \
     --parity-dump docs/baselines/p1-unset-baseline/dump.jsonl

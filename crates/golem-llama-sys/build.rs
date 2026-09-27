@@ -58,7 +58,9 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        manifest_dir.join("headers/golem-hooks.h").display()
+        repo_root
+            .join("vendor/llama.cpp/ggml/include/golem-hooks.h")
+            .display()
     );
     println!("cargo:rerun-if-env-changed={BACKEND_ENV}");
     println!("cargo:rerun-if-env-changed={SKIP_GATE_ENV}");
@@ -98,7 +100,7 @@ fn main() {
 
     let openmp_enabled = read_openmp_enabled(&binary_dir);
     emit_link_directives(resolved, openmp_enabled, &binary_dir);
-    generate_bindings(&manifest_dir, &repo_root, &out_dir);
+    generate_bindings(&repo_root, &out_dir);
 }
 
 fn run_pin_gate(repo_root: &Path) -> bool {
@@ -223,9 +225,9 @@ fn rocm_advisory_check(repo_root: &Path) {
     }
 }
 
-fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
+fn generate_bindings(repo_root: &Path, out_dir: &Path) {
     let vendor = repo_root.join("vendor/llama.cpp");
-    let hooks_header = manifest_dir.join("headers/golem-hooks.h");
+    let hooks_header = vendor.join("ggml/include/golem-hooks.h");
     let llama_header = vendor.join("include/llama.h");
     // size_t literal to the header; non-exhaustive enums keep future
     // llama.cpp enum additions non-breaking.
