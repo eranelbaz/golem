@@ -69,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     if ns.selftest:
         return selftest()
     if ns.cmd == "run":
+        if ns.skip_hip and ns.hip_bin:
+            ap.error("--hip-bin is discarded under --skip-hip — drop one of them")
         if not ns.skip_hip and not ns.hip_bin:
             ap.error("--hip-bin is required unless --skip-hip")
         return run_suite(cpu_bin=ns.cpu_bin, hip_bin=ns.hip_bin, model=ns.model,

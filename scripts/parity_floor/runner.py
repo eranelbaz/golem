@@ -58,8 +58,11 @@ def _kill_process_group(proc: subprocess.Popen, timeout_s: int) -> tuple[int, st
         stdout, stderr = proc.communicate(timeout=10)
     except subprocess.TimeoutExpired:
         # a grandchild outside the process group still holds the pipes: abandon them
-        proc.kill()
-        proc.wait(timeout=5)
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+            proc.poll()  # reap if it died in the interim; else abandon it
         stdout, stderr = "", ""
     stderr = (stderr or "") + f"\nTIMEOUT after {timeout_s}s (partial output preserved)"
     return -9, stdout, stderr

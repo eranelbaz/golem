@@ -38,6 +38,6 @@ jobs:
       # M1.4 parity-suite leg (stdlib driver): pytest file runs the in-script
       # selftest through the real xtask comparator. Must stay after the
       # workspace build so target/debug/xtask exists (no cargo-run fallback).
-      - run: python3 -m pip install --quiet pytest
+      - run: python3 -m pip install --quiet 'pytest==8.4.2'
       - run: python3 -m pytest tests/test_parity_suite.py -q
       - uses: EmbarkStudios/cargo-deny-action@v2

@@ -160,6 +160,16 @@ def test_selftest_dumps_use_selftest_model_hash():
 STUB_GOLEM = '''#!/usr/bin/env python3
 import hashlib, json, os, sys
 args = sys.argv[1:]
+# Flag whitelist: a driver typo (e.g. --n-gpu-layer) must fail the leg
+# loudly, never silently vanish from the dump headers.
+VALUE_FLAGS = {"--dump", "--quant", "--greedy", "--prompt", "--parity-dump",
+               "--n-predict", "--threads", "--n-gpu-layers", "--cpu-moe-layers"}
+ALLOWED = {"parity-op", "run", "--flash-attn"} | VALUE_FLAGS
+i = 0
+while i < len(args):
+    flag = args[i]
+    assert flag in ALLOWED, f"stub got unexpected arg {flag!r} (driver typo?)"
+    i += 2 if flag in VALUE_FLAGS else 1
 def value(flag):
     return args[args.index(flag) + 1]
 backend = os.path.basename(sys.argv[0]).rsplit("-", 1)[-1]
@@ -175,14 +185,14 @@ else:
     out, prompt = value("--parity-dump"), value("--prompt")
     # Record the pass-through `--threads` value (Task 7 calibration knob) so
     # tests can assert exactly which flag each leg received; None = flag absent.
-    threads = args[args.index("--threads") + 1] if "--threads" in args else None
+    threads = int(args[args.index("--threads") + 1]) if "--threads" in args else None
     npredict = value("--n-predict") if "--n-predict" in args else None
     header = {"format": "golem-parity-dump", "version": 1, "model_sha256": sha,
               "model_bytes": len(model), "backend": backend, "offload": backend == "hip",
-              "prompt_tokens": len(prompt.split()), "n_predict": npredict,
+              "prompt_tokens": len(prompt.split()), "n_predict": int(npredict),
               "threads": threads,
-              "gpu_layers": value("--n-gpu-layers") if "--n-gpu-layers" in args else None,
-              "cpu_moe": value("--cpu-moe-layers") if "--cpu-moe-layers" in args else None,
+              "gpu_layers": int(value("--n-gpu-layers")) if "--n-gpu-layers" in args else None,
+              "cpu_moe": int(value("--cpu-moe-layers")) if "--cpu-moe-layers" in args else None,
               "flash_attn": "--flash-attn" in args}
     body = "".join(json.dumps({"position": p, "token": p + 1, "top1": 2.0, "top2": 0.5}) + "\\n"
                    for p in range(3))
@@ -191,6 +201,27 @@ with open(out, "w") as f:
 '''
 
 FAILING_STUB = "#!/usr/bin/env sh\nexit 1\n"
+
+# Hangs forever on the T2 leg so the suite's per-leg timeout drives the
+# process-group kill; writes valid T1 dumps so earlier legs pass.
+SLEEP_GOLEM = '''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+def value(flag):
+    return args[args.index(flag) + 1]
+backend = os.path.basename(sys.argv[0]).rsplit("-", 1)[-1]
+if args[0] == "parity-op":
+    with open(value("--dump"), "w") as f:
+        f.write(json.dumps({"format": "golem-parity-op", "version": 1, "backend": backend,
+                            "m": 256, "k": 128, "n_expert": 8, "n_ids": 4, "seed": 1234,
+                            "quant": value("--quant")}) + "\\n")
+    sys.exit(0)
+time.sleep(30)
+'''
+
+# A hip-linked binary that never asked for device execution: the offload
+# gate must catch what the backend label alone cannot.
+HIP_NO_OFFLOAD_STUB = STUB_GOLEM.replace('"offload": backend == "hip"', '"offload": False')
 
 
 def _write_stub(path, content):
@@ -201,7 +232,8 @@ def _write_stub(path, content):
 
 def _run_suite(tmp_path, extra_args, cpu=None, hip=None):
     """Runs scripts/parity-suite.py run against stub binaries from the repo
-    root (the provenance gate hashes the real vendored tree)."""
+    root (the provenance gate hashes the real vendored tree). --hip-bin is
+    omitted under --skip-hip (passing both is a CLI error)."""
     bins = tmp_path / "bins"
     bins.mkdir(exist_ok=True)
     cpu = cpu or _write_stub(bins / "golem-cpu", STUB_GOLEM)
@@ -209,9 +241,12 @@ def _run_suite(tmp_path, extra_args, cpu=None, hip=None):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"stub model weights\n")
     out = str(tmp_path / "out")
+    args = ["--cpu-bin", cpu]
+    if "--skip-hip" not in extra_args:
+        args += ["--hip-bin", hip]
+    args += ["--model", str(model), "--out", out, *extra_args]
     proc = subprocess.run(
-        [sys.executable, SCRIPT, "run", "--cpu-bin", cpu, "--hip-bin", hip,
-         "--model", str(model), "--out", out, *extra_args],
+        [sys.executable, SCRIPT, "run", *args],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=SELFTEST_TIMEOUT_S)
     report_path = tmp_path / "out" / "report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else None
@@ -254,8 +289,8 @@ def test_run_mode_passes_threads_through_to_t2_legs(tmp_path):
     assert report["params"]["threads_a"] == 16 and report["params"]["threads_b"] == 4
     out = tmp_path / "out"
     for idx in range(8):
-        assert _dump_header(out / f"t2-cpu-{idx}.jsonl")["threads"] == "16"
-        assert _dump_header(out / f"t2-hip-{idx}.jsonl")["threads"] == "4"
+        assert _dump_header(out / f"t2-cpu-{idx}.jsonl")["threads"] == 16
+        assert _dump_header(out / f"t2-hip-{idx}.jsonl")["threads"] == 4
     for backend in ("cpu", "hip"):
         t1_header = _dump_header(out / f"t1-{backend}-fp32.jsonl")
         assert "threads" not in t1_header, "T1 legs must not carry a threads flag"
@@ -279,11 +314,11 @@ def test_run_mode_hardware_leg_flags_reach_t2_legs(tmp_path):
     for backend in ("cpu", "hip"):
         for idx in range(8):
             h = _dump_header(out / f"t2-{backend}-{idx}.jsonl")
-            assert h["n_predict"] == "96", "hardware legs generate 96 tokens"
+            assert h["n_predict"] == 96, "hardware legs generate 96 tokens"
             assert h["flash_attn"] is True, "fa=on on both hardware legs"
     hip_h = _dump_header(out / "t2-hip-0.jsonl")
     cpu_h = _dump_header(out / "t2-cpu-0.jsonl")
-    assert hip_h["gpu_layers"] == "99" and hip_h["cpu_moe"] == "45"
+    assert hip_h["gpu_layers"] == 99 and hip_h["cpu_moe"] == 45
     assert cpu_h["gpu_layers"] is None and cpu_h["cpu_moe"] is None, \
         "the CPU reference leg must stay fully on CPU"
     for backend in ("cpu", "hip"):
@@ -339,3 +374,98 @@ def test_verify_dump_backend_rejects_mislabeled_leg(tmp_path):
     dump.write_text(_t2_header(backend="cpu") + "\n")  # hip leg, cpu-linked dump
     with pytest.raises(SystemExit, match="mislabeled leg binary"):
         verify_dump_backend(str(dump), "hip")
+
+
+def test_verify_dump_backend_requires_offload_for_gpu_leg(tmp_path):
+    """backend=hip with offload=false is a hip-linked binary that never asked
+    for device execution — the T2 gate must fail it, not trust the label."""
+    dump = tmp_path / "t2-hip-0.jsonl"
+    dump.write_text(_t2_header(backend="hip") + "\n")  # _t2_header: offload False
+    with pytest.raises(SystemExit, match="never asked for device execution"):
+        verify_dump_backend(str(dump), "hip", require_offload=True)
+    # Without the flag (T1 legs) the backend label alone decides.
+    verify_dump_backend(str(dump), "hip")
+
+
+def test_comparator_failure_error_is_scrubbed(tmp_path, monkeypatch):
+    """Comparator stderr embeds absolute dump paths; the report error field
+    must carry basenames only (path-scrub policy covers failures too)."""
+    from parity_suite import driver
+    monkeypatch.setattr(
+        driver, "run_prompt",
+        lambda args, timeout_s: (2, "",
+                                 "guard: read /tmp/secret-dir/t2-cpu-0.jsonl: bad dump", 0.1))
+    state = {"status": "running", "pass": None, "legs": {}}
+    with pytest.raises(SystemExit):
+        driver._compare_or_die(state, str(tmp_path), ["xtask"],
+                               ["parity-compare", "t2", "--a", "a.jsonl"], 10)
+    raw = (tmp_path / "report.json").read_text()
+    assert "/tmp/secret-dir" not in raw, "comparator stderr leaked absolute paths"
+    assert "t2-cpu-0.jsonl" in json.loads(raw)["error"]
+
+
+def test_run_mode_leg_timeout_kills_group_and_writes_failed_report(tmp_path):
+    """The riskiest subprocess path — per-leg timeout → process-group SIGKILL
+    → rc=-9 — must surface as a `failed` report, not a stranded `running`."""
+    # Stub names must be golem-<backend>: the stub derives its dump header's
+    # backend label from its own file name.
+    (tmp_path / "bins").mkdir(exist_ok=True)
+    proc, report = _run_suite(
+        tmp_path, ["--timeout", "1"],
+        cpu=_write_stub(tmp_path / "bins" / "golem-cpu", SLEEP_GOLEM),
+        hip=_write_stub(tmp_path / "bins" / "golem-hip", SLEEP_GOLEM))
+    assert proc.returncode == 1, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert report["status"] == "failed"
+    assert "t2-cpu-0" in report["error"] and "rc=-9" in report["error"]
+    assert "(timed out)" in report["error"]
+    assert report["pass"] is not True
+
+
+def test_run_mode_rejects_hip_leg_that_never_offloads(tmp_path):
+    (tmp_path / "bins").mkdir(exist_ok=True)
+    proc, report = _run_suite(
+        tmp_path, [], hip=_write_stub(tmp_path / "bins" / "golem-hip", HIP_NO_OFFLOAD_STUB))
+    assert proc.returncode == 1
+    assert report["status"] == "failed"
+    assert "never asked for device execution" in report["error"]
+
+
+def test_run_mode_rejects_non_positive_knobs_before_any_leg(tmp_path):
+    for flag, bad in (("--n-predict", "0"), ("--gpu-layers", "0"),
+                      ("--timeout", "0"), ("--cpu-moe", "-1")):
+        proc, report = _run_suite(tmp_path, [flag, bad])
+        assert proc.returncode == 1, flag
+        assert report is None, f"{flag}: validation must precede the out dir"
+        assert flag.lstrip("-") in proc.stderr and "FATAL" in proc.stderr, flag
+
+
+def test_run_mode_rejects_skip_hip_with_hip_bin(tmp_path):
+    bins = tmp_path / "bins"
+    bins.mkdir()
+    cpu = _write_stub(bins / "golem-cpu", STUB_GOLEM)
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"stub model weights\n")
+    proc = subprocess.run(
+        [sys.executable, SCRIPT, "run", "--cpu-bin", cpu, "--hip-bin", cpu,
+         "--model", str(model), "--out", str(tmp_path / "out"), "--skip-hip"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=SELFTEST_TIMEOUT_S)
+    assert proc.returncode == 2
+    assert "--skip-hip" in proc.stderr and "--hip-bin" in proc.stderr
+    assert not (tmp_path / "out" / "report.json").exists()
+
+
+def test_stub_rejects_driver_flag_typos(tmp_path):
+    """The stub whitelists flags: a driver typo like --n-gpu-layer (missing
+    's') must fail the leg instead of silently dropping the knob."""
+    bins = tmp_path / "bins"
+    bins.mkdir()
+    stub = _write_stub(bins / "golem-cpu", STUB_GOLEM)
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"stub model weights\n")
+    proc = subprocess.run(
+        [sys.executable, stub, "run", "--greedy", str(model), "--prompt", "hi",
+         "--parity-dump", str(tmp_path / "d.jsonl"), "--n-predict", "3",
+         "--n-gpu-layer", "99"],
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode != 0
+    assert "unexpected arg" in proc.stderr and "n-gpu-layer" in proc.stderr

@@ -28,7 +28,12 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::rename(&tmp, path)
+    // A failed rename must not orphan the temp file either.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
