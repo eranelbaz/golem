@@ -18,12 +18,14 @@
 //! Report JSON is deterministic: serde serializes struct fields in
 //! declaration order, and the declaration order below is the frozen report
 //! contract. Backend mismatch (cpu vs hip) is recorded in the report, never
-//! failed; cross-dump guards (format/version, prompt_tokens, step count,
-//! step-position alignment, per-dump position contiguity from 0, per-step
-//! logit ordering (top1 ≥ top2), non-empty dumps, id set, quant/dims)
-//! are usage-class errors — exit 2.
+//! failed; cross-dump guards (format/version, model sha256, n_predict,
+//! prompt_tokens, step count, step-position alignment, per-dump position
+//! contiguity from 0, per-step logit ordering (top1 ≥ top2), non-empty dumps,
+//! header-vs-body record counts, id set, quant/dims) are usage-class errors
+//! — exit 2.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +53,21 @@ pub enum CompareError {
         /// `prompt_tokens` of leg A.
         a: u64,
         /// `prompt_tokens` of leg B.
+        b: u64,
+    },
+    /// T2 guard: the two dumps were written from different model bytes
+    /// (a model mix-up must never compare as a pass).
+    ModelShaMismatch {
+        /// `model_sha256` of leg A.
+        a: String,
+        /// `model_sha256` of leg B.
+        b: String,
+    },
+    /// T2 guard: the two dumps disagree on the requested `n_predict`.
+    NPredictMismatch {
+        /// Header `n_predict` of leg A.
+        a: u64,
+        /// Header `n_predict` of leg B.
         b: u64,
     },
     /// T2 guard: the two dumps have different step counts.
@@ -101,6 +118,11 @@ pub enum CompareError {
         /// What is wrong with the line.
         detail: String,
     },
+    /// A dump parsed but recorded no records after the header (empty body).
+    EmptyBody {
+        /// The format tag the dump carried.
+        expected: &'static str,
+    },
     /// A parameter is invalid (unparseable, negative epsilon, ...).
     Usage(String),
 }
@@ -116,6 +138,12 @@ impl std::fmt::Display for CompareError {
             }
             CompareError::PromptTokensMismatch { a, b } => {
                 write!(f, "guard: prompt_tokens mismatch: {a} vs {b}")
+            }
+            CompareError::ModelShaMismatch { a, b } => {
+                write!(f, "guard: model_sha256 mismatch: {a} vs {b}")
+            }
+            CompareError::NPredictMismatch { a, b } => {
+                write!(f, "guard: n_predict mismatch: {a} vs {b}")
             }
             CompareError::StepCountMismatch { a, b } => {
                 write!(f, "guard: step-count mismatch: {a} vs {b}")
@@ -141,6 +169,12 @@ impl std::fmt::Display for CompareError {
                 write!(
                     f,
                     "guard: expert-id set mismatch: only_a={only_a:?} only_b={only_b:?}"
+                )
+            }
+            CompareError::EmptyBody { expected } => {
+                write!(
+                    f,
+                    "dump body is empty (expected {expected:?} records after the header)"
                 )
             }
             CompareError::ShapeMismatch { detail } => {
@@ -173,6 +207,10 @@ pub struct DumpStep {
 pub struct ParityDump {
     /// Substrate backend the dump was recorded on (`cpu` / `hip`).
     pub backend: String,
+    /// Header `model_sha256` — must agree across a compared pair.
+    pub model_sha256: String,
+    /// Header `n_predict` — must agree across a compared pair.
+    pub n_predict: u64,
     /// Header `prompt_tokens` — must agree across a compared pair.
     pub prompt_tokens: u64,
     /// Recorded steps in dump order.
@@ -194,15 +232,6 @@ pub struct OpDump {
     pub n_expert: i64,
     /// f64 row checksum per expert id (ascending by id).
     pub checksums: BTreeMap<u32, f64>,
-}
-
-/// A matched pair of T2 dumps: the same prompt run on two substrates.
-#[derive(Debug, Clone, PartialEq)]
-pub struct T2Pair {
-    /// Leg A dump.
-    pub a: ParityDump,
-    /// Leg B dump.
-    pub b: ParityDump,
 }
 
 /// First-divergence record for one prompt pair (frozen field order).
@@ -381,6 +410,8 @@ fn require_i64(
 pub fn parse_t2_dump(text: &str) -> Result<ParityDump, CompareError> {
     let header = parse_header(text, T2_FORMAT)?;
     let backend = require_str(&header, "backend", T2_FORMAT)?.to_owned();
+    let model_sha256 = require_str(&header, "model_sha256", T2_FORMAT)?.to_owned();
+    let n_predict = require_u64(&header, "n_predict", T2_FORMAT)?;
     let prompt_tokens = require_u64(&header, "prompt_tokens", T2_FORMAT)?;
     let mut steps = Vec::new();
     for (lineno, line) in dump_lines(text).skip(1) {
@@ -420,13 +451,14 @@ pub fn parse_t2_dump(text: &str) -> Result<ParityDump, CompareError> {
     // An empty dump compares nothing and would pass at 100% — a leg that
     // recorded zero steps is a failed leg, not a perfect one.
     if steps.is_empty() {
-        return Err(CompareError::Format {
+        return Err(CompareError::EmptyBody {
             expected: T2_FORMAT,
-            detail: "dump records no steps".to_owned(),
         });
     }
     Ok(ParityDump {
         backend,
+        model_sha256,
+        n_predict,
         prompt_tokens,
         steps,
     })
@@ -447,6 +479,7 @@ pub fn parse_t1_dump(text: &str) -> Result<OpDump, CompareError> {
     let m = require_i64(&header, "m", T1_FORMAT)?;
     let k = require_i64(&header, "k", T1_FORMAT)?;
     let n_expert = require_i64(&header, "n_expert", T1_FORMAT)?;
+    let n_ids = require_u64(&header, "n_ids", T1_FORMAT)?;
     let mut checksums = BTreeMap::new();
     for (lineno, line) in dump_lines(text).skip(1) {
         let row: OpDumpRow = serde_json::from_str(line).map_err(|e| CompareError::Parse {
@@ -469,9 +502,20 @@ pub fn parse_t1_dump(text: &str) -> Result<OpDump, CompareError> {
     // Same empty-dump footgun as T2: zero id rows would compare as
     // max_abs = 0.0 and pass.
     if checksums.is_empty() {
+        return Err(CompareError::EmptyBody {
+            expected: T1_FORMAT,
+        });
+    }
+    // Header/body count guard: a writer bug (or a truncated transfer) that
+    // drops rows from *both* legs identically would slip past the id-set
+    // guard — the header's `n_ids` is the tamper check.
+    if checksums.len() as u64 != n_ids {
         return Err(CompareError::Format {
             expected: T1_FORMAT,
-            detail: "dump records no checksum rows".to_owned(),
+            detail: format!(
+                "header n_ids {n_ids} but body records {} checksum rows",
+                checksums.len()
+            ),
         });
     }
     Ok(OpDump {
@@ -484,16 +528,17 @@ pub fn parse_t1_dump(text: &str) -> Result<OpDump, CompareError> {
     })
 }
 
-/// Compares matched T2 dump pairs under the first-divergence verdict rule
+/// Compares one matched T2 dump pair under the first-divergence verdict rule
 /// and renders the deterministic report.
 ///
-/// Guards (exit-2-class): per pair, `prompt_tokens` and step count must
-/// agree, and both step lists must record the same `position` at every
-/// index (the pairing is by index). The verdict per pair is decided at its
+/// Guards (exit-2-class): the pair must agree on `model_sha256`, `n_predict`
+/// and `prompt_tokens`, and both step lists must record the same `position`
+/// at every index (the pairing is by index). The verdict is decided at the
 /// first divergence; subsequent positions only increment
 /// `post_split_positions`.
 pub fn compare_t2(
-    pairs: &[T2Pair],
+    a: &ParityDump,
+    b: &ParityDump,
     epsilon: f64,
     threshold_pct: f64,
     gpu_dev_bound: Option<f64>,
@@ -515,85 +560,93 @@ pub fn compare_t2(
             "threshold must be finite and within 0..=100, got {threshold_pct}"
         )));
     }
-    if pairs.is_empty() {
-        return Err(CompareError::Usage("no dump pairs to compare".to_owned()));
-    }
     let mut exact = 0u32;
     let mut tolerated = 0u32;
     let mut diverged = 0u32;
     let mut divergences = Vec::new();
     let mut post_split_positions = 0u64;
     let mut max_logit_dev = 0.0f64;
-    for pair in pairs {
-        // Cross-dump guards: the pair must describe the same prompt run.
-        if pair.a.prompt_tokens != pair.b.prompt_tokens {
-            return Err(CompareError::PromptTokensMismatch {
-                a: pair.a.prompt_tokens,
-                b: pair.b.prompt_tokens,
+    // Cross-dump guards: the pair must describe the same model run. A model
+    // mix-up or a differing generation-length knob must fail outright —
+    // standalone invocations have no driver above them to catch it.
+    if a.model_sha256 != b.model_sha256 {
+        return Err(CompareError::ModelShaMismatch {
+            a: a.model_sha256.clone(),
+            b: b.model_sha256.clone(),
+        });
+    }
+    if a.n_predict != b.n_predict {
+        return Err(CompareError::NPredictMismatch {
+            a: a.n_predict,
+            b: b.n_predict,
+        });
+    }
+    if a.prompt_tokens != b.prompt_tokens {
+        return Err(CompareError::PromptTokensMismatch {
+            a: a.prompt_tokens,
+            b: b.prompt_tokens,
+        });
+    }
+    if a.steps.len() != b.steps.len() {
+        return Err(CompareError::StepCountMismatch {
+            a: a.steps.len(),
+            b: b.steps.len(),
+        });
+    }
+    // First-divergence verdict: decide at the first token divergence;
+    // every position after it only counts toward post_split, never the
+    // match rate (cascade rule). The position-alignment guard runs at
+    // every index — including post-split ones: alignment is a usage
+    // property of the pair, not part of any verdict.
+    let mut first: Option<Divergence> = None;
+    for (index, (sa, sb)) in a.steps.iter().zip(b.steps.iter()).enumerate() {
+        if sa.position != sb.position {
+            return Err(CompareError::PositionMismatch {
+                index,
+                a: sa.position,
+                b: sb.position,
             });
         }
-        if pair.a.steps.len() != pair.b.steps.len() {
-            return Err(CompareError::StepCountMismatch {
-                a: pair.a.steps.len(),
-                b: pair.b.steps.len(),
-            });
+        if first.is_some() {
+            post_split_positions += 1;
+            continue;
         }
-        // First-divergence verdict: decide at the first token divergence;
-        // every position after it only counts toward post_split, never the
-        // match rate (cascade rule). The position-alignment guard runs at
-        // every index — including post-split ones: alignment is a usage
-        // property of the pair, not part of any verdict.
-        let mut first: Option<Divergence> = None;
-        for (index, (sa, sb)) in pair.a.steps.iter().zip(pair.b.steps.iter()).enumerate() {
-            if sa.position != sb.position {
-                return Err(CompareError::PositionMismatch {
-                    index,
-                    a: sa.position,
-                    b: sb.position,
-                });
-            }
-            if first.is_some() {
-                post_split_positions += 1;
-                continue;
-            }
-            max_logit_dev = max_logit_dev.max((f64::from(sa.top1) - f64::from(sb.top1)).abs());
-            if sa.token == sb.token {
-                continue;
-            }
-            // Gaps are computed in f64 from the exact f32 logits: when
-            // top1 ≈ top2 (the regime the epsilon rule decides), f32
-            // subtraction would lose the precision the comparison needs.
-            let gap_a = f64::from(sa.top1) - f64::from(sa.top2);
-            let gap_b = f64::from(sb.top1) - f64::from(sb.top2);
-            first = Some(Divergence {
-                position: sa.position,
-                a_token: sa.token,
-                b_token: sb.token,
-                gap_a,
-                gap_b,
-                tolerated: gap_a.min(gap_b) < epsilon,
-            });
+        max_logit_dev = max_logit_dev.max((f64::from(sa.top1) - f64::from(sb.top1)).abs());
+        if sa.token == sb.token {
+            continue;
         }
-        match first {
-            None => exact += 1,
-            Some(d) => {
-                if d.tolerated {
-                    tolerated += 1;
-                } else {
-                    diverged += 1;
-                }
-                divergences.push(d);
+        // Gaps are computed in f64 from the exact f32 logits: when
+        // top1 ≈ top2 (the regime the epsilon rule decides), f32
+        // subtraction would lose the precision the comparison needs.
+        let gap_a = f64::from(sa.top1) - f64::from(sa.top2);
+        let gap_b = f64::from(sb.top1) - f64::from(sb.top2);
+        first = Some(Divergence {
+            position: sa.position,
+            a_token: sa.token,
+            b_token: sb.token,
+            gap_a,
+            gap_b,
+            tolerated: gap_a.min(gap_b) < epsilon,
+        });
+    }
+    match first {
+        None => exact += 1,
+        Some(d) => {
+            if d.tolerated {
+                tolerated += 1;
+            } else {
+                diverged += 1;
             }
+            divergences.push(d);
         }
     }
-    let prompts = pairs.len() as u32;
-    let match_rate_pct = f64::from(exact) * 100.0 / f64::from(prompts);
+    let match_rate_pct = f64::from(exact) * 100.0;
     Ok(T2Report {
         harness: "t2-parity",
         version: 2,
         epsilon,
         threshold_pct,
-        prompts,
+        prompts: 1,
         exact,
         tolerated,
         diverged,
@@ -601,7 +654,7 @@ pub fn compare_t2(
         pass: diverged == 0 && match_rate_pct >= threshold_pct,
         divergences,
         post_split_positions,
-        backends: vec![pairs[0].a.backend.clone(), pairs[0].b.backend.clone()],
+        backends: vec![a.backend.clone(), b.backend.clone()],
         max_logit_dev,
         gpu_dev_bound,
         gpu_leg_pass: gpu_dev_bound.map(|b| max_logit_dev <= b),
@@ -788,13 +841,8 @@ pub fn execute(cli: &Cli) -> Result<String, String> {
         } => {
             let da = read_t2(a)?;
             let db = read_t2(b)?;
-            let report = compare_t2(
-                &[T2Pair { a: da, b: db }],
-                *epsilon,
-                *threshold_pct,
-                *gpu_dev_bound,
-            )
-            .map_err(|e| e.to_string())?;
+            let report = compare_t2(&da, &db, *epsilon, *threshold_pct, *gpu_dev_bound)
+                .map_err(|e| e.to_string())?;
             serde_json::to_string(&report).map_err(|e| format!("report serialization failed: {e}"))
         }
         Cli::T1 { a, b, bound } => {
@@ -827,7 +875,11 @@ pub fn run(args: Vec<String>) {
         Err(msg) => die(&msg),
     };
     match execute(&cli) {
-        Ok(line) => println!("{line}"),
+        Ok(line) => {
+            // Broken pipe (`| head`) must not panic: the frozen exit contract
+            // is 0 or 2, never a 101 from println!.
+            let _ = writeln!(std::io::stdout().lock(), "{line}");
+        }
         Err(msg) => die(&msg),
     }
 }
@@ -879,13 +931,11 @@ mod tests {
     fn t2(backend: &str, prompt_tokens: u64, spec: &[(u32, i32, f32, f32)]) -> ParityDump {
         ParityDump {
             backend: backend.to_owned(),
+            model_sha256: "abc".to_owned(),
+            n_predict: spec.len() as u64,
             prompt_tokens,
             steps: steps(spec),
         }
-    }
-
-    fn pair(a: ParityDump, b: ParityDump) -> T2Pair {
-        T2Pair { a, b }
     }
 
     /// Builds a T1 op dump body: frozen header + one checksum row per id.
@@ -936,6 +986,8 @@ mod tests {
         let text = t2_dump("hip", 33, &[(0, 10, 1.0, 0.5), (1, -3, 2.0, 0.25)]);
         let dump = parse_t2_dump(&text).expect("valid dump must parse");
         assert_eq!(dump.backend, "hip");
+        assert_eq!(dump.model_sha256, "abc");
+        assert_eq!(dump.n_predict, 2);
         assert_eq!(dump.prompt_tokens, 33);
         assert_eq!(dump.steps, steps(&[(0, 10, 1.0, 0.5), (1, -3, 2.0, 0.25)]));
     }
@@ -986,9 +1038,8 @@ mod tests {
         let text = t2_dump("cpu", 1, &[]);
         assert_eq!(
             parse_t2_dump(&text),
-            Err(CompareError::Format {
+            Err(CompareError::EmptyBody {
                 expected: T2_FORMAT,
-                detail: "dump records no steps".to_owned(),
             })
         );
     }
@@ -1009,23 +1060,20 @@ mod tests {
         let text = t1_dump("cpu", "fp32", &[]);
         assert_eq!(
             parse_t1_dump(&text),
-            Err(CompareError::Format {
+            Err(CompareError::EmptyBody {
                 expected: T1_FORMAT,
-                detail: "dump records no checksum rows".to_owned(),
             })
         );
     }
 
     #[test]
     fn compare_t2_rejects_threshold_outside_zero_to_hundred() {
-        let p = pair(
-            t2("cpu", 1, &[(0, 1, 1.0, 0.5)]),
-            t2("cpu", 1, &[(0, 1, 1.0, 0.5)]),
-        );
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
+        let b = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
         for bad in [-1.0, 100.5, f64::NAN] {
             assert!(
                 matches!(
-                    compare_t2(std::slice::from_ref(&p), EPS, bad, None),
+                    compare_t2(&a, &b, EPS, bad, None),
                     Err(CompareError::Usage(_))
                 ),
                 "threshold {bad} must be rejected"
@@ -1081,8 +1129,9 @@ mod tests {
     #[test]
     fn identical_dumps_are_exact_and_pass() {
         let spec = [(0u32, 5i32, 1.0f32, 0.5f32), (1, 6, 2.0, 0.25)];
-        let p = pair(t2("cpu", 9, &spec), t2("hip", 9, &spec));
-        let r = compare_t2(&[p], EPS, 100.0, None).expect("compare");
+        let a = t2("cpu", 9, &spec);
+        let b = t2("hip", 9, &spec);
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!(r.harness, "t2-parity");
         assert_eq!(r.version, 2);
         assert_eq!((r.prompts, r.exact, r.tolerated, r.diverged), (1, 1, 0, 0));
@@ -1117,7 +1166,7 @@ mod tests {
                 (3, 42, 1.0, 0.0), // gap_b 1.0
             ],
         );
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!((r.exact, r.tolerated, r.diverged), (0, 1, 0));
         assert_eq!(r.divergences.len(), 1);
         let d = &r.divergences[0];
@@ -1144,26 +1193,23 @@ mod tests {
             1,
             &[(0, 1, 0.5, 0.25), (1, 7, 0.75, 0.5), (2, 8, 9.0, 0.0)],
         );
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert!((r.max_logit_dev - 0.5).abs() < 1e-12);
     }
 
     #[test]
     fn gpu_dev_bound_sets_gpu_leg_pass_without_touching_token_pass() {
         // Diverged token stream (beyond eps), but bounded logit deviation 0.5.
-        let mk = || {
-            let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
-            let b = t2("hip", 1, &[(0, 2, 0.5, 0.0)]);
-            pair(a, b)
-        };
-        let r = compare_t2(&[mk()], EPS, 100.0, Some(0.5)).expect("compare");
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
+        let b = t2("hip", 1, &[(0, 2, 0.5, 0.0)]);
+        let r = compare_t2(&a, &b, EPS, 100.0, Some(0.5)).expect("compare");
         assert!(!r.pass, "token pass must stay false");
         assert_eq!(r.gpu_dev_bound, Some(0.5));
         assert_eq!(r.gpu_leg_pass, Some(true));
 
-        let r2 = compare_t2(&[mk()], EPS, 100.0, Some(0.25)).expect("compare");
+        let r2 = compare_t2(&a, &b, EPS, 100.0, Some(0.25)).expect("compare");
         assert_eq!(r2.gpu_leg_pass, Some(false));
-        let r3 = compare_t2(&[mk()], EPS, 100.0, None).expect("compare");
+        let r3 = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!(r3.gpu_leg_pass, None);
         assert!((r3.max_logit_dev - 0.5).abs() < 1e-12);
     }
@@ -1172,7 +1218,7 @@ mod tests {
     fn tolerated_asymmetry_gap_a_below_gap_b_above() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.875)]); // gap_a 0.125 < eps
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.5)]); // gap_b 0.5 >= eps
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!((r.tolerated, r.diverged), (1, 0));
         assert!(r.divergences[0].tolerated);
     }
@@ -1181,7 +1227,7 @@ mod tests {
     fn tolerated_asymmetry_mirrored() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]); // gap_a 0.5 >= eps
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.875)]); // gap_b 0.125 < eps
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!((r.tolerated, r.diverged), (1, 0));
         assert!(r.divergences[0].tolerated);
     }
@@ -1190,7 +1236,7 @@ mod tests {
     fn gap_equal_epsilon_diverges_strict_less_than() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.75)]); // gap_a 0.25 == eps
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.75)]); // gap_b 0.25 == eps
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!((r.exact, r.tolerated, r.diverged), (0, 0, 1));
         assert!(!r.divergences[0].tolerated);
         assert!(!r.pass);
@@ -1207,7 +1253,7 @@ mod tests {
             ],
         );
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.0), (1, 4, 1.0, 0.5)]);
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!(r.diverged, 1);
         assert_eq!(r.divergences[0].position, 0);
         assert_eq!(r.post_split_positions, 1);
@@ -1245,7 +1291,7 @@ mod tests {
                 (7, 9, 1.0, 0.5),
             ],
         );
-        let r = compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("compare");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!(r.post_split_positions, 7);
         assert_eq!(r.divergences.len(), 1);
         assert_eq!((r.exact, r.tolerated, r.diverged), (0, 1, 0));
@@ -1254,53 +1300,25 @@ mod tests {
     // ---- T2 comparison: pass rule -----------------------------------------
 
     #[test]
-    fn pass_rule_diverged_fails_even_when_match_rate_would_be_high() {
-        // Two prompts: one exact, one diverged. match_rate 50% >= threshold
-        // 50%, but diverged > 0 must still fail.
-        let exact_pair = pair(
-            t2("cpu", 1, &[(0, 1, 1.0, 0.5)]),
-            t2("hip", 1, &[(0, 1, 1.0, 0.5)]),
-        );
-        let diverged_pair = pair(
-            t2("cpu", 2, &[(0, 1, 1.0, 0.5)]),
-            t2("hip", 2, &[(0, 2, 1.0, 0.5)]),
-        );
-        let pairs = vec![exact_pair, diverged_pair];
-        let r = compare_t2(&pairs, EPS, 50.0, None).expect("compare");
-        assert_eq!((r.prompts, r.exact, r.diverged), (2, 1, 1));
-        assert_eq!(r.match_rate_pct, 50.0);
+    fn pass_rule_diverged_fails_even_at_zero_threshold() {
+        // Even a 0% threshold cannot rescue a diverged prompt...
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
+        let b = t2("hip", 1, &[(0, 2, 1.0, 0.5)]);
+        let r = compare_t2(&a, &b, EPS, 0.0, None).expect("compare");
+        assert_eq!((r.prompts, r.exact, r.diverged), (1, 0, 1));
         assert!(!r.pass, "diverged > 0 must fail regardless of match rate");
-        // Even a 0% threshold cannot rescue a diverged prompt.
-        let r = compare_t2(&pairs, EPS, 0.0, None).expect("compare");
-        assert!(!r.pass);
-        // All-exact at 100% threshold passes.
-        let r = compare_t2(
-            &[
-                pair(
-                    t2("cpu", 1, &[(0, 1, 1.0, 0.5)]),
-                    t2("hip", 1, &[(0, 1, 1.0, 0.5)]),
-                ),
-                pair(
-                    t2("cpu", 2, &[(0, 1, 1.0, 0.5)]),
-                    t2("hip", 2, &[(0, 1, 1.0, 0.5)]),
-                ),
-            ],
-            EPS,
-            100.0,
-            None,
-        )
-        .expect("compare");
+        // ...and an all-exact pair passes at the 100% threshold.
+        let b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert!(r.pass);
     }
 
     #[test]
     fn pass_rule_match_rate_below_threshold_fails() {
         // Tolerated only: diverged == 0, but match_rate 0% < 100%.
-        let tolerated_pair = pair(
-            t2("cpu", 1, &[(0, 1, 1.0, 0.875)]),
-            t2("hip", 1, &[(0, 2, 1.0, 0.5)]),
-        );
-        let r = compare_t2(&[tolerated_pair], EPS, 100.0, None).expect("compare");
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.875)]);
+        let b = t2("hip", 1, &[(0, 2, 1.0, 0.5)]);
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("compare");
         assert_eq!(r.diverged, 0);
         assert_eq!(r.match_rate_pct, 0.0);
         assert!(!r.pass, "match_rate below threshold must fail");
@@ -1313,17 +1331,71 @@ mod tests {
         let a = t2("cpu", 11, &[(0, 1, 1.0, 0.5)]);
         let b = t2("hip", 12, &[(0, 1, 1.0, 0.5)]);
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0, None),
+            compare_t2(&a, &b, EPS, 100.0, None),
             Err(CompareError::PromptTokensMismatch { a: 11, b: 12 })
         );
     }
 
     #[test]
-    fn guard_step_count_mismatch_is_usage_error() {
-        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.5)]);
-        let b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
+    fn guard_model_sha_mismatch_is_usage_error() {
+        // Standalone comparator runs have no driver above them: a model
+        // mix-up must fail here, not compare as a pass.
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
+        let mut b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
+        b.model_sha256 = "different".to_owned();
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0, None),
+            compare_t2(&a, &b, EPS, 100.0, None),
+            Err(CompareError::ModelShaMismatch {
+                a: "abc".to_owned(),
+                b: "different".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn guard_n_predict_mismatch_is_usage_error() {
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
+        let mut b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
+        b.n_predict = 2;
+        assert_eq!(
+            compare_t2(&a, &b, EPS, 100.0, None),
+            Err(CompareError::NPredictMismatch { a: 1, b: 2 })
+        );
+    }
+
+    #[test]
+    fn parse_t2_rejects_missing_model_sha256() {
+        let text = t2_dump("cpu", 1, &[(0, 1, 1.0, 0.5)]).replace("\"model_sha256\":\"abc\",", "");
+        assert!(matches!(
+            parse_t2_dump(&text),
+            Err(CompareError::Format { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_t1_rejects_body_shorter_than_n_ids() {
+        // Truncation that hits both legs identically slips past the id-set
+        // guard — the header's `n_ids` count is the tamper check.
+        let text = t1_dump("cpu", "fp32", &[(0, 1.0)]).replace("\"n_ids\":1", "\"n_ids\":4");
+        assert!(matches!(
+            parse_t1_dump(&text),
+            Err(CompareError::Format {
+                detail,
+                ..
+            })
+            if detail.contains("n_ids 4 but body records 1")
+        ));
+    }
+
+    #[test]
+    fn guard_step_count_mismatch_is_usage_error() {
+        // Headers agree (same n_predict — e.g. an EOG-truncated leg); the
+        // body step counts differ.
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.5)]);
+        let mut b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
+        b.n_predict = 2;
+        assert_eq!(
+            compare_t2(&a, &b, EPS, 100.0, None),
             Err(CompareError::StepCountMismatch { a: 2, b: 1 })
         );
     }
@@ -1335,7 +1407,7 @@ mod tests {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5), (1, 2, 1.0, 0.5)]);
         let b = t2("hip", 1, &[(0, 1, 1.0, 0.5), (2, 2, 1.0, 0.5)]);
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0, None),
+            compare_t2(&a, &b, EPS, 100.0, None),
             Err(CompareError::PositionMismatch {
                 index: 1,
                 a: 1,
@@ -1352,7 +1424,7 @@ mod tests {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.875), (1, 3, 1.0, 0.5)]);
         let b = t2("hip", 1, &[(0, 2, 1.0, 0.5), (5, 3, 1.0, 0.5)]);
         assert_eq!(
-            compare_t2(&[pair(a, b)], EPS, 100.0, None),
+            compare_t2(&a, &b, EPS, 100.0, None),
             Err(CompareError::PositionMismatch {
                 index: 1,
                 a: 1,
@@ -1437,24 +1509,18 @@ mod tests {
 
     #[test]
     fn bad_epsilon_and_threshold_are_usage_errors() {
-        let p = pair(
-            t2("cpu", 1, &[(0, 1, 1.0, 0.5)]),
-            t2("hip", 1, &[(0, 1, 1.0, 0.5)]),
-        );
+        let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
+        let b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
         assert!(matches!(
-            compare_t2(std::slice::from_ref(&p), -1.0, 100.0, None),
+            compare_t2(&a, &b, -1.0, 100.0, None),
             Err(CompareError::Usage(_))
         ));
         assert!(matches!(
-            compare_t2(std::slice::from_ref(&p), f64::NAN, 100.0, None),
+            compare_t2(&a, &b, f64::NAN, 100.0, None),
             Err(CompareError::Usage(_))
         ));
         assert!(matches!(
-            compare_t2(std::slice::from_ref(&p), EPS, f64::INFINITY, None),
-            Err(CompareError::Usage(_))
-        ));
-        assert!(matches!(
-            compare_t2(&[], EPS, 100.0, None),
+            compare_t2(&a, &b, EPS, f64::INFINITY, None),
             Err(CompareError::Usage(_))
         ));
     }
@@ -1529,8 +1595,7 @@ mod tests {
     fn backend_mismatch_is_recorded_never_failed() {
         let a = t2("cpu", 1, &[(0, 1, 1.0, 0.5)]);
         let b = t2("hip", 1, &[(0, 1, 1.0, 0.5)]);
-        let r =
-            compare_t2(&[pair(a, b)], EPS, 100.0, None).expect("backend mismatch must not fail");
+        let r = compare_t2(&a, &b, EPS, 100.0, None).expect("backend mismatch must not fail");
         assert_eq!(r.backends, vec!["cpu", "hip"]);
         assert!(r.pass);
         let a = op("cpu", "fp32", &[(0, 1.0)]);

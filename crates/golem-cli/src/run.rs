@@ -168,30 +168,17 @@ struct ParityDumpHeader<'a> {
     n_predict: u32,
 }
 
-/// One per-step record; also key-sorted (position < token < top1 < top2).
-#[derive(Serialize)]
-struct ParityDumpStep {
-    position: u32,
-    token: i32,
-    top1: f32,
-    top2: f32,
-}
-
 /// Renders the dump body: line-1 header, then one record per step, each a
-/// compact single-line JSON object in the frozen field order.
+/// compact single-line JSON object in the frozen field order (the record
+/// type is `golem_engine::parity::ParityStep`, serialized in place — no
+/// per-writer copy struct).
 fn render_parity_dump(header: &ParityDumpHeader<'_>, steps: &[ParityStep]) -> String {
     let mut out = String::with_capacity(96 + 96 * steps.len());
     // Plain string/number fields — serialization cannot fail.
     out.push_str(&serde_json::to_string(header).expect("header serialization cannot fail"));
     out.push('\n');
     for step in steps {
-        let record = ParityDumpStep {
-            position: step.position,
-            token: step.token,
-            top1: step.top1,
-            top2: step.top2,
-        };
-        out.push_str(&serde_json::to_string(&record).expect("step serialization cannot fail"));
+        out.push_str(&serde_json::to_string(step).expect("step serialization cannot fail"));
         out.push('\n');
     }
     out

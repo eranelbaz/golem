@@ -4,9 +4,12 @@
 #![allow(unsafe_code)]
 
 use golem_llama_sys::raw;
+use serde::Serialize;
 
 /// One generation step of a parity dump: the sampler's token choice plus the
-/// two largest logits of the row it was sampled from.
+/// two largest logits of the row it was sampled from. Serialized directly by
+/// the `golem run` dump writer (frozen field order = declaration order).
+#[derive(Serialize)]
 pub struct ParityStep {
     /// 0-based generation-step index (not `llama_pos`).
     pub position: u32,

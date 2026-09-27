@@ -15,8 +15,10 @@ Run from the repo root: vendor/ and engine/ are resolved relative to cwd.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 
 from parity_floor.config import PROMPTS, check_vendor_pin, pin_sha
@@ -68,15 +70,30 @@ def check_lock_pin(tree_hash: str) -> None:
 
 
 def _check_bin(role: str, path: str) -> None:
-    if not os.path.exists(path):
+    if not os.path.isfile(path):
         sys.exit(f"FATAL: {role} binary not found: {path}")
     if not os.access(path, os.X_OK):
         sys.exit(f"FATAL: {role} binary not executable: {path}")
 
 
+_SCRUBBED_PATH = re.compile(r"/[\w@+.-]+(?:/[\w@+.-]+)+")
+
+
+def scrub_paths(message: str) -> str:
+    """Reduce machine-local absolute paths to basenames (path-scrub policy:
+    report.json — and the fatal line printed from it — stays portable). The
+    pattern matches absolute paths of 2+ segments; every message that can
+    reach this point (leg rc lines, dump/guard failures, comparator stderr)
+    is path-bearing prose, not ratio or URL text."""
+    return _SCRUBBED_PATH.sub(lambda m: os.path.basename(m.group(0)), message)
+
+
 def _fatal_with_report(state: dict, outdir: str, message: str) -> None:
     """Die loudly but leave a `failed` checkpoint on disk — a fatal after the
-    first write_report must never strand report.json at status `running`."""
+    first write_report must never strand report.json at status `running`.
+    Scrubs the message: comparator/leg failure text embeds absolute dump and
+    binary paths that must not reach the artifact."""
+    message = scrub_paths(message)
     state["status"] = "failed"
     state["error"] = message
     write_report(state, outdir)
@@ -111,22 +128,59 @@ def t2_args(bin_path: str, model: str, prompt: str, dump_path: str,
     return args
 
 
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _xtask_stale(binary: str) -> bool:
+    """True when any comparator source is newer than the prebuilt binary — a
+    stale comparator must never silently decide pass/fail. The scanned dirs
+    mirror xtask's path dependencies (golem-gguf; the rest are crates.io);
+    extend it when xtask grows another path dep."""
+    root = _repo_root()
+    sources = [os.path.join(root, "xtask", "Cargo.toml")]
+    for src_dir in (os.path.join(root, "xtask", "src"),
+                    os.path.join(root, "crates", "golem-gguf", "src")):
+        sources += [os.path.join(src_dir, name) for name in os.listdir(src_dir)]
+    newest = max((os.stat(p).st_mtime for p in sources if os.path.exists(p)),
+                 default=0.0)
+    return os.stat(binary).st_mtime < newest
+
+
 def resolve_comparator(explicit: str | None) -> list[str]:
     """Comparator invocation prefix: an explicit --xtask path, else a prebuilt
-    target/{debug,release}/xtask, else `cargo run` (which may compile — the
-    selftest avoids it whenever a prebuilt binary exists)."""
+    target/{debug,release}/xtask (rejected when older than its sources), else
+    `cargo run` (which may compile — the selftest avoids it whenever a fresh
+    prebuilt binary exists)."""
     if explicit is not None:
         _check_bin("--xtask", explicit)
+        if _xtask_stale(explicit):
+            sys.exit("FATAL: --xtask binary is older than the comparator sources "
+                     "— rebuild it or drop the flag")
         return [explicit]
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    root = _repo_root()
     for candidate in (os.path.join(root, "target", "debug", "xtask"),
                       os.path.join(root, "target", "release", "xtask")):
         if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            if _xtask_stale(candidate):
+                print(f"SUITE: ignoring stale prebuilt {os.path.basename(candidate)} "
+                      "(older than its sources) — falling back to cargo run", flush=True)
+                continue
             return [candidate]
     cargo = (os.environ.get("CARGO") or "").strip() or "cargo"
     print("SUITE: no prebuilt xtask binary found — falling back to cargo run "
           "(may compile)", flush=True)
     return [cargo, "run", "-q", "-p", "xtask", "--"]
+
+
+def comparator_sha256(prefix: list[str]) -> str | None:
+    """Hash of the resolved comparator binary (None for cargo-run — the
+    report records the source pin instead). Same cargo/xtask discrimination
+    as the `comparator` mode field, so a renamed explicit --xtask is hashed."""
+    if prefix[0].endswith("cargo"):
+        return None
+    with open(prefix[0], "rb") as binary:
+        return hashlib.sha256(binary.read()).hexdigest()
 
 
 def run_comparator(prefix: list[str], argv_tail: list[str], timeout_s: int) -> dict:
@@ -167,14 +221,23 @@ def _dump_header(dump_path: str) -> dict:
     sys.exit(f"FATAL: dump has no header line: {os.path.basename(dump_path)}")
 
 
-def verify_dump_backend(dump_path: str, expected: str) -> None:
+def verify_dump_backend(dump_path: str, expected: str,
+                        require_offload: bool = False) -> None:
     """A leg labeled `hip` must have been produced by a hip-linked binary (and
     vice versa): the dump header records the substrate the binary was built
-    for, so a mislabeled leg dies here instead of poisoning the comparison."""
-    backend = _dump_header(dump_path).get("backend")
+    for, so a mislabeled leg dies here instead of poisoning the comparison.
+    `require_offload` additionally demands the header's `offload` intent flag:
+    a hip-linked binary that never asked for device execution would otherwise
+    pass the gate while running the whole leg on CPU."""
+    header = _dump_header(dump_path)
+    backend = header.get("backend")
     if backend != expected:
         sys.exit(f"FATAL: {os.path.basename(dump_path)} records backend={backend!r}, "
                  f"expected {expected!r} — mislabeled leg binary")
+    if require_offload and header.get("offload") is not True:
+        sys.exit(f"FATAL: {os.path.basename(dump_path)} records offload="
+                 f"{header.get('offload')!r}, expected true — hip leg never asked "
+                 f"for device execution")
 
 
 def dump_header_identity(dump_paths: list[str]) -> dict:
@@ -276,6 +339,7 @@ def build_report(state: dict) -> dict:
             "backend_env_input": {BACKEND_ENV_VAR: state.get("backend_env_input", "unset")},
         },
         "comparator": state.get("comparator", "xtask"),
+        "comparator_sha256": state.get("comparator_sha256"),
         "quant": state.get("quant"),
         "skip_hip": state.get("skip_hip", False),
         "params": {"epsilon": state.get("epsilon"), "threshold_pct": state.get("threshold_pct"),
@@ -316,39 +380,48 @@ def recheck_provenance(bin_path: str) -> str:
 
 
 def _run_leg(state: dict, outdir: str, logdir: str, name: str,
-             args: list[str], timeout_s: int, expected_backend: str) -> None:
+             args: list[str], timeout_s: int, expected_backend: str,
+             require_offload: bool = False) -> None:
     """One leg subprocess: re-verify provenance, run under the per-leg timeout
     (process-group kill via parity_floor.run_prompt), persist its output log,
-    verify the dump header's backend label, checkpoint the report."""
+    verify the dump header's backend label (and offload intent for GPU legs),
+    checkpoint the report. Every fatal path — SystemExit or an unexpected
+    exception — lands in _fatal_with_report, never a stranded `running`."""
     try:
         recheck_provenance(args[0])
+        rc, stdout, stderr, wall_s = run_prompt(args, timeout_s)
+        atomic_write(os.path.join(logdir, f"{name}.log"), (stdout or "") + (stderr or ""))
+        if rc != 0:
+            reason = f"leg {name} rc={rc} (log: {name}.log)"
+            if rc == -9:
+                reason += " (timed out)"
+            raise SystemExit(reason)
+        dump_path = args[args.index("--dump") + 1] if "--dump" in args else \
+            args[args.index("--parity-dump") + 1]
+        verify_dump_backend(dump_path, expected_backend, require_offload)
     except SystemExit as failure:
         _fatal_with_report(state, outdir, str(failure).removeprefix("FATAL: "))
-    rc, stdout, stderr, wall_s = run_prompt(args, timeout_s)
-    atomic_write(os.path.join(logdir, f"{name}.log"), (stdout or "") + (stderr or ""))
-    if rc != 0:
-        reason = f"leg {name} rc={rc} (log: {name}.log)"
-        if rc == -9:
-            reason += " (timed out)"
-        _fatal_with_report(state, outdir, reason)
-        return  # unreachable; keeps flow obvious
-    dump_path = args[args.index("--dump") + 1] if "--dump" in args else \
-        args[args.index("--parity-dump") + 1]
-    try:
-        verify_dump_backend(dump_path, expected_backend)
-    except SystemExit as failure:
-        _fatal_with_report(state, outdir, str(failure).removeprefix("FATAL: "))
+    except KeyboardInterrupt:
+        _fatal_with_report(state, outdir, f"leg {name} interrupted")
+    except Exception as failure:  # non-SystemExit must still leave a failed report
+        _fatal_with_report(state, outdir, f"leg {name} crashed: {failure!r}")
     print(f"SUITE: leg={name} rc=0 wall_s={wall_s:.1f}", flush=True)
     write_report(state, outdir)
 
 
-def _check_threads(threads_a: int | None, threads_b: int | None) -> None:
+def _check_knobs(threads_a: int | None, threads_b: int | None, timeout_s: int,
+                 n_predict: int, gpu_layers: int, cpu_moe: int) -> None:
     """The knobs must be engine-plausible before any leg starts (golem run
     itself rejects `--threads 0`; failing here keeps the failure message
-    beside the knob that caused it)."""
-    for knob, threads in (("threads-a", threads_a), ("threads-b", threads_b)):
-        if threads is not None and threads < 1:
-            sys.exit(f"FATAL: --{knob} must be >= 1, got {threads}")
+    beside the knob that caused it). `cpu_moe` may be 0 (pin no expert
+    layers — a meaningful all-GPU configuration)."""
+    for knob, value in (("threads-a", threads_a), ("threads-b", threads_b),
+                        ("timeout", timeout_s), ("n-predict", n_predict),
+                        ("gpu-layers", gpu_layers)):
+        if value is not None and value < 1:
+            sys.exit(f"FATAL: --{knob} must be >= 1, got {value}")
+    if cpu_moe < 0:
+        sys.exit(f"FATAL: --cpu-moe must be >= 0, got {cpu_moe}")
 
 
 def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant: str,
@@ -372,7 +445,7 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
     `gpu_layers`/`cpu_moe` go to the GPU (hip) leg only. `flash_attn_a` /
     `flash_attn_b` are per-leg flash-attention switches (fa=on-vs-off
     falsification, M1 escalation)."""
-    _check_threads(threads_a, threads_b)
+    _check_knobs(threads_a, threads_b, timeout_s, n_predict, gpu_layers, cpu_moe)
     tree_hash = pin_sha()
     check_vendor_pin(tree_hash)
     check_lock_pin(tree_hash)
@@ -391,6 +464,7 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
     try:
         comparator_prefix = resolve_comparator(xtask)
         comparator_mode = "cargo-run" if comparator_prefix[0].endswith("cargo") else "xtask"
+        comparator_sha = comparator_sha256(comparator_prefix)
         b_backend = "cpu" if skip_hip else "hip"  # --skip-hip: the cpu leg self-compares
         backends = ["cpu"] if skip_hip else ["cpu", "hip"]
         bins = {"cpu": cpu_bin, "hip": hip_bin}
@@ -399,6 +473,7 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
             "pin_sha": tree_hash,
             "backend_env_input": os.environ.get(BACKEND_ENV_VAR, "unset"),
             "comparator": comparator_mode,
+            "comparator_sha256": comparator_sha,
             "quant": quant, "skip_hip": skip_hip,
             "epsilon": epsilon, "threshold_pct": threshold_pct, "bound": bound,
             "threads_a": threads_a, "threads_b": threads_b,
@@ -414,7 +489,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
               f"{state['backend_env_input']} quant={quant} "
               f"legs={','.join(backends)} comparator={comparator_mode}", flush=True)
 
-        # T1 op legs: synthetic tensors, one dump per backend.
+        # T1 op legs: synthetic tensors, one dump per backend. T1 dumps carry
+        # no offload intent (no GPU knobs on the op surface).
         t1_dumps = {}
         for backend in backends:
             dump_path = os.path.join(outdir, f"t1-{backend}-{quant}.jsonl")
@@ -441,7 +517,8 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
                          t2_args(bins[backend], model, prompt, dump_path,
                                  leg_threads[backend], n_predict=n_predict,
                                  gpu_layers=leg_gpu[backend], cpu_moe=leg_moe[backend],
-                                 flash_attn=leg_fa[backend]), timeout_s, backend)
+                                 flash_attn=leg_fa[backend]), timeout_s, backend,
+                         require_offload=(backend == "hip"))
                 t2_dumps[backend].append(dump_path)
 
         try:
