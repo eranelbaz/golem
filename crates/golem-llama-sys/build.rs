@@ -257,6 +257,12 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .allowlist_function("ggml_new_tensor_2d")
         .allowlist_function("ggml_new_tensor_3d")
         .allowlist_function("ggml_nbytes")
+        // P1 hook-registration tests: tensor naming + expert-metadata math
+        // (golem_tensor_expert_count/stride_bytes consume these over FFI).
+        .allowlist_function("ggml_set_name")
+        .allowlist_function("ggml_n_dims")
+        .allowlist_function("ggml_type_size")
+        .allowlist_function("ggml_blck_size")
         // The op itself plus graph build; compute goes through the backend
         // registry below (Task 4a), so no CPU-only compute entry is bound.
         .allowlist_function("ggml_mul_mat_id")
