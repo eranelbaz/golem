@@ -25,7 +25,8 @@ __pycache__/
 
 # Local-only docs (not part of the repo)
 docs/baselines/m0-notes.md
-docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/plans/
 docs/worklog.md
 docs/tech-design.md
 docs/product-spec.md
