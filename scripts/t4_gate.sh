@@ -16,7 +16,9 @@ if [ "$run_upstream" = 1 ]; then
   build=$(mktemp -d)
   cmake -S "$repo_root/vendor/llama.cpp" -B "$build" -DGGML_HIP=OFF -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
-  cmake --build "$build" -j
+  # -j2: mtmd model TUs (deepseek-OCR etc.) are multi-GB under cc1plus; full
+  # -j OOMs the 16 GB CI runner. Override locally with GOLEM_T4_BUILD_JOBS.
+  cmake --build "$build" -j"${GOLEM_T4_BUILD_JOBS:-2}"
   # Keep LLAMA_BUILD_SERVER at its default (ON): tests/CMakeLists.txt unconditionally
   # builds test-chat, which links server-context — only defined when the server builds.
   # Skip network/fixture-dependent tests; excluding only test-download-model would
