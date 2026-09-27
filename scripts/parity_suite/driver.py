@@ -320,7 +320,10 @@ def _run_leg(state: dict, outdir: str, logdir: str, name: str,
     """One leg subprocess: re-verify provenance, run under the per-leg timeout
     (process-group kill via parity_floor.run_prompt), persist its output log,
     verify the dump header's backend label, checkpoint the report."""
-    recheck_provenance(args[0])
+    try:
+        recheck_provenance(args[0])
+    except SystemExit as failure:
+        _fatal_with_report(state, outdir, str(failure).removeprefix("FATAL: "))
     rc, stdout, stderr, wall_s = run_prompt(args, timeout_s)
     atomic_write(os.path.join(logdir, f"{name}.log"), (stdout or "") + (stderr or ""))
     if rc != 0:
