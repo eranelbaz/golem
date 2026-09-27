@@ -2508,3 +2508,52 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
+
+// --- golem P1: policy-hook plumbing (design §3.4). All behavior is behind
+// null guards; with hooks unset every code path here is a pure query. ---
+#include "golem-hooks.h"
+
+static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
+static golem_policy_query_fn        golem_h_policy_query        = NULL;
+static golem_notify_access_fn       golem_h_notify_access       = NULL;
+static void *                       golem_h_ctx                 = NULL;
+
+void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
+                          golem_policy_query_fn policy_query,
+                          golem_notify_access_fn notify_access,
+                          void *ctx) {
+    golem_h_ensure_host_resident = ensure_host_resident;
+    golem_h_policy_query         = policy_query;
+    golem_h_notify_access        = notify_access;
+    golem_h_ctx                  = ctx;
+}
+
+/* Expert weights in glm-arch MoE models are 3-D tensors whose names end in
+ * ffn_{gate,up,down}_exps (upstream names are blk.%d.ffn_*_exps,
+ * llama-arch.cpp:450-453): [n_embd, n_ff_exp, n_expert]. One expert is one
+ * ne[0]×ne[1] plane; nb[2] is the authoritative plane stride (also correct
+ * for padded/non-contiguous tensors, where recomputing from ne is not).
+ * Fused ffn_gate_up_exps is deliberately excluded — P2
+ * splits routed gate/up/down ranges independently. */
+static int golem_name_ends_with(const char *name, const char *suffix) {
+    size_t nl = strlen(name), sl = strlen(suffix);
+    return nl >= sl && strcmp(name + nl - sl, suffix) == 0;
+}
+
+static int golem_tensor_is_expert(const struct ggml_tensor *t) {
+    if (t == NULL || ggml_n_dims(t) != 3) return 0;
+    return golem_name_ends_with(t->name, "ffn_gate_exps")
+        || golem_name_ends_with(t->name, "ffn_up_exps")
+        || golem_name_ends_with(t->name, "ffn_down_exps");
+}
+
+int32_t golem_tensor_expert_count(const void *tensor) {
+    const struct ggml_tensor *t = (const struct ggml_tensor *) tensor;
+    return golem_tensor_is_expert(t) ? (int32_t) t->ne[2] : 0;
+}
+
+int32_t golem_tensor_expert_stride_bytes(const void *tensor) {
+    const struct ggml_tensor *t = (const struct ggml_tensor *) tensor;
+    if (!golem_tensor_is_expert(t)) return 0;
+    return (int32_t) t->nb[2];
+}

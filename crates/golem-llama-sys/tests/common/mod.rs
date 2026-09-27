@@ -1,3 +1,4 @@
+#![allow(unsafe_code, missing_docs)]
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -319,4 +320,77 @@ pub fn cs_stream_recipe(text: &str, source: &str) -> String {
         .strip_suffix("| sha256sum | awk '{print $1}'")
         .expect("cs() must end with the `| sha256sum | awk '{{print $1}}'` outer-hash fold");
     stream.trim_end().to_string()
+}
+
+// --- golem P1: ggml FFI helpers for hook/metadata tests ---
+
+use golem_llama_sys::raw;
+
+pub struct TestGgmlCtx(*mut raw::ggml_context);
+
+impl Drop for TestGgmlCtx {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { raw::ggml_free(self.0) };
+        }
+    }
+}
+
+/// Scratch context with in-context data (no_alloc=false), big enough for a
+/// handful of 3-D F32 tensors.
+pub fn test_ggml_ctx() -> TestGgmlCtx {
+    unsafe {
+        TestGgmlCtx(raw::ggml_init(raw::ggml_init_params {
+            mem_size: 4 * 1024 * 1024,
+            mem_buffer: std::ptr::null_mut(),
+            no_alloc: false,
+        }))
+    }
+}
+
+pub fn test_type() -> raw::ggml_type {
+    raw::ggml_type::GGML_TYPE_F32
+}
+
+pub fn type_size() -> usize {
+    std::mem::size_of::<f32>()
+}
+
+/// # Safety
+/// The returned tensor borrows `ctx`; it must not outlive it. `name` must be
+/// shorter than GGML_MAX_NAME (64).
+pub unsafe fn new_tensor_2d(
+    ctx: &TestGgmlCtx,
+    type_: raw::ggml_type,
+    ne0: i64,
+    ne1: i64,
+    name: &str,
+) -> *mut raw::ggml_tensor {
+    unsafe {
+        let c_name = std::ffi::CString::new(name).expect("tensor name with NUL");
+        let t = raw::ggml_new_tensor_2d(ctx.0, type_, ne0, ne1);
+        assert!(!t.is_null());
+        raw::ggml_set_name(t, c_name.as_ptr());
+        t
+    }
+}
+
+/// # Safety
+/// The returned tensor borrows `ctx`; it must not outlive it. `name` must be
+/// shorter than GGML_MAX_NAME (64).
+pub unsafe fn new_tensor_3d(
+    ctx: &TestGgmlCtx,
+    type_: raw::ggml_type,
+    ne0: i64,
+    ne1: i64,
+    ne2: i64,
+    name: &str,
+) -> *mut raw::ggml_tensor {
+    unsafe {
+        let c_name = std::ffi::CString::new(name).expect("tensor name with NUL");
+        let t = raw::ggml_new_tensor_3d(ctx.0, type_, ne0, ne1, ne2);
+        assert!(!t.is_null());
+        raw::ggml_set_name(t, c_name.as_ptr());
+        t
+    }
 }

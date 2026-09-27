@@ -1,5 +1,6 @@
-// Golem policy-hook ABI. Crate-local stub; moves into ggml/include/ as patch
-// P1 in M2.1 — the ABI is frozen now so Rust-side code does not churn.
+// Golem policy-hook ABI + expert-metadata queries (Golem patch P1).
+// Part of the vendored ggml include tree; the ABI is frozen so Rust-side
+// code does not churn. Wired into ggml-backend.cpp by P1.
 #ifndef GOLEM_HOOKS_H
 #define GOLEM_HOOKS_H
 
@@ -31,6 +32,11 @@ void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
                           golem_policy_query_fn policy_query,
                           golem_notify_access_fn notify_access,
                           void *ctx);
+
+/* 0 when `t` is not an expert tensor; else expert count. */
+int32_t golem_tensor_expert_count(const void *tensor);
+/* 0 when count is 0; else bytes per expert (one ne[0]×ne[1] plane stride, nb[2]). */
+int32_t golem_tensor_expert_stride_bytes(const void *tensor);
 
 #ifdef __cplusplus
 }

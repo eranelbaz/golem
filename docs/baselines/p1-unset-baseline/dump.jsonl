@@ -1,0 +1,17 @@
+{"format":"golem-parity-dump","version":1,"model_sha256":"7841ad0a71541113eb9d7c58237fd20871273fe59194321e64ed79d1a871cfe3","model_bytes":179040,"backend":"cpu","offload":false,"prompt_tokens":59,"n_predict":16}
+{"position":0,"token":77,"top1":9.536571,"top2":8.832573}
+{"position":1,"token":5,"top1":8.670975,"top2":7.7740355}
+{"position":2,"token":71,"top1":8.963603,"top2":7.9246593}
+{"position":3,"token":315,"top1":8.602775,"top2":8.404568}
+{"position":4,"token":62,"top1":9.226693,"top2":7.912456}
+{"position":5,"token":229,"top1":9.698798,"top2":8.972253}
+{"position":6,"token":202,"top1":9.366928,"top2":9.347957}
+{"position":7,"token":250,"top1":10.783648,"top2":8.06175}
+{"position":8,"token":311,"top1":8.247218,"top2":8.240704}
+{"position":9,"token":196,"top1":8.67682,"top2":8.388275}
+{"position":10,"token":17,"top1":10.2369375,"top2":8.137649}
+{"position":11,"token":5,"top1":8.230089,"top2":7.6797585}
+{"position":12,"token":157,"top1":8.624502,"top2":8.565406}
+{"position":13,"token":208,"top1":8.492445,"top2":8.258804}
+{"position":14,"token":42,"top1":12.645976,"top2":9.700228}
+{"position":15,"token":16,"top1":8.520616,"top2":8.21339}

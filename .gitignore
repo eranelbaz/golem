@@ -23,14 +23,11 @@ vendor/llama.cpp/build/
 __pycache__/
 *.pyc
 
-# Local-only docs (not part of the repo)
-docs/baselines/m0-notes.md
-docs/superpowers/
-docs/worklog.md
-docs/tech-design.md
-docs/product-spec.md
-docs/adr/
-docs/baselines/m0-exit-review.md
+# Local-only docs: docs/ carries baselines (and similar evidence) only;
+# planning/process material (superpowers plans, worklog, tech-design,
+# product-spec, adr, …) never enters the repo
+docs/*
+!docs/baselines/
 
 # Split substrate build trees (Task 7)
 /target-cpu/

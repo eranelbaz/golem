@@ -58,7 +58,9 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        manifest_dir.join("headers/golem-hooks.h").display()
+        repo_root
+            .join("vendor/llama.cpp/ggml/include/golem-hooks.h")
+            .display()
     );
     println!("cargo:rerun-if-env-changed={BACKEND_ENV}");
     println!("cargo:rerun-if-env-changed={SKIP_GATE_ENV}");
@@ -98,7 +100,7 @@ fn main() {
 
     let openmp_enabled = read_openmp_enabled(&binary_dir);
     emit_link_directives(resolved, openmp_enabled, &binary_dir);
-    generate_bindings(&manifest_dir, &repo_root, &out_dir);
+    generate_bindings(&repo_root, &out_dir);
 }
 
 fn run_pin_gate(repo_root: &Path) -> bool {
@@ -223,9 +225,9 @@ fn rocm_advisory_check(repo_root: &Path) {
     }
 }
 
-fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
+fn generate_bindings(repo_root: &Path, out_dir: &Path) {
     let vendor = repo_root.join("vendor/llama.cpp");
-    let hooks_header = manifest_dir.join("headers/golem-hooks.h");
+    let hooks_header = vendor.join("ggml/include/golem-hooks.h");
     let llama_header = vendor.join("include/llama.h");
     // size_t literal to the header; non-exhaustive enums keep future
     // llama.cpp enum additions non-breaking.
@@ -255,6 +257,12 @@ fn generate_bindings(manifest_dir: &Path, repo_root: &Path, out_dir: &Path) {
         .allowlist_function("ggml_new_tensor_2d")
         .allowlist_function("ggml_new_tensor_3d")
         .allowlist_function("ggml_nbytes")
+        // P1 hook-registration tests: tensor naming + expert-metadata math
+        // (golem_tensor_expert_count/stride_bytes consume these over FFI).
+        .allowlist_function("ggml_set_name")
+        .allowlist_function("ggml_n_dims")
+        .allowlist_function("ggml_type_size")
+        .allowlist_function("ggml_blck_size")
         // The op itself plus graph build; compute goes through the backend
         // registry below (Task 4a), so no CPU-only compute entry is bound.
         .allowlist_function("ggml_mul_mat_id")
