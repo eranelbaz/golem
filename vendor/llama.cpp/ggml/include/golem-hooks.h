@@ -35,7 +35,7 @@ void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
 
 /* 0 when `t` is not an expert tensor; else expert count. */
 int32_t golem_tensor_expert_count(const void *tensor);
-/* 0 when count is 0; else bytes per expert (one row-block stride). */
+/* 0 when count is 0; else bytes per expert (one ne[0]×ne[1] plane stride, nb[2]). */
 int32_t golem_tensor_expert_stride_bytes(const void *tensor);
 
 #ifdef __cplusplus

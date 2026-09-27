@@ -20,6 +20,18 @@ fn expert_metadata_derived_from_tensor_dims() {
         );
         let named = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "ffn_gate_exps");
         assert_eq!(golem_tensor_expert_count(named.cast()), 8);
+        assert_eq!(
+            golem_tensor_expert_count(
+                new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_up_exps").cast()
+            ),
+            8
+        );
+        assert_eq!(
+            golem_tensor_expert_count(
+                new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_down_exps").cast()
+            ),
+            8
+        );
         let dense = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "ffn_down");
         assert_eq!(golem_tensor_expert_count(dense.cast()), 0);
         assert_eq!(golem_tensor_expert_stride_bytes(dense.cast()), 0);
@@ -27,7 +39,17 @@ fn expert_metadata_derived_from_tensor_dims() {
 }
 
 #[test]
-fn register_then_unset_restores_null_state() {
+fn two_dim_tensor_with_exps_suffix_is_not_expert() {
+    unsafe {
+        let ctx = test_ggml_ctx();
+        let t = new_tensor_2d(&ctx, test_type(), 64, 32, "blk.0.ffn_gate_exps");
+        assert_eq!(golem_tensor_expert_count(t.cast()), 0);
+        assert_eq!(golem_tensor_expert_stride_bytes(t.cast()), 0);
+    }
+}
+
+#[test]
+fn register_null_hooks_smoke() {
     unsafe {
         golem_register_hooks(None, None, None, std::ptr::null_mut());
         // No assertion beyond "does not crash + links": the unset state is

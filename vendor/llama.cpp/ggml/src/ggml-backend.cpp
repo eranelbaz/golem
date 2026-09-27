@@ -2531,9 +2531,9 @@ void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
 /* Expert weights in glm-arch MoE models are 3-D tensors whose names end in
  * ffn_{gate,up,down}_exps (upstream names are blk.%d.ffn_*_exps,
  * llama-arch.cpp:450-453): [n_embd, n_ff_exp, n_expert]. One expert is one
- * ne[0]×ne[1] plane: per-expert bytes = ne[0]*ne[1] * type_size / blck_size
- * (ggml_type_size is per-BLOCK, ggml_blck_size is elements per block; they
- * cancel for F32). Fused ffn_gate_up_exps is deliberately excluded — P2
+ * ne[0]×ne[1] plane; nb[2] is the authoritative plane stride (also correct
+ * for padded/non-contiguous tensors, where recomputing from ne is not).
+ * Fused ffn_gate_up_exps is deliberately excluded — P2
  * splits routed gate/up/down ranges independently. */
 static int golem_name_ends_with(const char *name, const char *suffix) {
     size_t nl = strlen(name), sl = strlen(suffix);
@@ -2555,6 +2555,5 @@ int32_t golem_tensor_expert_count(const void *tensor) {
 int32_t golem_tensor_expert_stride_bytes(const void *tensor) {
     const struct ggml_tensor *t = (const struct ggml_tensor *) tensor;
     if (!golem_tensor_is_expert(t)) return 0;
-    return (int32_t) ((uint64_t) t->ne[0] * t->ne[1]
-        * ggml_type_size(t->type) / ggml_blck_size(t->type));
+    return (int32_t) t->nb[2];
 }

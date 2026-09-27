@@ -359,6 +359,25 @@ pub fn type_size() -> usize {
 /// # Safety
 /// The returned tensor borrows `ctx`; it must not outlive it. `name` must be
 /// shorter than GGML_MAX_NAME (64).
+pub unsafe fn new_tensor_2d(
+    ctx: &TestGgmlCtx,
+    type_: raw::ggml_type,
+    ne0: i64,
+    ne1: i64,
+    name: &str,
+) -> *mut raw::ggml_tensor {
+    unsafe {
+        let c_name = std::ffi::CString::new(name).expect("tensor name with NUL");
+        let t = raw::ggml_new_tensor_2d(ctx.0, type_, ne0, ne1);
+        assert!(!t.is_null());
+        raw::ggml_set_name(t, c_name.as_ptr());
+        t
+    }
+}
+
+/// # Safety
+/// The returned tensor borrows `ctx`; it must not outlive it. `name` must be
+/// shorter than GGML_MAX_NAME (64).
 pub unsafe fn new_tensor_3d(
     ctx: &TestGgmlCtx,
     type_: raw::ggml_type,
