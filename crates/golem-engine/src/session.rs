@@ -466,6 +466,29 @@ impl Session {
         self.config.n_gpu_layers > 0
     }
 
+    /// P4 device expert-copy cache counters (§3.4): bytes copied into / skipped
+    /// by the persistent device cache, evictions, and the derived skip ratio.
+    /// `None` unless this session drives the pooled GPU split — the only P2
+    /// call-site (hooks registered + offload requested).
+    pub fn device_cache_stats(&self) -> Option<DeviceCacheStats> {
+        if !self.offloaded() || self.p3_stats.is_none() {
+            return None;
+        }
+        // SAFETY: FFI getter; the returned pointer is a process-lifetime
+        // static (never null, never freed).
+        let block = unsafe { raw::golem_get_device_cache_stats() };
+        assert!(
+            !block.is_null(),
+            "golem_get_device_cache_stats returned null"
+        );
+        // SAFETY: layout contract from the C++ definition (bindgen renders
+        // the struct opaque): 3 contiguous lock-free u64 counters in member
+        // order bytes_copied, bytes_skipped, evictions.
+        let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 3]>() };
+        let load = |i: usize| counters[i].load(std::sync::atomic::Ordering::Relaxed);
+        Some(DeviceCacheStats::new(load(0), load(1), load(2)))
+    }
+
     /// Runs one chat turn: renders `messages` with the session template,
     /// clears the KV cache, re-prefills the full transcript in chunks, then
     /// greedily generates until EOG, `n_ctx - 1` positions, or `n_predict`
@@ -918,9 +941,58 @@ unsafe fn token_piece(vocab: *const raw::llama_vocab, token: raw::llama_token) -
     buf
 }
 
+/// P4 device expert-copy cache counters (§3.4), read when the RAM expert pool
+/// is enabled and the config requests GPU offload (the split scheduler is the
+/// only P2 call-site).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceCacheStats {
+    /// Expert plane bytes the split scheduler copied into the device cache.
+    pub bytes_copied: u64,
+    /// Expert plane bytes served from the device cache (no copy).
+    pub bytes_skipped: u64,
+    /// Cached experts evicted under the soft budget.
+    pub evictions: u64,
+    /// `bytes_skipped / (bytes_skipped + bytes_copied)`; 0.0 with no traffic.
+    pub skip_ratio: f64,
+}
+
+impl DeviceCacheStats {
+    fn new(bytes_copied: u64, bytes_skipped: u64, evictions: u64) -> Self {
+        Self {
+            bytes_copied,
+            bytes_skipped,
+            evictions,
+            skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
+        }
+    }
+}
+
+/// `skipped / (skipped + copied)`; 0.0 when there is no traffic at all.
+fn skip_ratio(bytes_copied: u64, bytes_skipped: u64) -> f64 {
+    let total = bytes_copied.saturating_add(bytes_skipped);
+    if total == 0 {
+        0.0
+    } else {
+        bytes_skipped as f64 / total as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_ratio_math() {
+        assert_eq!(skip_ratio(0, 0), 0.0, "no traffic ⇒ 0.0, not NaN");
+        assert_eq!(skip_ratio(3, 0), 0.0, "all copied ⇒ 0.0");
+        assert_eq!(skip_ratio(0, 5), 1.0, "all skipped ⇒ 1.0");
+        assert_eq!(skip_ratio(1, 3), 0.75);
+        let stats = DeviceCacheStats::new(1, 3, 7);
+        assert_eq!(stats.bytes_copied, 1);
+        assert_eq!(stats.bytes_skipped, 3);
+        assert_eq!(stats.evictions, 7);
+        assert_eq!(stats.skip_ratio, 0.75);
+    }
 
     #[test]
     fn fallback_template_contains_chatml_marker() {
