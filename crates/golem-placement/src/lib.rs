@@ -4,7 +4,10 @@
 //! (orderings consumed by the P2/P3 patches) and reported back via
 //! [`Policy::apply_transition`].
 
+pub mod journal;
 pub mod pool;
+
+pub use journal::{Journal, JournalRecord};
 
 use std::fmt;
 
