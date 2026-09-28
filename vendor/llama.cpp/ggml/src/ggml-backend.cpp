@@ -1891,8 +1891,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 dc_st.owned = t;
                             }
                             // The compute graph must read the owned persistent region; the valid
-                            // bits always describe bytes in it.
-                            node->src[0] = dc_st.owned;
+                            // bits always describe bytes in it. Redirect EVERY consumer of the
+                            // transient cpy (nodes[0] included) — any node left on the stale cpy
+                            // would read bytes the valid bits claim current.
+                            for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
+                                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                                    if (split->graph.nodes[ni]->src[j] == input_cpy) {
+                                        split->graph.nodes[ni]->src[j] = dc_st.owned;
+                                    }
+                                }
+                            }
                             dc = golem::golem_dc_step_impl(dc_st, routed, order,
                                 golem_h_device_cache_budget.load(std::memory_order_relaxed),
                                 expert_size, (int32_t) n_expert, input->data,
