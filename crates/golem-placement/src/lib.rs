@@ -152,6 +152,10 @@ impl Policy {
     /// fit their byte budgets, and count-inconsistent floor/cap pairs.
     /// Byte checks run first; count rejections use the
     /// `max_bytes_per_expert = 0` sentinel.
+    ///
+    /// # Panics
+    /// Panics if `half_life_steps <= 0` or non-finite (would produce NaN
+    /// scores), or if `theta_lo > theta_hi` (inverted hysteresis).
     pub fn new(
         cfg: PlacementConfig,
         max_bytes_per_expert: u64,
@@ -188,6 +192,11 @@ impl Policy {
                 max_bytes_per_expert: 0,
             });
         }
+        assert!(
+            cfg.half_life_steps > 0.0 && cfg.half_life_steps.is_finite(),
+            "half_life_steps must be finite and > 0"
+        );
+        assert!(cfg.theta_lo <= cfg.theta_hi, "theta_lo must be <= theta_hi");
         let n = cfg.layers as usize * cfg.experts_per_layer as usize;
         Ok(Self {
             cfg,
