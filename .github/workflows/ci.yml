@@ -1,5 +1,6 @@
 name: ci
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -67,8 +68,11 @@ jobs:
 
   # M2.3 P3 functional acceptance (Tasks 1/5/6 tests): the split-scheduler
   # expert-copy path only executes where a GPU split exists, so this leg runs
-  # on the self-hosted HIP runner; CPU CI never reaches it.
+  # on the self-hosted HIP runner; CPU CI never reaches it. No HIP runner is
+  # registered yet, so the job is workflow_dispatch-only — PR CI stays green
+  # and the leg runs manually (`gh workflow run ci.yml`) once the runner is up.
   p3-hip:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, hip]
     timeout-minutes: 60
     env:
