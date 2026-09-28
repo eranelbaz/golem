@@ -34,7 +34,17 @@ fn p3_counters_move_and_output_is_deterministic() {
     // Pool ON (1 GiB pool for tiny-moe's 3·8 planes of 2048 B):
     let mut cfg = common::offload::offload_config();
     cfg.ram_experts_gib = 1;
-    let mut on = Session::new(&cfg).unwrap();
+    let mut on = match Session::new(&cfg) {
+        Ok(s) => s,
+        Err(e) if e.to_string().contains("mlock") => {
+            eprintln!(
+                "SKIPPED: RLIMIT_MEMLOCK below the 1 GiB pool (ram_experts_gib=1); \
+                 run on a machine with unlimited memlock (HIP CI job): {e}"
+            );
+            return;
+        }
+        Err(e) => panic!("session with pooled offload failed: {e}"),
+    };
     let out_on = chat(&mut on, "Hello");
 
     let stats = on.p3_stats().expect("pool enabled ⇒ stats present");

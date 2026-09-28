@@ -372,6 +372,12 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # Golem P2 fuzz: device expert-copy cache state machine. The shared header
+    # lives in ggml/src; golem_dc_step is defined in ggml-backend.cpp -> link ggml.
+    llama_build_and_test(golem-p2-cache.cpp)
+    target_link_libraries(golem-p2-cache PRIVATE ggml)
+    target_include_directories(golem-p2-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

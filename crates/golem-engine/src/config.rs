@@ -31,6 +31,12 @@ pub struct EngineConfig {
     /// (T4 invariant). The CLI computes a suggestion but always passes an
     /// explicit whole-GiB value.
     pub ram_experts_gib: u64,
+    /// Soft cap for the P2 device expert-copy cache, in experts (§3.4). The
+    /// byte budget is `n × expert_stride`, set when the first expert tensor is
+    /// registered (the stride is only knowable from a live tensor). **0 =
+    /// unlimited** (the default): the device cache keeps every copied expert
+    /// and never evicts.
+    pub device_cache_experts: u32,
 }
 
 impl Default for EngineConfig {
@@ -45,6 +51,7 @@ impl Default for EngineConfig {
             flash_attn_on: false,
             cpu_moe_layers: None,
             ram_experts_gib: 0,
+            device_cache_experts: 0,
         }
     }
 }
@@ -68,5 +75,9 @@ mod tests {
         assert!(!c.flash_attn_on, "default leaves flash attention at AUTO");
         assert_eq!(c.cpu_moe_layers, None, "default writes no buft overrides");
         assert_eq!(c.ram_experts_gib, 0, "RAM expert pool defaults off (T4)");
+        assert_eq!(
+            c.device_cache_experts, 0,
+            "device cache defaults to unlimited (never evicts)"
+        );
     }
 }
