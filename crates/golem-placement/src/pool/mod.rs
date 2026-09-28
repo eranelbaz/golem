@@ -13,12 +13,14 @@ pub mod arena;
 pub mod primitives;
 
 mod pager;
+pub mod prefetch;
 mod residency;
 mod source;
 
 pub use arena::Arena;
 pub use pager::{ExpertPool, Lease, PoolError, SnapshotHandle};
+pub use prefetch::{AccessFeed, GATE_CAPACITY, PREFETCH_K, PrefetchHandle, spawn_prefetch};
 pub use residency::{
     Claim, Evicted, ExpertKind, P3Stats, PolicySnapshot, ResidencyMap, Victim, key_index,
 };
-pub use source::{ExpertSource, GgufPreadSource, SourceError};
+pub use source::{ExpertSource, GgufPreadSource, PoolGeometry, SourceError};

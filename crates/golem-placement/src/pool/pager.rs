@@ -10,7 +10,7 @@
 use std::fmt;
 
 use super::arena::Arena;
-use super::primitives::{Arc, Ordering};
+use super::primitives::{Arc, AtomicUsize, Ordering};
 use super::residency::{Claim, ExpertKind, P3Stats, PolicySnapshot, ResidencyMap};
 use super::source::ExpertSource;
 
@@ -87,6 +87,9 @@ pub struct ExpertPool {
     pub residency: Arc<ResidencyMap>,
     /// P3 counters.
     pub stats: Arc<P3Stats>,
+    /// In-flight demand page-ins (§6.5 demand-priority signal): the
+    /// prefetcher skips rounds while this is nonzero.
+    demand_inflight: AtomicUsize,
     source: Arc<dyn ExpertSource>,
     snapshots: Arc<SnapshotHandle>,
 }
@@ -117,9 +120,15 @@ impl ExpertPool {
             arena: Arc::new(arena),
             residency: Arc::new(ResidencyMap::new(n_layers, n_experts, slots)),
             stats,
+            demand_inflight: super::primitives::AtomicUsize::new(0),
             source,
             snapshots,
         })
+    }
+
+    /// Number of demand page-ins currently in flight (§6.5 gate input).
+    pub fn demand_inflight(&self) -> usize {
+        self.demand_inflight.load(Ordering::Relaxed)
     }
 
     /// Page in every missing key in `[first, last]` for this (layer, kind),
@@ -139,6 +148,27 @@ impl ExpertPool {
     /// Panics (debug) on an inverted `first > last` — a contract violation the
     /// glue must reject, never silently rewrite.
     pub fn ensure_range(
+        &self,
+        demand: bool,
+        layer: u32,
+        kind: ExpertKind,
+        first: u32,
+        last: u32,
+        copy: &mut dyn FnMut(&[u8]),
+    ) -> Result<(), PoolError> {
+        // The whole demand path — claims, I/O, copies — counts as in-flight
+        // demand so the prefetcher's per-round check observes it (§6.5).
+        if demand {
+            self.demand_inflight.fetch_add(1, Ordering::Relaxed);
+        }
+        let result = self.ensure_range_inner(demand, layer, kind, first, last, copy);
+        if demand {
+            self.demand_inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn ensure_range_inner(
         &self,
         demand: bool,
         layer: u32,

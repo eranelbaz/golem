@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use golem_llama_sys::raw;
 use golem_placement::pool::{
-    ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PolicySnapshot, SnapshotHandle,
+    AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PREFETCH_K,
+    PolicySnapshot, PrefetchHandle, SnapshotHandle, spawn_prefetch,
 };
 
 use crate::config::EngineConfig;
@@ -65,6 +66,14 @@ struct PoolHandle {
     /// Dense lead: expert tensors exist only from blk.<dense_lead> on; pool
     /// layers are renumbered to exclude it.
     dense_lead: u32,
+    /// §6.5 prefetch thread. Declaration order is the drop contract: the
+    /// handle is stopped and joined BEFORE the pool `Arc` drops. (M2.3 leaks
+    /// the whole handle — process lifetime, hooks never unregistered — so
+    /// neither field actually drops; the order keeps the invariant structural
+    /// when M4's server re-homes registration to a global.)
+    // Never read directly: its whole job is Drop (stop + join).
+    #[allow(dead_code)]
+    prefetch: PrefetchHandle,
     /// GGUF-side expert source, kept for registration-time cross-checks.
     source: Arc<GgufPreadSource>,
     /// The demand pager (arena + residency + stats).
@@ -167,6 +176,7 @@ pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError>
     let handle: &'static PoolHandle = Box::leak(Box::new(PoolHandle {
         n_layers: geo.n_layers,
         dense_lead,
+        prefetch: spawn_prefetch(pool.clone(), Arc::new(NoFeed), PREFETCH_K),
         source,
         pool: pool.clone(),
         n_experts: geo.n_experts,
@@ -211,6 +221,18 @@ pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError>
 fn p3_fatal(context: String) -> ! {
     tracing::error!("{context}");
     std::process::abort()
+}
+
+/// Empty access feed: the substrate has no `notify_access` call-site until
+/// P4 (M2.4), so the engine-spawned prefetcher runs but never observes
+/// accesses — the §6.5 mechanism is live, its real inputs are not (Global
+/// Constraints deviation 2).
+struct NoFeed;
+
+impl AccessFeed for NoFeed {
+    fn take_union(&self, _k: usize) -> Vec<(u32, ExpertKind, u32)> {
+        Vec::new()
+    }
 }
 
 /// The P1 `ensure_host_resident` trampoline. Runs on the substrate decode
