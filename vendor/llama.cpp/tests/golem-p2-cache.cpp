@@ -1,13 +1,7 @@
-// Golem P2 fuzz: exercises the shared device expert-copy cache state machine
-// (ggml/src/golem-device-cache.hpp — the exact template the split scheduler
-// runs) for the T4-fuzzed invariants:
-//   1. bit ⇒ current: a routed expert's device generation always equals the
-//      host generation after a step (copied this step, or copied when its bit
-//      was set and not overwritten since).
-//   4. victim choice (order permutation / routed set / budget) never changes
-//      the routed-coverage result — budget overflow included.
-// plus: stale-entry invalidation (fingerprint mismatch ⇒ reset) and
-// malformed-order aborts (duplicate / out-of-range / NULL).
+// Golem P2 fuzz: exercises the shared device expert-copy cache state machine (ggml/src/golem-device-cache.hpp - the exact template the split scheduler runs) for the T4-fuzzed invariants:
+//   1. bit => current: a routed expert's device generation always equals the host generation after a step (copied this step, or copied when its bit was set and not overwritten since).
+//   4. victim choice (order permutation / routed set / budget) never changes the routed-coverage result - budget overflow included.
+// plus: stale-entry invalidation (fingerprint mismatch => reset) and malformed-order aborts (duplicate / out-of-range / NULL).
 //
 // Aborts are asserted in fork()ed children (GGML_ABORT raises SIGABRT).
 #include "golem-device-cache.hpp"
@@ -47,10 +41,7 @@ struct Shadow {
     explicit Shadow(int32_t n_, size_t es) :
             host_gen(n_, 1), dev_gen(n_, ~(ggml_bitset_t) 0), expert_size(es), n(n_) {}
 
-    // host mutates a random subset of experts between steps. Only experts that
-    // are NOT bit-valid may mutate: MoE weights are immutable while a bit is
-    // valid (that IS the bit⇒current premise); mutating under a valid bit would
-    // be a host-side write the cache cannot observe.
+    // host mutates a random subset of experts between steps. Only experts that are NOT bit-valid may mutate: MoE weights are immutable while a bit is valid (that IS the bit=>current premise); mutating under a valid bit would be a host-side write the cache cannot observe.
     void mutate(std::mt19937_64 &rng, const std::vector<ggml_bitset_t> &valid) {
         for (int32_t id = 0; id < n; ++id) {
             if (!ggml_bitset_get(valid.data(), id) && rng() % 3 == 0) {
@@ -73,7 +64,7 @@ struct Shadow {
 };
 
 void check_state(const GolemDeviceCache &st, const Shadow &sh, const std::vector<int32_t> &routed) {
-    // invariant 1 (bit ⇒ current) + routed ⇒ current
+    // invariant 1 (bit => current) + routed => current
     for (int32_t id = 0; id < sh.n; ++id) {
         if (ggml_bitset_get(st.valid.data(), id)) {
             REQUIRE(sh.dev_gen[id] == sh.host_gen[id],
@@ -107,7 +98,7 @@ std::vector<int32_t> rand_perm(std::mt19937_64 rng, int32_t n) {
     return v;
 }
 
-// Deterministic leg: fresh cache, budget 0 (never evict) — exact accounting
+// Deterministic leg: fresh cache, budget 0 (never evict) - exact accounting
 // (lives below the overflow test; both defined once).
 
 // Budget-overflow leg: routed bytes > budget must terminate (soft-cap rule,
@@ -135,7 +126,7 @@ void test_budget_overflow_terminates() {
     REQUIRE(st.valid_bytes == n * es, "warmup valid_bytes %zu", st.valid_bytes);
     check_state(st, sh, all);
 
-    // tiny routed set, budget below current footprint ⇒ evictions, no overflow
+    // tiny routed set, budget below current footprint => evictions, no overflow
     std::vector<int32_t> routed = {3, 4};
     golem::GolemDcCounters c = step(routed, 4 * es);
     REQUIRE(c.evicted > 0, "expected evictions under soft cap");
@@ -143,14 +134,13 @@ void test_budget_overflow_terminates() {
             st.valid_bytes, (size_t) (4 * es));
     check_state(st, sh, routed);
 
-    // overflow: routed bytes alone exceed the budget — must still terminate
-    // and keep every routed expert read-current
+    // overflow: routed bytes alone exceed the budget - must still terminate and keep every routed expert read-current
     std::vector<int32_t> big = {10, 11, 12, 13, 14};
     step(big, 2 * es);
     check_state(st, sh, big);
 }
 
-// Deterministic leg: fresh cache, budget 0 (never evict) — exact accounting.
+// Deterministic leg: fresh cache, budget 0 (never evict) - exact accounting.
 void test_exact_accounting() {
     const int32_t n = 17;
     const size_t es = 100;
@@ -164,15 +154,13 @@ void test_exact_accounting() {
                                                          [&](int32_t f, int32_t l, bool p) {
                                                              sh.apply_copy(f, l, p);
                                                          });
-    // fresh: all runs copied; pad_ok for runs followed by an invalid expert
-    // ([0,2]→+es pad, [5,6]→+es pad, [16,16]→ no expert 17 ⇒ no pad)
+    // fresh: all runs copied; pad_ok for runs followed by an invalid expert ([0,2]->+es pad, [5,6]->+es pad, [16,16]-> no expert 17 => no pad)
     REQUIRE(c.copied == routed_bytes(routed, es) + 2 * es, "step1 copied %zu", c.copied);
     REQUIRE(c.skipped == 0, "step1 skipped %zu", c.skipped);
     REQUIRE(c.evicted == 0, "step1 evicted %zu", c.evicted);
     check_state(st, sh, routed);
 
-    // second identical step, budget 0: every run fully valid ⇒ all skipped, no
-    // copy, no padding tail (skipped runs never reach the pad decision)
+    // second identical step, budget 0: every run fully valid => all skipped, no copy, no padding tail (skipped runs never reach the pad decision)
     golem::GolemDcCounters c2 = golem::golem_dc_step_impl(st, routed, order.data(), 0, es, n,
                                                           (const void *) 0x1,
                                                           [&](int32_t f, int32_t l, bool p) {
@@ -197,7 +185,7 @@ void test_stale_reset() {
         GolemDeviceCache st;
         st.valid.assign(3, ~(ggml_bitset_t) 0); // wrong size, "all valid"
         st.valid_bytes = 3 * 64;
-        st.owner       = (const void *) 0x3;
+        st.owner = (const void *) 0x3;
         st.expert_size = es;
         golem::golem_dc_step(st, routed, order.data(), 0, es, n, (const void *) 0x3);
         REQUIRE(st.valid.size() == (size_t) ggml_bitset_size(n), "size-mismatch not reset");
@@ -207,7 +195,7 @@ void test_stale_reset() {
         GolemDeviceCache st;
         st.valid.assign(ggml_bitset_size(n), ~(ggml_bitset_t) 0);
         st.valid_bytes = n * es;
-        st.owner       = (const void *) 0xdead;
+        st.owner = (const void *) 0xdead;
         st.expert_size = es;
         golem::golem_dc_step(st, routed, order.data(), 0, es, n, (const void *) 0x3);
         REQUIRE(st.owner == (const void *) 0x3, "owner not re-fingerprinted");
@@ -227,9 +215,7 @@ void test_stale_reset() {
     }
 }
 
-// Invariant 1 + 4 fuzz loop: random routed sets, random order permutations,
-// random budgets (0 / small / exact / huge / random), host mutations between
-// steps. Victim selection may differ; routed coverage must not.
+// Invariant 1 + 4 fuzz loop: random routed sets, random order permutations, random budgets (0 / small / exact / huge / random), host mutations between steps. Victim selection may differ; routed coverage must not.
 void test_fuzz_random_steps() {
     std::mt19937_64 rng(0x6f6c656d); // "olem"
     for (int iter = 0; iter < 300; ++iter) {
@@ -260,7 +246,7 @@ void test_fuzz_random_steps() {
                     budget = 0; // full capacity
                     break;
                 case 1:
-                    budget = routed_bytes(routed, es) / 2; // below routed ⇒ overflow tolerated
+                    budget = routed_bytes(routed, es) / 2; // below routed => overflow tolerated
                     break;
                 case 2:
                     budget = routed_bytes(routed, es);

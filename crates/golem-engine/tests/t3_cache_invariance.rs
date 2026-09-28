@@ -30,7 +30,9 @@
 //!   copies never engaged the cache).
 //! - (a) fully pre-promoted — unlimited budget, 4 warmup turns cache every
 //!   routed expert; the measured turn's delta skip_ratio must exceed 0.5.
-//! - (c) randomized eviction stress — budget = 3 experts' bytes with the
+//! - (c) randomized eviction stress - budget = 1 expert's bytes (the tightest
+//!   non-degenerate budget; a 3-expert budget never evicts, since the routing
+//!   envelope is 3 and the soft cap is strict `>`) with the
 //!   test-only per-call order shuffle (`GOLEM_TEST_SHUFFLE_ORDER=1`, read
 //!   ONCE at setup; this file is its only setter); the measured turn must
 //!   evict.

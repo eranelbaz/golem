@@ -41,18 +41,15 @@ int32_t golem_tensor_expert_count(const void *tensor);
 /* 0 when count is 0; else bytes per expert (one ne[0]×ne[1] plane stride, nb[2]). */
 int32_t golem_tensor_expert_stride_bytes(const void *tensor);
 
-/* --- P2/P4: persistent device expert-copy cache (design §3.4). --- */
+/* --- P2/P4: persistent device expert-copy cache (design sec 3.4). --- */
 
-/* Soft cap (bytes) for the device expert-copy cache; 0 = full capacity
- * (never evict). Mutated over FFI by tests. */
+/* Soft cap (bytes) for the device expert-copy cache; 0 = full capacity (never evict). Mutated over FFI by tests. */
 void golem_set_device_cache_budget(size_t bytes);
 
-/* Clear the device cache map — the invalidation/multi-model seam (also
- * Task 4's cold-start lever). */
+/* Clear the device cache map - the invalidation/multi-model seam (also Task 4's cold-start lever). */
 void golem_reset_device_cache(void);
 
-/* P4 counters. Opaque here (C++ side keeps the members atomic); each member
- * is a lock-free 8-byte counter read by Rust as u64. */
+/* P4 counters. Opaque here (C++ side keeps the members atomic); each member is a lock-free 8-byte counter read by Rust as u64. */
 struct golem_device_cache_stats;
 const struct golem_device_cache_stats *golem_get_device_cache_stats(void);
 
