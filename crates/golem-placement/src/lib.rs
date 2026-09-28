@@ -4,6 +4,8 @@
 //! (orderings consumed by the P2/P3 patches) and reported back via
 //! [`Policy::apply_transition`].
 
+pub mod pool;
+
 use std::fmt;
 
 /// Residency tier of an expert (§6.1). Bits are independent per tier.

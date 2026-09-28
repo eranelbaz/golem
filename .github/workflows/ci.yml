@@ -1,5 +1,6 @@
 name: ci
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -35,6 +36,10 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --success-output=immediate
+      # T6 loom leg (§12.2): filtered to the pool's loom-written tests only —
+      # other placement tests are not written against loom primitives.
+      - name: T6 loom (placement pool)
+        run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-placement --features loom -E 'test(t6) or test(concurrent_claim)'
       # M1.4 parity-suite leg (stdlib driver): pytest file runs the in-script
       # selftest through the real xtask comparator. Must stay after the
       # workspace build so target/debug/xtask exists (no cargo-run fallback).
@@ -60,3 +65,23 @@ jobs:
           cargo run -p xtask -- gen-tiny-moe --out /tmp/tiny-moe.gguf
           cargo build -p golem-cli
           scripts/t4_gate.sh --upstream-tests target/debug/golem /tmp/tiny-moe.gguf
+
+  # M2.3 P3 functional acceptance (Tasks 1/5/6 tests): the split-scheduler
+  # expert-copy path only executes where a GPU split exists, so this leg runs
+  # on the self-hosted HIP runner; CPU CI never reaches it. No HIP runner is
+  # registered yet, so the job is workflow_dispatch-only — PR CI stays green
+  # and the leg runs manually (`gh workflow run ci.yml`) once the runner is up.
+  p3-hip:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, hip]
+    timeout-minutes: 60
+    env:
+      GOLEM_LLAMA_SYS_BACKEND: hip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run -p golem-engine --features hip-tests -E 'test(p3_)'

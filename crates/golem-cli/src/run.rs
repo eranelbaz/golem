@@ -1,5 +1,7 @@
 //! `golem run` (tech design §9): greedy decode of a local GGUF model, either
 //! one-shot via `--prompt` or as a stdin REPL of independent single turns.
+// The RLIMIT_MEMLOCK preflight is the one sanctioned unsafe call-site here.
+#![allow(unsafe_code)]
 
 use std::error::Error;
 use std::io::{BufRead, Read, Write};
@@ -8,8 +10,10 @@ use std::path::{Path, PathBuf};
 use golem_engine::ParityStep;
 use golem_engine::atomic::write_atomic;
 use golem_engine::config::EngineConfig;
+use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_llama_sys::substrate_backend;
+use golem_placement::pool::GgufPreadSource;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -50,6 +54,13 @@ pub struct RunArgs {
     /// HIP leg combines this with `--n-gpu-layers` to reproduce `-ncmoe 45`.
     #[arg(long, value_parser = clap::value_parser!(u32))]
     pub cpu_moe_layers: Option<u32>,
+    /// RAM expert pool size in GiB (P3, §5.4); 0/omitted keeps the pool off.
+    /// Fractional GiB are floored to whole GiB (the engine config is whole-GiB).
+    /// The pool is `mlock`ed: before loading anything, the preflight checks
+    /// `RLIMIT_MEMLOCK` and available RAM, and exits with an actionable
+    /// suggestion instead of failing mid-load.
+    #[arg(long, value_name = "GIB")]
+    pub ram_experts_gib: Option<f64>,
     /// Write a T2 parity dump (JSONL: line-1 header, then one record per
     /// generation step) to this file instead of streaming the completion;
     /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
@@ -72,6 +83,9 @@ impl RunArgs {
             n_gpu_layers: self.n_gpu_layers,
             flash_attn_on: self.flash_attn,
             cpu_moe_layers: self.cpu_moe_layers,
+            // Fractional GiB floor to the engine's whole-GiB unit; a value in
+            // (0, 1) therefore disables the pool — the help text says so.
+            ram_experts_gib: self.ram_experts_gib.unwrap_or(0.0).max(0.0) as u64,
             ..EngineConfig::default()
         }
     }
@@ -84,6 +98,9 @@ impl RunArgs {
 /// loop continues.
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     let config = args.to_config();
+    if config.ram_experts_gib > 0 {
+        preflight_ram_pool(&args.model, config.ram_experts_gib)?;
+    }
     let mut session = Session::new(&config)?;
 
     match (&args.prompt, &args.parity_dump) {
@@ -96,6 +113,82 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         (None, Some(_)) => Err("--parity-dump requires --prompt".into()),
         (None, None) => repl(&mut session),
     }
+}
+
+/// `RLIMIT_MEMLOCK` bytes, `None` = unlimited.
+fn memlock_limit() -> Option<u64> {
+    // SAFETY: plain getrlimit(2) with an out-pointer; no invariants.
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } != 0 {
+        return None; // cannot read the limit — let the arena backstop decide
+    }
+    (rl.rlim_cur != libc::RLIM_INFINITY).then_some(rl.rlim_cur)
+}
+
+/// P3 pool preflight, before any weights load: refuse to start when the
+/// requested pool cannot be locked (`RLIMIT_MEMLOCK` too low) or would exceed
+/// 75% of free RAM, each with an actionable `min(75% free RAM, expert bytes)`
+/// suggestion (§5.4: mlock is a correctness feature — never fall back).
+fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
+    let want_bytes = gib
+        .checked_mul(1 << 30)
+        .ok_or("--ram-experts-gib overflows")?;
+
+    // Expert bytes from the GGUF tensor table (header walk only).
+    let expert_bytes = expert_plane_bytes(model).unwrap_or_else(|e| {
+        eprintln!("warning: cannot pre-scan expert tensors from {model:?}: {e}");
+        0
+    });
+
+    // Free-RAM suggestion: min(75% of free, what the experts actually need).
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let free = sys.free_memory();
+    let suggest = (free * 3 / 4).min(if expert_bytes > 0 {
+        expert_bytes
+    } else {
+        u64::MAX
+    });
+
+    if let Some(limit) = memlock_limit() {
+        if want_bytes > limit {
+            eprintln!(
+                "error: --ram-experts-gib {gib} needs {want_bytes} B locked but RLIMIT_MEMLOCK \
+                 is {limit} B.\nRaise it: `ulimit -l unlimited` (or systemd `LimitMEMLOCK=\
+                 infinity`), or size the pool down, e.g. --ram-experts-gib {}",
+                suggest / (1 << 30)
+            );
+            std::process::exit(1);
+        }
+    }
+    if want_bytes > free * 3 / 4 {
+        eprintln!(
+            "error: --ram-experts-gib {gib} wants {want_bytes} B but only {free} B is free \
+             (cap: 75% of free RAM).\nSuggested size: --ram-experts-gib {} (expert bytes: \
+             {expert_bytes} B)",
+            suggest / (1 << 30)
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Total pageable expert bytes: sum of `stride × n_experts` over the model's
+/// expert planes (dense lead excluded), via the same GGUF walk the pool uses.
+fn expert_plane_bytes(model: &Path) -> Result<u64, Box<dyn Error>> {
+    let metadata = read_metadata(model)?;
+    let arch = metadata
+        .kv_str("general.architecture")
+        .unwrap_or_default()
+        .to_owned();
+    let dense_lead = metadata
+        .kv_u64(&format!("{arch}.leading_dense_block_count"))
+        .unwrap_or(0) as u32;
+    let src = GgufPreadSource::open(model, dense_lead)?;
+    Ok(src.geometry().map(|g| g.expert_bytes).unwrap_or(0))
 }
 
 fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
@@ -459,6 +552,16 @@ mod tests {
             config.cpu_moe_layers, None,
             "default writes no buft overrides"
         );
+        assert_eq!(config.ram_experts_gib, 0, "pool off by default");
+    }
+
+    #[test]
+    fn run_args_map_ram_experts_gib_flag_into_config() {
+        let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2"]).to_config();
+        assert_eq!(config.ram_experts_gib, 2);
+        // Fractional GiB floor to the engine's whole-GiB unit.
+        let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2.75"]).to_config();
+        assert_eq!(config.ram_experts_gib, 2);
     }
 
     #[test]

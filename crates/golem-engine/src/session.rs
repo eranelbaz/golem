@@ -5,14 +5,16 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use golem_llama_sys::raw;
 use golem_llama_sys::{Backend, substrate_backend};
+use golem_placement::pool::P3Stats;
 
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::gguf;
+use crate::p3_glue;
 use crate::parity::{self, ParityStep};
 use crate::sanity;
 
@@ -393,6 +395,12 @@ pub struct Session {
     config: EngineConfig,
     template: CString,
     last_prompt_tokens: Vec<raw::llama_token>,
+    /// P3 counters when the RAM expert pool is enabled (nonzero
+    /// `ram_experts_gib`); `None` keeps flagless runs pristine (hooks unset,
+    /// T4). The pool itself lives in the process-lifetime leaked hook handle;
+    /// this is only the stats view, so no drop-order coupling with the
+    /// substrate.
+    p3_stats: Option<Arc<P3Stats>>,
 }
 
 impl Session {
@@ -417,12 +425,30 @@ impl Session {
             return Err(EngineError::TemplateUnavailable);
         }
 
+        // P3 (§3.4): build the RAM expert pool + register hooks once, when the
+        // config asks for it. Registration happens for the process lifetime
+        // (leaked handle); a second pool-enabled session in one process is a
+        // loud error (see p3_glue::enable).
+        let p3_stats = if config.ram_experts_gib > 0 {
+            Some(p3_glue::enable(config)?)
+        } else {
+            None
+        };
+
         Ok(Session {
             loaded,
             config: config.clone(),
             template,
             last_prompt_tokens: Vec::new(),
+            p3_stats,
         })
+    }
+
+    /// The P3 slow-path counters when the RAM expert pool is enabled for this
+    /// session; `None` when the pool is off (the default). Demand and prefetch
+    /// page-ins are counted separately (Global Constraints).
+    pub fn p3_stats(&self) -> Option<&P3Stats> {
+        self.p3_stats.as_deref()
     }
 
     /// The tokenized prompt of the most recent `chat_turn` (post-render,

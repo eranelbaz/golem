@@ -38,6 +38,10 @@ pub enum EngineError {
     /// Filesystem failure.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    /// RAM expert pool (P3, §5.4) construction failed — arena mapping/mlock,
+    /// expert-tensor geometry, or a second pool-enabled session in one process.
+    #[error("RAM expert pool: {0}")]
+    PoolInit(String),
 }
 
 #[cfg(test)]

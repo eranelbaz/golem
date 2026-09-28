@@ -7,5 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+golem-gguf = { path = "../golem-gguf" }
+libc = { workspace = true }
+# Loom is referenced by lib code (pool/primitives.rs) under `cfg(loom)`, so it
+# must be a regular optional dependency — a dev-dependency is invisible to the
+# lib target and the loom leg would not compile.
+loom = { version = "0.7", optional = true }
+tracing = { workspace = true }
+
+[features]
+loom = ["dep:loom"]
+
+[dev-dependencies]
+xtask = { path = "../../xtask" }
+
 [lints]
 workspace = true

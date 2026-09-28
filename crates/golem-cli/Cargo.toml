@@ -15,9 +15,12 @@ path = "src/main.rs"
 clap = { workspace = true }
 golem-engine = { path = "../golem-engine" }
 golem-llama-sys = { path = "../golem-llama-sys" }
+golem-placement = { path = "../golem-placement" }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 xtask = { path = "../../xtask" }
