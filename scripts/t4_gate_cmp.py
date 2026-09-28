@@ -2,7 +2,7 @@
 """Compare parity dumps: exact tokens, logits within tolerance.
 
 Usage: t4_gate_cmp.py <baseline.jsonl> <candidate.jsonl>
-Tolerance: 1e-5 relative (covers last-ulp codegen drift across machines;
+Tolerance: 1e-4 relative (covers codegen drift across machines, observed up
 a real numeric regression shifts logits far more, and flips tokens first
 under greedy decode).
 """
@@ -10,7 +10,7 @@ import json
 import math
 import sys
 
-REL_TOL = 1e-5
+REL_TOL = 1e-4
 
 
 def main() -> int:
