@@ -216,7 +216,7 @@ pub fn read_journal(path: &Path) -> io::Result<(Journal, JournalHeader)> {
     for line in lines {
         recs.push(parse_record_line(line)?);
     }
-    let mut journal = Journal::new(recs.len().max(1));
+    let mut journal = Journal::new(recs.len().clamp(1, JOURNAL_CAP));
     for rec in recs {
         journal.push(rec);
     }
@@ -241,6 +241,13 @@ pub fn journal_dir() -> Option<PathBuf> {
         std::env::var("GOLEM_DATA_DIR").ok().as_deref(),
         std::env::var("GOLEM_INSTANCE").ok().as_deref(),
     )
+}
+
+/// Path of the journal file inside [`journal_dir`] — the handle M3 startup
+/// feeds to [`read_journal`] for warm start and shutdown feeds to
+/// [`write_journal`] (§11); `None` when no data dir is configured.
+pub fn journal_path() -> Option<PathBuf> {
+    journal_dir().map(|d| d.join("journal.log"))
 }
 
 #[cfg(test)]
@@ -429,5 +436,12 @@ mod tests {
         );
         assert_eq!(from(None, Some("i")), None);
         assert_eq!(from(None, None), None);
+    }
+
+    /// Holds unconditionally: both sides read the same environment, so the
+    /// assertion can't see a stale ambient `GOLEM_DATA_DIR`.
+    #[test]
+    fn journal_path_is_journal_dir_log() {
+        assert_eq!(journal_path(), journal_dir().map(|d| d.join("journal.log")));
     }
 }

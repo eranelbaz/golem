@@ -1,6 +1,6 @@
 //! Three-tier expert placement policy: disk, RAM, VRAM (tech design §6.1–6.4).
 //!
-//! Pure logic — no FFI, no I/O, no threads. Residency changes are decided here
+//! Pure logic — no FFI, no threads. Residency changes are decided here
 //! (orderings consumed by the P2/P3 patches) and reported back via
 //! [`Policy::apply_transition`].
 
