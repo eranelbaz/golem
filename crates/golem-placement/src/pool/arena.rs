@@ -66,8 +66,13 @@ fn last_errno() -> i32 {
 /// `&Arena` hands out `&[u8]`/`&mut [u8]` views of slots, but exclusivity is
 /// granted ONLY by the residency map: one lease = one reader of one slot, and
 /// the filler holds the claim (granted at `claim`, exclusive against eviction)
-/// until its copy completes. The arena itself never hands out overlapping
-/// views across different slots — slots are disjoint by construction.
+/// until its copy completes. The fill-completion gate closes the remaining
+/// window: between `claim` and the filler's `finish_fill` the key is mid-fill
+/// in its shard, so NO other thread can obtain a lease on it (`Resident`
+/// claims park until the gate opens) — `slot_mut`'s `&mut` is truly exclusive
+/// during the fill, and `slot`'s `&` readers all start after it. The arena
+/// itself never hands out overlapping views across different slots — slots
+/// are disjoint by construction.
 pub struct Arena {
     base: NonZeroUsize,
     len: usize,
@@ -162,14 +167,16 @@ impl Arena {
 
     /// Mutable slot view for the page-in path. Caller must hold the `Filled`
     /// claim for `i` (exclusive): a single writer per slot between claim and
-    /// the copy-under-lease, enforced by the residency map's lease granted at
-    /// claim time.
+    /// fill completion — the residency map's claim granted this caller the
+    /// only lease, and the fill-completion gate keeps every other claimer
+    /// parked until the fill is reported done, after which this `&mut` has
+    /// ended and only shared `&` reads remain.
     ///
     /// # Panics
     /// Panics when `i >= slot_count`.
     // &self → &mut [u8] is the point: the aliasing rule it relies on is the
     // Filled-claim exclusivity contract documented above, which the residency
-    // map enforces.
+    // map's claim + fill gate enforce.
     #[allow(clippy::mut_from_ref)]
     pub(crate) fn slot_mut(&self, i: u32) -> &mut [u8] {
         assert!(i < self.slots);

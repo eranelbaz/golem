@@ -69,6 +69,25 @@ fn t6_access_pagein_evict_copy_no_torn_reads() {
     });
 }
 
+/// Same-key concurrent claims: exactly one thread fills; the other must park
+/// on the fill-completion gate and then read FULLY written bytes — no torn
+/// mid-fill reads under lease.
+#[test]
+fn t6_same_key_concurrent_claim_no_torn_fill() {
+    primitives::model(|| {
+        let pool = loom_pool();
+        let p2 = pool.clone();
+        let second = primitives::spawn(move || {
+            let mut copy =
+                |bytes: &[u8]| assert!(bytes.iter().all(|&b| b == 1), "torn mid-fill read");
+            let _ = p2.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut copy);
+        });
+        let mut copy = |bytes: &[u8]| assert!(bytes.iter().all(|&b| b == 1), "torn mid-fill read");
+        let _ = pool.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut copy);
+        second.join().unwrap();
+    });
+}
+
 #[test]
 fn t6_leased_expert_never_evicted() {
     primitives::model(|| {

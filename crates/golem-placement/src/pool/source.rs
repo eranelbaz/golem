@@ -235,8 +235,13 @@ impl ExpertSource for GgufPreadSource {
         let mut done = 0usize;
         for _ in 0..READ_RETRIES {
             // Safe pread wrapper (FileExt::read_at): does not move the cursor,
-            // so concurrent readers cannot disturb each other.
-            let n = self.file.read_at(&mut plane[done..], off)?;
+            // so concurrent readers cannot disturb each other. Interrupted
+            // reads retry within the same bounded loop as short reads.
+            let n = match self.file.read_at(&mut plane[done..], off) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,

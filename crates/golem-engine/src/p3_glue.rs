@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use golem_llama_sys::raw;
@@ -99,6 +99,11 @@ unsafe impl Sync for PoolHandle {}
 /// Process-lifetime registration: set once, read forever, never torn down.
 static HANDLE: OnceLock<&'static PoolHandle> = OnceLock::new();
 
+/// Build-in-progress reservation: set by the first `enable` BEFORE any
+/// resource is allocated, so a concurrent second `enable` fails fast instead
+/// of racing [`HANDLE`] and leaking a built arena + prefetch thread.
+static ENABLING: AtomicBool = AtomicBool::new(false);
+
 /// Builds the RAM expert pool for `config` (which must set
 /// `ram_experts_gib > 0`) and registers the P3 hooks for the process
 /// lifetime. Returns the pool's counters for [`crate::session::Session::
@@ -110,6 +115,23 @@ static HANDLE: OnceLock<&'static PoolHandle> = OnceLock::new();
 /// serves exactly one; multi-session arrives with M4's global registration).
 pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     debug_assert!(config.ram_experts_gib > 0, "enable() with pool disabled");
+    if ENABLING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(EngineError::PoolInit(
+            "concurrent pool-enabled session construction".into(),
+        ));
+    }
+    let result = enable_inner(config);
+    if result.is_err() {
+        // Reservation released: a later enable() may retry from scratch.
+        ENABLING.store(false, Ordering::SeqCst);
+    }
+    result
+}
+
+fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     if HANDLE.get().is_some() {
         return Err(EngineError::PoolInit(
             "a pool-enabled session already exists (one per process in M2.3)".into(),
@@ -183,13 +205,11 @@ pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError>
         tensors: Mutex::new(HashMap::new()),
         slow_calls: AtomicUsize::new(0),
     }));
-    if HANDLE.set(handle).is_err() {
-        // Raced a concurrent enable(); the leaked arena is inert garbage the
-        // process carries — loud failure beats silent double registration.
-        return Err(EngineError::PoolInit(
-            "concurrent pool-enabled session construction".into(),
-        ));
-    }
+    // CAS reservation above ⇒ no concurrent setter and `get()` was None.
+    assert!(
+        HANDLE.set(handle).is_ok(),
+        "HANDLE must be unset after winning the enable reservation"
+    );
 
     // SAFETY: `handle` is leaked ('static) and never mutated after this, so
     // the context pointer outlives every callback; `Some(ensure_host_resident)`

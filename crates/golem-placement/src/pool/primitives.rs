@@ -10,7 +10,7 @@
 #[cfg(loom)]
 pub use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(loom)]
-pub use loom::sync::{Arc, Mutex};
+pub use loom::sync::{Arc, Condvar, Mutex};
 /// Thread handle from [`spawn`] (modeled under loom).
 #[cfg(loom)]
 pub type JoinHandle<T> = loom::thread::JoinHandle<T>;
@@ -39,7 +39,7 @@ pub fn yield_now() {
 #[cfg(not(loom))]
 pub use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
-pub use std::sync::{Arc, Mutex};
+pub use std::sync::{Arc, Condvar, Mutex};
 #[cfg(not(loom))]
 /// Thread handle from [`spawn`] (std).
 pub type JoinHandle<T> = std::thread::JoinHandle<T>;

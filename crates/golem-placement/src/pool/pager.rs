@@ -211,8 +211,12 @@ impl ExpertPool {
         Ok(())
     }
 
-    /// Fills one slot from the source. On failure: cancel the claim's lease
-    /// (residency bit cleared, slot recycled) and surface the error.
+    /// Fills one slot from the source. The `Filled`/evict claim left this key
+    /// mid-fill in the residency shard: the fill writes through the exclusive
+    /// gate, and only `finish_fill` (below, before the lease-held copy) lets
+    /// parked `Resident` claimers of this key read the slot. On failure:
+    /// cancel the claim's lease (residency bit cleared, slot recycled, gate
+    /// opened) and surface the error.
     fn page_in(
         &self,
         demand: bool,
@@ -226,6 +230,7 @@ impl ExpertPool {
             .read_expert(layer, kind, expert, self.arena.slot_mut(slot))
         {
             Ok(()) => {
+                self.residency.finish_fill(layer, kind, expert);
                 let counter = if demand {
                     &self.stats.demand_slow_pageins
                 } else {
