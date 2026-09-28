@@ -12,16 +12,29 @@
 #include <cstdint>
 #include <vector>
 
+struct ggml_context;
+struct ggml_backend_buffer;
+
 namespace golem {
 
-// Validity state for one device expert-copy buffer. Reset on ANY fingerprint
-// mismatch (recycled device addresses across same-n_expert tensors must not
-// alias stale bits).
+// Validity state for one device expert-copy cache entry. Reset on ANY
+// fingerprint mismatch (recycled host addresses across same-n_expert tensors
+// must not alias stale bits).
 struct GolemDeviceCache {
     std::vector<ggml_bitset_t> valid; // bitset over n_expert
     size_t valid_bytes = 0;
     const void *owner = nullptr; // host tensor fingerprint (alias guard)
     size_t expert_size = 0;
+    // Persistent OWNED device region (design §3.4): a full-size twin of the
+    // host expert tensor allocated once on the split backend; compute reads
+    // it (node->src[0] is redirected to it). The scheduler's transient cpy
+    // slots alias one address across the expert planes, so caching validity
+    // there is unsound — each plane's copy overwrites the others'. The owned
+    // region is exclusive per host tensor. Held (and freed by
+    // golem_reset_device_cache) by the map entry.
+    struct ggml_tensor *         owned     = nullptr;
+    struct ggml_backend_buffer * owned_buf = nullptr;
+    struct ggml_context *        owned_ctx = nullptr;
 };
 
 // Per-step accounting; the caller folds these into the P4 atomic counters.
@@ -85,7 +98,16 @@ GolemDcCounters golem_dc_step_impl(GolemDeviceCache &st, const std::vector<int32
     // Fresh or aliased/stale entry: reset.
     if (st.valid.size() != (size_t) ggml_bitset_size(n_experts) || st.owner != host_data ||
         st.expert_size != expert_size) {
+        // Preserve the owned persistent region across state resets: the
+        // region is keyed by the entry (host tensor), not by the resettable
+        // validity state.
+        struct ggml_tensor *         owned     = st.owned;
+        struct ggml_backend_buffer * owned_buf = st.owned_buf;
+        struct ggml_context *        owned_ctx = st.owned_ctx;
         st                = GolemDeviceCache{};
+        st.owned          = owned;
+        st.owned_buf      = owned_buf;
+        st.owned_ctx      = owned_ctx;
         st.valid.assign(ggml_bitset_size(n_experts), 0);
         st.owner          = host_data;
         st.expert_size    = expert_size;
