@@ -79,18 +79,19 @@ fn seeded_ranking_matches_trace_hot_set() {
         }
     }
 
-    // Top-16 by seeded score vs top-16 by an independent replay of the same
-    // trace (§6.3 math redone here, not via Policy): ≥ 14 overlap. The
-    // recency-preserving sweep decays every key to the common horizon
-    // T+gap, so recent accesses dominate — hit counts are NOT the
-    // comparator (exact set equality is flaky on a stochastic trace).
+    // Top-16 by seeded score vs top-16 by an independent replay of the
+    // same trace (§6.3 math redone here, not via Policy): ≥ 14 overlap.
+    // Replay at the original step (no gap); the gap is applied exactly
+    // once at the sweep to the common horizon T+gap, so recent accesses
+    // dominate — hit counts are NOT the comparator (exact set equality
+    // is flaky on a stochastic trace). Net decay of an access at step s
+    // is e^(−(T+gap−s)/H), matching seed_from_journal exactly.
     let mut expected = [0f64; NUM_KEYS];
     let mut last_touch = [0u64; NUM_KEYS];
     let h = header.half_life_steps;
     for &(step, key) in &trace {
-        let v = step + GAP;
-        expected[key] = expected[key] * (-((v - last_touch[key]) as f64) / h).exp() + 1.0;
-        last_touch[key] = v;
+        expected[key] = expected[key] * (-((step - last_touch[key]) as f64) / h).exp() + 1.0;
+        last_touch[key] = step;
     }
     let horizon = (STEPS - 1) + GAP; // journal.last_step() + gap_steps
     for k in 0..NUM_KEYS {

@@ -493,15 +493,17 @@ impl Policy {
     }
 
     /// Seed scores from a previous run's journal (§6.3 warm-up). Each
-    /// recorded access is replayed at virtual step `r.step + gap_steps`
-    /// through the §6.2 lazy-decay score function, then every key is
-    /// swept to the common horizon `journal.last_step() + gap_steps` —
-    /// net decay of an access at journal step `s` is
-    /// `e^(−(T+gap−s)/H)` where `T` is the journal's last step, so the
-    /// most recent access (`s = T`) decays by `e^(−gap/H)` and older
-    /// accesses decay strictly more: recency is preserved. Raw accesses
-    /// are replayed without
-    /// per-step dedup, mirroring the recorder. Returns [`SeedMismatch`]
+    /// recorded access is replayed at its original virtual step `r.step`
+    /// (no gap) through the §6.2 lazy-decay score function, then every
+    /// key is swept once to the common horizon `journal.last_step() +
+    /// gap_steps` — the gap is applied exactly once, at the sweep. Net
+    /// decay of an access at journal step `s` is `e^(−(T+gap−s)/H)`
+    /// where `T` is the journal's last step, so the most recent access
+    /// (`s = T`) decays by `e^(−gap/H)` and older accesses decay
+    /// strictly more: recency is preserved, and within-run inter-access
+    /// decays remain the true `s2 − s1`. Raw accesses are replayed
+    /// without per-step dedup, mirroring the recorder. Returns
+    /// [`SeedMismatch`]
     /// when the journal's header doesn't match this policy's
     /// `PlacementConfig` — same flat key count but different topology
     /// (e.g. 2×128 vs 1×256), or different half_life — silently seeding
@@ -532,7 +534,7 @@ impl Policy {
         };
         let horizon = t + gap_steps;
         for r in journal.iter() {
-            let vstep = r.step + gap_steps;
+            let vstep = r.step;
             for &k in &r.accesses {
                 let df = self.decay_factor(self.states[k].last_score_step, vstep);
                 let st = &mut self.states[k];
@@ -540,11 +542,11 @@ impl Policy {
                 st.last_score_step = vstep;
             }
         }
-        // Finalization sweep: decay every key to the common horizon
-        // `T + gap_steps` (never through public `score()`/`on_access`,
-        // whose monotonic debug_asserts would trip), then stamp
-        // `last_score_step = 0`. Keys never replayed have score 0, so
-        // the sweep is a no-op for them.
+        // Finalization sweep: apply the gap exactly once by decaying
+        // every key to the common horizon `T + gap_steps` (never through
+        // public `score()`/`on_access`, whose monotonic debug_asserts
+        // would trip), then stamp `last_score_step = 0`. Keys never
+        // replayed have score 0, so the sweep is a no-op for them.
         for k in 0..self.states.len() {
             let df = self.decay_factor(self.states[k].last_score_step, horizon);
             let st = &mut self.states[k];
@@ -1120,6 +1122,62 @@ mod tests {
         assert!(a > b, "A@1000 ({a}) must outrank B@3 ({b})");
         // Key absent from the journal: exact zero, no blanket bump.
         assert_eq!(p.score(2, 0), 0.0);
+        // Sweep contract: on_access from step 0 must be immediately legal.
+        p.on_access(0, 0);
+    }
+
+    #[test]
+    fn seed_from_journal_applies_gap_once_at_sweep() {
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 8,
+                vram_experts_min: 1,
+                ram_slots: 8,
+                ram_experts_min: 1,
+                half_life_steps: 512.0,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut j = Journal::new(journal::JOURNAL_CAP);
+        j.push(JournalRecord {
+            step: 3,
+            accesses: vec![1],
+            transitions: vec![],
+        });
+        j.push(JournalRecord {
+            step: 1000,
+            accesses: vec![0],
+            transitions: vec![],
+        });
+        let header = journal::JournalHeader {
+            layers: 1,
+            experts_per_layer: 8,
+            half_life_steps: 512.0,
+        };
+        p.seed_from_journal(&header, &j, 512).unwrap();
+        // Gap applied exactly once at the sweep to T+gap = 1512: newest
+        // access A@1000 decays by e^(−512/512), older B@3 by
+        // e^(−(997+512)/512). Replay at r.step (no gap) keeps
+        // inter-access decay at the true 997.
+        let a = p.score(0, 0);
+        let ea = (-512.0f64 / 512.0).exp();
+        assert!(
+            (a - ea).abs() <= ea * 1e-9,
+            "score(A,0)={a}, expected e^(-1)={ea}"
+        );
+        let b = p.score(1, 0);
+        let eb = (-(997.0f64 + 512.0) / 512.0).exp();
+        assert!(
+            (b - eb).abs() <= eb * 1e-9,
+            "score(B,0)={b}, expected e^(-1509/512)={eb}"
+        );
+        assert!(a > b, "A@1000 ({a}) must outrank B@3 ({b})");
         // Sweep contract: on_access from step 0 must be immediately legal.
         p.on_access(0, 0);
     }
