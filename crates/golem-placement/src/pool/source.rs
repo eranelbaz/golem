@@ -13,12 +13,28 @@ use golem_gguf::{data_section_offset, ggml_row_bytes, tensor_entries};
 
 use super::residency::ExpertKind;
 
+/// Pool geometry derived from the expert plane table (§5.4): a uniform slot
+/// size (the max plane stride — per-kind strides may diverge on quants), the
+/// dense-lead-adjusted layer/expert counts, and total expert bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolGeometry {
+    /// Max plane stride in bytes — the arena slot size.
+    pub slot_size: u64,
+    /// Expert layer count (dense lead excluded).
+    pub n_layers: u32,
+    /// Experts per layer (uniform; the loader enforces cross-tensor equality).
+    pub n_experts: u32,
+    /// Sum over planes of `stride × n_experts` — total pageable expert bytes.
+    pub expert_bytes: u64,
+}
+
 /// Reads one expert plane from a byte source.
 pub trait ExpertSource: Send + Sync {
-    /// Read one expert plane into `into` (len == plane stride for that kind).
-    /// Blocking; bounded internal retries on EINTR/short reads; a 0-byte read
-    /// is `UnexpectedEof`. `layer` is the DENSE-LEAD-ADJUSTED index (blk.1 is
-    /// expert layer 0 in tiny-moe).
+    /// Read one expert plane into the first `stride` bytes of `into` (length
+    /// ≥ that stride; slots may exceed the plane when per-kind strides
+    /// diverge — §3.4). Blocking; bounded internal retries on EINTR/short
+    /// reads; a 0-byte read is `UnexpectedEof`. `layer` is the
+    /// DENSE-LEAD-ADJUSTED index (blk.1 is expert layer 0 in tiny-moe).
     ///
     /// # Errors
     /// I/O failure after the retry bound, unknown plane, or buffer/stride
@@ -116,6 +132,28 @@ fn blk_of(name: &str) -> Option<u32> {
 }
 
 impl GgufPreadSource {
+    /// Aggregate pool geometry over the walked expert planes, or `None` when
+    /// the model carries no expert tensors.
+    pub fn geometry(&self) -> Option<PoolGeometry> {
+        let mut slot_size = 0u64;
+        let mut n_layers = 0u32;
+        let mut n_experts = 0u32;
+        let mut expert_bytes = 0u64;
+        for (&(layer, _), p) in &self.planes {
+            slot_size = slot_size.max(p.stride);
+            n_layers = n_layers.max(layer + 1);
+            n_experts = n_experts.max(p.n_experts);
+            expert_bytes =
+                expert_bytes.checked_add(p.stride.checked_mul(u64::from(p.n_experts))?)?;
+        }
+        (slot_size > 0).then_some(PoolGeometry {
+            slot_size,
+            n_layers,
+            n_experts,
+            expert_bytes,
+        })
+    }
+
     /// Opens `path` and walks the GGUF tensor table. Expert layers are
     /// numbered EXCLUDING the dense lead: pool layer = gguf blk −
     /// `n_dense_lead` (tiny-moe: 1).
@@ -183,18 +221,22 @@ impl ExpertSource for GgufPreadSource {
                 format!("expert {expert} out of range (n={})", p.n_experts),
             ));
         }
-        if into.len() as u64 != p.stride {
+        let stride = usize::try_from(p.stride).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "plane stride exceeds usize")
+        })?;
+        if into.len() < stride {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("buffer {} != plane stride {}", into.len(), p.stride),
+                format!("buffer {} < plane stride {stride}", into.len()),
             ));
         }
+        let plane = &mut into[..stride];
         let mut off = p.base + u64::from(expert) * p.stride;
         let mut done = 0usize;
         for _ in 0..READ_RETRIES {
             // Safe pread wrapper (FileExt::read_at): does not move the cursor,
             // so concurrent readers cannot disturb each other.
-            let n = self.file.read_at(&mut into[done..], off)?;
+            let n = self.file.read_at(&mut plane[done..], off)?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -203,7 +245,7 @@ impl ExpertSource for GgufPreadSource {
             }
             done += n;
             off += n as u64;
-            if done == into.len() {
+            if done == plane.len() {
                 return Ok(());
             }
         }
@@ -298,6 +340,30 @@ mod tests {
         assert!(
             src.read_expert(0, ExpertKind::Gate, 0, &mut buf[..128])
                 .is_err()
+        );
+        // oversized buffer is fine: the first `stride` bytes carry the plane,
+        // the tail is untouched (slots may exceed diverging plane strides).
+        let mut big = vec![0xAAu8; PLANE_ELEMS * 4 + 64];
+        src.read_expert(0, ExpertKind::Gate, 3, &mut big).unwrap();
+        assert_eq!(
+            &big[..PLANE_ELEMS * 4],
+            &FixtureRng::new(xtask::tiny_moe::DEFAULT_SEED)
+                .plane_bytes(DRAWS_BEFORE_B1_GATE + 3 * PLANE_ELEMS, PLANE_ELEMS)[..]
+        );
+        assert!(big[PLANE_ELEMS * 4..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn geometry_aggregates_the_expert_plane_table() {
+        let src = GgufPreadSource::open(&fixture(), 1).unwrap();
+        let g = src.geometry().unwrap();
+        assert_eq!(g.n_layers, 1, "tiny-moe: blk.1 is the only expert layer");
+        assert_eq!(g.n_experts, 8);
+        assert_eq!(g.slot_size, (PLANE_ELEMS * 4) as u64);
+        assert_eq!(
+            g.expert_bytes,
+            3 * 8 * (PLANE_ELEMS * 4) as u64,
+            "3 kinds × 8 experts × plane stride"
         );
     }
 

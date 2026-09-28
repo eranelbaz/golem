@@ -1,8 +1,10 @@
 //! P3 acceptance seam: ensure_host_resident is invoked by the split scheduler
 //! before expert host bytes are read, with the weights tensor + routed range.
-//! Runs only where a GPU split exists (feature `hip-tests`, HIP CI job);
+//! Runs only where a GPU split exists
+//! (feature `hip-tests`, HIP CI job);
 //! CPU builds never enter the split-scheduler expert-copy path.
 #![cfg(feature = "hip-tests")]
+#![allow(unsafe_code)]
 mod common;
 
 use golem_engine::session::{ChatTurn, Session};

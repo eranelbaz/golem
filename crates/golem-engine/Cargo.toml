@@ -10,9 +10,11 @@ publish = false
 [dependencies]
 golem-gguf = { path = "../golem-gguf" }
 golem-llama-sys = { path = "../golem-llama-sys" }
+golem-placement = { path = "../golem-placement" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 hip-tests = []

@@ -26,6 +26,11 @@ pub struct EngineConfig {
     /// `-ncmoe N` flag (a common/arg.cpp path unreachable through libllama at
     /// this pin). `None` keeps the llama.cpp default (no overrides).
     pub cpu_moe_layers: Option<u32>,
+    /// RAM expert pool size in GiB (P3, §5.4). **0 = off** (the default): no
+    /// pool is built, hooks stay unset, decode is byte-identical upstream
+    /// (T4 invariant). The CLI computes a suggestion but always passes an
+    /// explicit whole-GiB value.
+    pub ram_experts_gib: u64,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +44,7 @@ impl Default for EngineConfig {
             n_gpu_layers: 0,
             flash_attn_on: false,
             cpu_moe_layers: None,
+            ram_experts_gib: 0,
         }
     }
 }
@@ -61,5 +67,6 @@ mod tests {
         );
         assert!(!c.flash_attn_on, "default leaves flash attention at AUTO");
         assert_eq!(c.cpu_moe_layers, None, "default writes no buft overrides");
+        assert_eq!(c.ram_experts_gib, 0, "RAM expert pool defaults off (T4)");
     }
 }
