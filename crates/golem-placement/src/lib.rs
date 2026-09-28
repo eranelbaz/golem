@@ -555,6 +555,41 @@ impl Policy {
         }
         Ok(())
     }
+
+    /// Warm-start plan (§6.3): after [`Policy::seed_from_journal`], the
+    /// ordered flat keys to page-in and promote BEFORE the first request.
+    /// Computes its own top-N ranking BY SCORE — deliberately bypassing the
+    /// `pass` promotion gates (residency, dwell, θ_hi): a freshly-seeded
+    /// policy is fully cold (every key [`Tier::Disk`]), and `pass()`
+    /// promotion requires RAM residency, so `pass(step).vram_order` is
+    /// empty by construction regardless of score and MUST NOT be the
+    /// source. Ties break by ascending key index (matching `pass()`'s
+    /// ordering). Returns `(vram, ram)`: `vram` = top `vram_experts_max`
+    /// by seeded score, best-first, the first `vram_experts_min` of which
+    /// are the VRAM floor; `ram` = next `ram_experts_min` best keys not
+    /// already in `vram`, the RAM floor. Does NOT touch residency — the
+    /// pool executes page-in + promote and reports back via
+    /// [`Policy::apply_transition`] (existing P2/P3 contract).
+    ///
+    /// # Panics
+    /// Panics under the monotonic-step debug_assert if any
+    /// `last_score_step` is nonzero — call only on a policy still at step
+    /// 0, i.e. immediately after `seed_from_journal`.
+    pub fn warm_plan(&mut self) -> (Vec<usize>, Vec<usize>) {
+        let cfg = self.cfg.clone();
+        let mut rank: Vec<(f64, usize)> = (0..self.states.len())
+            .map(|k| (self.score(k, 0), k))
+            .collect();
+        rank.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let vram_end = cfg.vram_experts_max.min(rank.len());
+        let vram = rank[..vram_end].iter().map(|&(_, k)| k).collect();
+        let ram = rank[vram_end..]
+            .iter()
+            .take(cfg.ram_experts_min)
+            .map(|&(_, k)| k)
+            .collect();
+        (vram, ram)
+    }
 }
 
 /// Journal/policy fingerprint disagreement from

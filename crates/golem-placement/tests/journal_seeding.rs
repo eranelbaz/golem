@@ -4,7 +4,9 @@
 //! duplicated from `tests/properties.rs` (its helpers are private to that
 //! binary).
 
-use golem_placement::{Journal, JournalHeader, PlacementConfig, Policy, journal::JOURNAL_CAP};
+use golem_placement::{
+    Journal, JournalHeader, PlacementConfig, Policy, Tier, journal::JOURNAL_CAP,
+};
 
 struct XorShift(u64);
 
@@ -110,5 +112,152 @@ fn seeded_ranking_matches_trace_hot_set() {
     assert!(
         overlap >= 14,
         "top-16 overlap {overlap}/16 below threshold: by score {top_scored:?}, independent {top_expected:?}"
+    );
+}
+
+/// Record a deterministic trace into a journal (same generator as the test
+/// above) and return the journal plus the full (step, key) trace.
+fn gen_trace(seed: u64) -> (Journal, Vec<(u64, usize)>) {
+    let mut p = fixture();
+    p.attach_journal(Journal::new(JOURNAL_CAP));
+    let mut xor = XorShift(seed);
+    let mut trace = Vec::with_capacity(STEPS as usize);
+    for step in 0..STEPS {
+        let key = if xor.next() % 100 < 60 {
+            (xor.next() as usize) % HOT
+        } else {
+            (xor.next() as usize) % NUM_KEYS
+        };
+        p.on_access(key, step);
+        trace.push((step, key));
+    }
+    (p.detach_journal().unwrap(), trace)
+}
+
+/// Fresh policy seeded from `journal` at the standard gap.
+fn seeded_policy(journal: &Journal) -> Policy {
+    let header = JournalHeader {
+        layers: 2,
+        experts_per_layer: 128,
+        half_life_steps: 512.0,
+    };
+    let mut p = fixture();
+    p.seed_from_journal(&header, journal, GAP).unwrap();
+    p
+}
+
+/// Independent §6.2 replay of `trace` (not via `Policy`): net seeded score
+/// per key, gap applied once at the sweep to horizon T+gap.
+fn independent_scores(trace: &[(u64, usize)]) -> [f64; NUM_KEYS] {
+    let mut expected = [0f64; NUM_KEYS];
+    let mut last_touch = [0u64; NUM_KEYS];
+    let h = 512.0; // fixture half_life
+    for &(step, key) in trace {
+        expected[key] = expected[key] * (-((step - last_touch[key]) as f64) / h).exp() + 1.0;
+        last_touch[key] = step;
+    }
+    let horizon = (STEPS - 1) + GAP;
+    for k in 0..NUM_KEYS {
+        expected[k] *= (-((horizon - last_touch[k]) as f64) / h).exp();
+    }
+    expected
+}
+
+#[test]
+fn warm_plan_slices_seeded_ranking_into_floors() {
+    let (journal, trace) = gen_trace(0x9E3779B97F4A7C15);
+    let mut p = seeded_policy(&journal);
+    let (vram, ram) = p.warm_plan();
+    let cfg = p.config().clone();
+
+    // Exact shape: vram_experts_max VRAM keys, ram_experts_min RAM keys.
+    assert_eq!(vram.len(), cfg.vram_experts_max);
+    assert_eq!(ram.len(), cfg.ram_experts_min);
+    for &k in &ram {
+        assert!(!vram.contains(&k), "key {k} appears in both floors");
+    }
+
+    // Both lists follow pass()'s total order: score desc, ties by
+    // ascending key index; ram continues where vram stops (next-best).
+    let mut rank_of = |key: usize| (p.score(key, 0), key);
+    let mut check_order = |ks: &[usize]| {
+        for pair in ks.windows(2) {
+            let (a, b) = (rank_of(pair[0]), rank_of(pair[1]));
+            assert!(
+                a.0 > b.0 || (a.0 == b.0 && a.1 < b.1),
+                "keys {} and {} out of order",
+                pair[0],
+                pair[1]
+            );
+        }
+    };
+    check_order(&vram);
+    check_order(&ram);
+    let last_vram = rank_of(vram[cfg.vram_experts_max - 1]);
+    let first_ram = rank_of(ram[0]);
+    assert!(
+        last_vram.0 > first_ram.0 || (last_vram.0 == first_ram.0 && last_vram.1 < first_ram.1),
+        "ram floor starts before the vram ranking ends"
+    );
+
+    // The plan's VRAM list tracks an independent §6.2 replay of the same
+    // trace: near-total overlap on the top vram_experts_max.
+    let expected = independent_scores(&trace);
+    let mut by_expected: Vec<usize> = (0..NUM_KEYS).collect();
+    by_expected.sort_by(|&a, &b| expected[b].total_cmp(&expected[a]).then(a.cmp(&b)));
+    let top_expected: std::collections::HashSet<usize> =
+        by_expected.into_iter().take(cfg.vram_experts_max).collect();
+    let overlap = vram.iter().filter(|k| top_expected.contains(k)).count();
+    assert!(
+        overlap >= cfg.vram_experts_max - 2,
+        "warm plan vram overlap {overlap}/{} with independent replay",
+        cfg.vram_experts_max
+    );
+}
+
+#[test]
+fn warm_plan_pre_promotion_zeroes_demand_pageins() {
+    let (journal, trace) = gen_trace(0x9E3779B97F4A7C15);
+    let window = 256usize;
+
+    // Warm run: seed, apply the plan at step 0 (pool executes page-in +
+    // promote and reports back via apply_transition), replay the window.
+    let mut warm = seeded_policy(&journal);
+    let (vram, ram) = warm.warm_plan();
+    let mut promoted = std::collections::HashSet::new();
+    for &k in &vram {
+        warm.apply_transition(k, Tier::Vram, true, 0);
+        promoted.insert(k);
+    }
+    for &k in &ram {
+        warm.apply_transition(k, Tier::Ram, true, 0);
+        promoted.insert(k);
+    }
+    let resident = |p: &Policy, k: usize| p.residency(k, Tier::Vram) || p.residency(k, Tier::Ram);
+    let mut warm_demand = 0usize;
+    for &(step, key) in trace.iter().take(window) {
+        warm.on_access(key, step);
+        if promoted.contains(&key) && !resident(&warm, key) {
+            warm_demand += 1;
+        }
+    }
+
+    // Cold run: same trace from the same disk-cold start, no seeding.
+    let mut cold = fixture();
+    let mut cold_demand = 0usize;
+    for &(step, key) in trace.iter().take(window) {
+        cold.on_access(key, step);
+        if promoted.contains(&key) && !resident(&cold, key) {
+            cold_demand += 1;
+        }
+    }
+
+    assert_eq!(
+        warm_demand, 0,
+        "pre-promoted keys must never demand-page-in"
+    );
+    assert!(
+        cold_demand >= HOT,
+        "cold run page-ins {cold_demand} below hot-set size {HOT} in the same window"
     );
 }
