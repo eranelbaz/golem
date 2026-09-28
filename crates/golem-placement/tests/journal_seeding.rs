@@ -81,9 +81,9 @@ fn seeded_ranking_matches_trace_hot_set() {
 
     // Top-16 by seeded score vs top-16 by an independent replay of the same
     // trace (§6.3 math redone here, not via Policy): ≥ 14 overlap. The
-    // sweep-to-0 weight of an access is e^(−(step+gap)/H), so the ranking
-    // is dominated by early-run mass — hit counts are NOT the comparator
-    // (exact set equality is flaky on a stochastic trace).
+    // recency-preserving sweep decays every key to the common horizon
+    // T+gap, so recent accesses dominate — hit counts are NOT the
+    // comparator (exact set equality is flaky on a stochastic trace).
     let mut expected = [0f64; NUM_KEYS];
     let mut last_touch = [0u64; NUM_KEYS];
     let h = header.half_life_steps;
@@ -92,8 +92,9 @@ fn seeded_ranking_matches_trace_hot_set() {
         expected[key] = expected[key] * (-((v - last_touch[key]) as f64) / h).exp() + 1.0;
         last_touch[key] = v;
     }
+    let horizon = (STEPS - 1) + GAP; // journal.last_step() + gap_steps
     for k in 0..NUM_KEYS {
-        expected[k] *= (-(last_touch[k] as f64) / h).exp();
+        expected[k] *= (-((horizon - last_touch[k]) as f64) / h).exp();
     }
     let mut by_score: Vec<usize> = (0..NUM_KEYS).collect();
     by_score.sort_by(|&a, &b| p2.score(b, 0).total_cmp(&p2.score(a, 0)));

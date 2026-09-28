@@ -494,9 +494,13 @@ impl Policy {
 
     /// Seed scores from a previous run's journal (§6.3 warm-up). Each
     /// recorded access is replayed at virtual step `r.step + gap_steps`
-    /// through the §6.2 lazy-decay score function, then all scores are
-    /// swept to step 0 — net decay of an access is `e^(−(r.step+gap)/H)`;
-    /// the last step is not rebased. Raw accesses are replayed without
+    /// through the §6.2 lazy-decay score function, then every key is
+    /// swept to the common horizon `journal.last_step() + gap_steps` —
+    /// net decay of an access at journal step `s` is
+    /// `e^(−(T+gap−s)/H)` where `T` is the journal's last step, so the
+    /// most recent access (`s = T`) decays by `e^(−gap/H)` and older
+    /// accesses decay strictly more: recency is preserved. Raw accesses
+    /// are replayed without
     /// per-step dedup, mirroring the recorder. Returns [`SeedMismatch`]
     /// when the journal's header doesn't match this policy's
     /// `PlacementConfig` — same flat key count but different topology
@@ -523,6 +527,10 @@ impl Policy {
                 policy_half_life: self.cfg.half_life_steps,
             });
         }
+        let Some(t) = journal.last_step() else {
+            return Ok(());
+        };
+        let horizon = t + gap_steps;
         for r in journal.iter() {
             let vstep = r.step + gap_steps;
             for &k in &r.accesses {
@@ -532,11 +540,13 @@ impl Policy {
                 st.last_score_step = vstep;
             }
         }
-        // Finalization sweep to step 0. Direct writes: the public
-        // `score()`/`on_access` would trip their monotonic debug_asserts
-        // (0 < virtual step); this sweep is what legalizes them.
+        // Finalization sweep: decay every key to the common horizon
+        // `T + gap_steps` (never through public `score()`/`on_access`,
+        // whose monotonic debug_asserts would trip), then stamp
+        // `last_score_step = 0`. Keys never replayed have score 0, so
+        // the sweep is a no-op for them.
         for k in 0..self.states.len() {
-            let df = self.decay_factor(self.states[k].last_score_step, 0);
+            let df = self.decay_factor(self.states[k].last_score_step, horizon);
             let st = &mut self.states[k];
             st.score *= df;
             st.last_score_step = 0;
@@ -1061,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_from_journal_replays_and_sweeps_to_zero() {
+    fn seed_from_journal_replays_and_sweeps_preserving_recency() {
         let mut p = Policy::new(
             PlacementConfig {
                 layers: 1,
@@ -1095,19 +1105,19 @@ mod tests {
             half_life_steps: 512.0,
         };
         p.seed_from_journal(&header, &j, 0).unwrap();
+        // Recency-preserving sweep to horizon T+gap = 1000: the newest
+        // access (A@1000 = T) is undecayed, older B@3 keeps only
+        // e^(−997/512).
         let a = p.score(0, 0);
-        let expected = (-(1000.0f64) / 512.0).exp();
+        assert!((a - 1.0).abs() <= 1e-9, "score(A,0)={a}, expected 1.0");
+        let b = p.score(1, 0);
+        let expected = (-997.0f64 / 512.0).exp();
         assert!(
-            (a - expected).abs() <= expected * 1e-9,
-            "score(A,0)={a}, expected e^(-1000/512)={expected}"
+            (b - expected).abs() <= expected * 1e-9,
+            "score(B,0)={b}, expected e^(-997/512)={expected}"
         );
-        // Sweep-to-0 semantics: an access further in the past of the run is
-        // decayed harder, so B@3 retains more weight than A@1000.
-        assert!(
-            p.score(1, 0) > a,
-            "B@3 ({}) must outrank A@1000 ({a})",
-            p.score(1, 0)
-        );
+        // Recency order restored: the most recent access outranks the old one.
+        assert!(a > b, "A@1000 ({a}) must outrank B@3 ({b})");
         // Key absent from the journal: exact zero, no blanket bump.
         assert_eq!(p.score(2, 0), 0.0);
         // Sweep contract: on_access from step 0 must be immediately legal.
