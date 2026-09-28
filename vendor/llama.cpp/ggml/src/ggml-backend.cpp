@@ -20,7 +20,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // --- golem P1: hook statics live at the top of this file so the
@@ -32,6 +35,33 @@ static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
 static golem_policy_query_fn        golem_h_policy_query        = NULL;
 static golem_notify_access_fn       golem_h_notify_access       = NULL;
 static void *                       golem_h_ctx                 = NULL;
+
+// --- golem P2/P4: persistent device expert-copy cache (design §3.4).
+// Engages ONLY when policy_query is registered; otherwise the copy path
+// below is byte-identical to upstream (T4 invariant).
+// (C++17 TU: std::atomic instead of C11 _Atomic — same lock-free ABI.)
+static std::atomic<size_t> golem_h_device_cache_budget{0}; // 0 = full capacity; mutated over FFI by tests
+void golem_set_device_cache_budget(size_t bytes) { golem_h_device_cache_budget.store(bytes, std::memory_order_relaxed); }
+
+struct golem_device_cache_stats {
+    std::atomic<uint64_t> bytes_copied;   // host→device expert bytes written
+    std::atomic<uint64_t> bytes_skipped;  // bytes skipped because bit-valid
+    std::atomic<uint64_t> evictions;      // experts invalidated to stay under budget
+};
+static golem_device_cache_stats golem_h_dc_stats = {};
+const golem_device_cache_stats *golem_get_device_cache_stats(void) { return &golem_h_dc_stats; }
+
+#include "golem-device-cache.hpp" // golem::GolemDeviceCache + step fn: shared with the ctest fuzz TU (ODR)
+
+namespace golem { // named (not anonymous): golem_dc_step is linked from the ctest fuzz TU
+static std::mutex                                         golem_dc_mutex;
+static std::unordered_map<const void *, GolemDeviceCache> golem_dc; // key: device copy buffer data ptr
+} // namespace golem
+
+void golem_reset_device_cache(void) {
+    std::lock_guard<std::mutex> lk(golem::golem_dc_mutex);
+    golem::golem_dc.clear();
+}
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1749,14 +1779,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                    // pad_ok: append the padding tail only when the expert
+                    // after the run exists and is NOT bit-valid (correctness
+                    // core §3 — keeps "bit ⇒ byte-identity" locally provable).
+                    auto copy_experts = [&](int32_t first_id, int32_t last_id, bool pad_ok) {
                         if (golem_h_ensure_host_resident != NULL) {
                             golem_h_ensure_host_resident(golem_h_ctx, input, first_id, last_id);
                         }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        const size_t padding_end = (last_id < n_expert - 1 && pad_ok) ? padding : 0;
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
@@ -1766,29 +1799,83 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
-
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                    if (golem_h_policy_query == NULL) {
+                        // upstream loop, verbatim (T4 invariant: unset hooks ==
+                        // byte-identical behavior)
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
                         }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
 
-                        if (id == last_id + 1) {
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id, true);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
+                        }
+                        copy_experts(first_id, last_id, true);
+                    } else {
+                        // P2 path: persistent device expert-copy cache. The state
+                        // machine (order validation, budget eviction, run skip/copy
+                        // decision, accounting) lives in golem-device-cache.hpp —
+                        // shared verbatim with tests/golem-p2-cache.cpp (ODR).
+                        // Preconditions: policy AND pager present (a policy without
+                        // the P3 pager would read unpaged host bytes); n_copies == 1
+                        // (Global Constraints).
+                        if (golem_h_ensure_host_resident == NULL) {
+                            GGML_ABORT("golem P2: policy_query set without P3 pager");
+                        }
+                        if (sched->n_copies != 1) {
+                            GGML_ABORT("golem P2: requires n_copies == 1 (v1: single GPU)");
+                        }
+                        const int32_t *order = golem_h_policy_query(golem_h_ctx, input, (int32_t) n_expert);
+
+                        std::vector<int32_t> routed;
+                        for (int64_t id = 0; id < n_expert; ++id) {
+                            if (ggml_bitset_get(used_ids.data(), id)) {
+                                routed.push_back((int32_t) id);
+                            }
                         }
 
-                        copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
+                        golem::GolemDcCounters dc;
+                        std::vector<std::pair<int32_t, int32_t>> pending;
+                        std::vector<bool> pending_pad;
+                        {
+                            std::lock_guard<std::mutex> lk(golem::golem_dc_mutex);
+                            // Physical writes are deferred until after the mutex is
+                            // dropped (never hold golem_dc_mutex across an FFI call):
+                            // the callback only records the runs to copy.
+                            dc = golem::golem_dc_step_impl(golem::golem_dc[input_cpy->data], routed, order,
+                                golem_h_device_cache_budget.load(std::memory_order_relaxed),
+                                expert_size, (int32_t) n_expert, input->data,
+                                [&](int32_t first_id, int32_t last_id, bool pad_ok) {
+                                    pending.emplace_back(first_id, last_id);
+                                    pending_pad.push_back(pad_ok);
+                                });
+                            golem_h_dc_stats.bytes_copied.fetch_add(dc.copied, std::memory_order_relaxed);
+                            golem_h_dc_stats.bytes_skipped.fetch_add(dc.skipped, std::memory_order_relaxed);
+                            golem_h_dc_stats.evictions.fetch_add(dc.evicted, std::memory_order_relaxed);
+                        }
+                        for (size_t i = 0; i < pending.size(); ++i) {
+                            copy_experts(pending[i].first, pending[i].second, pending_pad[i]);
+                        }
+                        if (golem_h_notify_access != NULL) {
+                            for (int32_t id : routed) {
+                                golem_h_notify_access(golem_h_ctx, id);
+                            }
+                        }
                     }
-                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
