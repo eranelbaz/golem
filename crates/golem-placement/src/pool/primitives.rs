@@ -59,3 +59,17 @@ where
 pub fn yield_now() {
     std::thread::yield_now();
 }
+
+/// Coerces a concrete `Arc<T>` to a trait-object `Arc` (used for
+/// `Arc<dyn ExpertSource>`). loom's `Arc` is a newtype, so the compiler's
+/// implicit unsizing coercion does not apply; both modes end at the same
+/// typed surface.
+#[cfg(loom)]
+pub fn arc_dyn<T: ?Sized>(value: std::sync::Arc<T>) -> Arc<T> {
+    loom::sync::Arc::from_std(value)
+}
+/// Pass-through in std mode (the built-in unsizing coercion already applies).
+#[cfg(not(loom))]
+pub fn arc_dyn<T: ?Sized>(value: Arc<T>) -> Arc<T> {
+    value
+}

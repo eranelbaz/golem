@@ -12,10 +12,12 @@
 pub mod arena;
 pub mod primitives;
 
+mod pager;
 mod residency;
 mod source;
 
 pub use arena::Arena;
+pub use pager::{ExpertPool, Lease, PoolError, SnapshotHandle};
 pub use residency::{
     Claim, Evicted, ExpertKind, P3Stats, PolicySnapshot, ResidencyMap, Victim, key_index,
 };
