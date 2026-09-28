@@ -14,8 +14,12 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+hip-tests = []
+
 [dev-dependencies]
 xtask = { path = "../../xtask" }
+libc = { workspace = true }
 
 [lints]
 workspace = true

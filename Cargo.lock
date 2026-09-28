@@ -271,6 +271,7 @@ version = "0.1.0"
 dependencies = [
  "golem-gguf",
  "golem-llama-sys",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

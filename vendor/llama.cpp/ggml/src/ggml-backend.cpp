@@ -23,6 +23,16 @@
 #include <unordered_map>
 #include <vector>
 
+// --- golem P1: hook statics live at the top of this file so the
+// split-scheduler copy_experts lambda (below) can read them; golem_register_hooks
+// and the expert-metadata queries stay in the P1 section near the end. ---
+#include "golem-hooks.h"
+
+static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
+static golem_policy_query_fn        golem_h_policy_query        = NULL;
+static golem_notify_access_fn       golem_h_notify_access       = NULL;
+static void *                       golem_h_ctx                 = NULL;
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -1740,6 +1750,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (golem_h_ensure_host_resident != NULL) {
+                            golem_h_ensure_host_resident(golem_h_ctx, input, first_id, last_id);
+                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -2511,12 +2524,7 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
 
 // --- golem P1: policy-hook plumbing (design §3.4). All behavior is behind
 // null guards; with hooks unset every code path here is a pure query. ---
-#include "golem-hooks.h"
-
-static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
-static golem_policy_query_fn        golem_h_policy_query        = NULL;
-static golem_notify_access_fn       golem_h_notify_access       = NULL;
-static void *                       golem_h_ctx                 = NULL;
+// (golem-hooks.h + the hook statics live at the top of this file.)
 
 void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
                           golem_policy_query_fn policy_query,

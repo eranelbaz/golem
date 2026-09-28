@@ -2,3 +2,5 @@
 pub fn tiny_moe_path() -> std::path::PathBuf {
     xtask::tiny_moe::cached_fixture()
 }
+
+pub mod offload;
