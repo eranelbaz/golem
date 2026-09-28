@@ -7,6 +7,7 @@ a real numeric regression shifts logits far more, and flips tokens first
 under greedy decode).
 """
 import json
+import math
 import sys
 
 REL_TOL = 1e-5
@@ -30,7 +31,7 @@ def main() -> int:
                 bv, cv = float(jb[k]), float(jc[k])
                 rel = abs(bv - cv) / max(abs(bv), abs(cv), 1e-30)
                 worst = max(worst, rel)
-                if rel > REL_TOL:
+                if not (math.isfinite(bv) and math.isfinite(cv)) or rel > REL_TOL:
                     print(f"line {i}: {k} {bv} vs {cv} (rel {rel:.2e} > {REL_TOL})", file=sys.stderr)
                     return 1
             elif jb[k] != jc[k]:
