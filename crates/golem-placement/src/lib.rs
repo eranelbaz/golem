@@ -7,7 +7,7 @@
 pub mod journal;
 pub mod pool;
 
-pub use journal::{Journal, JournalRecord};
+pub use journal::{Journal, JournalHeader, JournalRecord};
 
 use std::fmt;
 
@@ -491,6 +491,73 @@ impl Policy {
             ram_evict_order,
         }
     }
+
+    /// Seed scores from a previous run's journal (§6.3 warm-up). Each
+    /// recorded access is replayed at virtual step `r.step + gap_steps`
+    /// through the §6.2 lazy-decay score function, then all scores are
+    /// swept to step 0 — net decay of an access is `e^(−(r.step+gap)/H)`;
+    /// the last step is not rebased. Raw accesses are replayed without
+    /// per-step dedup, mirroring the recorder. Returns [`SeedMismatch`]
+    /// when the journal's header doesn't match this policy's
+    /// `PlacementConfig` — same flat key count but different topology
+    /// (e.g. 2×128 vs 1×256), or different half_life — silently seeding
+    /// the wrong experts is worse than a cold start. On Ok, ALL
+    /// `last_score_step` values are swept to 0 (scores decayed into the
+    /// sweep): the policy is left in a state where `on_access(k, 0)` is
+    /// immediately legal — no debug_assert trip, no caller ordering
+    /// requirement. Residency/dwell are NOT seeded — tiers start cold.
+    pub fn seed_from_journal(
+        &mut self,
+        header: &JournalHeader,
+        journal: &Journal,
+        gap_steps: u64,
+    ) -> Result<(), SeedMismatch> {
+        if header.layers != self.cfg.layers
+            || header.experts_per_layer != self.cfg.experts_per_layer
+            || header.half_life_steps != self.cfg.half_life_steps
+        {
+            return Err(SeedMismatch {
+                journal: header.clone(),
+                policy_layers: self.cfg.layers,
+                policy_experts: self.cfg.experts_per_layer,
+                policy_half_life: self.cfg.half_life_steps,
+            });
+        }
+        for r in journal.iter() {
+            let vstep = r.step + gap_steps;
+            for &k in &r.accesses {
+                let df = self.decay_factor(self.states[k].last_score_step, vstep);
+                let st = &mut self.states[k];
+                st.score = st.score * df + 1.0;
+                st.last_score_step = vstep;
+            }
+        }
+        // Finalization sweep to step 0. Direct writes: the public
+        // `score()`/`on_access` would trip their monotonic debug_asserts
+        // (0 < virtual step); this sweep is what legalizes them.
+        for k in 0..self.states.len() {
+            let df = self.decay_factor(self.states[k].last_score_step, 0);
+            let st = &mut self.states[k];
+            st.score *= df;
+            st.last_score_step = 0;
+        }
+        Ok(())
+    }
+}
+
+/// Journal/policy fingerprint disagreement from
+/// [`Policy::seed_from_journal`] — refusing to seed is safer than warming
+/// the wrong experts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedMismatch {
+    /// Header carried by the journal that was offered.
+    pub journal: JournalHeader,
+    /// This policy's layers.
+    pub policy_layers: u32,
+    /// This policy's experts per layer.
+    pub policy_experts: u32,
+    /// This policy's score half-life (§6.2).
+    pub policy_half_life: f64,
 }
 
 /// One entry in a policy ordering.
@@ -991,5 +1058,81 @@ mod tests {
         assert_eq!(recs[0].accesses, vec![0]);
         assert_eq!(recs[1].step, 2); // empty step 1 dropped
         assert_eq!(recs[1].accesses, vec![1]);
+    }
+
+    #[test]
+    fn seed_from_journal_replays_and_sweeps_to_zero() {
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 8,
+                vram_experts_min: 1,
+                ram_slots: 8,
+                ram_experts_min: 1,
+                half_life_steps: 512.0,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut j = Journal::new(journal::JOURNAL_CAP);
+        j.push(JournalRecord {
+            step: 3,
+            accesses: vec![1],
+            transitions: vec![],
+        });
+        j.push(JournalRecord {
+            step: 1000,
+            accesses: vec![0],
+            transitions: vec![],
+        });
+        let header = journal::JournalHeader {
+            layers: 1,
+            experts_per_layer: 8,
+            half_life_steps: 512.0,
+        };
+        p.seed_from_journal(&header, &j, 0).unwrap();
+        let a = p.score(0, 0);
+        let expected = (-(1000.0f64) / 512.0).exp();
+        assert!(
+            (a - expected).abs() <= expected * 1e-9,
+            "score(A,0)={a}, expected e^(-1000/512)={expected}"
+        );
+        // Sweep-to-0 semantics: an access further in the past of the run is
+        // decayed harder, so B@3 retains more weight than A@1000.
+        assert!(
+            p.score(1, 0) > a,
+            "B@3 ({}) must outrank A@1000 ({a})",
+            p.score(1, 0)
+        );
+        // Key absent from the journal: exact zero, no blanket bump.
+        assert_eq!(p.score(2, 0), 0.0);
+        // Sweep contract: on_access from step 0 must be immediately legal.
+        p.on_access(0, 0);
+    }
+
+    #[test]
+    fn seed_from_journal_rejects_mismatched_header() {
+        let mut p = policy1();
+        let j = Journal::new(journal::JOURNAL_CAP);
+        let wrong_topology = journal::JournalHeader {
+            layers: 2,
+            experts_per_layer: 128,
+            half_life_steps: 512.0,
+        };
+        let err = p.seed_from_journal(&wrong_topology, &j, 0).unwrap_err();
+        assert_eq!(err.journal, wrong_topology);
+        assert_eq!(err.policy_layers, 1);
+        assert_eq!(err.policy_experts, 8);
+        assert_eq!(err.policy_half_life, 512.0);
+        let wrong_half_life = journal::JournalHeader {
+            layers: 1,
+            experts_per_layer: 8,
+            half_life_steps: 100.0,
+        };
+        assert!(p.seed_from_journal(&wrong_half_life, &j, 0).is_err());
     }
 }
