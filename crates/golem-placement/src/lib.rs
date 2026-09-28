@@ -150,6 +150,13 @@ impl Default for ExpertState {
 pub struct Policy {
     cfg: PlacementConfig,
     states: Vec<ExpertState>,
+    journal: Option<Journal>,
+    /// Step of the last record created (pending or pushed); recording resumes
+    /// strictly after this step on re-attach.
+    journal_step: Option<u64>,
+    /// Record for the current step; pushed to the journal when a later step's
+    /// record is created or on [`Policy::detach_journal`].
+    pending: Option<JournalRecord>,
 }
 
 impl Policy {
@@ -207,6 +214,9 @@ impl Policy {
         Ok(Self {
             cfg,
             states: vec![ExpertState::default(); n],
+            journal: None,
+            journal_step: None,
+            pending: None,
         })
     }
 
@@ -244,6 +254,76 @@ impl Policy {
         let st = &mut self.states[key];
         st.score = st.score * df + 1.0;
         st.last_score_step = step;
+        self.record_access(key, step);
+    }
+
+    /// Enable journal recording (§11), replacing any prior journal.
+    /// Recording starts at the next step strictly greater than the last
+    /// recorded step.
+    pub fn attach_journal(&mut self, journal: Journal) {
+        if self.journal.is_some() {
+            self.flush_pending();
+        }
+        self.journal = Some(journal);
+    }
+
+    /// Flush the pending record (if any) and return the journal for
+    /// dump-on-shutdown; `None` when not attached.
+    pub fn detach_journal(&mut self) -> Option<Journal> {
+        self.flush_pending();
+        self.journal.take()
+    }
+
+    fn record_access(&mut self, key: usize, step: u64) {
+        if self.journal.is_none() {
+            return;
+        }
+        self.start_record(step);
+        if let Some(p) = self.pending.as_mut() {
+            p.accesses.push(key);
+        }
+    }
+
+    fn record_transition(&mut self, key: usize, tier: Tier, present: bool, step: u64) {
+        if self.journal.is_none() {
+            return;
+        }
+        self.start_record(step);
+        if let Some(p) = self.pending.as_mut() {
+            p.transitions.push((key, tier, present));
+        }
+    }
+
+    /// Create the pending record for `step`, pushing (or dropping, when
+    /// empty) any record from an earlier step. Steps at or before
+    /// `journal_step` are skipped, so re-attached journals record only
+    /// strictly later steps.
+    fn start_record(&mut self, step: u64) {
+        if self.pending.as_ref().is_some_and(|p| p.step == step) {
+            return;
+        }
+        if self.journal_step.is_some_and(|s| step <= s) {
+            return;
+        }
+        self.flush_pending();
+        self.journal_step = Some(step);
+        self.pending = Some(JournalRecord {
+            step,
+            accesses: Vec::new(),
+            transitions: Vec::new(),
+        });
+    }
+
+    /// Push the pending record when non-empty; drop it otherwise (records
+    /// exist only for steps with at least one access or transition).
+    fn flush_pending(&mut self) {
+        if let Some(p) = self.pending.take() {
+            if !p.accesses.is_empty() || !p.transitions.is_empty() {
+                if let Some(j) = self.journal.as_mut() {
+                    j.push(p);
+                }
+            }
+        }
     }
 
     /// Effective score at `step` (§6.2), refreshed in place.
@@ -288,6 +368,7 @@ impl Policy {
             st.tiers &= !bit;
         }
         st.last_transition_step = step;
+        self.record_transition(key, tier, present, step);
     }
 
     /// Residency of `key` in `tier`.
@@ -403,6 +484,7 @@ impl Policy {
             });
         }
         ram_evict_order.reverse();
+        self.start_record(step);
         PolicyOutput {
             vram_order,
             vram_evict_order,
@@ -803,5 +885,111 @@ mod tests {
         let mut p = policy1();
         p.on_access(0, 10);
         p.on_access(0, 5);
+    }
+
+    #[test]
+    fn auto_records_scripted_sequence() {
+        let mut p = policy1();
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(0, 0);
+        p.on_access(1, 0);
+        p.pass(0);
+        p.apply_transition(2, Tier::Vram, true, 1);
+        p.pass(1);
+        let j = p.detach_journal().unwrap();
+        let recs: Vec<_> = j.iter().collect();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].step, 0);
+        assert_eq!(recs[0].accesses, vec![0, 1]);
+        assert!(recs[0].transitions.is_empty());
+        assert_eq!(recs[1].step, 1);
+        assert!(recs[1].accesses.is_empty());
+        assert_eq!(recs[1].transitions, vec![(2, Tier::Vram, true)]);
+    }
+
+    #[test]
+    fn detach_flushes_open_record() {
+        let mut p = policy1();
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(3, 2);
+        let j = p.detach_journal().unwrap();
+        assert_eq!(j.len(), 1);
+        assert_eq!(j.iter().next().unwrap().step, 2);
+        assert_eq!(j.iter().next().unwrap().accesses, vec![3]);
+    }
+
+    #[test]
+    fn pass_twice_replaces_not_duplicates() {
+        let mut p = policy1();
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(5, 0);
+        p.pass(0);
+        p.pass(0);
+        let j = p.detach_journal().unwrap();
+        assert_eq!(j.len(), 1);
+        let rec = j.iter().next().unwrap();
+        assert_eq!(rec.step, 0);
+        assert_eq!(rec.accesses, vec![5]);
+    }
+
+    #[test]
+    fn reattach_starts_at_next_step() {
+        let mut p = policy1();
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(0, 1);
+        assert_eq!(p.detach_journal().unwrap().len(), 1);
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(1, 1); // at journal_step: not recorded
+        p.on_access(2, 2); // strictly greater: recorded
+        let j = p.detach_journal().unwrap();
+        assert_eq!(j.len(), 1);
+        let rec = j.iter().next().unwrap();
+        assert_eq!(rec.step, 2);
+        assert_eq!(rec.accesses, vec![2]);
+    }
+
+    #[test]
+    fn detached_policy_records_nothing() {
+        let mut p = policy1();
+        p.on_access(0, 0);
+        p.pass(0);
+        p.apply_transition(1, Tier::Ram, true, 1);
+        assert!(p.detach_journal().is_none());
+
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(2, 2);
+        let j = p.detach_journal().unwrap();
+        p.on_access(3, 3);
+        p.pass(3);
+        assert_eq!(j.len(), 1);
+        assert_eq!(j.iter().next().unwrap().step, 2);
+        assert!(p.detach_journal().is_none());
+    }
+
+    #[test]
+    fn noop_transitions_not_recorded() {
+        let mut p = policy1();
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.apply_transition(0, Tier::Disk, true, 0); // already resident: no-op
+        p.apply_transition(1, Tier::Vram, false, 1); // already absent: no-op
+        assert!(p.detach_journal().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_intermediate_steps_produce_no_records() {
+        let mut p = policy1();
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(0, 0);
+        p.pass(1); // empty step 1 created
+        p.pass(2); // empty step 1 dropped
+        p.on_access(1, 2);
+        p.pass(3); // pushes the step-2 record
+        let j = p.detach_journal().unwrap();
+        let recs: Vec<_> = j.iter().collect();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].step, 0); // non-empty: kept
+        assert_eq!(recs[0].accesses, vec![0]);
+        assert_eq!(recs[1].step, 2); // empty step 1 dropped
+        assert_eq!(recs[1].accesses, vec![1]);
     }
 }
