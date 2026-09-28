@@ -48,6 +48,7 @@ struct golem_device_cache_stats {
     std::atomic<uint64_t> bytes_skipped;  // bytes skipped because bit-valid
     std::atomic<uint64_t> evictions;      // experts invalidated to stay under budget
 };
+static_assert(sizeof(golem_device_cache_stats) == 3 * sizeof(uint64_t), "golem_device_cache_stats layout must match the Rust [AtomicU64; 3] FFI cast");
 static golem_device_cache_stats golem_h_dc_stats = {};
 const golem_device_cache_stats *golem_get_device_cache_stats(void) { return &golem_h_dc_stats; }
 
