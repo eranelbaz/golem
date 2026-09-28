@@ -7,10 +7,16 @@
 //! The residency shard lock is leaf-most: policy state reaches `claim` only
 //! through lock-free [`PolicySnapshot`] reads made before the lock is taken.
 
+/// mlock'd slot arena — the only `unsafe` in the pool module.
+#[allow(unsafe_code)]
+pub mod arena;
 pub mod primitives;
 
 mod residency;
+mod source;
 
+pub use arena::Arena;
 pub use residency::{
     Claim, Evicted, ExpertKind, P3Stats, PolicySnapshot, ResidencyMap, Victim, key_index,
 };
+pub use source::{ExpertSource, GgufPreadSource, SourceError};

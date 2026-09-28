@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use super::primitives::{AtomicU64, Mutex};
 
 /// Which of an expert layer's three planes (§3.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpertKind {
     /// `ffn_gate_exps`.
     Gate,
