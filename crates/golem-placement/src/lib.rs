@@ -113,7 +113,7 @@ pub fn key(layers: u32, experts_per_layer: u32, layer: u32, expert: u32) -> Opti
     if layer >= layers || expert >= experts_per_layer {
         return None;
     }
-    Some((layer * experts_per_layer + expert) as usize)
+    Some(layer as usize * experts_per_layer as usize + expert as usize)
 }
 
 const TIER_DISK: u8 = 1;
@@ -151,7 +151,8 @@ impl Policy {
     /// Feasibility check at load time (§6.4): rejects floor sets that cannot
     /// fit their byte budgets, and count-inconsistent floor/cap pairs.
     /// Byte checks run first; count rejections use the
-    /// `max_bytes_per_expert = 0` sentinel.
+    /// `max_bytes_per_expert = 0` sentinel (safe because a genuine byte
+    /// failure cannot occur when the caller passes 0).
     ///
     /// # Panics
     /// Panics if `half_life_steps <= 0` or non-finite (would produce NaN
@@ -226,7 +227,14 @@ impl Policy {
 
     /// Record an access at `step` (§6.2): lazy decay since the expert's last
     /// score touch, then `+1`.
+    ///
+    /// # Panics
+    /// Panics if `key` is out of range (use [`key`] to build it).
     pub fn on_access(&mut self, key: usize, step: u64) {
+        debug_assert!(
+            step >= self.states[key].last_score_step,
+            "steps must be monotonic"
+        );
         let df = self.decay_factor(self.states[key].last_score_step, step);
         let st = &mut self.states[key];
         st.score = st.score * df + 1.0;
@@ -234,7 +242,14 @@ impl Policy {
     }
 
     /// Effective score at `step` (§6.2), refreshed in place.
+    ///
+    /// # Panics
+    /// Panics if `key` is out of range (use [`key`] to build it).
     pub fn score(&mut self, key: usize, step: u64) -> f64 {
+        debug_assert!(
+            step >= self.states[key].last_score_step,
+            "steps must be monotonic"
+        );
         let df = self.decay_factor(self.states[key].last_score_step, step);
         let st = &mut self.states[key];
         st.score *= df;
@@ -244,7 +259,14 @@ impl Policy {
 
     /// Report a residency change executed by P2/P3 (§6.3). Flips the tier bit
     /// and restarts the dwell clock.
+    ///
+    /// # Panics
+    /// Panics if `key` is out of range (use [`key`] to build it).
     pub fn apply_transition(&mut self, key: usize, tier: Tier, present: bool, step: u64) {
+        debug_assert!(
+            step >= self.states[key].last_transition_step,
+            "steps must be monotonic"
+        );
         let bit = match tier {
             Tier::Disk => TIER_DISK,
             Tier::Ram => TIER_RAM,
@@ -264,6 +286,9 @@ impl Policy {
     }
 
     /// Residency of `key` in `tier`.
+    ///
+    /// # Panics
+    /// Panics if `key` is out of range (use [`key`] to build it).
     pub fn residency(&self, key: usize, tier: Tier) -> bool {
         let bit = match tier {
             Tier::Disk => TIER_DISK,
@@ -322,20 +347,23 @@ impl Policy {
             }
         }
 
-        let in_order: Vec<usize> = vram_order.iter().map(|e| e.key).collect();
-        let vram_floor_keys: Vec<usize> = vram_order
-            .iter()
-            .filter(|e| e.floor_pinned)
-            .map(|e| e.key)
-            .collect();
-        // Evictable = floor-unpinned vram resident that either missed the truncated
-        // order (beyond-cut — hard cap, dwell-free) or crossed below θ_lo with dwell.
+        let mut in_order = vec![false; n];
+        let mut promoted = vec![false; n];
+        let mut floor_pinned = vec![false; n];
+        for e in &vram_order {
+            in_order[e.key] = true;
+            if e.floor_pinned {
+                floor_pinned[e.key] = true;
+            } else if !resident(e.key, TIER_VRAM) {
+                promoted[e.key] = true;
+            }
+        }
         let mut vram_evict_order: Vec<PolicyEntry> = rank
             .iter()
             .filter(|&&(s, k)| {
                 resident(k, TIER_VRAM)
-                    && !vram_floor_keys.contains(&k)
-                    && (!in_order.contains(&k) || (s < cfg.theta_lo && dwell_ok(k)))
+                    && !floor_pinned[k]
+                    && (!in_order[k] || (s < cfg.theta_lo && dwell_ok(k)))
             })
             .map(|&(s, k)| PolicyEntry {
                 key: k,
@@ -353,6 +381,10 @@ impl Policy {
             }
             if ram_floor < cfg.ram_experts_min {
                 ram_floor += 1;
+                continue;
+            }
+            // promoted into VRAM this pass — P2 owns it, P3 must not evict it
+            if promoted[k] {
                 continue;
             }
             // decision 5: min-dwell gates RAM eviction too
@@ -532,9 +564,9 @@ mod tests {
         let hot = p.score(0, 100);
         let cold = p.score(1, 100);
         assert!(hot > cold, "hot {hot} cold {cold}");
-        p.on_access(1, 0);
+        p.on_access(1, 100);
         let decayed = p.score(1, 512);
-        assert!(decayed < 1.0 / std::f64::consts::E + 1e-9, "{decayed}");
+        assert!(decayed < 0.5, "{decayed}");
     }
 
     #[test]
@@ -705,5 +737,66 @@ mod tests {
             out.ram_evict_order.iter().any(|e| e.key == 7),
             "cold unpinned ram expert evictable"
         );
+    }
+
+    #[test]
+    fn promote_candidate_not_offered_for_ram_eviction() {
+        let mut p = policy1();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        for s in 0..300 {
+            p.on_access(0, s);
+        }
+        let out = p.pass(300);
+        assert!(
+            out.vram_order.iter().any(|e| e.key == 0),
+            "candidate promotes"
+        );
+        assert!(
+            out.ram_evict_order.iter().all(|e| e.key != 0),
+            "same key must not be in both orderings: {out:?}"
+        );
+    }
+
+    #[test]
+    fn floor_pin_survives_below_theta_lo_with_dwell() {
+        let cfg = PlacementConfig {
+            layers: 1,
+            experts_per_layer: 8,
+            vram_experts_max: 8,
+            vram_experts_min: 1,
+            ..Default::default()
+        };
+        let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
+        p.apply_transition(0, Tier::Vram, true, 0);
+        p.on_access(0, 0); // score 1.0, decays below θ_lo after enough idle
+        let out = p.pass(5_000);
+        assert!(
+            out.vram_evict_order.iter().all(|e| e.key != 0),
+            "floor-pinned resident below θ_lo is still never evicted: {out:?}"
+        );
+    }
+
+    #[test]
+    fn zero_ram_floor_allows_any_ram_resident_evictable() {
+        let cfg = PlacementConfig {
+            layers: 1,
+            experts_per_layer: 8,
+            vram_experts_max: 8,
+            ram_experts_min: 0,
+            ..Default::default()
+        };
+        let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        let out = p.pass(10_000);
+        assert!(out.ram_evict_order.iter().any(|e| e.key == 0));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "monotonic")]
+    fn backward_step_panics_in_debug() {
+        let mut p = policy1();
+        p.on_access(0, 10);
+        p.on_access(0, 5);
     }
 }
