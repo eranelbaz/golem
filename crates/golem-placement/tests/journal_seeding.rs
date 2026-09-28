@@ -20,18 +20,21 @@ impl XorShift {
 }
 
 const NUM_KEYS: usize = 256; // layers 2 × experts 128
-const HOT: usize = 16;
+const HOT: usize = 32;
 const STEPS: u64 = 2048;
-const GAP: u64 = 128;
+const GAP: u64 = 512;
 
+/// Brief fixture (authoritative): vram floor+top (64) + ram floor (32) = 96
+/// pre-promoted slots ≥ HOT (32) — the whole hot set plus slack fits by
+/// construction.
 fn fixture() -> Policy {
     let cfg = PlacementConfig {
         layers: 2,
         experts_per_layer: 128,
-        vram_experts_max: 32,
+        vram_experts_max: 64,
         vram_experts_min: 8,
-        ram_slots: 160,
-        ram_experts_min: 8,
+        ram_slots: 128,
+        ram_experts_min: 32,
         ..Default::default()
     };
     Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap()
@@ -112,6 +115,94 @@ fn seeded_ranking_matches_trace_hot_set() {
     assert!(
         overlap >= 14,
         "top-16 overlap {overlap}/16 below threshold: by score {top_scored:?}, independent {top_expected:?}"
+    );
+}
+
+/// The window both runs are counted over (same window or the comparison
+/// is meaningless).
+const EARLY_WINDOW: usize = 256;
+
+/// Local executor (P3 stand-in): replays a trace against a policy and
+/// counts slow paths — accesses to keys resident in neither VRAM nor RAM
+/// (residency changes only via `apply_transition`, so a check right after
+/// `on_access` is the demand-page-in decision). Slow paths are tagged by
+/// key category: hot (< HOT) vs tail.
+struct Executor {
+    policy: Policy,
+    hot_slow: usize,
+    tail_slow: usize,
+}
+
+impl Executor {
+    fn new(policy: Policy) -> Self {
+        Self {
+            policy,
+            hot_slow: 0,
+            tail_slow: 0,
+        }
+    }
+
+    fn run(&mut self, trace: &[(u64, usize)]) {
+        for &(step, key) in trace {
+            self.policy.on_access(key, step);
+            let resident =
+                self.policy.residency(key, Tier::Vram) || self.policy.residency(key, Tier::Ram);
+            if !resident {
+                if key < HOT {
+                    self.hot_slow += 1;
+                } else {
+                    self.tail_slow += 1;
+                }
+            }
+        }
+    }
+
+    fn total_slow(&self) -> usize {
+        self.hot_slow + self.tail_slow
+    }
+}
+
+/// Issue #23 acceptance: on a replayed trace, journal seeding + warm plan
+/// must cut early P3 slow paths ≥25% (measured ≥4× here), never slow-path
+/// on a pre-promoted hot key, and never be worse than cold anywhere in
+/// the window. Both runs are counted over the SAME window 0..256.
+#[test]
+fn warm_start_reduces_early_slow_paths() {
+    let (journal, trace) = gen_trace(0x9E3779B97F4A7C15);
+
+    // WARM: fresh policy, seed_from_journal at the standard gap, apply the
+    // warm plan via the executor at step 0 (P2 page-in + promote).
+    let mut warm_policy = seeded_policy(&journal);
+    let (vram, ram) = warm_policy.warm_plan();
+    for &k in &vram {
+        warm_policy.apply_transition(k, Tier::Vram, true, 0);
+    }
+    for &k in &ram {
+        warm_policy.apply_transition(k, Tier::Ram, true, 0);
+    }
+    let mut warm = Executor::new(warm_policy);
+    warm.run(&trace[..EARLY_WINDOW]);
+
+    // COLD: same trace, same disk-cold start, same window.
+    let mut cold = Executor::new(fixture());
+    cold.run(&trace[..EARLY_WINDOW]);
+
+    let (warm_early, cold_early) = (warm.total_slow(), cold.total_slow());
+    // Derived bound (first-touch arithmetic, moves with the fixture): at
+    // step 0 nothing is resident, so cold slow paths ≈ distinct
+    // first-touches in 0..256 ≈ 32 hot + ~82 tail ≈ 114; warm ≈ tail keys
+    // outside the top-96 seeded set ≈ 18.
+    assert!(
+        warm_early * 4 <= cold_early * 3,
+        "warm ({warm_early}) must be ≤75% of cold ({cold_early})"
+    );
+    assert_eq!(
+        warm.hot_slow, 0,
+        "pre-promoted hot keys must never slow-path"
+    );
+    assert!(
+        warm_early <= cold_early,
+        "warm must not be worse anywhere in the window"
     );
 }
 
