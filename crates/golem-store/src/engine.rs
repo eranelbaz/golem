@@ -137,6 +137,10 @@ impl IoEngine {
     /// [`StoreError::Unavailable`].
     ///
     /// # Panics
+    /// When `expected_crcs.len()` differs from the striped plan length, or
+    /// `buf.len() != req.len`.
+    ///
+    /// # Panics
     /// When `expected_crcs.len()` differs from the striped plan length.
     pub fn read_page(
         &self,
@@ -157,9 +161,11 @@ impl IoEngine {
         // (plan_single semantics), consuming their CRC by striped-plan
         // position.
         let (reply_tx, reply_rx) = mpsc::channel();
+        let mut server = Vec::with_capacity(plan.len());
         for (index, chunk) in plan.iter().enumerate() {
             let replica =
                 self.assigned_replica(sources, &slots, req.shard_index, chunk.replica_index)?;
+            server.push(replica);
             let job = Job {
                 index,
                 source: Arc::clone(&slots[replica]),
@@ -180,12 +186,15 @@ impl IoEngine {
             parts[index] = Some(res);
         }
 
-        for ((chunk, &expected_crc), part) in plan.iter().zip(req.expected_crcs).zip(parts) {
+        for (((chunk, &expected_crc), part), &served_by) in
+            plan.iter().zip(req.expected_crcs).zip(parts).zip(&server)
+        {
             let first = part.expect("every dispatched job gets a reply");
             let data = self.serve_chunk(
                 sources,
                 req.shard_index,
                 *chunk,
+                served_by,
                 expected_crc,
                 first,
                 &slots,
@@ -219,11 +228,13 @@ impl IoEngine {
     /// read (I/O or CRC32C mismatch), degrade the replica that failed, then
     /// retry the whole chunk from each remaining healthy replica until one
     /// verifies (same expected CRC: mirrors are byte-identical).
+    #[allow(clippy::too_many_arguments)]
     fn serve_chunk(
         &self,
         sources: &dyn ShardSources,
         shard_index: usize,
         chunk: Chunk,
+        served_by: usize,
         expected_crc: u32,
         first: io::Result<Vec<u8>>,
         slots: &[Arc<dyn ChunkSource>],
@@ -233,7 +244,7 @@ impl IoEngine {
             Ok(_) => format!("crc32c mismatch at offset {}", chunk.offset),
             Err(e) => format!("io error: {e}"),
         };
-        self.degrade(sources, shard_index, chunk.replica_index, &chunk, &first);
+        self.degrade(sources, shard_index, served_by, &chunk, &first);
         for (replica, source) in slots.iter().enumerate() {
             if sources.slot(shard_index, replica).health() != ReplicaHealth::Healthy {
                 continue;
@@ -492,6 +503,55 @@ mod tests {
         assert_eq!(sources.slot(0, 1).health(), ReplicaHealth::Healthy);
         assert_eq!(sources.slot(0, 2).health(), ReplicaHealth::Degraded);
         assert_eq!(sources.slot(0, 3).health(), ReplicaHealth::Healthy);
+    }
+
+    #[test]
+    fn degraded_replica_is_reassigned_without_double_failure() {
+        // First read degrades replica 0 (chunk 0); the second read must
+        // reassign chunk 0 to the first healthy replica and still be correct.
+        let (_root, manifest) = fixture(4, "reassign");
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let sources = TestSources {
+            reg,
+            fail: vec![(0, 0, ErrorKind::Other)],
+        };
+        let engine = IoEngine::new(2);
+        let expected_crcs = crcs(0, SHARD_BYTES, 4);
+        let mut buf = vec![0u8; SHARD_BYTES];
+        let req = PageRead {
+            shard_index: 0,
+            offset: 0,
+            len: SHARD_BYTES,
+            expected_crcs: &expected_crcs,
+        };
+        engine.read_page(&sources, &req, &mut buf).unwrap();
+        assert_eq!(buf, pattern(0, SHARD_BYTES));
+        buf.fill(0);
+        engine.read_page(&sources, &req, &mut buf).unwrap();
+        assert_eq!(buf, pattern(0, SHARD_BYTES));
+    }
+
+    #[test]
+    fn single_replica_eio_is_unavailable_immediately() {
+        let (_root, manifest) = fixture(1, "single-eio");
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let sources = TestSources {
+            reg,
+            fail: vec![(0, 0, ErrorKind::Other)],
+        };
+        let engine = IoEngine::new(1);
+        let expected_crcs = crcs(0, SHARD_BYTES, 1);
+        let req = PageRead {
+            shard_index: 0,
+            offset: 0,
+            len: SHARD_BYTES,
+            expected_crcs: &expected_crcs,
+        };
+        let mut buf = vec![0u8; SHARD_BYTES];
+        match engine.read_page(&sources, &req, &mut buf) {
+            Err(StoreError::Unavailable { shard }) => assert_eq!(shard, SHARD_FILE),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 
     #[test]
