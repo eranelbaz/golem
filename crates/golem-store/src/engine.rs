@@ -542,6 +542,55 @@ mod tests {
         assert_eq!(sources.slot(0, 1).health(), ReplicaHealth::Healthy);
     }
 
+    /// T5 acceptance: manifest JSON on disk → load_manifest →
+    /// ReplicaRegistry::open → IoEngine, real-file rot on all four replicas.
+    #[test]
+    fn t5_end_to_end_manifest_to_engine_with_real_file_rot() {
+        let (root, manifest) = fixture(4, "t5e2e");
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+        let loaded = crate::manifest::load_manifest(&manifest_path).unwrap();
+        let reg = ReplicaRegistry::open(&loaded).unwrap();
+        let engine = IoEngine::new(DEFAULT_IO_THREADS);
+        let expected_crcs = crcs(0, SHARD_BYTES, 4);
+        let req = PageRead {
+            shard_index: 0,
+            offset: 0,
+            len: SHARD_BYTES,
+            expected_crcs: &expected_crcs,
+        };
+
+        // Pristine read: full shard, PASS, all replicas Healthy.
+        let mut buf = vec![0u8; SHARD_BYTES];
+        engine.read_page(&reg, &req, &mut buf).unwrap();
+        assert_eq!(buf, pattern(0, SHARD_BYTES));
+        for r in 0..4 {
+            assert_eq!(reg.slot(0, r).health(), ReplicaHealth::Healthy);
+        }
+
+        // Rot: 3 bytes inside each damaged replica's own striped chunk
+        // (4 replicas × 4096 bytes → chunk i covers [i*1024, (i+1)*1024)).
+        // Expected CRCs unchanged (pristine pattern). Chunks 0/1 fail CRC on
+        // their assigned replica and fail over to the pristine mirrors.
+        flip(&root.join("r0"), 100..103);
+        flip(&root.join("r1"), 1100..1103);
+        engine.read_page(&reg, &req, &mut buf).unwrap();
+        assert_eq!(buf, pattern(0, SHARD_BYTES));
+        assert_eq!(reg.slot(0, 0).health(), ReplicaHealth::Degraded);
+        assert_eq!(reg.slot(0, 1).health(), ReplicaHealth::Degraded);
+        assert_eq!(reg.slot(0, 2).health(), ReplicaHealth::Healthy);
+        assert_eq!(reg.slot(0, 3).health(), ReplicaHealth::Healthy);
+
+        // Rot the same bytes on the remaining replicas: chunk 0 now fails on
+        // every replica → Unavailable, not silent corruption.
+        flip(&root.join("r2"), 100..103);
+        flip(&root.join("r3"), 100..103);
+        match engine.read_page(&reg, &req, &mut buf) {
+            Err(StoreError::Unavailable { shard }) => assert_eq!(shard, SHARD_FILE),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rot_on_all_replicas_is_unavailable_not_silent() {
         let (root, manifest) = fixture(2, "rot-all");

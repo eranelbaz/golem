@@ -1,8 +1,19 @@
 //! Golem store (tech design §5): multi-disk mirrored storage, striped reads,
 //! checksummed shards, manifest-driven model layout.
 //!
-//! Scope: [`StoreError`], manifest types + validating loader (`manifest`),
-//! replica I/O, striping, and the thread-pool pread engine (`engine`).
+//! Design coverage:
+//! - §5.1 replica registry: per-slot health, same-drive detection
+//!   ([`replica`], [`ReplicaRegistry::shared_device_warnings`]).
+//! - §5.2 deterministic striped chunk planning ([`stripe`]) and the
+//!   fixed thread-pool pread engine ([`IoEngine`]).
+//! - §5.3 CRC32C per-chunk validation against caller-supplied page-table
+//!   digests ([`PageRead::expected_crcs`]).
+//! - §5.4 per-chunk failover to the next healthy replica with one-way
+//!   [`ReplicaHealth::Degraded`] marking; all replicas down →
+//!   [`StoreError::Unavailable`] (never silent corruption).
+//!
+//! Scope: [`StoreError`], manifest types + validating loader ([`manifest`]),
+//! replica I/O, striping, and the pread engine ([`engine`]).
 
 mod engine;
 mod manifest;
