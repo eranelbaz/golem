@@ -63,30 +63,28 @@ impl ReplicaSlot {
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
         let mut filled = 0;
         while filled < buf.len() {
-            let n = self
+            let n = match self
                 .file
                 .read_at(&mut buf[filled..], offset + filled as u64)
-                .or_else(|e| {
-                    // `File::read_at` does not retry EINTR (unlike `read`):
-                    // §5.2 degrades on device errors, not signals — a one-way
-                    // health flip must not be triggerable by a spurious
-                    // interrupt.
-                    if e.kind() == std::io::ErrorKind::Interrupted {
-                        Ok(0)
-                    } else {
-                        Err(e)
-                    }
-                })?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "short read at offset {offset}: {} of {} bytes",
-                        filled,
-                        buf.len()
-                    ),
-                ));
-            }
+            {
+                // `File::read_at` does not retry EINTR (unlike `read`):
+                // §5.2 degrades on device errors, not signals — a one-way
+                // health flip must not be triggerable by a spurious
+                // interrupt.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "short read at offset {offset}: {} of {} bytes",
+                            filled,
+                            buf.len()
+                        ),
+                    ));
+                }
+                Ok(n) => n,
+            };
             filled += n;
         }
         Ok(())
