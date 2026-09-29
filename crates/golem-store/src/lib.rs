@@ -5,8 +5,13 @@
 //! Replica I/O, striping, and integrity verification land in later tasks.
 
 mod manifest;
+mod replica;
 
 pub use manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, load_manifest};
+pub use replica::{
+    ReplicaHealth, ReplicaRegistry, ReplicaSlot, ShardReplicas, parent_device_name,
+    physical_device_name,
+};
 
 use std::path::PathBuf;
 
