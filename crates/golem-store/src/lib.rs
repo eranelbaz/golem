@@ -1,13 +1,15 @@
 //! Golem store (tech design §5): multi-disk mirrored storage, striped reads,
 //! checksummed shards, manifest-driven model layout.
 //!
-//! Scope: [`StoreError`], manifest types + validating loader (`manifest`).
-//! Replica I/O, striping, and integrity verification land in later tasks.
+//! Scope: [`StoreError`], manifest types + validating loader (`manifest`),
+//! replica I/O, striping, and the thread-pool pread engine (`engine`).
 
+mod engine;
 mod manifest;
 mod replica;
 mod stripe;
 
+pub use engine::{ChunkSource, DEFAULT_IO_THREADS, IoEngine, PageRead, ShardSources};
 pub use manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, load_manifest};
 pub use replica::{
     ReplicaHealth, ReplicaRegistry, ReplicaSlot, ShardReplicas, parent_device_name,
