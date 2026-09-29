@@ -189,7 +189,7 @@ def main():
         ap.error("--runner is required (unless --selftest): no runner binary exists yet "
                  "until the M3 deliverable implements the contract (see docstring)")
     # Synthetic default trace (3 steps × 4 keys) until the M3 replay tooling
-    # emits the real one; --trace keeps the door open without new plumbing.
+    # emits the real one; override via GOLEM_SOAK_TRACE.
     argv = vars(args)
     argv["trace"] = os.environ.get("GOLEM_SOAK_TRACE", "101\n102\n103\n104\n\n"
                                    "201\n202\n203\n204\n\n301\n302\n303\n304\n")

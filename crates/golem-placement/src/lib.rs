@@ -278,9 +278,10 @@ impl Policy {
         if self.journal.is_none() {
             return;
         }
-        self.start_record(step);
-        if let Some(p) = self.pending.as_mut() {
-            p.accesses.push(key);
+        if self.start_record(step) {
+            if let Some(p) = self.pending.as_mut() {
+                p.accesses.push(key);
+            }
         }
     }
 
@@ -288,22 +289,25 @@ impl Policy {
         if self.journal.is_none() {
             return;
         }
-        self.start_record(step);
-        if let Some(p) = self.pending.as_mut() {
-            p.transitions.push((key, tier, present));
+        if self.start_record(step) {
+            if let Some(p) = self.pending.as_mut() {
+                p.transitions.push((key, tier, present));
+            }
         }
     }
 
     /// Create the pending record for `step`, pushing (or dropping, when
     /// empty) any record from an earlier step. Steps at or before
     /// `journal_step` are skipped, so re-attached journals record only
-    /// strictly later steps.
-    fn start_record(&mut self, step: u64) {
+    /// strictly later steps. Returns whether the pending record now
+    /// belongs to `step` — a skipped step (regressed or already recorded)
+    /// returns false and the caller must not attribute the event to it.
+    fn start_record(&mut self, step: u64) -> bool {
         if self.pending.as_ref().is_some_and(|p| p.step == step) {
-            return;
+            return true;
         }
         if self.journal_step.is_some_and(|s| step <= s) {
-            return;
+            return false;
         }
         self.flush_pending();
         self.journal_step = Some(step);
@@ -312,6 +316,7 @@ impl Policy {
             accesses: Vec::new(),
             transitions: Vec::new(),
         });
+        true
     }
 
     /// Push the pending record when non-empty; drop it otherwise (records
@@ -507,7 +512,9 @@ impl Policy {
     /// when the journal's header doesn't match this policy's
     /// `PlacementConfig` — same flat key count but different topology
     /// (e.g. 2×128 vs 1×256), or different half_life — silently seeding
-    /// the wrong experts is worse than a cold start. On Ok, ALL
+    /// the wrong experts is worse than a cold start. Also refuses a
+    /// journal containing a key outside this policy's flat key range:
+    /// a well-formed but corrupt file would otherwise panic on replay. On Ok, ALL
     /// `last_score_step` values are swept to 0 (scores decayed into the
     /// sweep): the policy is left in a state where `on_access(k, 0)` is
     /// immediately legal — no debug_assert trip, no caller ordering
@@ -529,10 +536,25 @@ impl Policy {
                 policy_half_life: self.cfg.half_life_steps,
             });
         }
-        let Some(t) = journal.last_step() else {
-            return Ok(());
-        };
-        let horizon = t + gap_steps;
+        // An empty journal still honors the sweep contract: decay every
+        // key into step 0 (decay_factor is magnitude-based, so this is
+        // e^(−s/H) for a key last touched at s) rather than early-returning
+        // with nonzero `last_score_step` stamps.
+        // Pre-validate before any mutation: a mid-replay Err would leave
+        // partially-seeded scores with nonzero `last_score_step` stamps,
+        // tripping `warm_plan`'s debug_assert. `SeedMismatch` doubles as
+        // the refusal type here — all its fields equal this policy's own
+        // config when the trigger is a key range, not the header.
+        let n = self.states.len();
+        if journal.iter().any(|r| r.accesses.iter().any(|&k| k >= n)) {
+            return Err(SeedMismatch {
+                journal: header.clone(),
+                policy_layers: self.cfg.layers,
+                policy_experts: self.cfg.experts_per_layer,
+                policy_half_life: self.cfg.half_life_steps,
+            });
+        }
+        let horizon = journal.last_step().map_or(0, |t| t + gap_steps);
         for r in journal.iter() {
             let vstep = r.step;
             for &k in &r.accesses {
@@ -1215,6 +1237,62 @@ mod tests {
         assert!(a > b, "A@1000 ({a}) must outrank B@3 ({b})");
         // Sweep contract: on_access from step 0 must be immediately legal.
         p.on_access(0, 0);
+    }
+
+    #[test]
+    fn regressed_step_not_attributed_to_pending_record() {
+        let mut p = policy1();
+        p.attach_journal(Journal::new(journal::JOURNAL_CAP));
+        p.on_access(0, 10); // per-key asserts pass for both keys
+        p.on_access(1, 5); // regressed step: must not land in step-10 record
+        p.on_access(2, 10); // back to the open step: recorded
+        let j = p.detach_journal().unwrap();
+        let recs: Vec<_> = j.iter().collect();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].step, 10);
+        assert_eq!(recs[0].accesses, vec![0, 2]);
+    }
+
+    #[test]
+    fn seed_from_journal_rejects_out_of_range_key() {
+        let mut p = policy1();
+        let mut j = Journal::new(journal::JOURNAL_CAP);
+        j.push(JournalRecord {
+            step: 3,
+            accesses: vec![8], // flat key count is 8 (1×8): out of range
+            transitions: vec![],
+        });
+        let header = journal::JournalHeader {
+            layers: 1,
+            experts_per_layer: 8,
+            half_life_steps: 512.0,
+        };
+        assert!(p.seed_from_journal(&header, &j, 0).is_err());
+        // Boundary key is fine.
+        j.clear();
+        j.push(JournalRecord {
+            step: 3,
+            accesses: vec![7],
+            transitions: vec![],
+        });
+        assert!(p.seed_from_journal(&header, &j, 0).is_ok());
+    }
+
+    #[test]
+    fn seed_from_journal_empty_sweeps_to_zero() {
+        let mut p = policy1();
+        p.on_access(0, 100); // policy saw steps before seeding
+        let j = Journal::new(journal::JOURNAL_CAP);
+        let header = journal::JournalHeader {
+            layers: 1,
+            experts_per_layer: 8,
+            half_life_steps: 512.0,
+        };
+        p.seed_from_journal(&header, &j, 0).unwrap();
+        let expected = (-100.0f64 / 512.0).exp();
+        let s = p.score(0, 0);
+        assert!((s - expected).abs() <= expected * 1e-9);
+        p.on_access(1, 0); // sweep contract holds
     }
 
     #[test]
