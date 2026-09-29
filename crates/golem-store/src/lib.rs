@@ -6,12 +6,14 @@
 
 mod manifest;
 mod replica;
+mod stripe;
 
 pub use manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, load_manifest};
 pub use replica::{
     ReplicaHealth, ReplicaRegistry, ReplicaSlot, ShardReplicas, parent_device_name,
     physical_device_name,
 };
+pub use stripe::{Chunk, plan_single, plan_striped};
 
 use std::path::PathBuf;
 
