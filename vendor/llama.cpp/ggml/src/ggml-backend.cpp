@@ -34,6 +34,26 @@
 static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
 static int golem_expert_stem_kind(const char *name); // defined in the P1 section (used at split time, C-3)
 
+// Golem C-2: copy a pooled expert run slot by slot. The padding tail (MMQ
+// non-NaN guard after the last routed expert) is a separate copy of the LAST
+// routed expert's own first bytes — never an overrun of its slot, which is
+// exactly expert_size when expert_size is the pool's max stride and the slot
+// may sit at the end of the arena mapping. set_fn issues one copy (the
+// scheduler passes ggml_backend_tensor_set_async bound to the split backend).
+typedef void (*golem_set_copy_fn)(void *dst, const void *src, size_t dst_off, size_t len, void *ud);
+void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
+                                  size_t padding_end, const void *const *ptrs, size_t n,
+                                  golem_set_copy_fn set_fn, void *ud) {
+    size_t off = expert_offset;
+    for (size_t i = 0; i < n; ++i) {
+        set_fn(dst, ptrs[i], off, expert_size, ud);
+        off += expert_size;
+    }
+    if (padding_end != 0) {
+        set_fn(dst, ptrs[n - 1], off, padding_end, ud);
+    }
+}
+
 static golem_copy_done_fn golem_h_copy_done = NULL;
 static golem_policy_query_fn golem_h_policy_query = NULL;
 static golem_notify_access_fn golem_h_notify_access = NULL;
@@ -1847,20 +1867,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // loader's expert bytes may be a read-only file
                             // mmap. Expert slots are independent allocations,
                             // so copy per expert; the 512 B non-NaN MMQ tail
-                            // after the last expert is sourced from that last
+                            // after the last expert is a separate copy of that
                             // expert's own first bytes (content never read by
                             // the kernels; upstream used the next expert's
-                            // bytes, which would cost a full plane page-in).
+                            // bytes). A slot is exactly expert_size whenever
+                            // expert_size is the pool's max stride, so reading
+                            // past it could leave the arena mapping entirely.
                             static thread_local std::vector<const void *> golem_ptrs;
                             const size_t n = last_id - first_id + 1;
                             if (golem_ptrs.size() < n) golem_ptrs.resize(n);
                             golem_h_ensure_host_resident(golem_h_ctx, input, first_id, last_id, golem_ptrs.data());
-                            size_t off = expert_offset;
-                            for (size_t i = 0; i < n; ++i) {
-                                const size_t bytes = expert_size + (i == n - 1 ? padding_end : 0);
-                                ggml_backend_tensor_set_async(split_backend, dst, golem_ptrs[i], off, bytes);
-                                off += expert_size;
-                            }
+                            golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_end,
+                                golem_ptrs.data(), n,
+                                [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
+                                    ggml_backend_tensor_set_async((ggml_backend_t) ud, (ggml_tensor *) dst, src, dst_off, len);
+                                }, split_backend);
                             return;
                         }
 

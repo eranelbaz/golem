@@ -378,6 +378,11 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(golem-p2-cache.cpp)
     target_link_libraries(golem-p2-cache PRIVATE ggml)
     target_include_directories(golem-p2-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    # Golem C-2 regression: pooled-run copy never reads past the last slot
+    # (padding tail = separate copy of the last expert's own bytes).
+    llama_build_and_test(golem-p3-copy.cpp)
+    target_link_libraries(golem-p3-copy PRIVATE ggml)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
