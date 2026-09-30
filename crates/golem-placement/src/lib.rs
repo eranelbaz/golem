@@ -404,6 +404,11 @@ impl Policy {
             let Some(tail) = vram_order.last().copied() else {
                 unreachable!("order is at capacity, so non-empty");
             };
+            // The strict > rejects zero-score ties (0 >= 1.2·0 would churn
+            // arbitrarily); the swap transiently leaves a displaced resident
+            // in VRAM past the cap until its eviction lands — bounded by
+            // D_min, and the real P2 slab (K slots, C-3) enforces the hard
+            // budget at promotion time.
             if self.states[k].score > tail.score
                 && self.states[k].score >= SWAP_MARGIN * tail.score
                 && (resident(k, TIER_VRAM) || dwell_ok(tail.key))

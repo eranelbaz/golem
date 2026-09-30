@@ -44,6 +44,9 @@ typedef void (*golem_set_copy_fn)(void *dst, const void *src, size_t dst_off, si
 void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
                                   size_t padding_end, const void *const *ptrs, size_t n,
                                   golem_set_copy_fn set_fn, void *ud) {
+    if (n == 0) {
+        return;
+    }
     size_t off = expert_offset;
     for (size_t i = 0; i < n; ++i) {
         set_fn(dst, ptrs[i], off, expert_size, ud);

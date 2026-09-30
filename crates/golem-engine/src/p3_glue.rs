@@ -257,7 +257,6 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
 /// GGUF/geometry failures, arena mmap/mlock failures (no silent unlocked
 /// fallback, §5.4), or a second pool-enabled session in one process (M2.3
 /// serves exactly one; multi-session arrives with M4's global registration).
-/// Whether the process-global hooks are registered (review H-10 guard).
 /// Bumps the policy decode step: `Session` calls this after every successful
 /// `llama_decode` (§6.2 as amended: a step is one decode call, prefill chunks
 /// included). No-op while hooks are unregistered (self-check decodes).
@@ -267,6 +266,8 @@ pub(crate) fn advance_decode_step() {
     }
 }
 
+/// Whether the process-global hooks are registered (a second pool-enabled
+/// session in one process is refused; M4's global registration re-homes it).
 pub(crate) fn hooks_registered() -> bool {
     HANDLE.get().is_some()
 }
@@ -411,7 +412,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // The device-cache budget IS a per-(layer, kind) expert count (M-13/C-3).
     // It is never "unlimited": device allocations are bounded by the VRAM
     // budget, never proportional to expert count (unbounded slabs are ≈184 GB
-    // on GLM-5.3-Flash — 126 live tensors × 289 planes × ≈5 MB — against a
+    // on GLM-5.3-Flash — 126 live tensors × 288 experts × ≈5 MB — against a
     // 24 GiB card). An explicit config value wins; otherwise K derives from
     // the free VRAM at enable time (the model's non-expert weights are
     // already resident, so what is free is what the slabs + KV + compute

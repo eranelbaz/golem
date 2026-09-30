@@ -637,7 +637,7 @@ mod tests {
     #[test]
     #[cfg(not(loom))] // loom primitives require a model() context
     fn clock_churn_does_not_single_out_one_hot_expert() {
-        // Review H-2 property: the victim is the CLOCK hand's key, not a
+        // Property: the victim is the CLOCK hand's coldest key, never a
         // fixed index. Trace (3 slots, hot = key 2, colds = keys 0/1/3, one
         // rotating cold claim per round after re-touching hot): the hand
         // always finds a cold key whose second chance a previous sweep
