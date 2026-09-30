@@ -16,7 +16,7 @@ typedef struct golem_policy_state golem_policy_state;
 
 /* Hook: ensure [first_id, last_id] of `tensor` are resident in the host expert
  * pool before the substrate reads them (blocks; called on the decode thread).
- * ABI v2 (review C-2): fills out_ptrs[e - first_id] with the pool-side host
+ * ABI v2 (design §3.4): fills out_ptrs[e - first_id] with the pool-side host
  * pointer of expert e's plane — the RAM pool is the source of the host→device
  * copy, because the loader's expert bytes may live in a read-only file mmap.
  * The pool holds a lease on each returned slot until the matching
@@ -55,17 +55,22 @@ int32_t golem_tensor_expert_count(const void *tensor);
 int32_t golem_tensor_expert_stride_bytes(const void *tensor);
 
 /* Force GPU offload of ops on host-resident weights below the upstream
- * batch-32 threshold (review C-4): MUL_MAT_ID's batch is ne[2] = tokens, 1
+ * batch-32 threshold (the review): MUL_MAT_ID's batch is ne[2] = tokens, 1
  * during decode, so without this experts compute on the CPU. Values ≤ 0
  * restore the env/default behavior. Read once at device init — call before
  * backend init. Implemented in ggml-backend.cpp (backend-agnostic); the
  * CUDA/HIP device init consults it. */
 void golem_set_expert_offload_min_batch(int n);
 
-/* --- P2/P4: persistent device expert-copy cache (design sec 3.4). --- */
+/* --- P2/P4: slot-indirected device expert cache (the review; design sec 3.4 v2). --- */
 
-/* Soft cap (bytes) for the device expert-copy cache; 0 = full capacity (never evict). Mutated over FFI by tests. */
-void golem_set_device_cache_budget(size_t bytes);
+/* Per-tensor expert-slot budget for the device cache, in EXPERTS (review
+ * M-13: a count per (layer, kind), never a byte cap derived from one
+ * tensor's stride). 0 = unlimited (a full-size slab). Mutated over FFI by
+ * tests and set once by the engine at pool enable. */
+void golem_set_device_cache_experts(int32_t k);
+/* Current budget (0 = unlimited). */
+int32_t golem_device_cache_experts(void);
 
 /* Clear the device cache map - the invalidation/multi-model seam (also Task 4's cold-start lever). */
 void golem_reset_device_cache(void);

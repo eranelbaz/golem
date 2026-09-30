@@ -32,6 +32,8 @@
 #include "golem-hooks.h"
 
 static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
+static int golem_expert_stem_kind(const char *name); // defined in the P1 section (used at split time, C-3)
+
 static golem_copy_done_fn golem_h_copy_done = NULL;
 static golem_policy_query_fn golem_h_policy_query = NULL;
 static golem_notify_access_fn golem_h_notify_access = NULL;
@@ -39,8 +41,9 @@ static void * golem_h_ctx = NULL;
 
 // --- golem P2/P4: persistent device expert-copy cache (design sec 3.4). Engages ONLY when policy_query is registered; otherwise the copy path below is byte-identical to upstream (T4 invariant).
 // (C++17 TU: std::atomic instead of C11 _Atomic - same lock-free ABI.)
-static std::atomic<size_t> golem_h_device_cache_budget{0}; // 0 = full capacity; mutated over FFI by tests
-void golem_set_device_cache_budget(size_t bytes) { golem_h_device_cache_budget.store(bytes, std::memory_order_relaxed); }
+static std::atomic<int> golem_h_device_cache_experts{0}; // 0 = unlimited (full-size); mutated over FFI (the review: the budget IS a per-(layer, kind) expert count)
+void golem_set_device_cache_experts(int32_t k) { golem_h_device_cache_experts.store(k, std::memory_order_relaxed); }
+int32_t golem_device_cache_experts(void) { return golem_h_device_cache_experts.load(std::memory_order_relaxed); }
 
 struct golem_device_cache_stats {
     std::atomic<uint64_t> bytes_copied; // host->device expert bytes written
@@ -55,18 +58,21 @@ const golem_device_cache_stats *golem_get_device_cache_stats(void) { return &gol
 
 namespace golem { // named (not anonymous): golem_dc_step is linked from the ctest fuzz TU
 static std::mutex                                         golem_dc_mutex;
-static std::unordered_map<const void *, GolemDeviceCache> golem_dc; // key: HOST weights tensor data ptr (the stable identity; device cpy addresses alias across splits - each split's copy tensor can reuse the same device address, which reset every entry and defeated all reuse)
+static std::unordered_map<const void *, GolemSlabEntry> golem_dc; // key: HOST weights tensor data ptr (the stable identity; device cpy addresses alias across splits - each split's copy tensor can reuse the same device address, which reset every entry and defeated all reuse)
 } // namespace golem
 
 void golem_reset_device_cache(void) {
     std::lock_guard<std::mutex> lk(golem::golem_dc_mutex);
-    // Free the owned persistent device regions with their entries - the invalidation seam is also the reclamation point (model reload).
+    // Free the remapped-ids device regions with their entries — the
+    // invalidation seam is also the reclamation point (model reload). The
+    // slab itself is the scheduler's cpy tensor: owned by the graph, freed
+    // with it (the review: no owned twin anymore).
     for (auto & kv : golem::golem_dc) {
-        if (kv.second.owned_buf != nullptr) {
-            ggml_backend_buffer_free(kv.second.owned_buf);
+        if (kv.second.ids_buf != nullptr) {
+            ggml_backend_buffer_free(kv.second.ids_buf);
         }
-        if (kv.second.owned_ctx != nullptr) {
-            ggml_free(kv.second.owned_ctx);
+        if (kv.second.ids_ctx != nullptr) {
+            ggml_free(kv.second.ids_ctx);
         }
     }
     golem::golem_dc.clear();
@@ -1450,7 +1456,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            // Golem C-3/H-5: when golem hooks own the copy
+                            // path, a routed-expert weights tensor feeding
+                            // MUL_MAT_ID never uses the compute-buffer cpy —
+                            // the data lives in a persistent per-entry device
+                            // slab (K+1 planes, budgeted by
+                            // golem_set_device_cache_experts; the +1 is a
+                            // non-NaN MMQ padding slot). The cpy is a tiny
+                            // placeholder so the compute buffer does not carry
+                            // a full-size copy of every expert tensor, and the
+                            // node srcs are redirected to the slab per compute
+                            // (and restored after — kernels capture pointers
+                            // at launch; graphs are off while hooks are set).
+                            // Unset hooks keep the full upstream dup (T4).
+                            struct ggml_tensor * tensor_copy;
+                            const bool golem_expert_input =
+                                golem_h_policy_query != NULL &&
+                                node->op == GGML_OP_MUL_MAT_ID && j == 0 &&
+                                golem_expert_stem_kind(src->name) != 0;
+                            if (golem_expert_input) {
+                                tensor_copy = ggml_new_tensor(sched->ctx, src->type, 1,
+                                                              (const int64_t[]){ 64 });
+                            } else {
+                                tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            }
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
@@ -1703,6 +1732,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    // Golem P2: (slot, original) of every MUL_MAT_ID src[2] redirected to a
+    // remapped-ids tensor. Restored after each split: llama reuses the graph
+    // across decode steps, and the next step must read the router's ids, not
+    // the previous step's slot numbers.
+    std::vector<std::pair<ggml_tensor **, ggml_tensor *>> golem_ids_redirects;
+    const auto golem_restore_ids = [&]() {
+        for (auto & r : golem_ids_redirects) {
+            *r.first = r.second;
+        }
+        golem_ids_redirects.clear();
+    };
 
     int prev_backend_id = -1;
 
@@ -1862,8 +1902,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         copy_experts(first_id, last_id, true);
                     } else {
-                        // P2 path: persistent device expert-copy cache. The state machine (order validation, budget eviction, run skip/copy decision, accounting) lives in golem-device-cache.hpp - shared verbatim with tests/golem-p2-cache.cpp (ODR).
-                        // Preconditions: policy AND pager present (a policy without the P3 pager would read unpaged host bytes); n_copies == 1 (Global Constraints).
+                        // P2 v2 (design §3.4 v2): slot-indirected device cache.
+                        // The shrank slab cpy (created at split time) holds K+1
+                        // expert planes; MUL_MAT_ID reads it through a remapped
+                        // ids tensor (values in [0, K)) — routing untouched
+                        // (I1), addressing moved. State machine shared verbatim
+                        // with tests/golem-p2-cache.cpp (ODR).
+                        // Preconditions: policy AND pager present; n_copies == 1.
                         if (golem_h_ensure_host_resident == NULL) {
                             GGML_ABORT("golem P2: policy_query set without P3 pager");
                         }
@@ -1879,50 +1924,106 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
-                        golem::GolemDcCounters dc;
-                        std::vector<std::pair<int32_t, int32_t>> pending;
-                        std::vector<bool> pending_pad;
-                        struct ggml_tensor * dc_dst = input_cpy;
+                        // The persistent per-tensor slab (K+1 planes) lives in
+                        // its own device buffer — independent of galloc plans,
+                        // so cached slot bytes survive graph rebuilds. Fingerprint:
+                        // host tensor + K + geometry only.
+                        const int32_t K_cfg =
+                            golem_h_device_cache_experts.load(std::memory_order_relaxed);
+                        const int32_t K =
+                            (K_cfg > 0 && K_cfg < (int32_t) n_expert) ? K_cfg : (int32_t) n_expert;
+                        golem::GolemSlabCounters dc;
                         {
                             std::lock_guard<std::mutex> lk(golem::golem_dc_mutex);
-                            // Key by the HOST tensor identity; the cached bytes live in an OWNED persistent device region (created below) - the scheduler's transient cpy slots alias one address across the expert planes, so caching validity on them is unsound (each plane's copy overwrites the others'). Recycled host addresses across model reloads are cleared by golem_reset_device_cache() at P3 enable (the invalidation seam) - raw hook users (tests) must reset the same way.
-                            golem::GolemDeviceCache &dc_st = golem::golem_dc[input->data];
-                            if (dc_st.owned == nullptr) {
-                                // Full-size twin of the host expert tensor, allocated once on the split backend; compute is redirected to it (below). Owned by the entry; freed by golem_reset_device_cache.
+                            golem::GolemSlabEntry &st = golem::golem_dc[input->data];
+                            // (Re)allocate the slab + remapped-ids tensor on
+                            // fingerprint change. The slab is zeroed once (the
+                            // padding slot must stay non-NaN); its plane bytes
+                            // are written only by the copies below.
+                            if (st.slab == nullptr || st.K != K ||
+                                st.expert_size != expert_size ||
+                                st.owner != input->data) {
+                                if (st.buf != nullptr) {
+                                    ggml_backend_buffer_free(st.buf);
+                                }
+                                if (st.ctx != nullptr) {
+                                    ggml_free(st.ctx);
+                                }
                                 struct ggml_init_params ip = { 512, nullptr, /* no_alloc */ true };
-                                dc_st.owned_ctx = ggml_init(ip);
-                                GGML_ASSERT(dc_st.owned_ctx != nullptr);
-                                struct ggml_tensor * t =
-                                    ggml_new_tensor(dc_st.owned_ctx, input->type, ggml_n_dims(input), input->ne);
-                                GGML_ASSERT(t != nullptr);
-                                dc_st.owned_buf = ggml_backend_alloc_ctx_tensors(dc_st.owned_ctx, split_backend);
-                                GGML_ASSERT(dc_st.owned_buf != nullptr);
-                                dc_st.owned = t;
+                                st.ctx = ggml_init(ip);
+                                GGML_ASSERT(st.ctx != nullptr);
+                                st.slab = ggml_new_tensor(st.ctx, input->type, 3,
+                                    (const int64_t[]){ input->ne[0], input->ne[1], (int64_t) K + 1 });
+                                GGML_ASSERT(st.slab != nullptr);
+                                st.buf = ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
+                                GGML_ASSERT(st.buf != nullptr);
+                                const std::vector<uint8_t> zeros(expert_size, 0);
+                                ggml_backend_tensor_set(st.slab, zeros.data(),
+                                                        (size_t) K * expert_size, expert_size);
+                                st.owner = input->data;
+                                st.K = K;
+                                st.n_experts = (int32_t) n_expert;
+                                st.expert_size = expert_size;
                             }
-                            // The compute graph must read the owned persistent region; the valid bits always describe bytes in it. Redirect EVERY consumer of the transient cpy (nodes[0] included) - any node left on the stale cpy would read bytes the valid bits claim current.
+                            // Remapped-ids device tensor: resized on ids-shape
+                            // change (slot validity is independent of it).
+                            if (st.ids_dev == nullptr || st.ids_ne0 != (int64_t) ids_tensor->ne[0] ||
+                                st.ids_ne1 != (int64_t) ids_tensor->ne[1]) {
+                                if (st.ids_buf != nullptr) {
+                                    ggml_backend_buffer_free(st.ids_buf);
+                                }
+                                if (st.ids_ctx != nullptr) {
+                                    ggml_free(st.ids_ctx);
+                                }
+                                struct ggml_init_params ip = { 512, nullptr, /* no_alloc */ true };
+                                st.ids_ctx = ggml_init(ip);
+                                GGML_ASSERT(st.ids_ctx != nullptr);
+                                st.ids_dev = ggml_new_tensor(st.ids_ctx, GGML_TYPE_I32, 2,
+                                    (const int64_t[]){ ids_tensor->ne[0], ids_tensor->ne[1] });
+                                GGML_ASSERT(st.ids_dev != nullptr);
+                                st.ids_buf = ggml_backend_alloc_ctx_tensors(st.ids_ctx, split_backend);
+                                GGML_ASSERT(st.ids_buf != nullptr);
+                                st.ids_ne0 = ids_tensor->ne[0];
+                                st.ids_ne1 = ids_tensor->ne[1];
+                            }
+
+                            // Slab step: decide skips/copies/evictions + remap.
+                            std::vector<std::pair<int32_t, int32_t>> pending; // (slot, expert id)
+                            dc = golem::golem_slab_step(st, routed, ids.data(),
+                                (int64_t) ids.size(), order, K, (int32_t) n_expert, expert_size,
+                                input->data,
+                                [&](int32_t slot, int32_t id) { pending.emplace_back(slot, id); });
+
+                            // Physical writes: page the pool (C-2 API), then one
+                            // async copy per staged slot.
+                            for (const auto &pr : pending) {
+                                const void *ptr = NULL;
+                                golem_h_ensure_host_resident(golem_h_ctx, input, pr.second, pr.second, &ptr);
+                                GGML_ASSERT(ptr != NULL);
+                                ggml_backend_tensor_set_async(split_backend, st.slab, ptr,
+                                    (size_t) pr.first * expert_size, expert_size);
+                            }
+                            // Remapped ids → device, then redirect every slab
+                            // consumer: src[0] → slab, src[2] → remapped ids.
+                            // Both are restored after the split's compute (the
+                            // recorded originals are the scheduler's cpy tensors;
+                            // kernels capture pointers at launch and graphs are
+                            // off while hooks are set).
+                            ggml_backend_tensor_set_async(split_backend, st.ids_dev, st.remap.data(),
+                                0, st.remap.size() * sizeof(int32_t));
                             for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
-                                for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                                    if (split->graph.nodes[ni]->src[j] == input_cpy) {
-                                        split->graph.nodes[ni]->src[j] = dc_st.owned;
-                                    }
+                                struct ggml_tensor * n2 = split->graph.nodes[ni];
+                                if (n2->op == GGML_OP_MUL_MAT_ID && n2->src[0] == input_cpy) {
+                                    golem_ids_redirects.emplace_back(&n2->src[0], n2->src[0]);
+                                    n2->src[0] = st.slab;
+                                    golem_ids_redirects.emplace_back(&n2->src[2], n2->src[2]);
+                                    n2->src[2] = st.ids_dev;
                                 }
                             }
-                            dc = golem::golem_dc_step_impl(dc_st, routed, order,
-                                golem_h_device_cache_budget.load(std::memory_order_relaxed),
-                                expert_size, (int32_t) n_expert, input->data,
-                                [&](int32_t first_id, int32_t last_id, bool pad_ok) {
-                                    pending.emplace_back(first_id, last_id);
-                                    pending_pad.push_back(pad_ok);
-                                });
-                            golem_h_dc_stats.bytes_copied.fetch_add(dc.copied, std::memory_order_relaxed);
-                            golem_h_dc_stats.bytes_skipped.fetch_add(dc.skipped, std::memory_order_relaxed);
-                            golem_h_dc_stats.evictions.fetch_add(dc.evicted, std::memory_order_relaxed);
-                            dc_dst = dc_st.owned; // physical writes go to the owned region
                         }
-                        // Physical writes deferred past the mutex, into the OWNED region.
-                        for (size_t i = 0; i < pending.size(); ++i) {
-                            copy_experts_to(dc_dst, pending[i].first, pending[i].second, pending_pad[i]);
-                        }
+                        golem_h_dc_stats.bytes_copied.fetch_add(dc.copied * expert_size, std::memory_order_relaxed);
+                        golem_h_dc_stats.bytes_skipped.fetch_add(dc.skipped * expert_size, std::memory_order_relaxed);
+                        golem_h_dc_stats.evictions.fetch_add(dc.evicted, std::memory_order_relaxed);
                         if (golem_h_notify_access != NULL) {
                             for (int32_t id : routed) {
                                 golem_h_notify_access(golem_h_ctx, id);
@@ -1947,6 +2048,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            golem_restore_ids();
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1970,6 +2072,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    golem_restore_ids();
                     return ec;
                 }
 
@@ -1982,6 +2085,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+            golem_restore_ids();
         }
 
         // record the event of this split
@@ -2706,7 +2810,7 @@ int golem_expert_offload_min_batch(int default_value) {
  * followed by ".weight" (runtime ggml names: blk.%d.ffn_*_exps.weight;
  * gguf-side names drop the suffix). The same rule is implemented in Rust
  * (golem-gguf::ExpertKind::from_tensor_name) — one shared matcher semantics
- * (review C-1/M-9): the loader can create `.scale` variants and dense
+ * (the shared expert-matcher rule): the loader can create `.scale` variants and dense
  * ffn_gate tensors whose names contain the stems too. One expert is one
  * ne[0]×ne[1] plane; nb[2] is the authoritative plane stride (also correct
  * for padded/non-contiguous tensors, where recomputing from ne is not).

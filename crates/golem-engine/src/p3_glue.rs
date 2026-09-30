@@ -49,9 +49,6 @@ struct TensorEntry {
     layer: u32,
     /// Which of the layer's three planes.
     kind: ExpertKind,
-    /// Bytes per expert plane — `golem_tensor_expert_stride_bytes` (`nb[2]`,
-    /// authoritative; never recomputed, never hard-coded per kind).
-    stride: usize,
     /// Expert count (`ne[2]` via `golem_tensor_expert_count`).
     n_experts: u32,
 }
@@ -91,11 +88,6 @@ struct PoolHandle {
     /// NEXT compute — the engine synchronizes after every decode
     /// (session.rs, review H-2), so the prior step's DMAs are complete.
     in_flight_leases: Mutex<Vec<golem_placement::pool::Lease>>,
-    /// Pending device-cache budget in experts (from `device_cache_experts`);
-    /// consumed (× stride) at the first expert-tensor registration, where
-    /// `golem_tensor_expert_stride_bytes` first becomes knowable. 0 = nothing
-    /// to set (unlimited, the default).
-    budget_pending_experts: AtomicUsize,
 }
 
 // SAFETY: `data` pointers point into the substrate's host weights buffer,
@@ -419,7 +411,6 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         in_flight_leases: Mutex::new(Vec::new()),
         slow_calls: AtomicUsize::new(0),
         policy,
-        budget_pending_experts: AtomicUsize::new(config.device_cache_experts as usize),
     }));
     // CAS reservation above ⇒ no concurrent setter and `get()` was None.
     assert!(
@@ -431,6 +422,13 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // entries from an earlier in-process model — the invalidation seam).
     // SAFETY: FFI call, no invariants.
     unsafe { raw::golem_reset_device_cache() };
+    // Review M-13/C-3: the device-cache budget IS a per-(layer, kind) expert
+    // count — the slab is per tensor and the count is geometry-independent,
+    // so it is set once here (0 = unlimited, the default).
+    // SAFETY: FFI setter, no invariants.
+    unsafe {
+        raw::golem_set_device_cache_experts(config.device_cache_experts as i32);
+    }
 
     // SAFETY: `handle` is leaked ('static) and never mutated after this, so
     // the context pointer outlives every callback; all three are valid fn
@@ -579,14 +577,6 @@ extern "C" fn policy_query(ctx: *mut c_void, tensor: *const c_void, n_experts: i
             entry.n_experts, entry.layer
         ));
     }
-    // Budget is configured in experts but C wants bytes; the stride is only
-    // knowable from a live expert tensor, so the first registration settles
-    // it. No expert tensor ever registered ⇒ budget never set (unlimited).
-    let pending = h.budget_pending_experts.swap(0, Ordering::Relaxed);
-    if pending > 0 {
-        // SAFETY: FFI setter, no invariants.
-        unsafe { raw::golem_set_device_cache_budget((pending * entry.stride) as u64) };
-    }
     *h.policy.last_queried.lock().unwrap() = Some((entry.layer, entry.kind));
     let order = h.policy.order_for(entry.layer, entry.kind);
     // Belt-and-suspenders: C validates the permutation authoritatively
@@ -707,7 +697,6 @@ impl PoolHandle {
         let entry = TensorEntry {
             layer,
             kind,
-            stride,
             n_experts: n_experts as u32,
         };
         self.tensors.lock().unwrap().insert(key, entry);

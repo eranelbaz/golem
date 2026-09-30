@@ -18,7 +18,7 @@ fn golem_p2_device_cache_stats_roundtrip() {
     assert_eq!(std::mem::size_of::<raw::golem_device_cache_stats>(), 0);
 
     // SAFETY: FFI call, no invariants (0 = full capacity).
-    unsafe { raw::golem_set_device_cache_budget(0) };
+    unsafe { raw::golem_set_device_cache_experts(0) };
     let p = unsafe { raw::golem_get_device_cache_stats() };
     assert!(!p.is_null());
 

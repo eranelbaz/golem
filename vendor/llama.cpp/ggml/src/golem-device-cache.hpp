@@ -1,4 +1,13 @@
-// Golem patch P2: device expert-copy cache state machine (design sec 3.4). Included by BOTH ggml-backend.cpp (split-scheduler copy path) and tests/golem-p2-cache.cpp (fuzz harness): a single shared definition - hand-copied declarations would be an ODR drift (silent wrong-layout crash).
+// Golem patch P2 v2 (design §3.4 v2): SLOT-INDIRECTED device expert cache.
+// Included by BOTH ggml-backend.cpp (split-scheduler copy path) and
+// tests/golem-p2-cache.cpp (fuzz harness): a single shared definition —
+// hand-copied declarations would be an ODR drift (silent wrong-layout crash).
+//
+// The device cache is a slab of K+1 expert-plane slots (the shrank scheduler
+// input cpy; +1 non-NaN padding slot), and MUL_MAT_ID reads it through a
+// REMAPPED ids tensor (values in [0, K)): routing is untouched — only the
+// addressing moves. A full-size device twin (184 GB on the target model) and
+// the full-size compute-buffer cpy are both gone.
 #ifndef GOLEM_DEVICE_CACHE_HPP
 #define GOLEM_DEVICE_CACHE_HPP
 
@@ -14,53 +23,62 @@ struct ggml_backend_buffer;
 
 namespace golem {
 
-// Validity state for one device expert-copy cache entry. Reset on ANY fingerprint mismatch (recycled host addresses across same-n_expert tensors must not alias stale bits).
-struct GolemDeviceCache {
-    std::vector<ggml_bitset_t> valid; // bitset over n_expert
-    size_t valid_bytes = 0;
-    const void *owner = nullptr; // host tensor fingerprint (alias guard)
+// One (layer, kind) slab. Keyed by the host tensor fingerprint; any sched
+// slab pointer change resets the state, so
+// validity bits never describe stale device bytes.
+struct GolemSlabEntry {
+    // fingerprint
+    const void *owner = nullptr;   // host tensor data ptr
+    int32_t K = 0;                 // addressable slots (padding slot excluded)
+    int32_t n_experts = 0;
     size_t expert_size = 0;
-    // Persistent OWNED device region (design sec 3.4): a full-size twin of the host expert tensor allocated once on the split backend; compute reads it (node->src[0] is redirected to it). The scheduler's transient cpy slots alias one address across the expert planes, so caching validity there is unsound - each plane's copy overwrites the others'. The owned region is exclusive per host tensor. Held (and freed by golem_reset_device_cache) by the map entry.
-    struct ggml_tensor * owned = nullptr;
-    struct ggml_backend_buffer * owned_buf = nullptr;
-    struct ggml_context * owned_ctx = nullptr;
+    // persistent device slab (K+1 planes; owns its buffer, independent of
+    // galloc plans — cached slot bytes survive graph rebuilds)
+    struct ggml_tensor *slab = nullptr;
+    struct ggml_backend_buffer *buf = nullptr;
+    struct ggml_context *ctx = nullptr;
+    int64_t ids_ne0 = 0;           // remapped-ids tensor shape fingerprint
+    int64_t ids_ne1 = 0;
+    // state
+    std::vector<int32_t> slot_of;  // expert id → slot, -1 = unassigned
+    std::vector<ggml_bitset_t> valid; // bitset over slots: slot bytes current
+    // remapped ids device tensor (int32, same 2-D shape as the ids node)
+    struct ggml_tensor *ids_dev = nullptr;
+    struct ggml_backend_buffer *ids_buf = nullptr;
+    struct ggml_context *ids_ctx = nullptr;
+    std::vector<int32_t> remap;    // host staging for the remapped ids
 };
 
 // Per-step accounting; the caller folds these into the P4 atomic counters.
-struct GolemDcCounters {
-    uint64_t copied = 0; // host->device expert bytes written (incl. padding tails)
-    uint64_t skipped = 0; // bytes skipped because bit-valid
-    uint64_t evicted = 0; // experts invalidated to stay under budget
+struct GolemSlabCounters {
+    uint64_t copied = 0;   // expert planes written this step
+    uint64_t skipped = 0;  // routed experts whose slot bytes were current
+    uint64_t evicted = 0;  // slots stolen from non-routed experts
 };
 
-inline size_t golem_dc_popcount_bytes(const std::vector<ggml_bitset_t> &bs, size_t expert_size) {
-    size_t n = 0;
-    for (ggml_bitset_t w : bs) {
-#if defined(__GNUC__) || defined(__clang__)
-        n += (size_t) __builtin_popcount(w);
-#else
-        for (; w; w >>= 1) {
-            n += (size_t) (w & 1);
-        }
-#endif
-    }
-    return n * expert_size;
-}
-
-// One scheduler step against `st` - pure state machine; the physical host->device write is delegated to on_copy(first_id, last_id, pad_ok).
+// One scheduler step against `st`.
 //
-// - `order` must be a permutation of [0, n_experts) in evict-first order; NULL / duplicate / out-of-range ids abort (C-side choke point).
-// - `budget_bytes` is a soft cap: walk `order` clearing non-routed valid bits while valid_bytes > budget; routed experts are never evicted and overflow is tolerated (walk stops when only routed experts remain valid). 0 => full capacity (never evict).
-// - Copy phase: each maximal run [first_id, last_id] of routed ids is skipped (accounted in `skipped`) when all its bits are valid; otherwise it is copied via on_copy with bits set and `copied` incremented, including the padding_end tail. pad_ok = last_id+1 < n_experts && that expert's bit is invalid (correctness core sec 3: keeps "bit => byte-identity" provable).
-// - valid_bytes is recomputed from popcount after the eviction walk and again after the copy phase (no drift).
-// - Any fingerprint mismatch (owner / expert_size / n_experts) resets `st` to all-invalid first.
-template <typename CopyFn>
-GolemDcCounters golem_dc_step_impl(GolemDeviceCache &st, const std::vector<int32_t> &routed,
-                                   const int32_t *order, size_t budget_bytes, size_t expert_size,
-                                   int32_t n_experts, const void *host_data, CopyFn &&on_copy) {
-    GolemDcCounters c;
+// - `routed` = sorted used-expert ids (from the ids bitset); `ids`/`ids_count`
+//   = the raw ids values; `order` = Rust's evict-first permutation of
+//   [0, n_experts) (NULL / duplicate / out-of-range aborts — C-side choke
+//   point); `K` = addressable slots of the slab.
+// - Every routed expert gets a valid slot: free first, else evict the first
+//   non-routed assigned expert in `order` (policy-driven victim). Routed set
+//   larger than K cannot be staged → GGML_ABORT (fail-loud; prefill slab
+//   sizing is design D-7, deferred to M3.5).
+// - on_copy(slot, id): physical host→device write of expert `id`'s plane into
+//   `slot`. Called once per non-current routed expert.
+// - st.remap = the remapped ids (same element order/count as `ids`), ready
+//   for the caller's H2D of the ids_dev tensor.
+template <typename OnCopy>
+GolemSlabCounters golem_slab_step(GolemSlabEntry &st, const std::vector<int32_t> &routed,
+                                  const int32_t *ids, int64_t ids_count, const int32_t *order,
+                                  int32_t K, int32_t n_experts, size_t expert_size,
+                                  const void *host_data, OnCopy &&on_copy) {
+    GolemSlabCounters c;
     GGML_ASSERT(n_experts > 0);
     GGML_ASSERT(expert_size > 0);
+    GGML_ASSERT(K > 0 && K <= n_experts);
 
     // Validate order FIRST: all ids distinct, all in [0, n_experts).
     {
@@ -73,83 +91,99 @@ GolemDcCounters golem_dc_step_impl(GolemDeviceCache &st, const std::vector<int32
         }
     }
 
-    // Fresh or aliased/stale entry: reset.
-    if (st.valid.size() != (size_t) ggml_bitset_size(n_experts) || st.owner != host_data ||
-        st.expert_size != expert_size) {
-        // Preserve the owned persistent region across state resets: the region is keyed by the entry (host tensor), not by the resettable validity state.
-        struct ggml_tensor * owned = st.owned;
-        struct ggml_backend_buffer * owned_buf = st.owned_buf;
-        struct ggml_context * owned_ctx = st.owned_ctx;
-        st = GolemDeviceCache{};
-        st.owned = owned;
-        st.owned_buf = owned_buf;
-        st.owned_ctx = owned_ctx;
-        st.valid.assign(ggml_bitset_size(n_experts), 0);
+    // Fresh or stale (address reuse across model/graph changes): reset.
+    if ((int32_t) st.slot_of.size() != n_experts || st.owner != host_data ||
+        st.K != K || st.expert_size != expert_size) {
+        st.slot_of.assign(n_experts, -1);
+        st.valid.assign(ggml_bitset_size(K + 1), 0);
         st.owner = host_data;
+        st.K = K;
+        st.n_experts = n_experts;
         st.expert_size = expert_size;
     }
 
-    // (a) budget eviction (soft cap): evict-first walk of `order`.
-    const size_t budget = budget_bytes == 0 ? (size_t) n_experts * expert_size : budget_bytes;
-    if (st.valid_bytes > budget) {
-        std::vector<ggml_bitset_t> is_routed(ggml_bitset_size(n_experts), 0);
-        for (int32_t id : routed) {
-            GGML_ASSERT(id >= 0 && id < n_experts);
-            ggml_bitset_set(is_routed.data(), id);
-        }
-        size_t vb = st.valid_bytes;
-        for (int32_t i = 0; i < n_experts && vb > budget; ++i) {
-            const int32_t id = order[i];
-            if (!ggml_bitset_get(is_routed.data(), id) && ggml_bitset_get(st.valid.data(), id)) {
-                ggml_bitset_clear(st.valid.data(), id);
-                vb -= expert_size;
-                c.evicted++;
-            }
-        }
-    }
-    st.valid_bytes = golem_dc_popcount_bytes(st.valid, expert_size);
-
-    // (b) copy routed ranges with invalid experts; skip fully-valid runs.
-    bool in_run = false;
-    int32_t first_id = -1, last_id = -1;
-    const auto flush = [&](int32_t f, int32_t l) {
-        const size_t run_bytes = (size_t) (l - f + 1) * expert_size;
-        for (int32_t id = f; id <= l; ++id) {
-            if (!ggml_bitset_get(st.valid.data(), id)) {
-                const bool pad_ok = l + 1 < n_experts && !ggml_bitset_get(st.valid.data(), l + 1);
-                for (int32_t id2 = f; id2 <= l; ++id2) {
-                    ggml_bitset_set(st.valid.data(), id2);
-                }
-                c.copied += run_bytes + (pad_ok ? std::min<size_t>(expert_size, 512) : 0);
-                on_copy(f, l, pad_ok);
-                return;
-            }
-        }
-        c.skipped += run_bytes; // all bits in the run valid
-    };
+    std::vector<ggml_bitset_t> is_routed(ggml_bitset_size(n_experts), 0);
     for (int32_t id : routed) {
-        if (!in_run || id != last_id + 1) {
-            if (in_run) {
-                flush(first_id, last_id);
-            }
-            first_id = id;
-            in_run = true;
-        }
-        last_id = id;
-    }
-    if (in_run) {
-        flush(first_id, last_id);
+        GGML_ASSERT(id >= 0 && id < n_experts);
+        ggml_bitset_set(is_routed.data(), id);
     }
 
-    // Recompute from popcount after the copy phase (no drift).
-    st.valid_bytes = golem_dc_popcount_bytes(st.valid, expert_size);
+    const auto find_free_slot = [&]() -> int32_t {
+        for (int32_t s = 0; s < K; ++s) {
+            if (!ggml_bitset_get(st.valid.data(), s)) {
+                // A free slot must not be owned by a live assignment.
+                return s;
+            }
+        }
+        return -1;
+    };
+    const auto evict_one = [&]() -> int32_t {
+        for (int32_t i = 0; i < n_experts; ++i) {
+            const int32_t cand = order[i];
+            const int32_t s = st.slot_of[cand];
+            if (s != -1 && !ggml_bitset_get(is_routed.data(), cand)) {
+                ggml_bitset_clear(st.valid.data(), s);
+                st.slot_of[cand] = -1;
+                c.evicted++;
+                return s;
+            }
+        }
+        return -1;
+    };
+
+    for (int32_t id : routed) {
+        const int32_t cur = st.slot_of[id];
+        if (cur != -1 && ggml_bitset_get(st.valid.data(), cur)) {
+            c.skipped++;
+            continue;
+        }
+        int32_t s = find_free_slot();
+        if (s == -1) {
+            s = evict_one();
+        }
+        if (s == -1) {
+            // K smaller than the routed set: the ids cannot be staged. Fail
+            // loud — silently dropping an expert would corrupt decode.
+            GGML_ABORT("golem P2 slab: routed set (%d) exceeds slots (K=%d); "
+                       "raise --vram-experts or lower the ubatch (design D-7)",
+                       (int) routed.size(), (int) K);
+        }
+        // Stealing a slot may orphan its previous owner's assignment; the
+        // evict path already cleared it. Free-slot reuse below can also hit a
+        // slot still referenced by a dead slot_of entry — clear that too.
+        for (int32_t id2 = 0; id2 < n_experts; ++id2) {
+            if (st.slot_of[id2] == s && id2 != id) {
+                st.slot_of[id2] = -1;
+            }
+        }
+        st.slot_of[id] = s;
+        ggml_bitset_set(st.valid.data(), s);
+        on_copy(s, id);
+        c.copied++;
+    }
+
+    // Build the remapped ids (values in [0, K]; ids_dev adds the padding slot
+    // as index K — never referenced by valid remaps).
+    st.remap.resize(ids_count);
+    for (int64_t i = 0; i < ids_count; ++i) {
+        const int32_t v = ids[i];
+        GGML_ASSERT(v >= 0 && v < n_experts);
+        const int32_t s = st.slot_of[v];
+        GGML_ASSERT(s != -1 && "routed bitset must cover every ids value");
+        st.remap[i] = s;
+    }
     return c;
 }
 
-// Non-template, non-static entry point linked from the ctest fuzz TU (tests/golem-p2-cache.cpp): counts physical writes without performing them - the state invariants do not depend on byte contents.
-inline GolemDcCounters golem_dc_step(GolemDeviceCache &st, const std::vector<int32_t> &routed, const int32_t *order, size_t budget_bytes, size_t expert_size, int32_t n_experts, const void *host_data) {
-    return golem_dc_step_impl(st, routed, order, budget_bytes, expert_size, n_experts, host_data,
-                              [](int32_t, int32_t, bool) {});
+// Non-template, non-static entry point linked from the ctest fuzz TU
+// (tests/golem-p2-cache.cpp): counts physical writes without performing them
+// (on_copy is a no-op) — the state invariants do not depend on byte contents.
+inline GolemSlabCounters golem_slab_step_nop(GolemSlabEntry &st, const std::vector<int32_t> &routed,
+                                             const int32_t *ids, int64_t ids_count,
+                                             const int32_t *order, int32_t K, int32_t n_experts,
+                                             size_t expert_size, const void *host_data) {
+    return golem_slab_step(st, routed, ids, ids_count, order, K, n_experts, expert_size,
+                           host_data, [](int32_t, int32_t) {});
 }
 
 } // namespace golem

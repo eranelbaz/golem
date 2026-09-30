@@ -199,7 +199,7 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", il), {n_embd, n_expert}, flags);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   il), {n_expert}, flags);
 
-            // Golem (review H-3): routed expert planes are staged by Golem's
+            // Golem (design §4.3): routed expert planes are staged by Golem's
             // own RAM pool straight from the GGUF (golem-hooks C-2 path);
             // the loader must map them without reading/populating them.
             // TENSOR_READ_LAZY is a no-op when lazy_mode != ON.

@@ -2561,7 +2561,7 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
-    // Golem (design sec 3.5, review D-8): the golem hooks fire inside the
+    // Golem (design sec 3.5, design §3.5): the golem hooks fire inside the
     // split-scheduler expert-copy branch; a captured graph replays the
     // recorded copies without re-entering the hooks, silently freezing
     // routing-dependent copies. Disable capture whenever golem hooks are on.

@@ -7,7 +7,7 @@
 //! is `#[cfg]`-skipped there (same gate as `p3_hook_fires.rs`).
 //!
 //! Pool OFF, one session: the C counters, `golem_reset_device_cache`, and
-//! `golem_set_device_cache_budget` are process-global statics — they tick
+//! `golem_set_device_cache_experts` is a process-global static — it ticks
 //! whenever the P2 path runs, which here is driven by test-registered hooks
 //! (the `p2_policy_query` seam: policy_query + ensure_host_resident both
 //! set). The engine-registered-hook path (RAM pool) needs `ram_experts_gib`
@@ -203,9 +203,10 @@ fn register_p2_hooks(shuffle: bool) {
     }
 }
 
-fn set_budget(experts: u64) {
-    // SAFETY: FFI setter, no invariants (0 = full capacity).
-    unsafe { golem_llama_sys::raw::golem_set_device_cache_budget(experts * expert_stride_bytes()) };
+fn set_budget(experts: i32) {
+    // SAFETY: FFI setter, no invariants (0 = unlimited; review M-13: the
+    // budget is a per-tensor expert COUNT — C-3's slab is sized from it).
+    unsafe { golem_llama_sys::raw::golem_set_device_cache_experts(experts) };
 }
 
 fn reset_cache() {
@@ -260,7 +261,7 @@ fn t3_four_cache_states_decode_identically() {
     let mut session = Session::new(&config()).unwrap();
 
     // --- (b) cold start — runs FIRST (self-check warmup must not count).
-    set_budget(0); // full capacity
+    set_budget(8); // K = n_expert: every routed pair fits
     reset_cache();
     let cold0 = Snapshot::now();
     let tokens_cold = greedy_tokens(&mut session);
@@ -287,7 +288,7 @@ fn t3_four_cache_states_decode_identically() {
     );
 
     // --- (a) fully pre-promoted: warm every routed expert, then measure.
-    set_budget(0);
+    set_budget(8);
     for _ in 0..WARMUP_TURNS {
         warm_chat(&mut session);
     }
@@ -305,7 +306,7 @@ fn t3_four_cache_states_decode_identically() {
         warm0.skipped_delta(&warm1)
     );
 
-    // --- (c) 1-expert budget, shuffled order.
+    // --- (c) 1-slot-pair budget (K = routed pair), shuffled order.
     // The eviction walk itself is covered deterministically by the vendored
     // ctest (tests/golem-p2-cache.cpp: soft-cap evictions, routed-expert
     // protection). It cannot be fired from real decode on tiny-moe: the
@@ -313,12 +314,12 @@ fn t3_four_cache_states_decode_identically() {
     // set never contains a non-routed expert. What must hold here — and what
     // only the full scheduler can prove — is that eviction-time state does
     // not perturb decode (I1).
-    set_budget(1);
+    set_budget(2);
     reset_cache(); // the stress must start cold
     let tokens_stress = greedy_tokens(&mut session);
 
-    // --- (d) low budget: 1 expert's stride per tensor.
-    set_budget(1);
+    // --- (d) low budget: K = routed pair.
+    set_budget(2);
     reset_cache();
     let tokens_low = greedy_tokens(&mut session);
 
