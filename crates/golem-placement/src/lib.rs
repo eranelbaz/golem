@@ -32,32 +32,25 @@ impl fmt::Display for Tier {
     }
 }
 
-/// A floor set cannot fit its tier budget (§6.4) — maps to
+/// A cap cannot fit its tier budget (§6.4) — maps to
 /// `golem_plan_infeasible` at the boundary; carries the exact numbers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Infeasible {
-    /// Tier whose floor/budget pair failed.
+    /// Tier whose cap/budget pair failed.
     pub tier: Tier,
-    /// Bytes the floor set requires (`u64::MAX` on `checked_mul` overflow, 0 on a count rejection).
+    /// Bytes the cap requires (`u64::MAX` on `checked_mul` overflow).
     pub required_bytes: u64,
     /// The failing budget.
     pub budget_bytes: u64,
-    /// Per-expert bytes supplied to [`Policy::new`]; 0 when rejected on counts.
+    /// Per-expert bytes supplied to [`Policy::new`].
     pub max_bytes_per_expert: u64,
 }
 
 impl fmt::Display for Infeasible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.max_bytes_per_expert == 0 {
-            return write!(
-                f,
-                "golem_plan_infeasible: {} floor count exceeds capacity",
-                self.tier
-            );
-        }
         write!(
             f,
-            "golem_plan_infeasible: {} floor requires {} bytes ({} experts × {} B) but budget is {}",
+            "golem_plan_infeasible: {} cap requires {} bytes ({} experts × {} B) but budget is {}",
             self.tier,
             self.required_bytes,
             self.required_bytes / self.max_bytes_per_expert,
@@ -88,10 +81,6 @@ pub struct PlacementConfig {
     pub vram_experts_max: usize,
     /// Host pool capacity, in experts.
     pub ram_slots: usize,
-    /// VRAM floor: top-N vram residents pinned against eviction.
-    pub vram_experts_min: usize,
-    /// RAM floor: top-N ram residents pinned against eviction.
-    pub ram_experts_min: usize,
 }
 
 impl Default for PlacementConfig {
@@ -105,8 +94,6 @@ impl Default for PlacementConfig {
             min_dwell_steps: 256,
             vram_experts_max: 0,
             ram_slots: 0,
-            vram_experts_min: 0,
-            ram_experts_min: 0,
         }
     }
 }
@@ -145,7 +132,7 @@ impl Default for ExpertState {
 }
 
 /// Placement policy over a flat expert table (§6.1): scores (§6.2), transitions
-/// with hysteresis + min-dwell + floors (§6.3), budgets (§6.4).
+/// with hysteresis + min-dwell (§6.3), budgets (§6.4).
 #[derive(Debug)]
 pub struct Policy {
     cfg: PlacementConfig,
@@ -160,11 +147,11 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Feasibility check at load time (§6.4): rejects floor sets that cannot
-    /// fit their byte budgets, and count-inconsistent floor/cap pairs.
-    /// Byte checks run first; count rejections use the
-    /// `max_bytes_per_expert = 0` sentinel (safe because a genuine byte
-    /// failure cannot occur when the caller passes 0).
+    /// Feasibility check at load time (§6.4, caps only — user decision O3):
+    /// rejects caps that cannot fit their byte budgets. Byte checks run
+    /// first; count rejections use the `max_bytes_per_expert = 0` sentinel
+    /// (safe because a genuine byte failure cannot occur when the caller
+    /// passes 0).
     ///
     /// # Panics
     /// Panics if `half_life_steps <= 0` or non-finite (would produce NaN
@@ -175,7 +162,7 @@ impl Policy {
         vram_budget_bytes: u64,
         ram_budget_bytes: u64,
     ) -> Result<Self, Infeasible> {
-        let vram_req = (cfg.vram_experts_min as u64).saturating_mul(max_bytes_per_expert);
+        let vram_req = (cfg.vram_experts_max as u64).saturating_mul(max_bytes_per_expert);
         if vram_req > vram_budget_bytes {
             return Err(Infeasible {
                 tier: Tier::Vram,
@@ -184,25 +171,13 @@ impl Policy {
                 max_bytes_per_expert,
             });
         }
-        let ram_req = (cfg.ram_experts_min as u64).saturating_mul(max_bytes_per_expert);
+        let ram_req = (cfg.ram_slots as u64).saturating_mul(max_bytes_per_expert);
         if ram_req > ram_budget_bytes {
             return Err(Infeasible {
                 tier: Tier::Ram,
                 required_bytes: ram_req,
                 budget_bytes: ram_budget_bytes,
                 max_bytes_per_expert,
-            });
-        }
-        if cfg.vram_experts_min > cfg.vram_experts_max || cfg.ram_experts_min > cfg.ram_slots {
-            return Err(Infeasible {
-                tier: if cfg.vram_experts_min > cfg.vram_experts_max {
-                    Tier::Vram
-                } else {
-                    Tier::Ram
-                },
-                required_bytes: 0,
-                budget_bytes: 0,
-                max_bytes_per_expert: 0,
             });
         }
         assert!(
@@ -422,56 +397,29 @@ impl Policy {
                 vram_order.push(PolicyEntry {
                     key: k,
                     score: self.states[k].score,
-                    floor_pinned: false,
                 });
             }
         }
-        let mut vram_floor = 0usize;
-        for e in &mut vram_order {
-            if vram_floor == cfg.vram_experts_min {
-                break;
-            }
-            // decision 3: floors pin residents — candidates don't consume quota
-            if resident(e.key, TIER_VRAM) {
-                e.floor_pinned = true;
-                vram_floor += 1;
-            }
-        }
-
         let mut in_order = vec![false; n];
         let mut promoted = vec![false; n];
-        let mut floor_pinned = vec![false; n];
         for e in &vram_order {
             in_order[e.key] = true;
-            if e.floor_pinned {
-                floor_pinned[e.key] = true;
-            } else if !resident(e.key, TIER_VRAM) {
+            if !resident(e.key, TIER_VRAM) {
                 promoted[e.key] = true;
             }
         }
         let mut vram_evict_order: Vec<PolicyEntry> = rank
             .iter()
             .filter(|&&(s, k)| {
-                resident(k, TIER_VRAM)
-                    && !floor_pinned[k]
-                    && (!in_order[k] || (s < cfg.theta_lo && dwell_ok(k)))
+                resident(k, TIER_VRAM) && (!in_order[k] || (s < cfg.theta_lo && dwell_ok(k)))
             })
-            .map(|&(s, k)| PolicyEntry {
-                key: k,
-                score: s,
-                floor_pinned: false,
-            })
+            .map(|&(s, k)| PolicyEntry { key: k, score: s })
             .collect();
         vram_evict_order.reverse();
 
         let mut ram_evict_order: Vec<PolicyEntry> = Vec::new();
-        let mut ram_floor = 0usize;
         for &(_, k) in &rank {
             if !resident(k, TIER_RAM) || resident(k, TIER_VRAM) {
-                continue;
-            }
-            if ram_floor < cfg.ram_experts_min {
-                ram_floor += 1;
                 continue;
             }
             // promoted into VRAM this pass — P2 owns it, P3 must not evict it
@@ -485,7 +433,6 @@ impl Policy {
             ram_evict_order.push(PolicyEntry {
                 key: k,
                 score: self.states[k].score,
-                floor_pinned: false,
             });
         }
         ram_evict_order.reverse();
@@ -587,9 +534,8 @@ impl Policy {
     /// empty by construction regardless of score and MUST NOT be the
     /// source. Ties break by ascending key index (matching `pass()`'s
     /// ordering). Returns `(vram, ram)`: `vram` = top `vram_experts_max`
-    /// by seeded score, best-first, the first `vram_experts_min` of which
-    /// are the VRAM floor; `ram` = next `ram_experts_min` best keys not
-    /// already in `vram`, the RAM floor. Does NOT touch residency — the
+    /// by seeded score, best-first; `ram` = the next best keys that fit
+    /// the rest of the pool (`ram_slots − vram`). Does NOT touch residency — the
     /// pool executes page-in + promote and reports back via
     /// [`Policy::apply_transition`] (existing P2/P3 contract).
     ///
@@ -607,7 +553,7 @@ impl Policy {
         let vram = rank[..vram_end].iter().map(|&(_, k)| k).collect();
         let ram = rank[vram_end..]
             .iter()
-            .take(cfg.ram_experts_min)
+            .take(cfg.ram_slots.saturating_sub(vram_end))
             .map(|&(_, k)| k)
             .collect();
         (vram, ram)
@@ -636,8 +582,6 @@ pub struct PolicyEntry {
     pub key: usize,
     /// Effective score at the pass.
     pub score: f64,
-    /// Pinned by the tier floor — the executor must not evict.
-    pub floor_pinned: bool,
 }
 
 /// Orderings a policy pass produces (§6.3). P2 consumes `vram_order`
@@ -662,9 +606,7 @@ mod tests {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 1,
             ram_slots: 8,
-            ram_experts_min: 1,
             ..Default::default()
         };
         Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap()
@@ -675,9 +617,7 @@ mod tests {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 4,
-            vram_experts_min: 1,
             ram_slots: 8,
-            ram_experts_min: 1,
             ..Default::default()
         };
         Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap()
@@ -700,12 +640,11 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_vram_floor_that_exceeds_budget() {
+    fn new_rejects_vram_cap_that_exceeds_budget() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
-            vram_experts_max: 8,
-            vram_experts_min: 4,
+            vram_experts_max: 4,
             ..Default::default()
         };
         let err = Policy::new(cfg, 1000, 3000, u64::MAX).unwrap_err();
@@ -722,11 +661,11 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_ram_floor_that_exceeds_budget() {
+    fn new_rejects_ram_cap_that_exceeds_budget() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
-            ram_experts_min: 4,
+            ram_slots: 4,
             ..Default::default()
         };
         let err = Policy::new(cfg, 1000, u64::MAX, 3000).unwrap_err();
@@ -742,39 +681,15 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_bad_counts() {
-        let a = PlacementConfig {
-            layers: 1,
-            experts_per_layer: 8,
-            ram_experts_min: 3,
-            ram_slots: 2,
-            ..Default::default()
-        };
-        assert!(Policy::new(a, 1, u64::MAX, 1 << 40).is_err());
-        let b = PlacementConfig {
-            layers: 1,
-            experts_per_layer: 8,
-            vram_experts_min: 5,
-            vram_experts_max: 4,
-            ..Default::default()
-        };
-        let err = Policy::new(b, 1, 1 << 40, 1 << 40).unwrap_err();
-        assert_eq!(err.max_bytes_per_expert, 0);
-        assert!(err.to_string().contains("count"));
-    }
-
-    #[test]
     fn new_accepts_feasible_config() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 2,
             ram_slots: 6,
-            ram_experts_min: 2,
             ..Default::default()
         };
-        let p = Policy::new(cfg, 1000, 4000, 8000).unwrap();
+        let p = Policy::new(cfg, 1000, 8000, 8000).unwrap();
         assert_eq!(p.len(), 8);
     }
 
@@ -863,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_candidates_respect_hysteresis_floor_and_cap() {
+    fn eviction_candidates_respect_hysteresis_and_cap() {
         let mut p = seeded();
         for k in 0..5 {
             p.apply_transition(k, Tier::Ram, true, 0);
@@ -877,13 +792,13 @@ mod tests {
             out.vram_evict_order.iter().any(|e| e.key == 4),
             "coldest beyond-cut resident must be evictable: {out:?}"
         );
-        assert!(
-            out.vram_evict_order.iter().all(|e| e.key != 0),
-            "floor-pinned top resident is never evicted"
+        assert_eq!(
+            out.vram_evict_order.first().map(|e| e.key),
+            Some(4),
+            "coldest beyond-cut resident is evicted first"
         );
         assert!(out.vram_order.len() <= 4, "budget cap respected");
         assert_eq!(out.vram_order[0].key, 0, "best-first ordering");
-        assert!(out.vram_order[0].floor_pinned);
     }
 
     #[test]
@@ -915,7 +830,6 @@ mod tests {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 0,
             ..Default::default()
         };
         let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
@@ -939,26 +853,25 @@ mod tests {
     }
 
     #[test]
-    fn ram_eviction_order_excludes_vram_resident_and_floor() {
+    fn ram_eviction_order_excludes_vram_resident() {
         let mut p = seeded();
         p.apply_transition(1, Tier::Ram, true, 0);
         p.apply_transition(2, Tier::Ram, true, 0);
         p.apply_transition(1, Tier::Vram, true, 1);
-        p.on_access(2, 9999); // top ram score → ram floor pin
         let out = p.pass(10_000);
         assert!(
             out.ram_evict_order.iter().all(|e| e.key != 1),
             "vram-resident excluded"
         );
         assert!(
-            out.ram_evict_order.iter().all(|e| e.key != 2),
-            "ram floor-pinned excluded"
+            out.ram_evict_order.iter().any(|e| e.key == 2),
+            "cold ram expert evictable"
         );
         p.apply_transition(7, Tier::Ram, true, 0);
         let out = p.pass(10_001);
         assert!(
             out.ram_evict_order.iter().any(|e| e.key == 7),
-            "cold unpinned ram expert evictable"
+            "cold ram expert evictable"
         );
     }
 
@@ -981,31 +894,11 @@ mod tests {
     }
 
     #[test]
-    fn floor_pin_survives_below_theta_lo_with_dwell() {
+    fn ram_resident_is_evictable() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 1,
-            ..Default::default()
-        };
-        let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
-        p.apply_transition(0, Tier::Vram, true, 0);
-        p.on_access(0, 0); // score 1.0, decays below θ_lo after enough idle
-        let out = p.pass(5_000);
-        assert!(
-            out.vram_evict_order.iter().all(|e| e.key != 0),
-            "floor-pinned resident below θ_lo is still never evicted: {out:?}"
-        );
-    }
-
-    #[test]
-    fn zero_ram_floor_allows_any_ram_resident_evictable() {
-        let cfg = PlacementConfig {
-            layers: 1,
-            experts_per_layer: 8,
-            vram_experts_max: 8,
-            ram_experts_min: 0,
             ..Default::default()
         };
         let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
@@ -1136,9 +1029,7 @@ mod tests {
                 layers: 1,
                 experts_per_layer: 8,
                 vram_experts_max: 8,
-                vram_experts_min: 1,
                 ram_slots: 8,
-                ram_experts_min: 1,
                 half_life_steps: 512.0,
                 ..Default::default()
             },
@@ -1190,9 +1081,7 @@ mod tests {
                 layers: 1,
                 experts_per_layer: 8,
                 vram_experts_max: 8,
-                vram_experts_min: 1,
                 ram_slots: 8,
-                ram_experts_min: 1,
                 half_life_steps: 512.0,
                 ..Default::default()
             },

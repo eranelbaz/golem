@@ -19,16 +19,14 @@ pub fn key_index(layer: u32, kind: ExpertKind, expert: u32, n_experts: u32) -> u
 }
 
 /// Immutable, pre-materialized policy state consumed by eviction victim picks
-/// (§6.6): keys the policy pins (tier floors) and keys protected like
-/// outstanding leases. The pool never locks policy state — `claim` receives a
-/// snapshot built before the shard lock is taken; the shard lock stays
-/// leaf-most.
+/// (§6.6): keys protected like outstanding leases. The pool never locks
+/// policy state — `claim` receives a snapshot built before the shard lock is
+/// taken; the shard lock stays leaf-most.
 ///
 /// Pool-local for M2.3 (`test_empty`/`pin`/`lease` helpers); the M2.2-backed
 /// builder lands with the engine wiring.
 #[derive(Debug, Clone, Default)]
 pub struct PolicySnapshot {
-    pinned: HashSet<Key>,
     protected: HashSet<Key>,
 }
 
@@ -47,19 +45,13 @@ impl PolicySnapshot {
         Self::default()
     }
 
-    /// Floor-pin a key: never picked as an eviction victim.
-    pub fn pin(&mut self, layer: u32, kind: ExpertKind, expert: u32) {
-        self.pinned.insert(key_of(layer, kind, expert));
-    }
-
     /// Protect a key exactly like an outstanding map lease would.
     pub fn lease(&mut self, layer: u32, kind: ExpertKind, expert: u32) {
         self.protected.insert(key_of(layer, kind, expert));
     }
 
     fn excludes(&self, layer: u32, kind: ExpertKind, expert: u32) -> bool {
-        let key = key_of(layer, kind, expert);
-        self.pinned.contains(&key) || self.protected.contains(&key)
+        self.protected.contains(&key_of(layer, kind, expert))
     }
 }
 
@@ -532,7 +524,7 @@ mod tests {
     fn full_pool_returns_victim_excluding_leased_and_pinned() {
         let m = ResidencyMap::new(1, 8, 2);
         let mut snap = PolicySnapshot::test_empty();
-        snap.pin(0, ExpertKind::Gate, 0); // floor-pinned
+        snap.lease(0, ExpertKind::Gate, 0); // protected like an outstanding lease
         m.claim(0, ExpertKind::Gate, 0, &snap).unwrap();
         m.finish_fill(0, ExpertKind::Gate, 0);
         m.claim(0, ExpertKind::Gate, 1, &snap).unwrap();
@@ -683,10 +675,10 @@ mod tests {
         // Regression: snapshot keys were built with key_index(.., u32::MAX),
         // which matched real keys only at (layer 0, Gate) — a pin/lease on any
         // other layer or kind was silently ignored by victim picks.
-        // Pin, layer 1, Gate:
+        // Snapshot-lease, layer 1, Gate:
         let m = ResidencyMap::new(2, 4, 2); // global pool: 2 slots total
         let mut snap = PolicySnapshot::test_empty();
-        snap.pin(1, ExpertKind::Gate, 0);
+        snap.lease(1, ExpertKind::Gate, 0);
         m.claim(1, ExpertKind::Gate, 0, &snap).unwrap();
         m.finish_fill(1, ExpertKind::Gate, 0);
         m.claim(1, ExpertKind::Down, 0, &snap).unwrap();
@@ -697,9 +689,9 @@ mod tests {
         assert_eq!(
             (e.victim.kind, e.victim.expert),
             (ExpertKind::Down, 0),
-            "pinned (1, Gate, 0) must never be picked"
+            "snapshot-leased (1, Gate, 0) must never be picked"
         );
-        assert!(m.is_resident(1, ExpertKind::Gate, 0), "pin held");
+        assert!(m.is_resident(1, ExpertKind::Gate, 0), "lease held");
 
         // Snapshot lease, layer 1, non-Gate kind (victim scan hits it first):
         let m = ResidencyMap::new(2, 4, 2);

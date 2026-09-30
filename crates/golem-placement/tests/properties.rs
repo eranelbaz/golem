@@ -1,5 +1,5 @@
 //! Randomized-trace acceptance properties (board task M2.2):
-//! floor always resident · no thrash under oscillation · budget never exceeded.
+//! hottest keys resident · no thrash under oscillation · budget never exceeded.
 //!
 //! Deterministic xorshift PRNG, no `rand` dependency. The executor applies
 //! `pass()` output exactly as P2/P3 would; `misbehave = true` skips VRAM
@@ -29,9 +29,7 @@ fn fixture() -> Policy {
         layers: 2,
         experts_per_layer: 128,
         vram_experts_max: 32,
-        vram_experts_min: 8,
         ram_slots: 160, // headroom: 2 hot rotations + uniform tail ≈ 122 — dwell-gated page-ins need eviction supply
-        ram_experts_min: 8,
         ..Default::default()
     };
     Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap()
@@ -106,9 +104,9 @@ fn run_trace(seed: u64, misbehave: bool) -> (Vec<String>, usize, usize) {
     let mut violations: Vec<String> = Vec::new();
     let mut max_vram: usize = 0;
     let mut max_ram: usize = 0;
+    let mut prev_top: Option<Vec<usize>> = None;
     // hot-set base offset advances by 1 every 3·D_min steps
     let rotation_period = 3 * p.config().min_dwell_steps;
-    let mut prev_floor: Option<Vec<usize>> = None;
 
     for step in 0..STEPS {
         let key = if xor.next() % 100 < 60 {
@@ -119,23 +117,18 @@ fn run_trace(seed: u64, misbehave: bool) -> (Vec<String>, usize, usize) {
         let key = key % NUM_KEYS;
         p.on_access(key, step);
         let out = p.pass(step);
-        // property 1: floor recorded by the previous pass is still resident
+        // property 1: the top of the previous pass's VRAM order is still
+        // resident (no thrash at the head of the ranking)
         if step > WARMUP {
-            if let Some(floor) = &prev_floor {
-                for &k in floor {
+            if let Some(top) = &prev_top {
+                for &k in top {
                     if !p.residency(k, Tier::Vram) {
-                        violations.push(format!("step {step}: vram floor key {k} lost residency"));
+                        violations.push(format!("step {step}: vram top key {k} lost residency"));
                     }
                 }
             }
         }
-        prev_floor = Some(
-            out.vram_order
-                .iter()
-                .filter(|e| e.floor_pinned)
-                .map(|e| e.key)
-                .collect(),
-        );
+        prev_top = Some(out.vram_order.iter().take(8).map(|e| e.key).collect());
         ex.apply(&mut p, key, step, &out, &mut violations);
         // property 3: budgets never exceeded
         let vram = (0..p.len()).filter(|&k| p.residency(k, Tier::Vram)).count();
@@ -159,7 +152,7 @@ fn run_trace(seed: u64, misbehave: bool) -> (Vec<String>, usize, usize) {
 }
 
 #[test]
-fn floor_resident_no_thrash_budget_held_across_seeds() {
+fn vram_top_no_thrash_budget_held_across_seeds() {
     for i in 0..5 {
         let seed = 0x9E3779B97F4A7C15 ^ i;
         let (violations, max_vram, max_ram) = run_trace(seed, false);

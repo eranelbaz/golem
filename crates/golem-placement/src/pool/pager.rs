@@ -510,7 +510,7 @@ mod tests {
         pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut |_| {})
             .unwrap();
         let mut snap = PolicySnapshot::test_empty();
-        snap.pin(0, ExpertKind::Gate, 0);
+        snap.lease(0, ExpertKind::Gate, 0);
         pool.snapshots.update(Arc::new(snap));
         pool.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut |_| {})
             .unwrap();
@@ -519,7 +519,7 @@ mod tests {
             .unwrap();
         assert!(
             pool.residency.is_resident(0, ExpertKind::Gate, 0),
-            "floor pin held"
+            "snapshot-lease held"
         );
         assert!(!pool.residency.is_resident(0, ExpertKind::Gate, 1));
         assert!(pool.residency.is_resident(0, ExpertKind::Gate, 2));
