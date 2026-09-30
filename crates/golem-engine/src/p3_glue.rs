@@ -287,6 +287,11 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
 /// GGUF/geometry failures, arena mmap/mlock failures (no silent unlocked
 /// fallback, §5.4), or a second pool-enabled session in one process (M2.3
 /// serves exactly one; multi-session arrives with M4's global registration).
+/// Whether the process-global hooks are registered (review H-10 guard).
+pub(crate) fn hooks_registered() -> bool {
+    HANDLE.get().is_some()
+}
+
 pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     debug_assert!(config.ram_experts_gib > 0, "enable() with pool disabled");
     if ENABLING

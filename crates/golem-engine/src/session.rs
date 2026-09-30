@@ -446,6 +446,21 @@ impl Session {
         let p3_stats = if config.ram_experts_gib > 0 {
             Some(p3_glue::enable(config)?)
         } else {
+            // Review H-10: the hooks are process-global and never
+            // unregistered (no safe quiescence point). If a pooled session
+            // already registered them, a later pool-off session's decode
+            // would be served from THAT pool — its tensor table keyed by
+            // recycled host addresses — silently paging the OLD model's
+            // bytes into the new model. One pool owner per process; a second
+            // model needs a second process (design §9.3 as built).
+            if p3_glue::hooks_registered() {
+                return Err(EngineError::PoolInit(
+                    "a pool-enabled session owns this process's expert hooks; \
+                     another model in the same process would be served the old \
+                     model's bytes — use a second process"
+                        .into(),
+                ));
+            }
             None
         };
 

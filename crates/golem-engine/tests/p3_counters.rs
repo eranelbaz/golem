@@ -101,10 +101,14 @@ fn p3_counters_move_and_output_is_deterministic() {
     // within a session (asserted above via the warm turn); cross-session
     // bitwise equality is NOT a GPU guarantee — benign logit ties flip when
     // buffer layouts differ (the T2 logit-gap story), and this assertion was
-    // never actually exercised on HIP before H-7 (it skipped). Keep only a
-    // liveness check on a second pooled session (hooks are process-global).
-    let off_cfg = common::offload::offload_config();
-    let mut off = Session::new(&off_cfg).unwrap();
-    let out_off = chat(&mut off, "Hello");
-    assert!(!out_off.is_empty(), "second pooled session decodes");
+    // never actually exercised on HIP before H-7 (it skipped).
+    //
+    // Review H-10: a second session in this process — pooled or not — must
+    // be refused: the hooks are process-global and would serve the old
+    // model's pool bytes to a new model's recycled tensor addresses.
+    let off = Session::new(&common::offload::offload_config());
+    assert!(
+        off.is_err(),
+        "a second session in a hook-owning process must be refused (H-10)"
+    );
 }
