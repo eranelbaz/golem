@@ -241,6 +241,49 @@ pub struct TensorEntry {
     pub ggml_type: u32,
 }
 
+/// Routed-expert plane kind. One matcher for C and Rust semantics (review
+/// C-1/M-9): the exact stem `ffn_{gate,up,down}_exps` at a name-segment
+/// boundary, optionally followed by `.weight`. Everything else — the router
+/// `ffn_gate_inp`, dense `ffn_gate`, and loader-created `.scale` variants — is
+/// not an expert plane. Fused `ffn_gate_up_exps` is excluded (P2 splits
+/// routed gate/up/down ranges independently).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpertKind {
+    /// `ffn_gate_exps`.
+    Gate,
+    /// `ffn_up_exps`.
+    Up,
+    /// `ffn_down_exps`.
+    Down,
+}
+
+impl ExpertKind {
+    /// All kinds, in ordinal order.
+    pub const ALL: [ExpertKind; 3] = [Self::Gate, Self::Up, Self::Down];
+
+    /// Parses from a ggml or GGUF tensor name.
+    pub fn from_tensor_name(name: &str) -> Option<Self> {
+        let base = name.strip_suffix(".weight").unwrap_or(name);
+        for (stem, kind) in [
+            ("ffn_gate_exps", Self::Gate),
+            ("ffn_up_exps", Self::Up),
+            ("ffn_down_exps", Self::Down),
+        ] {
+            if let Some(prefix) = base.strip_suffix(stem) {
+                if prefix.is_empty() || prefix.ends_with('.') {
+                    return Some(kind);
+                }
+            }
+        }
+        None
+    }
+
+    /// Flat ordinal (Gate=0, Up=1, Down=2).
+    pub fn ordinal(self) -> usize {
+        self as usize
+    }
+}
+
 /// Walks the KV block, capturing `general.alignment` (default 32) and
 /// rejecting non-U32 or non-power-of-two values (gguf.h requirement).
 fn walk_kvs(r: &mut (impl Read + Seek), n_kv: u64) -> Result<u64, Error> {
@@ -323,6 +366,36 @@ pub fn tensor_entries(r: &mut (impl Read + Seek)) -> Result<Vec<TensorEntry>, Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_name_matcher_exact_stem_and_weight() {
+        assert_eq!(
+            ExpertKind::from_tensor_name("blk.1.ffn_gate_exps.weight"),
+            Some(ExpertKind::Gate)
+        );
+        assert_eq!(
+            ExpertKind::from_tensor_name("blk.44.ffn_down_exps"),
+            Some(ExpertKind::Down)
+        );
+        assert_eq!(
+            ExpertKind::from_tensor_name("ffn_up_exps.weight"),
+            Some(ExpertKind::Up)
+        );
+        // Loader .scale variants, router, dense FFN: never expert planes.
+        assert_eq!(
+            ExpertKind::from_tensor_name("blk.1.ffn_gate_exps.scale"),
+            None
+        );
+        assert_eq!(
+            ExpertKind::from_tensor_name("blk.1.ffn_gate_inp.weight"),
+            None
+        );
+        assert_eq!(ExpertKind::from_tensor_name("blk.0.ffn_gate.weight"), None);
+        assert_eq!(
+            ExpertKind::from_tensor_name("blk.0.ffn_gate_up_exps.weight"),
+            None
+        );
+    }
 
     #[test]
     fn skip_value_rejects_nested_arrays() {

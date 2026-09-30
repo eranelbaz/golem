@@ -9,40 +9,8 @@ use std::collections::HashSet;
 
 use super::primitives::{AtomicU64, Condvar, Mutex};
 
-/// Which of an expert layer's three planes (§3.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ExpertKind {
-    /// `ffn_gate_exps`.
-    Gate,
-    /// `ffn_up_exps`.
-    Up,
-    /// `ffn_down_exps`.
-    Down,
-}
-
-impl ExpertKind {
-    /// All kinds, in ordinal order.
-    pub const ALL: [ExpertKind; 3] = [Self::Gate, Self::Up, Self::Down];
-
-    /// Parses from a ggml tensor name: runtime ggml names
-    /// (`...ffn_gate_exps`) and GGUF-side names (`...ffn_gate_exps.weight`)
-    /// both match; every other name is not an expert plane.
-    pub fn from_tensor_name(name: &str) -> Option<Self> {
-        if name.contains("ffn_gate_exps") {
-            Some(Self::Gate)
-        } else if name.contains("ffn_up_exps") {
-            Some(Self::Up)
-        } else if name.contains("ffn_down_exps") {
-            Some(Self::Down)
-        } else {
-            None
-        }
-    }
-
-    fn ordinal(self) -> usize {
-        self as usize
-    }
-}
+// One expert-name matcher shared by C and Rust semantics (review C-1/M-9).
+pub use golem_gguf::ExpertKind;
 
 /// Flat pool key for `(layer, kind, expert)`.
 pub fn key_index(layer: u32, kind: ExpertKind, expert: u32, n_experts: u32) -> usize {

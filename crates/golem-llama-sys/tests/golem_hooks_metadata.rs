@@ -12,7 +12,7 @@ use golem_llama_sys::raw::*;
 fn expert_metadata_derived_from_tensor_dims() {
     unsafe {
         let ctx = test_ggml_ctx();
-        let t = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_gate_exps");
+        let t = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_gate_exps.weight");
         assert_eq!(golem_tensor_expert_count(t.cast()), 8);
         assert_eq!(
             golem_tensor_expert_stride_bytes(t.cast()),
@@ -22,18 +22,21 @@ fn expert_metadata_derived_from_tensor_dims() {
         assert_eq!(golem_tensor_expert_count(named.cast()), 8);
         assert_eq!(
             golem_tensor_expert_count(
-                new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_up_exps").cast()
+                new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_up_exps.weight").cast()
             ),
             8
         );
         assert_eq!(
             golem_tensor_expert_count(
-                new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_down_exps").cast()
+                new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_down_exps.weight").cast()
             ),
             8
         );
         let dense = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "ffn_down");
         assert_eq!(golem_tensor_expert_count(dense.cast()), 0);
+        // Loader-created .scale variants are not expert planes (review C-1/M-9).
+        let scale = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_gate_exps.scale");
+        assert_eq!(golem_tensor_expert_count(scale.cast()), 0);
         assert_eq!(golem_tensor_expert_stride_bytes(dense.cast()), 0);
     }
 }

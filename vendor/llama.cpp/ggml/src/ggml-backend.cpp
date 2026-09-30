@@ -2649,9 +2649,13 @@ void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
     golem_h_ctx                  = ctx;
 }
 
-/* Expert weights in glm-arch MoE models are 3-D tensors whose names end in
- * ffn_{gate,up,down}_exps (upstream names are blk.%d.ffn_*_exps,
- * llama-arch.cpp:450-453): [n_embd, n_ff_exp, n_expert]. One expert is one
+/* Expert weights in glm-arch MoE models are 3-D tensors whose names contain
+ * the stem ffn_{gate,up,down}_exps as a whole name segment, optionally
+ * followed by ".weight" (runtime ggml names: blk.%d.ffn_*_exps.weight;
+ * gguf-side names drop the suffix). The same rule is implemented in Rust
+ * (golem-gguf::ExpertKind::from_tensor_name) — one shared matcher semantics
+ * (review C-1/M-9): the loader can create `.scale` variants and dense
+ * ffn_gate tensors whose names contain the stems too. One expert is one
  * ne[0]×ne[1] plane; nb[2] is the authoritative plane stride (also correct
  * for padded/non-contiguous tensors, where recomputing from ne is not).
  * Fused ffn_gate_up_exps is deliberately excluded — P2
@@ -2661,11 +2665,26 @@ static int golem_name_ends_with(const char *name, const char *suffix) {
     return nl >= sl && strcmp(name + nl - sl, suffix) == 0;
 }
 
+static int golem_expert_stem_kind(const char *name) {
+    const char *suffixes[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    char base[GGML_MAX_NAME];
+    size_t nl = strnlen(name, GGML_MAX_NAME);
+    if (nl >= sizeof(base)) return 0;
+    memcpy(base, name, nl + 1);
+    size_t bl = strlen(base);
+    if (golem_name_ends_with(base, ".weight")) base[bl - 7] = '\0';
+    for (int k = 0; k < 3; k++) {
+        size_t sl = strlen(suffixes[k]);
+        size_t rest = strlen(base);
+        if (rest >= sl && strcmp(base + rest - sl, suffixes[k]) == 0 &&
+            (rest == sl || base[rest - sl - 1] == '.')) return k + 1;
+    }
+    return 0;
+}
+
 static int golem_tensor_is_expert(const struct ggml_tensor *t) {
     if (t == NULL || ggml_n_dims(t) != 3) return 0;
-    return golem_name_ends_with(t->name, "ffn_gate_exps")
-        || golem_name_ends_with(t->name, "ffn_up_exps")
-        || golem_name_ends_with(t->name, "ffn_down_exps");
+    return golem_expert_stem_kind(t->name) != 0;
 }
 
 int32_t golem_tensor_expert_count(const void *tensor) {

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::error::EngineError;
 use crate::gguf::{GgufMetadata, GgufValue, TensorMeta};
+use golem_gguf::ExpertKind;
 
 /// FFN expert-tensor suffixes, in canonical order.
 const EXPERT_SUFFIXES: [&str; 3] = ["gate", "up", "down"];
@@ -11,21 +12,22 @@ const EXPERT_SUFFIXES: [&str; 3] = ["gate", "up", "down"];
 /// Expert-tensor table: layer number -> suffix -> tensor info.
 type Experts<'a> = BTreeMap<u32, BTreeMap<&'a str, &'a TensorMeta>>;
 
-/// Parses `blk.<N>.ffn_<gate|up|down>_exps.*` into `(layer, suffix)`.
-fn parse_expert_name(name: &str) -> Option<(u32, &str)> {
+/// Parses `blk.<N>.ffn_<gate|up|down>_exps` (optionally `.weight`) into
+/// `(layer, suffix)` via the one shared matcher (review C-1/M-9); everything
+/// else — router, dense FFN, `.scale` variants — is not an expert plane.
+fn parse_expert_name(name: &str) -> Option<(u32, &'static str)> {
+    let kind = ExpertKind::from_tensor_name(name)?;
     let rest = name.strip_prefix("blk.")?;
     let dot = rest.find('.')?;
     let layer = rest[..dot].parse().ok()?;
-    let rest = &rest[dot + 1..];
-    EXPERT_SUFFIXES
-        .into_iter()
-        .find(|s| {
-            rest.strip_prefix("ffn_")
-                .and_then(|r| r.strip_prefix(s))
-                .and_then(|r| r.strip_prefix("_exps."))
-                .is_some()
-        })
-        .map(|s| (layer, s))
+    Some((
+        layer,
+        match kind {
+            ExpertKind::Gate => "gate",
+            ExpertKind::Up => "up",
+            ExpertKind::Down => "down",
+        },
+    ))
 }
 
 /// Static name of a non-integral `GgufValue`, for loud error messages.
