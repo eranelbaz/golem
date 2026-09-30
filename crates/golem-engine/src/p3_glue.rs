@@ -432,6 +432,9 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
 /// Constraints: the void ABI leaves no non-silent failure path; corrupt-weight
 /// decode is worse than a dead process — documented, deliberate).
 fn p3_fatal(context: String) -> ! {
+    // stderr is the one channel always available in an abort path (tracing
+    // may have no subscriber installed).
+    eprintln!("golem p3 fatal: {context}");
     tracing::error!("{context}");
     std::process::abort()
 }

@@ -113,6 +113,12 @@ fn device_cache_skips_on_second_identical_turn() {
     let mut session = match Session::new(&cfg) {
         Ok(s) => s,
         Err(e) if e.to_string().contains("mlock") => {
+            // A failed precondition FAILS (review H-7): an early return reads
+            // as a pass to the harness. Opt-in skip only via explicit env.
+            assert!(
+                std::env::var("GOLEM_ALLOW_SKIP").as_deref() == Ok("1"),
+                "precondition failed: RLIMIT_MEMLOCK below the 1 GiB pool                  (ram_experts_gib=1); raise memlock or set GOLEM_ALLOW_SKIP=1                  to opt out: {e}"
+            );
             eprintln!(
                 "SKIPPED: RLIMIT_MEMLOCK below the 1 GiB pool (ram_experts_gib=1); \
                  run on a machine with unlimited memlock (HIP CI job): {e}"
