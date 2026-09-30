@@ -148,6 +148,12 @@ impl Arena {
         })
     }
 
+    /// Base pointer and byte length of the whole arena, for GPU pinning
+    /// (review H-4) and metrics; the arena keeps ownership.
+    pub fn as_ptr_range(&self) -> (*mut u8, usize) {
+        (self.ptr(), self.len)
+    }
+
     fn ptr(&self) -> *mut u8 {
         self.base.get() as *mut u8
     }

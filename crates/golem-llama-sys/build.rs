@@ -65,6 +65,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={BACKEND_ENV}");
     println!("cargo:rerun-if-env-changed={SKIP_GATE_ENV}");
     println!("cargo:rerun-if-env-changed={AMDGPU_TARGET_ENV}");
+    println!("cargo:rustc-check-cfg=cfg(golem_backend_hip)");
 
     let (raw, resolved) = detect_backend();
     // links = "llama-cpp" surfaces this downstream as DEP_LLAMA_CPP_BACKEND.
@@ -417,6 +418,7 @@ fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) 
         println!("cargo:rustc-link-lib=dylib=hipblas");
         println!("cargo:rustc-link-lib=dylib=rocblas");
         println!("cargo:rustc-link-lib=dylib=amdhip64");
+        println!("cargo:rustc-cfg=golem_backend_hip");
     }
     println!("cargo:rustc-link-lib=dylib=pthread");
     println!("cargo:rustc-link-lib=dylib=dl");

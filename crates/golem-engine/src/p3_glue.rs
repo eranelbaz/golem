@@ -357,6 +357,28 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     let arena = golem_placement::pool::Arena::new(slots as usize * slot_size, slot_size)
         .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
+    // Review H-4 (design §3.5): mlock alone leaves the H2D copy pageable —
+    // driver bounce buffers, ~half of PCIe bandwidth, not truly async, and
+    // PCIe is the §2.4 bottleneck. Register the arena with the HIP runtime;
+    // a failed registration is a startup failure, never a silent downgrade.
+    #[cfg(golem_backend_hip)]
+    {
+        let (ptr, len) = arena.as_ptr_range();
+        // SAFETY: the arena is a live, page-aligned, solely-owned mapping of
+        // exactly `len` bytes (mmap + mlock above); registration happens
+        // before any slot is handed out and unregister rides the process
+        // teardown (the pool is leaked by design, hooks never unregistered).
+        if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
+            return Err(EngineError::PoolInit(format!(
+                "hipHostRegister failed on the {len}-byte expert pool (HIP result {r})"
+            )));
+        }
+        tracing::info!(
+            gib = len as f64 / (1 << 30) as f64,
+            "expert pool GPU-pinned"
+        );
+    }
+
     // M2.3 policy state: empty snapshot (nothing pinned/protected) until the
     // M2.2-backed builder lands with M2.4's snapshot wiring.
     let snapshots = Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty())));
