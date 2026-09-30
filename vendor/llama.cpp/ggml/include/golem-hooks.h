@@ -27,8 +27,8 @@ typedef void (*golem_ensure_host_resident_fn)(void *ctx, const void *tensor,
 
 /* Hook: releases the host-pool leases taken by ensure_host_resident since
  * the previous copy_done. Called at the start of each scheduler compute —
- * the previous decode fully synchronized before returning to the caller, so
- * its DMAs are complete and the slots are safe to recycle. */
+ * the engine synchronizes after every llama_decode (session.rs), so the
+ * previous decode's DMAs are complete and the slots are safe to recycle. */
 typedef void (*golem_copy_done_fn)(void *ctx);
 
 /* Hook: supply eviction/keep ordering for the device expert-copy cache.

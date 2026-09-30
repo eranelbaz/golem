@@ -229,11 +229,12 @@ pub fn check(metadata: &GgufMetadata) -> Result<(), EngineError> {
     let mtp_from = (nextn > 0)
         .then(|| {
             let bc = block_count(metadata)?.expect("nextn without block_count");
-            assert!(
-                nextn <= bc,
-                "nextn_predict_layers {nextn} > block_count {bc}"
-            );
-            Ok::<u32, EngineError>((bc - nextn) as u32)
+            if nextn > bc {
+                return Err(EngineError::UnsupportedModel(format!(
+                    "nextn_predict_layers {nextn} > block_count {bc}"
+                )));
+            }
+            Ok((bc - nextn) as u32)
         })
         .transpose()?;
     let mut experts: Experts = BTreeMap::new();

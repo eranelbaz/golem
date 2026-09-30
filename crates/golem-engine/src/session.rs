@@ -303,6 +303,13 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
     if code != 0 {
         return Err(EngineError::Decode(code));
     }
+    // Review H-2 (quality pass): llama_decode is async w.r.t. the GPU —
+    // synchronize before returning so the expert-copy leases released at the
+    // next compute can never outlive an in-flight DMA. Sampling reads logits
+    // through getters that synchronize, but decode paths without sampling
+    // (probes, future draft loops) must not rely on that.
+    // SAFETY: ctx is live.
+    unsafe { raw::llama_synchronize(ctx.as_ptr()) };
 
     // SAFETY: vocab is live; n_vocab is the loaded vocab size (non-negative).
     let n_vocab = unsafe { raw::llama_vocab_n_tokens(vocab) };
@@ -338,6 +345,10 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         if code != 0 {
             return Err(EngineError::Decode(code));
         }
+        // H-2: synchronize before the logits getter and the next compute's
+        // lease release (see decode_and_synchronize above).
+        // SAFETY: ctx is live.
+        unsafe { raw::llama_synchronize(ctx.as_ptr()) };
 
         // SAFETY: successful decode with one output token; n floats valid.
         let logits_ptr = unsafe { raw::llama_get_logits_ith(ctx.as_ptr(), 0) };
@@ -635,6 +646,9 @@ impl Session {
                 // 1 = no KV slot left (ctx too small for the prompt); the rest fatal alike.
                 return Err(EngineError::Decode(code));
             }
+            // H-2: synchronize (see decode helper above).
+            // SAFETY: ctx is live.
+            unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += len;
             last_chunk_len = len;
         }
@@ -704,6 +718,9 @@ impl Session {
             if code != 0 {
                 return Err(EngineError::Decode(code));
             }
+            // H-2: synchronize (see decode helper above).
+            // SAFETY: ctx is live.
+            unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += 1;
             // SAFETY: sampler chain and ctx are live; the decode emitted logits for slot 0.
             tok = unsafe { raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), 0) };

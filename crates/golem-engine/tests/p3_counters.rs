@@ -41,10 +41,10 @@ fn p3_counters_move_and_output_is_deterministic() {
             // as a pass to the harness. Opt-in skip only via explicit env.
             assert!(
                 std::env::var("GOLEM_ALLOW_SKIP").as_deref() == Ok("1"),
-                "precondition failed: RLIMIT_MEMLOCK below the 1 GiB pool                  (ram_experts_gib=1); raise memlock or set GOLEM_ALLOW_SKIP=1                  to opt out: {e}"
+                "precondition failed: RLIMIT_MEMLOCK below the pool size                  (ram_experts_gib=1); raise memlock or set GOLEM_ALLOW_SKIP=1 to opt out: {e}"
             );
             eprintln!(
-                "SKIPPED: RLIMIT_MEMLOCK below the 1 GiB pool (ram_experts_gib=1); \
+                "SKIPPED: RLIMIT_MEMLOCK below the pool size (ram_experts_gib=1); \
                  run on a machine with unlimited memlock (HIP CI job): {e}"
             );
             return;

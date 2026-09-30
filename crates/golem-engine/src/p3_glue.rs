@@ -88,8 +88,8 @@ struct PoolHandle {
     policy: &'static PolicyQueryState,
     /// Leases held from the previous scheduler compute (review C-2): filled
     /// by `ensure_host_resident`, drained by `copy_done` at the start of the
-    /// NEXT compute — the substrate synchronizes before `llama_decode`
-    /// returns, so the prior step's DMAs are complete by then.
+    /// NEXT compute — the engine synchronizes after every decode
+    /// (session.rs, review H-2), so the prior step's DMAs are complete.
     in_flight_leases: Mutex<Vec<golem_placement::pool::Lease>>,
     /// Pending device-cache budget in experts (from `device_cache_experts`);
     /// consumed (× stride) at the first expert-tensor registration, where
@@ -540,8 +540,8 @@ pub(crate) extern "C" fn ensure_host_resident(
 }
 
 /// Review C-2: releases the host-pool leases of the previous compute. Runs
-/// at the START of a scheduler compute; the previous decode synchronized
-/// before returning to Rust, so its DMAs are complete.
+/// at the START of a scheduler compute; the engine synchronizes after
+/// every decode (review H-2), so its DMAs are complete.
 extern "C" fn copy_done(ctx: *mut c_void) {
     // SAFETY: ctx was installed by `enable` as a leaked `&'static PoolHandle`.
     let h = unsafe { &*(ctx as *const PoolHandle) };

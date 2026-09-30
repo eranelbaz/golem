@@ -171,15 +171,18 @@ impl GgufPreadSource {
         let split_count = golem_gguf::kv_int(&kvs, "split.count").unwrap_or(1);
         let nextn = golem_gguf::arch_kv_int(&kvs, "nextn_predict_layers").unwrap_or(0);
         let block_count = golem_gguf::arch_kv_int(&kvs, "block_count");
-        let mtp_from = block_count.map(|bc| {
-            // A nextn value larger than block_count is a corrupt KV, not
-            // "skip everything": name it.
-            assert!(
-                nextn <= bc,
-                "nextn_predict_layers {nextn} > block_count {bc}"
-            );
-            bc - nextn
-        });
+        let mtp_from = block_count
+            .map(|bc| {
+                // A nextn value larger than block_count is a corrupt KV, not
+                // "skip everything": name it (library rule: Result, not panic).
+                if nextn > bc {
+                    return Err(SourceError::Gguf(golem_gguf::Error(format!(
+                        "nextn_predict_layers {nextn} > block_count {bc}"
+                    ))));
+                }
+                Ok(bc - nextn)
+            })
+            .transpose()?;
 
         let mut files = Vec::with_capacity(split_count as usize);
         let mut planes = HashMap::new();

@@ -287,7 +287,10 @@ impl ExpertPool {
         slot: u32,
         claim: Option<FillClaim>,
     ) -> Result<(), PoolError> {
-        let fill_claim = claim.unwrap_or(FillClaim { slot });
+        // The claim comes from claim() (Filled/Evicted both grant one) — the
+        // residency map is the only constructor (review H-1).
+        let fill_claim =
+            claim.expect("page_in without a FillClaim (review H-1 capability invariant)");
         match self
             .source
             .read_expert(layer, kind, expert, self.arena.slot_mut(slot, &fill_claim))

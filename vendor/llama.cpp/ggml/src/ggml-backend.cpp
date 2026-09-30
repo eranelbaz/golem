@@ -1691,9 +1691,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     // Golem C-2: release the host-pool leases taken during the PREVIOUS
-    // compute. The caller synchronizes before llama_decode returns, so those
-    // copies are complete; the leases must survive until here so eviction
-    // cannot recycle a slot mid-DMA.
+    // compute. The engine (golem session loop) synchronizes after every
+    // decode, so those copies are complete; the leases must survive until
+    // here so eviction cannot recycle a slot mid-DMA.
     if (golem_h_copy_done != NULL) {
         golem_h_copy_done(golem_h_ctx);
     }
@@ -1806,27 +1806,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // Golem C-2: the RAM pool is the H2D source — the
                             // loader's expert bytes may be a read-only file
                             // mmap. Expert slots are independent allocations,
-                            // so copy per expert; the MMQ padding rides on the
-                            // last expert of the run, as upstream's contiguous
-                            // copy did.
+                            // so copy per expert; the 512 B non-NaN MMQ tail
+                            // after the last expert is sourced from that last
+                            // expert's own first bytes (content never read by
+                            // the kernels; upstream used the next expert's
+                            // bytes, which would cost a full plane page-in).
                             static thread_local std::vector<const void *> golem_ptrs;
                             const size_t n = last_id - first_id + 1;
-                            const size_t want = n + (padding_end > 0 ? 1 : 0);
-                            if (golem_ptrs.size() < want) golem_ptrs.resize(want);
-                            // Ask the pool for one expert past the run when a
-                            // padding tail is needed: upstream's contiguous
-                            // copy used the next expert's bytes as padding.
-                            const int32_t ens_last = last_id + (padding_end > 0 ? 1 : 0);
-                            golem_h_ensure_host_resident(golem_h_ctx, input, first_id, ens_last, golem_ptrs.data());
+                            if (golem_ptrs.size() < n) golem_ptrs.resize(n);
+                            golem_h_ensure_host_resident(golem_h_ctx, input, first_id, last_id, golem_ptrs.data());
                             size_t off = expert_offset;
                             for (size_t i = 0; i < n; ++i) {
                                 const size_t bytes = expert_size + (i == n - 1 ? padding_end : 0);
-                                if (i == n - 1 && padding_end > 0 && golem_ptrs[n] != NULL) {
-                                    // padding rides on the NEXT expert's slot
-                                    ggml_backend_tensor_set_async(split_backend, dst, golem_ptrs[n], off, bytes);
-                                } else {
-                                    ggml_backend_tensor_set_async(split_backend, dst, golem_ptrs[i], off, bytes);
-                                }
+                                ggml_backend_tensor_set_async(split_backend, dst, golem_ptrs[i], off, bytes);
                                 off += expert_size;
                             }
                             return;

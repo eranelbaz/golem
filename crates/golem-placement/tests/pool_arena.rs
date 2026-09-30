@@ -5,8 +5,8 @@
 //! [`ExpertPool`].
 
 use golem_gguf::ExpertKind;
+use golem_placement::pool::primitives::{Arc, arc_dyn};
 use golem_placement::pool::{Arena, ExpertPool, P3Stats, PolicySnapshot, SnapshotHandle};
-use std::sync::Arc;
 
 /// Deterministic 1-byte-per-expert source: expert `e` of layer 0 reads as
 /// `0xAA + e`; other layers fail (out of scope).
@@ -41,7 +41,7 @@ fn arena_locks_and_slots_are_disjoint() {
     let slot_size = 16 * 32 * 4; // n_ff_exp * n_embd * F32 (tiny-moe plane)
     let pool = ExpertPool::new(
         Arena::new(slot_size * 4, slot_size).expect("mlock may fail on low RLIMIT_MEMLOCK"),
-        Arc::new(ByteSource),
+        arc_dyn(std::sync::Arc::new(ByteSource)),
         Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
         Arc::new(P3Stats::new()),
         1, // n_layers
