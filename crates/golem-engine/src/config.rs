@@ -13,7 +13,9 @@ pub struct EngineConfig {
     pub batch_tokens: u32,
     /// Maximum tokens to generate per completion.
     pub n_predict: u32,
-    /// Decode threads (tech design §7.2: default 1).
+    /// Decode threads (§7.2 as amended: physical cores / 2, min 1 — CPU-side
+    /// ops still run on these: sampling, the non-offloaded tail, tokenizer,
+    /// ids readback).
     pub threads: u32,
     /// Model layers to offload to the GPU (`llama_model_params::n_gpu_layers`,
     /// llama.h): 0 keeps the whole model on CPU — the CI-leg default.
@@ -46,7 +48,9 @@ impl Default for EngineConfig {
             n_ctx: 256,
             batch_tokens: 512,
             n_predict: 64,
-            threads: 1,
+            threads: std::thread::available_parallelism()
+                .map(|n| (n.get() / 2).max(1) as u32)
+                .unwrap_or(1),
             n_gpu_layers: 0,
             flash_attn_on: false,
             cpu_moe_layers: None,
@@ -66,7 +70,12 @@ mod tests {
         assert_eq!(c.n_ctx, 256);
         assert_eq!(c.batch_tokens, 512);
         assert_eq!(c.n_predict, 64);
-        assert_eq!(c.threads, 1);
+        assert_eq!(
+            c.threads,
+            std::thread::available_parallelism()
+                .map(|n| (n.get() / 2).max(1) as u32)
+                .unwrap_or(1)
+        );
         assert_eq!(c.model_path, PathBuf::new());
         assert_eq!(
             c.n_gpu_layers, 0,

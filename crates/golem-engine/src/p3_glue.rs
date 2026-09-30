@@ -376,9 +376,8 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     );
 
     // M2.4 P2 state: per-expert recency (never-accessed first, then
-    // ascending last-access step). Floors are cut (declared deviation:
-    // `floor_pinned` needs PlacementConfig, which enable() lacks) — pure
-    // recency order. The shuffle knob is read exactly once per process here.
+    // ascending last-access step) — pure recency order. The shuffle knob is
+    // read exactly once per process here.
     let shuffle = std::env::var("GOLEM_TEST_SHUFFLE_ORDER").is_ok_and(|v| v != "0");
     let policy: &'static PolicyQueryState = Box::leak(Box::new(PolicyQueryState::new(
         geo.n_layers,

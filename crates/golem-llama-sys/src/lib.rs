@@ -93,4 +93,17 @@ pub mod pinned {
 
     /// Flag value for [`hip_host_unregister`] callers that need it.
     pub const UNREGISTER_FLAG: std::ffi::c_uint = HIP_HOST_REGISTER_UNREGISTER;
+
+    /// `(free, total)` device bytes (`hipMemGetInfo`). `None` when the HIP
+    /// runtime reports an error — callers must then refuse to derive a device
+    /// budget rather than guess.
+    pub fn free_device_mem() -> Option<(usize, usize)> {
+        unsafe extern "C" {
+            fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> std::ffi::c_int;
+        }
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: plain out-parameters, no invariants.
+        let r = unsafe { hipMemGetInfo(&mut free, &mut total) };
+        if r == 0 { Some((free, total)) } else { None }
+    }
 }
