@@ -180,35 +180,82 @@ impl ExpertPool {
         debug_assert!(first <= last, "inverted range ({first}, {last})");
         let snapshot = self.snapshots.current();
         for expert in first..=last {
-            let slot = match self.residency.claim(layer, kind, expert, &snapshot) {
-                Ok(Claim::Resident { slot }) => {
-                    self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
-                    slot
-                }
-                Ok(Claim::Filled { slot }) => {
-                    self.page_in(demand, layer, kind, expert, slot)?;
-                    slot
-                }
-                Err(evicted) => {
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                    self.page_in(demand, layer, kind, expert, evicted.slot)?;
-                    evicted.slot
-                }
-            };
-            // SAFETY of the copy: `slot` is only readable under this lease
-            // (claim granted it; eviction excludes leased keys), so `copy`
-            // observes exactly this key's bytes — the T6 invariant.
-            let lease = Lease {
+            let (slot, lease) = self.claim_leased(demand, layer, kind, expert, &snapshot)?;
+            copy(self.arena.slot(slot));
+            drop(lease);
+        }
+        Ok(())
+    }
+
+    /// Claims one expert's slot, paging it in if needed, and returns the slot
+    /// index plus the UNDROPPED lease (review C-2: the caller keeps the lease
+    /// until the host→device DMA is known complete, then drops it).
+    fn claim_leased(
+        &self,
+        demand: bool,
+        layer: u32,
+        kind: ExpertKind,
+        expert: u32,
+        snapshot: &PolicySnapshot,
+    ) -> Result<(u32, Lease), PoolError> {
+        let slot = match self.residency.claim(layer, kind, expert, snapshot) {
+            Ok(Claim::Resident { slot }) => {
+                self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+                slot
+            }
+            Ok(Claim::Filled { slot }) => {
+                self.page_in(demand, layer, kind, expert, slot)?;
+                slot
+            }
+            Err(evicted) => {
+                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                self.page_in(demand, layer, kind, expert, evicted.slot)?;
+                evicted.slot
+            }
+        };
+        Ok((
+            slot,
+            Lease {
                 map: self.residency.clone(),
                 layer,
                 kind,
                 expert,
                 slot,
-            };
-            copy(self.arena.slot(slot));
-            drop(lease);
+            },
+        ))
+    }
+
+    /// Review C-2: claims `[first, last]`, pages each expert in, and returns
+    /// the pool-side host pointer per expert together with the held leases.
+    /// The caller MUST drop the leases only after the device has consumed the
+    /// bytes (the glue releases them from the `copy_done` hook).
+    pub fn ensure_range_leased(
+        &self,
+        demand: bool,
+        layer: u32,
+        kind: ExpertKind,
+        first: u32,
+        last: u32,
+    ) -> Result<(Vec<*const u8>, Vec<Lease>), PoolError> {
+        debug_assert!(first <= last, "inverted range ({first}, {last})");
+        if demand {
+            self.demand_inflight.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(())
+        let result = (|| {
+            let snapshot = self.snapshots.current();
+            let mut ptrs = Vec::with_capacity((last - first + 1) as usize);
+            let mut leases = Vec::with_capacity((last - first + 1) as usize);
+            for expert in first..=last {
+                let (slot, lease) = self.claim_leased(demand, layer, kind, expert, &snapshot)?;
+                ptrs.push(self.arena.slot(slot).as_ptr());
+                leases.push(lease);
+            }
+            Ok((ptrs, leases))
+        })();
+        if demand {
+            self.demand_inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Fills one slot from the source. The `Filled`/evict claim left this key

@@ -55,7 +55,15 @@ fn policy_query_is_consulted_with_valid_permutations() {
         _tensor: *const libc::c_void,
         _first: i32,
         _last: i32,
+        _ptrs: *mut *const libc::c_void,
     ) {
+        // ABI v2 (C-2): the substrate copies from the returned pointers; these
+        // hook-level tests don't page from a pool, so serve one static buffer.
+        const SRC: [u8; 65536] = [0u8; 65536];
+        let src = SRC.as_ptr() as *const libc::c_void;
+        for i in 0..((_last - _first + 1) as usize) {
+            unsafe { *_ptrs.add(i) = src };
+        }
     }
 
     // SAFETY: valid fn pointers; process-lifetime registration (no unregis-
@@ -66,6 +74,7 @@ fn policy_query_is_consulted_with_valid_permutations() {
             Some(on_ensure),
             Some(on_query),
             Some(on_notify),
+            None,
             std::ptr::null_mut(),
         );
     }

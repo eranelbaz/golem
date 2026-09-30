@@ -21,7 +21,16 @@ fn ensure_host_resident_fires_on_offload_decode() {
         _tensor: *const libc::c_void,
         first: i32,
         last: i32,
+        _ptrs: *mut *const libc::c_void,
     ) {
+        // ABI v2 (C-2): the substrate copies from the returned pointers; these
+        // hook-level tests don't page from a pool, so serve one static buffer.
+        const SRC: [u8; 65536] = [0u8; 65536];
+        let src = SRC.as_ptr() as *const libc::c_void;
+        for i in 0..((last - first + 1) as usize) {
+            unsafe { *_ptrs.add(i) = src };
+        }
+
         CALLS.fetch_add(1, Ordering::SeqCst);
         LAST_RANGE.store(((first as usize) << 16) | last as usize, Ordering::SeqCst);
     }
@@ -31,6 +40,7 @@ fn ensure_host_resident_fires_on_offload_decode() {
     unsafe {
         golem_llama_sys::raw::golem_register_hooks(
             Some(on_ensure),
+            None,
             None,
             None,
             std::ptr::null_mut(),

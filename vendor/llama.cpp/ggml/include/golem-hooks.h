@@ -15,9 +15,21 @@ extern "C" {
 typedef struct golem_policy_state golem_policy_state;
 
 /* Hook: ensure [first_id, last_id] of `tensor` are resident in the host expert
- * pool before the substrate reads them (blocks; called on the decode thread). */
+ * pool before the substrate reads them (blocks; called on the decode thread).
+ * ABI v2 (review C-2): fills out_ptrs[e - first_id] with the pool-side host
+ * pointer of expert e's plane — the RAM pool is the source of the host→device
+ * copy, because the loader's expert bytes may live in a read-only file mmap.
+ * The pool holds a lease on each returned slot until the matching
+ * copy_done(ctx) call, so eviction cannot recycle a slot mid-DMA. */
 typedef void (*golem_ensure_host_resident_fn)(void *ctx, const void *tensor,
-                                              int32_t first_id, int32_t last_id);
+                                              int32_t first_id, int32_t last_id,
+                                              const void **out_ptrs);
+
+/* Hook: releases the host-pool leases taken by ensure_host_resident since
+ * the previous copy_done. Called at the start of each scheduler compute —
+ * the previous decode fully synchronized before returning to the caller, so
+ * its DMAs are complete and the slots are safe to recycle. */
+typedef void (*golem_copy_done_fn)(void *ctx);
 
 /* Hook: supply eviction/keep ordering for the device expert-copy cache.
  * policy_query returns a permutation of [0, n_experts) in evict-first order;
@@ -34,6 +46,7 @@ typedef void (*golem_notify_access_fn)(void *ctx, int64_t expert_id);
 void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
                           golem_policy_query_fn policy_query,
                           golem_notify_access_fn notify_access,
+                          golem_copy_done_fn copy_done,
                           void *ctx);
 
 /* 0 when `t` is not an expert tensor; else expert count. */

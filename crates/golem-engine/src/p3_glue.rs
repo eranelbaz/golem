@@ -54,10 +54,6 @@ struct TensorEntry {
     stride: usize,
     /// Expert count (`ne[2]` via `golem_tensor_expert_count`).
     n_experts: u32,
-    /// Plane 0 of the tensor's host weights buffer. Stable for the process
-    /// lifetime: hooks are never unregistered, so the substrate's weights
-    /// buffer (and this pointer) outlives every callback by construction.
-    data: *mut u8,
 }
 
 /// The leaked process-lifetime P3 state. See [`HANDLE`].
@@ -90,6 +86,11 @@ struct PoolHandle {
     /// P2/P4 policy state (order building + access bookkeeping), leaked
     /// alongside the handle and shared with the prefetch feed by reference.
     policy: &'static PolicyQueryState,
+    /// Leases held from the previous scheduler compute (review C-2): filled
+    /// by `ensure_host_resident`, drained by `copy_done` at the start of the
+    /// NEXT compute — the substrate synchronizes before `llama_decode`
+    /// returns, so the prior step's DMAs are complete by then.
+    in_flight_leases: Mutex<Vec<golem_placement::pool::Lease>>,
     /// Pending device-cache budget in experts (from `device_cache_experts`);
     /// consumed (× stride) at the first expert-tensor registration, where
     /// `golem_tensor_expert_stride_bytes` first becomes knowable. 0 = nothing
@@ -388,6 +389,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         pool: pool.clone(),
         n_experts: geo.n_experts,
         tensors: Mutex::new(HashMap::new()),
+        in_flight_leases: Mutex::new(Vec::new()),
         slow_calls: AtomicUsize::new(0),
         policy,
         budget_pending_experts: AtomicUsize::new(config.device_cache_experts as usize),
@@ -413,6 +415,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
             Some(ensure_host_resident),
             Some(policy_query),
             Some(notify_access),
+            Some(copy_done),
             handle as *const PoolHandle as *mut c_void,
         );
     }
@@ -447,11 +450,12 @@ fn p3_fatal(context: String) -> ! {
 /// No input clamping: an out-of-range or inverted `[first_id, last_id]` is a
 /// contract violation → logged + `abort()` (Global Constraints). Non-expert
 /// tensors return immediately (null-guard semantics upstream of the pool).
-extern "C" fn ensure_host_resident(
+pub(crate) extern "C" fn ensure_host_resident(
     ctx: *mut c_void,
     tensor: *const c_void,
     first_id: i32,
     last_id: i32,
+    out_ptrs: *mut *const c_void,
 ) {
     // SAFETY: ctx was installed by `enable` as a leaked `&'static PoolHandle`
     // and is never mutated afterwards; it outlives every callback.
@@ -467,40 +471,33 @@ extern "C" fn ensure_host_resident(
     }
     let first = first_id as u32;
     let last = last_id as u32;
+    let n = (last - first + 1) as usize;
+    // SAFETY: C allocates `n` entries and passes the array here (copy_experts_to).
+    let out: &mut [*const c_void] = unsafe {
+        assert!(!out_ptrs.is_null());
+        std::slice::from_raw_parts_mut(out_ptrs, n)
+    };
 
-    for expert in first..=last {
-        // Plane `e` lives at data + e·stride (plane 0 at +0; the registration
-        // cross-check proved the source agrees byte-for-byte).
-        let stride = entry.stride;
-        // SAFETY: `add` is in-bounds: expert < n_experts (checked above) and
-        // the buffer holds n_experts·stride bytes (registration-time
-        // cross-check vs the source's GGUF geometry walk).
-        let dst = unsafe { entry.data.add(expert as usize * stride) };
-        let result = h.pool.ensure_range(
-            true,
-            entry.layer,
-            entry.kind,
-            expert,
-            expert,
-            &mut |slot: &[u8]| {
-                // SAFETY: copy under the lease (the slot cannot be refilled while
-                // the lease is held, §6.6); `dst` is the tensor's process-lifetime
-                // host buffer, and the C call-site reads it only after this
-                // callback returns; ranges are exactly one plane apart.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(slot.as_ptr(), dst, stride);
-                }
-            },
-        );
-        if let Err(e) = result {
-            p3_fatal(format!(
-                "P3 page-in failed (layer {}, {kind:?}, expert {expert}): {e}; \
-                 aborting rather than decoding on garbage",
+    // Review C-2: the pool IS the H2D source. Claim + page-in each expert and
+    // hand the slot pointer to C; the lease stays held (in `in_flight_leases`)
+    // until `copy_done`, so eviction cannot recycle a slot mid-DMA.
+    let (ptrs, leases) =
+        match h
+            .pool
+            .ensure_range_leased(true, entry.layer, entry.kind, first, last)
+        {
+            Ok(r) => r,
+            Err(e) => p3_fatal(format!(
+                "P3 page-in failed (layer {}, {kind:?}, experts [{first}, {last}]): {e}; \
+             aborting rather than decoding on garbage",
                 entry.layer,
                 kind = entry.kind
-            ));
-        }
+            )),
+        };
+    for (slot, dst) in ptrs.into_iter().zip(out.iter_mut()) {
+        *dst = slot as *const c_void;
     }
+    h.in_flight_leases.lock().unwrap().extend(leases);
 
     // Counters visibility: one info line per 1000 slow paths (real metrics
     // are P4's).
@@ -513,6 +510,15 @@ extern "C" fn ensure_host_resident(
             "P3 slow-path progress"
         );
     }
+}
+
+/// Review C-2: releases the host-pool leases of the previous compute. Runs
+/// at the START of a scheduler compute; the previous decode synchronized
+/// before returning to Rust, so its DMAs are complete.
+extern "C" fn copy_done(ctx: *mut c_void) {
+    // SAFETY: ctx was installed by `enable` as a leaked `&'static PoolHandle`.
+    let h = unsafe { &*(ctx as *const PoolHandle) };
+    h.in_flight_leases.lock().unwrap().clear(); // Lease::drop releases each
 }
 
 /// §6.5 prefetch feed backed by the P2 access map: `notify_access` (P4)
@@ -676,7 +682,6 @@ impl PoolHandle {
             kind,
             stride,
             n_experts: n_experts as u32,
-            data: t.data.cast::<u8>(),
         };
         self.tensors.lock().unwrap().insert(key, entry);
         tracing::debug!(tensor = %name, layer, ?kind, stride, "P3 tensor registered");

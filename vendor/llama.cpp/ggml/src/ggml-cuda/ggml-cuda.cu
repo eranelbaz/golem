@@ -1,4 +1,8 @@
 #include "ggml-cuda.h"
+
+// Golem C-4 threshold override + D-8 graphs gate (defined in ggml-backend.cpp).
+extern "C" int golem_expert_offload_min_batch(int default_value);
+extern "C" int golem_graphs_disabled(void);
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2556,6 +2560,14 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+
+    // Golem (design sec 3.5, review D-8): the golem hooks fire inside the
+    // split-scheduler expert-copy branch; a captured graph replays the
+    // recorded copies without re-entering the hooks, silently freezing
+    // routing-dependent copies. Disable capture whenever golem hooks are on.
+    if (golem_graphs_disabled()) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph

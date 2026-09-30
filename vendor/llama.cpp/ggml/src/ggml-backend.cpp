@@ -32,6 +32,7 @@
 #include "golem-hooks.h"
 
 static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
+static golem_copy_done_fn golem_h_copy_done = NULL;
 static golem_policy_query_fn golem_h_policy_query = NULL;
 static golem_notify_access_fn golem_h_notify_access = NULL;
 static void * golem_h_ctx = NULL;
@@ -1689,6 +1690,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+    // Golem C-2: release the host-pool leases taken during the PREVIOUS
+    // compute. The caller synchronizes before llama_decode returns, so those
+    // copies are complete; the leases must survive until here so eviction
+    // cannot recycle a slot mid-DMA.
+    if (golem_h_copy_done != NULL) {
+        golem_h_copy_done(golem_h_ctx);
+    }
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1789,13 +1797,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // group consecutive experts and copy them together
                     // pad_ok: append the padding tail only when the expert after the run exists and is NOT bit-valid (correctness core sec 3 - keeps "bit => byte-identity" locally provable).
                     auto copy_experts_to = [&](struct ggml_tensor * dst, int32_t first_id, int32_t last_id, bool pad_ok) {
-                        if (golem_h_ensure_host_resident != NULL) {
-                            golem_h_ensure_host_resident(golem_h_ctx, input, first_id, last_id);
-                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = (last_id < n_expert - 1 && pad_ok) ? padding : 0;
+
+                        if (golem_h_ensure_host_resident != NULL) {
+                            // Golem C-2: the RAM pool is the H2D source — the
+                            // loader's expert bytes may be a read-only file
+                            // mmap. Expert slots are independent allocations,
+                            // so copy per expert; the MMQ padding rides on the
+                            // last expert of the run, as upstream's contiguous
+                            // copy did.
+                            static thread_local std::vector<const void *> golem_ptrs;
+                            const size_t n = last_id - first_id + 1;
+                            const size_t want = n + (padding_end > 0 ? 1 : 0);
+                            if (golem_ptrs.size() < want) golem_ptrs.resize(want);
+                            // Ask the pool for one expert past the run when a
+                            // padding tail is needed: upstream's contiguous
+                            // copy used the next expert's bytes as padding.
+                            const int32_t ens_last = last_id + (padding_end > 0 ? 1 : 0);
+                            golem_h_ensure_host_resident(golem_h_ctx, input, first_id, ens_last, golem_ptrs.data());
+                            size_t off = expert_offset;
+                            for (size_t i = 0; i < n; ++i) {
+                                const size_t bytes = expert_size + (i == n - 1 ? padding_end : 0);
+                                if (i == n - 1 && padding_end > 0 && golem_ptrs[n] != NULL) {
+                                    // padding rides on the NEXT expert's slot
+                                    ggml_backend_tensor_set_async(split_backend, dst, golem_ptrs[n], off, bytes);
+                                } else {
+                                    ggml_backend_tensor_set_async(split_backend, dst, golem_ptrs[i], off, bytes);
+                                }
+                                off += expert_size;
+                            }
+                            return;
+                        }
 
                         ggml_backend_tensor_set_async(split_backend,
                             dst,
@@ -2642,8 +2677,10 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
 void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
                           golem_policy_query_fn policy_query,
                           golem_notify_access_fn notify_access,
+                          golem_copy_done_fn copy_done,
                           void *ctx) {
     golem_h_ensure_host_resident = ensure_host_resident;
+    golem_h_copy_done            = copy_done;
     golem_h_policy_query         = policy_query;
     golem_h_notify_access        = notify_access;
     golem_h_ctx                  = ctx;
@@ -2658,8 +2695,13 @@ void golem_set_expert_offload_min_batch(int n) {
 }
 
 // Declared `extern "C"` in the CUDA/HIP TUs (ggml-cuda.cu); the header does
-// not declare this internal helper, so pin the linkage here.
+// not declare these internal helpers, so pin the linkage here.
 extern "C" int golem_expert_offload_min_batch(int default_value);
+extern "C" int golem_graphs_disabled(void);
+
+int golem_graphs_disabled(void) {
+    return golem_h_ensure_host_resident != NULL || golem_h_policy_query != NULL;
+}
 
 int golem_expert_offload_min_batch(int default_value) {
     return golem_op_offload_min_batch_override >= 0

@@ -54,7 +54,7 @@ fn two_dim_tensor_with_exps_suffix_is_not_expert() {
 #[test]
 fn register_null_hooks_smoke() {
     unsafe {
-        golem_register_hooks(None, None, None, std::ptr::null_mut());
+        golem_register_hooks(None, None, None, None, std::ptr::null_mut());
         // No assertion beyond "does not crash + links": the unset state is
         // byte-identity-proven by Task 4's dump gate.
     }

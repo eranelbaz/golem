@@ -91,7 +91,7 @@ GolemDcCounters golem_dc_step_impl(GolemDeviceCache &st, const std::vector<int32
 
     // (a) budget eviction (soft cap): evict-first walk of `order`.
     const size_t budget = budget_bytes == 0 ? (size_t) n_experts * expert_size : budget_bytes;
-    if (st.valid_bytes > budget) {
+        if (st.valid_bytes > budget) {
         std::vector<ggml_bitset_t> is_routed(ggml_bitset_size(n_experts), 0);
         for (int32_t id : routed) {
             GGML_ASSERT(id >= 0 && id < n_experts);
