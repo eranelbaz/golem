@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use golem_gguf::{data_section_offset, ggml_row_bytes, tensor_entries};
 
@@ -108,21 +108,22 @@ impl From<golem_gguf::Error> for SourceError {
     }
 }
 
-/// Per-(layer, kind) plane geometry: absolute file offset of expert 0, the
-/// plane byte stride (from the GGUF row size — per-kind, never a constant),
-/// and the expert count.
+/// Per-(layer, kind) plane geometry: shard index, absolute file offset of
+/// expert 0, the plane byte stride (from the GGUF row size — per-kind, never
+/// a constant), and the expert count.
 #[derive(Debug, Clone, Copy)]
 struct Plane {
+    shard: usize,
     base: u64,
     stride: u64,
     n_experts: u32,
 }
 
-/// One open GGUF replica; `pread`-style reads at computed plane offsets (the
-/// file cursor is never shared, so concurrent reads are safe).
+/// One open GGUF replica set; `pread`-style reads at computed plane offsets
+/// (the file cursors are never shared, so concurrent reads are safe).
 #[derive(Debug)]
 pub struct GgufPreadSource {
-    file: File,
+    files: Vec<File>,
     planes: HashMap<(u32, ExpertKind), Plane>,
 }
 
@@ -154,47 +155,120 @@ impl GgufPreadSource {
         })
     }
 
-    /// Opens `path` and walks the GGUF tensor table. Expert layers are
-    /// numbered EXCLUDING the dense lead: pool layer = gguf blk −
-    /// `n_dense_lead` (tiny-moe: 1).
+    /// Opens the shard set rooted at `path` and walks every shard's GGUF
+    /// tensor table (review C-5: split GGUFs, where the first shard can be
+    /// metadata-only). Sibling shards are discovered by rewriting the
+    /// `-NNNNN-of-MMMMM.gguf` suffix per `split.count`. Expert layers are
+    /// numbered EXCLUDING the dense lead AND the trailing MTP/NextN blocks
+    /// (review R-2): pool layer = gguf blk − `n_dense_lead`, live only for
+    /// `n_dense_lead ≤ blk < block_count − nextn_predict_layers`.
     ///
     /// # Errors
-    /// File open/parse failures, or an expert tensor whose stride math fails.
+    /// File open/parse failures, a missing/misnamed sibling shard, or an
+    /// expert tensor whose stride math fails.
     pub fn open(path: &Path, n_dense_lead: u32) -> Result<Self, SourceError> {
-        let mut file = File::open(path)?;
-        let data_start = data_section_offset(&mut file)?;
-        let entries = tensor_entries(&mut file)?;
-        let mut planes = HashMap::new();
-        for e in entries {
-            let Some(kind) = ExpertKind::from_tensor_name(&e.name) else {
-                continue;
-            };
-            let Some(blk) = blk_of(&e.name) else {
-                return Err(SourceError::UnnamedBlock(e.name));
-            };
-            if blk < n_dense_lead {
-                continue; // dense lead carries no expert tensors
-            }
-            let stride = ggml_row_bytes(e.ggml_type, e.dims[0])
-                .ok_or(SourceError::UnknownGgmlType {
-                    name: e.name.clone(),
-                    ggml_type: e.ggml_type,
-                })?
-                .checked_mul(e.dims[1])
-                .ok_or(SourceError::StrideOverflow {
-                    name: e.name.clone(),
-                })?;
-            planes.insert(
-                (blk - n_dense_lead, kind),
-                Plane {
-                    base: data_start + e.offset,
-                    stride,
-                    n_experts: e.dims[2] as u32,
-                },
+        let kvs = golem_gguf::read_kvs(&mut File::open(path)?)?;
+        let split_count = golem_gguf::kv_int(&kvs, "split.count").unwrap_or(1);
+        let nextn = golem_gguf::arch_kv_int(&kvs, "nextn_predict_layers").unwrap_or(0);
+        let block_count = golem_gguf::arch_kv_int(&kvs, "block_count");
+        let mtp_from = block_count.map(|bc| {
+            // A nextn value larger than block_count is a corrupt KV, not
+            // "skip everything": name it.
+            assert!(
+                nextn <= bc,
+                "nextn_predict_layers {nextn} > block_count {bc}"
             );
+            bc - nextn
+        });
+
+        let mut files = Vec::with_capacity(split_count as usize);
+        let mut planes = HashMap::new();
+        for shard in 0..split_count {
+            let shard_path = shard_path(path, shard, split_count)?;
+            let mut file = File::open(&shard_path)?;
+            let data_start = data_section_offset(&mut file)?;
+            for e in tensor_entries(&mut file)? {
+                let Some(kind) = ExpertKind::from_tensor_name(&e.name) else {
+                    continue;
+                };
+                let Some(blk) = blk_of(&e.name) else {
+                    return Err(SourceError::UnnamedBlock(e.name));
+                };
+                if blk < n_dense_lead {
+                    continue; // dense lead carries no expert tensors
+                }
+                if let Some(mtp_from) = mtp_from {
+                    if u64::from(blk) >= mtp_from {
+                        continue; // MTP/NextN block: skipped at load (R-2)
+                    }
+                }
+                let stride = ggml_row_bytes(e.ggml_type, e.dims[0])
+                    .ok_or(SourceError::UnknownGgmlType {
+                        name: e.name.clone(),
+                        ggml_type: e.ggml_type,
+                    })?
+                    .checked_mul(e.dims[1])
+                    .ok_or(SourceError::StrideOverflow {
+                        name: e.name.clone(),
+                    })?;
+                planes.insert(
+                    (blk - n_dense_lead, kind),
+                    Plane {
+                        shard: shard as usize,
+                        base: data_start + e.offset,
+                        stride,
+                        n_experts: e.dims[2] as u32,
+                    },
+                );
+            }
+            files.push(file);
         }
-        Ok(Self { file, planes })
+        Ok(Self { files, planes })
     }
+}
+
+/// Sibling-shard path for shard `no` of `count`, rewriting the standard
+/// `-NNNNN-of-MMMMM.gguf` suffix of `first`. Single-file models (`count ==
+/// 1`) return `first` unchanged.
+fn shard_path(first: &Path, no: u64, count: u64) -> Result<PathBuf, SourceError> {
+    if count == 1 {
+        return Ok(first.to_path_buf());
+    }
+    let name = first.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        SourceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("non-UTF-8 model path {first:?}"),
+        ))
+    })?;
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    let Some((prefix, counts)) = stem.rsplit_once("-of-") else {
+        return Err(SourceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "split.count = {count} but {name} does not end in -NNNNN-of-MMMMM.{ext:?}; \
+                 cannot discover sibling shards"
+            ),
+        )));
+    };
+    let Some((base, idx)) = prefix.rsplit_once('-') else {
+        return Err(SourceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot split shard index from {name}"),
+        )));
+    };
+    if !idx.bytes().all(|b| b.is_ascii_digit()) || idx.is_empty() {
+        return Err(SourceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shard index {idx:?} in {name} is not numeric"),
+        )));
+    }
+    let width = idx.len();
+    let ext_dot = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    Ok(first.with_file_name(format!("{base}-{:0width$}-of-{counts}{ext_dot}", no + 1)))
 }
 
 /// Retry bound for EINTR / short reads (Global Constraints: bounded, then
@@ -237,7 +311,7 @@ impl ExpertSource for GgufPreadSource {
             // Safe pread wrapper (FileExt::read_at): does not move the cursor,
             // so concurrent readers cannot disturb each other. Interrupted
             // reads retry within the same bounded loop as short reads.
-            let n = match self.file.read_at(&mut plane[done..], off) {
+            let n = match self.files[p.shard].read_at(&mut plane[done..], off) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
@@ -380,6 +454,37 @@ mod tests {
         let (o3, _) = src.plane(0, ExpertKind::Gate, 3).unwrap();
         assert_eq!(o3 - o0, 3 * stride);
         assert!(src.plane(1, ExpertKind::Up, 0).is_none());
+    }
+
+    #[test]
+    fn split_source_walks_all_shards_and_excludes_mtp() {
+        let paths = xtask::shape_moe::cached_fixture();
+        let src = GgufPreadSource::open(&paths[0], 1).unwrap();
+        let g = src.geometry().unwrap();
+        // blk.2 is the MTP/NextN block (nextn_predict_layers = 1): excluded.
+        assert_eq!(
+            g.n_layers, 1,
+            "MTP expert block must not join the pool (R-2)"
+        );
+        assert_eq!(g.n_experts, 64);
+        let (base_g, s_gate) = src.plane(0, ExpertKind::Gate, 0).unwrap();
+        let (_, s_up) = src.plane(0, ExpertKind::Up, 0).unwrap();
+        let (_, s_down) = src.plane(0, ExpertKind::Down, 0).unwrap();
+        assert_eq!(
+            (s_gate, s_up, s_down),
+            (144 * 32, 176 * 32, 210 * 32),
+            "mixed K-quant rows × ne1 = 32"
+        );
+        assert_eq!(
+            g.expert_bytes,
+            64 * (144 + 176 + 210) * 32,
+            "3 planes × 64 experts, per-kind strides"
+        );
+        // Metadata-only shard 1 holds no planes; all bytes live in shard 2.
+        let mut buf = vec![0u8; 144 * 32];
+        src.read_expert(0, ExpertKind::Gate, 63, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xA5), "read from the data shard");
+        let _ = base_g;
     }
 
     #[test]

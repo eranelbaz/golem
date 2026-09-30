@@ -334,6 +334,79 @@ fn walk_table(r: &mut (impl Read + Seek), n_tensors: u64) -> Result<Vec<TensorEn
     Ok(out)
 }
 
+/// The KV values the placement/store readers consume; anything else is
+/// skipped, never parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvVal {
+    /// Any integer tag, widened.
+    Int(u64),
+    /// A string value.
+    Str(String),
+}
+
+/// Reads the KV block as `(key, value)` pairs for the integer/string values
+/// the Rust readers need; all other tags are skipped. Rewinds to the start
+/// first.
+///
+/// # Errors
+/// GGUF parse failures (bad magic/version, truncated KV block).
+pub fn read_kvs(r: &mut (impl Read + Seek)) -> Result<Vec<(String, KvVal)>, Error> {
+    r.rewind().map_err(short_read)?;
+    let (_, _, n_kv) = read_header(r)?;
+    let mut out = Vec::new();
+    for _ in 0..n_kv {
+        let key = read_string(r)?;
+        let tag = read_u32(r)?;
+        let val = match tag {
+            TYPE_U8 => KvVal::Int(u64::from(read_u8(r)?)),
+            TYPE_I8 => KvVal::Int(read_u8(r)? as i8 as u64),
+            TYPE_U16 => KvVal::Int(u64::from(read_u16(r)?)),
+            TYPE_I16 => KvVal::Int(read_u16(r)? as i16 as i64 as u64),
+            TYPE_U32 => KvVal::Int(u64::from(read_u32(r)?)),
+            TYPE_I32 => KvVal::Int(read_u32(r)? as i32 as i64 as u64),
+            TYPE_U64 => KvVal::Int(read_u64(r)?),
+            TYPE_I64 => KvVal::Int(read_u64(r)? as i64 as u64),
+            TYPE_BOOL => KvVal::Int(u64::from(read_u8(r)? != 0)),
+            TYPE_STR => KvVal::Str(read_string(r)?),
+            _ => {
+                skip_value(r, tag)?;
+                continue;
+            }
+        };
+        out.push((key, val));
+    }
+    Ok(out)
+}
+
+/// Looks up an integer KV by exact key.
+#[must_use]
+pub fn kv_int(kvs: &[(String, KvVal)], key: &str) -> Option<u64> {
+    kvs.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            KvVal::Int(i) => Some(*i),
+            _ => None,
+        })
+}
+
+/// Looks up a string KV by exact key.
+#[must_use]
+pub fn kv_str<'a>(kvs: &'a [(String, KvVal)], key: &str) -> Option<&'a str> {
+    kvs.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            KvVal::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+}
+
+/// Looks up an arch-prefixed integer KV (`<arch>.<suffix>`) by suffix.
+#[must_use]
+pub fn arch_kv_int(kvs: &[(String, KvVal)], suffix: &str) -> Option<u64> {
+    let arch = kv_str(kvs, "general.architecture")?;
+    kv_int(kvs, &format!("{arch}.{suffix}"))
+}
+
 /// Absolute file offset of the tensor-data section: end of the tensor table
 /// (which follows the KV block) aligned up to `general.alignment` — the layout
 /// gguf.h and the fixture writer produce. Rewinds to the start first.

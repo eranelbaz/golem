@@ -2,13 +2,19 @@
 #![allow(missing_docs)]
 use std::io::Write;
 
-use xtask::{parity, parity_compare, tiny_moe};
+use xtask::{parity, parity_compare, shape_moe, tiny_moe};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         None | Some("hello") => println!("xtask: workspace automation entry point"),
         Some("gen-tiny-moe") => gen_tiny_moe(args.collect()),
+        Some("gen-shape-moe") => {
+            let paths = shape_moe::cached_fixture();
+            for p in paths {
+                println!("wrote {}", p.display());
+            }
+        }
         Some("parity") => parity::run(args.collect()),
         Some("parity-compare") => parity_compare::run(args.collect()),
         Some(other) => {

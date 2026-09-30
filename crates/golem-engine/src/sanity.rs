@@ -75,6 +75,37 @@ fn block_count(metadata: &GgufMetadata) -> Result<Option<u64>, EngineError> {
     }
 }
 
+/// Reads `<arch>.nextn_predict_layers`, defaulting to 0 (no MTP block).
+/// Present-but-non-integral or negative is a loud error.
+fn nextn_layers(metadata: &GgufMetadata) -> Result<Option<u64>, EngineError> {
+    let Some(arch) = metadata.kv_str("general.architecture") else {
+        return Ok(None);
+    };
+    let key = format!("{arch}.nextn_predict_layers");
+    let Some((_, value)) = metadata.kvs.iter().find(|(k, _)| *k == key) else {
+        return Ok(None);
+    };
+    let signed = |v: i64| -> Result<Option<u64>, EngineError> {
+        u64::try_from(v)
+            .map(Some)
+            .map_err(|_| EngineError::UnsupportedModel(format!("{key}: negative {v}")))
+    };
+    match value {
+        GgufValue::U8(v) => Ok(Some(u64::from(*v))),
+        GgufValue::U16(v) => Ok(Some(u64::from(*v))),
+        GgufValue::U32(v) => Ok(Some(u64::from(*v))),
+        GgufValue::U64(v) => Ok(Some(*v)),
+        GgufValue::I8(v) => signed(i64::from(*v)),
+        GgufValue::I16(v) => signed(i64::from(*v)),
+        GgufValue::I32(v) => signed(i64::from(*v)),
+        GgufValue::I64(v) => signed(*v),
+        other => Err(EngineError::UnsupportedModel(format!(
+            "{key}: non-integral value of type {}; nextn_predict_layers must be an integer",
+            value_type_name(other)
+        ))),
+    }
+}
+
 /// True if `layers` (ascending) is a run with step 1.
 fn is_contiguous(layers: &[u32]) -> bool {
     layers.windows(2).all(|w| w[1] == w[0] + 1)
@@ -88,12 +119,23 @@ fn layer_list(layers: &[u32]) -> String {
         .join(", ")
 }
 
-/// Expert-bearing layers must form a contiguous run `L..=block_count-1`
-/// (a dense lead is valid); without the KV, observed layers must at least be
-/// contiguous. Every covered layer must carry all three suffixes.
+/// Expert-bearing layers must form a contiguous run `L..=block_count -
+/// nextn_predict_layers - 1` (dense lead first, MTP/NextN block excluded:
+/// review R-2); without the KV, observed layers must at least be contiguous.
+/// Every covered layer must carry all three suffixes.
 fn check_coverage(metadata: &GgufMetadata, experts: &Experts) -> Result<(), EngineError> {
     let observed: Vec<u32> = experts.keys().copied().collect();
-    match block_count(metadata)? {
+    let nextn = nextn_layers(metadata)?;
+    let block_count = block_count(metadata)?;
+    if let (Some(bc), Some(nextn)) = (block_count, nextn) {
+        if nextn > bc {
+            return Err(EngineError::UnsupportedModel(format!(
+                "nextn_predict_layers {nextn} > block_count {bc}"
+            )));
+        }
+    }
+    let last_live = block_count.map(|bc| bc.saturating_sub(nextn.unwrap_or(0)));
+    match last_live {
         Some(count) => {
             let ends_at_last = observed
                 .last()
@@ -102,8 +144,8 @@ fn check_coverage(metadata: &GgufMetadata, experts: &Experts) -> Result<(), Engi
                 let last = count.saturating_sub(1);
                 return Err(EngineError::UnsupportedModel(format!(
                     "expert tensors cover [{}] but must form a contiguous run of layers ending \
-                     at the last block (block_count = {count}); expected blk.{last} to bear \
-                     ffn_gate_exps/ffn_up_exps/ffn_down_exps",
+                     at the last live block (block_count − nextn_predict_layers = {count}); \
+                     expected blk.{last} to bear ffn_gate_exps/ffn_up_exps/ffn_down_exps",
                     layer_list(&observed)
                 )));
             }
@@ -181,9 +223,27 @@ fn check_cross_layer_uniformity(experts: &Experts) -> Result<(), EngineError> {
 /// cross-layer shape/dtype uniformity. Violations are
 /// [`EngineError::UnsupportedModel`] with the offending names and shapes.
 pub fn check(metadata: &GgufMetadata) -> Result<(), EngineError> {
+    // The MTP/NextN block is skipped at load and carries its own expert set;
+    // it never counts toward the expected live run (review R-2).
+    let nextn = nextn_layers(metadata)?.unwrap_or(0);
+    let mtp_from = (nextn > 0)
+        .then(|| {
+            let bc = block_count(metadata)?.expect("nextn without block_count");
+            assert!(
+                nextn <= bc,
+                "nextn_predict_layers {nextn} > block_count {bc}"
+            );
+            Ok::<u32, EngineError>((bc - nextn) as u32)
+        })
+        .transpose()?;
     let mut experts: Experts = BTreeMap::new();
     for tensor in &metadata.tensors {
         if let Some((layer, suffix)) = parse_expert_name(&tensor.name) {
+            if let Some(mtp_from) = mtp_from {
+                if layer >= mtp_from {
+                    continue;
+                }
+            }
             experts.entry(layer).or_default().insert(suffix, tensor);
         }
     }
@@ -279,6 +339,44 @@ mod tests {
         m.tensors.retain(|t| !t.name.starts_with("blk.1."));
         let err = check(&m).unwrap_err();
         assert!(err.to_string().contains("blk.1"));
+    }
+
+    #[test]
+    fn mtp_block_is_excluded_from_expected_run() {
+        // Real-model shape: blk.45 (NextN/MTP) carries experts but is skipped
+        // at load, so the live run ends at block_count − nextn (review R-2).
+        let mut m = valid_meta();
+        m.kvs.push((
+            "glm4moe.nextn_predict_layers".to_string(),
+            GgufValue::U32(1),
+        ));
+        for t in [
+            expert_tensor(2, "gate", 8, 16, 32),
+            expert_tensor(2, "up", 8, 16, 32),
+            expert_tensor(2, "down", 8, 32, 16),
+        ] {
+            m.tensors.push(crate::gguf::TensorMeta {
+                name: t.name,
+                n_dims: t.n_dims,
+                ne: t.ne,
+                ggml_type: t.ggml_type,
+                offset: 0,
+            });
+        }
+        assert!(
+            check(&m).is_ok(),
+            "blk.2 = block_count − 1 is MTP: allowed to carry experts"
+        );
+        // Same shape WITHOUT nextn KV: run must end at the last block.
+        m.kvs.pop();
+        let err = check(&m);
+        assert!(
+            err.is_err(),
+            "expected Err, got {err:?} (has_nextn={})",
+            m.kvs
+                .iter()
+                .any(|(k, _)| k.ends_with("nextn_predict_layers"))
+        );
     }
 
     #[test]

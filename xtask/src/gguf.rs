@@ -105,13 +105,25 @@ pub fn write_gguf(
     let mut offset = 0u64;
     for (t, data) in tensors {
         let name = &t.name;
-        if t.ggml_type != GGML_TYPE_F32 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{name}: only GGML_TYPE_F32 tensors are supported"),
-            ));
-        }
-        let expected = t.dims.iter().product::<u64>() as usize * 4;
+        // F32 rows are ne-product × 4; quant rows come from the shared block
+        // table. Anything without a block layout is refused.
+        let expected = if t.ggml_type == GGML_TYPE_F32 {
+            t.dims.iter().product::<u64>() as usize * 4
+        } else {
+            let (ne0, rest) = t.dims.split_first().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name}: rank-0 tensor"),
+                )
+            })?;
+            let row = golem_gguf::ggml_row_bytes(t.ggml_type, *ne0).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name}: ggml type {} has no block layout", t.ggml_type),
+                )
+            })?;
+            (row * rest.iter().product::<u64>()) as usize
+        };
         let got = data.len();
         if got != expected {
             return Err(std::io::Error::new(
