@@ -162,6 +162,13 @@ pub fn load(config: &EngineConfig) -> Result<LoadedModel, EngineError> {
         // SAFETY: returns llama.cpp's default model params by value.
         let mut params = unsafe { raw::llama_model_default_params() };
         params.n_gpu_layers = n_gpu_layers_i32(config.n_gpu_layers);
+        // Review H-3: expert tensors must never be pre-faulted into the page
+        // cache (186 GiB of MAP_POPULATE livelocked the kernel and flushed
+        // everything else). The pool pages them from the GGUF itself (C-2), so
+        // mark them TENSOR_READ_LAZY in the arch (glm5next.cpp) and turn the
+        // loader's on-demand mode on: non-expert weights (≈8.4 GiB) load
+        // normally, expert ranges are mapped without populate.
+        params.lazy_mode = raw::llama_lazy_mode::LLAMA_LAZY_MODE_ON;
         if !moe_overrides.is_empty() {
             params.tensor_buft_overrides = moe_overrides.as_ptr();
         }
