@@ -106,6 +106,10 @@ pub enum Claim {
     Filled {
         /// The slot the caller must fill.
         slot: u32,
+        /// Exclusive-fill capability for that slot (review H-1): the only
+        /// way to take `&mut` on an arena slot; constructed here and in the
+        /// eviction path, both inside the shard lock.
+        claim: FillClaim,
     },
     /// Already resident; a lease was granted; `slot` names the filled slot.
     Resident {
@@ -122,6 +126,17 @@ pub struct Evicted {
     pub victim: Victim,
     /// The slot the caller must refill (== `victim.slot`).
     pub slot: u32,
+    /// Exclusive-fill capability for that slot (review H-1).
+    pub claim: FillClaim,
+}
+
+/// Exclusive-fill capability for one arena slot (review H-1): a safe `&mut`
+/// on a slot requires one; only the residency map constructs them, under the
+/// shard lock, exactly when it has reassigned the slot to the claimer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillClaim {
+    /// The slot this claim exclusively fills.
+    pub(crate) slot: u32,
 }
 
 /// The key + slot an eviction displaced.
@@ -254,7 +269,10 @@ impl ResidencyMap {
                 sh.slot_of[i] = slot as i32;
                 Self::bit_set(&mut sh.bits, i);
                 sh.leases[i] += 1;
-                return Ok(Claim::Filled { slot });
+                return Ok(Claim::Filled {
+                    slot,
+                    claim: FillClaim { slot },
+                });
             }
             // Pool (shard partition) full: atomic victim pick + clear + reassign.
             let victim = (0..Self::keys_per_layer(self.n_experts)).find(|&c| {
@@ -288,6 +306,7 @@ impl ResidencyMap {
                     slot,
                 },
                 slot,
+                claim: FillClaim { slot },
             });
         }
     }
@@ -397,7 +416,7 @@ mod tests {
         assert!(!m.is_resident(0, ExpertKind::Gate, 3));
         let snap = PolicySnapshot::test_empty();
         match m.claim(0, ExpertKind::Gate, 3, &snap).unwrap() {
-            Claim::Filled { slot } => assert_eq!(slot, 0),
+            Claim::Filled { slot, .. } => assert_eq!(slot, 0),
             Claim::Resident { .. } => panic!("first claim must fill"),
         }
         assert!(m.is_resident(0, ExpertKind::Gate, 3));
@@ -443,7 +462,7 @@ mod tests {
         assert!(!m.is_resident(0, ExpertKind::Gate, 0));
         // The freed slot serves the next miss.
         match m.claim(0, ExpertKind::Gate, 1, &snap).unwrap() {
-            Claim::Filled { slot } => assert_eq!(slot, 0),
+            Claim::Filled { slot, .. } => assert_eq!(slot, 0),
             Claim::Resident { .. } => panic!("slot must have been recycled"),
         }
     }
@@ -461,7 +480,7 @@ mod tests {
                 .claim(0, ExpertKind::Gate, 5, &snap)
                 .unwrap()
             {
-                Claim::Filled { slot } => {
+                Claim::Filled { slot, .. } => {
                     assert_eq!(slot, 0);
                     m.finish_fill(0, ExpertKind::Gate, 5);
                 }
@@ -557,7 +576,10 @@ mod tests {
                 // it claims the recycled slot fresh.
                 matches!(
                     m2.claim(0, ExpertKind::Gate, 5, &snap2),
-                    Ok(Claim::Filled { slot: 0 })
+                    Ok(Claim::Filled {
+                        slot: 0,
+                        claim: FillClaim { slot: 0 }
+                    })
                 )
             });
             std::thread::sleep(std::time::Duration::from_millis(20));

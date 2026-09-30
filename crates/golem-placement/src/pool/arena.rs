@@ -158,14 +158,16 @@ impl Arena {
         self.base.get() as *mut u8
     }
 
-    /// Read slot bytes. Caller must hold a lease on the key mapped to `i`.
+    /// Read slot bytes, under a live [`Lease`](super::pager::Lease) on the
+    /// key mapped to `i` (review H-1: the lease is the capability; only the
+    /// pager constructs leases, so a shared read is unreachable without one).
     ///
     /// # Panics
-    /// Panics when `i >= slot_count`.
-    pub fn slot(&self, i: u32) -> &[u8] {
+    /// Panics when `i >= slot_count` or the lease names another slot.
+    pub fn slot(&self, i: u32, lease: &crate::pool::pager::Lease) -> &[u8] {
         assert!(i < self.slots);
-        // SAFETY: i < slots ⇒ [base + i*slot_size, +slot_size) is inside the
-        // mapping; the caller holds a lease, so no writer touches it (§6.6).
+        assert_eq!(lease.slot(), i, "slot read under a lease for another slot");
+        // SAFETY: i < slots ⇒ in-bounds; the lease excludes writers (§6.6).
         unsafe {
             std::slice::from_raw_parts(self.ptr().add(i as usize * self.slot_size), self.slot_size)
         }
@@ -183,9 +185,18 @@ impl Arena {
     // &self → &mut [u8] is the point: the aliasing rule it relies on is the
     // Filled-claim exclusivity contract documented above, which the residency
     // map's claim + fill gate enforce.
-    #[allow(clippy::mut_from_ref)]
-    pub(crate) fn slot_mut(&self, i: u32) -> &mut [u8] {
+    /// Mutable slot view for the page-in path, under the exclusive
+    /// [`FillClaim`](super::residency::FillClaim) (review H-1).
+    ///
+    /// # Panics
+    /// Panics when `i >= slot_count` or the claim names another slot.
+    #[allow(clippy::mut_from_ref)] // the point: FillClaim proves exclusivity
+    pub(crate) fn slot_mut(&self, i: u32, claim: &crate::pool::residency::FillClaim) -> &mut [u8] {
         assert!(i < self.slots);
+        assert_eq!(
+            claim.slot, i,
+            "slot fill under a FillClaim for another slot"
+        );
         // SAFETY: same bounds as `slot`; exclusivity comes from the Filled
         // claim — the residency map guarantees no other writer or reader for
         // this slot until the claim is released.
@@ -195,15 +206,6 @@ impl Arena {
                 self.slot_size,
             )
         }
-    }
-
-    /// Fill slot bytes. Caller must hold the `Filled` claim for `i`.
-    ///
-    /// # Panics
-    /// Panics when `i >= slot_count` or `src` is longer than a slot.
-    pub fn fill_slot(&self, i: u32, src: &[u8]) {
-        assert!(src.len() <= self.slot_size, "fill larger than slot");
-        self.slot_mut(i)[..src.len()].copy_from_slice(src);
     }
 
     /// Number of slots.

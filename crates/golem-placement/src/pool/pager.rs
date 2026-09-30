@@ -11,7 +11,7 @@ use std::fmt;
 
 use super::arena::Arena;
 use super::primitives::{Arc, AtomicUsize, Ordering};
-use super::residency::{Claim, ExpertKind, P3Stats, PolicySnapshot, ResidencyMap};
+use super::residency::{Claim, ExpertKind, FillClaim, P3Stats, PolicySnapshot, ResidencyMap};
 use super::source::ExpertSource;
 
 /// Lock-free-ish read handle over the current [`PolicySnapshot`] (rebuilt by
@@ -70,6 +70,13 @@ pub struct Lease {
     kind: ExpertKind,
     expert: u32,
     slot: u32,
+}
+
+impl Lease {
+    /// The slot this lease covers (capability check for [`Arena::slot`]).
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
 }
 
 impl Drop for Lease {
@@ -181,7 +188,7 @@ impl ExpertPool {
         let snapshot = self.snapshots.current();
         for expert in first..=last {
             let (slot, lease) = self.claim_leased(demand, layer, kind, expert, &snapshot)?;
-            copy(self.arena.slot(slot));
+            copy(self.arena.slot(slot, &lease));
             drop(lease);
         }
         Ok(())
@@ -198,19 +205,26 @@ impl ExpertPool {
         expert: u32,
         snapshot: &PolicySnapshot,
     ) -> Result<(u32, Lease), PoolError> {
-        let slot = match self.residency.claim(layer, kind, expert, snapshot) {
+        let (slot, _claim) = match self.residency.claim(layer, kind, expert, snapshot) {
             Ok(Claim::Resident { slot }) => {
                 self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
-                slot
+                (slot, Option::<FillClaim>::None)
             }
-            Ok(Claim::Filled { slot }) => {
-                self.page_in(demand, layer, kind, expert, slot)?;
-                slot
+            Ok(Claim::Filled { slot, claim }) => {
+                self.page_in(demand, layer, kind, expert, slot, Some(claim))?;
+                (slot, None)
             }
             Err(evicted) => {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                self.page_in(demand, layer, kind, expert, evicted.slot)?;
-                evicted.slot
+                self.page_in(
+                    demand,
+                    layer,
+                    kind,
+                    expert,
+                    evicted.slot,
+                    Some(evicted.claim),
+                )?;
+                (evicted.slot, None)
             }
         };
         Ok((
@@ -247,7 +261,7 @@ impl ExpertPool {
             let mut leases = Vec::with_capacity((last - first + 1) as usize);
             for expert in first..=last {
                 let (slot, lease) = self.claim_leased(demand, layer, kind, expert, &snapshot)?;
-                ptrs.push(self.arena.slot(slot).as_ptr());
+                ptrs.push(self.arena.slot(slot, &lease).as_ptr());
                 leases.push(lease);
             }
             Ok((ptrs, leases))
@@ -271,10 +285,12 @@ impl ExpertPool {
         kind: ExpertKind,
         expert: u32,
         slot: u32,
+        claim: Option<FillClaim>,
     ) -> Result<(), PoolError> {
+        let fill_claim = claim.unwrap_or(FillClaim { slot });
         match self
             .source
-            .read_expert(layer, kind, expert, self.arena.slot_mut(slot))
+            .read_expert(layer, kind, expert, self.arena.slot_mut(slot, &fill_claim))
         {
             Ok(()) => {
                 self.residency.finish_fill(layer, kind, expert);
@@ -306,7 +322,7 @@ impl ExpertPool {
     pub fn lease_for_test(&self, layer: u32, kind: ExpertKind, expert: u32) -> Lease {
         let snapshot = PolicySnapshot::test_empty();
         let slot = match self.residency.claim(layer, kind, expert, &snapshot) {
-            Ok(Claim::Resident { slot }) | Ok(Claim::Filled { slot }) => slot,
+            Ok(Claim::Resident { slot }) | Ok(Claim::Filled { slot, .. }) => slot,
             Err(evicted) => evicted.slot,
         };
         Lease {
@@ -320,7 +336,7 @@ impl ExpertPool {
 
     /// Slot bytes covered by `lease` (lease guarantees no refill).
     pub fn slot_bytes_under(&self, lease: &Lease) -> &[u8] {
-        self.arena.slot(lease.slot)
+        self.arena.slot(lease.slot(), lease)
     }
 }
 
