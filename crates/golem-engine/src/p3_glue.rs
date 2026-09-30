@@ -30,7 +30,6 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use golem_llama_sys::raw;
 use golem_placement::pool::{
@@ -106,10 +105,6 @@ static HANDLE: OnceLock<&'static PoolHandle> = OnceLock::new();
 /// of racing [`HANDLE`] and leaking a built arena + prefetch thread.
 static ENABLING: AtomicBool = AtomicBool::new(false);
 
-/// Notifications quieter than this re-arm the turn flag (wall-clock
-/// fallback): a decode turn is far shorter, an inter-turn gap far longer.
-const TURN_GAP_NS: u64 = 500_000_000;
-
 /// P2 policy state (§3.4): per-expert last-access steps feeding the
 /// evict-first order, plus the double-buffered order slices returned to C.
 ///
@@ -123,9 +118,11 @@ type AccessMap = HashMap<(u32, ExpertKind), Vec<Option<u64>>>;
 struct PolicyQueryState {
     /// (layer, kind) → per-expert last-access step; `None` = never accessed.
     last_access: Mutex<AccessMap>,
-    /// Decode-turn counter, bumped on the first `notify_access` of a turn
-    /// (the `turn` flag) with a wall-clock fallback that re-arms the flag
-    /// after a quiet gap — C exposes no turn boundary.
+    /// Decode-step counter: one `llama_decode` call = one step (§6.2 as
+    /// amended — prefill chunks count as one step each), bumped by
+    /// [`advance_decode_step`] from `Session`'s decode paths. Rust drives
+    /// decode, so Rust owns the step — the wall-clock turn heuristic this
+    /// replaced collapsed a whole chat turn into one step.
     step: AtomicU64,
     /// Double-buffered order slices: the slice returned to C stays valid
     /// until the next policy_query call (frozen-buffer contract, Global
@@ -135,10 +132,6 @@ struct PolicyQueryState {
     exposed: AtomicUsize,
     /// Last (layer, kind) passed to policy_query; notify attribution key.
     last_queried: Mutex<Option<(u32, ExpertKind)>>,
-    /// True between the first notify of a decode turn and its quiet-gap end.
-    turn: AtomicBool,
-    /// Last notify timestamp (ns since the epoch) for the fallback re-arm.
-    last_notify_ns: AtomicU64,
     /// `GOLEM_TEST_SHUFFLE_ORDER`, read ONCE at enable; reverses the recency
     /// order to prove consumers are order-agnostic (any permutation is legal,
     /// invariant 4; tests/t3_cache_invariance.rs is the only setter).
@@ -155,8 +148,6 @@ impl PolicyQueryState {
             bufs: [Mutex::new(Vec::new()), Mutex::new(Vec::new())],
             exposed: AtomicUsize::new(0),
             last_queried: Mutex::new(None),
-            turn: AtomicBool::new(false),
-            last_notify_ns: AtomicU64::new(0),
             shuffle,
             n_layers,
             n_experts,
@@ -190,22 +181,9 @@ impl PolicyQueryState {
         build_order(&hist, self.n_experts as usize, self.shuffle)
     }
 
-    /// Record one routed-expert access under the last queried (layer, kind);
-    /// bumps `step` on the first notify of a turn.
+    /// Record one routed-expert access under the last queried (layer, kind)
+    /// at the current decode step.
     fn note_access(&self, expert_id: i64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let last = self.last_notify_ns.swap(now, Ordering::Relaxed);
-        if now.saturating_sub(last) > TURN_GAP_NS {
-            // Wall-clock fallback: a quiet gap means the previous turn is
-            // over even though no explicit boundary exists.
-            self.turn.store(false, Ordering::Relaxed);
-        }
-        if !self.turn.swap(true, Ordering::Relaxed) {
-            self.step.fetch_add(1, Ordering::Relaxed);
-        }
         let step = self.step.load(Ordering::Relaxed);
         let Some((layer, kind)) = *self.last_queried.lock().unwrap() else {
             return; // defensive: notify before any query — nothing to attribute
@@ -280,6 +258,15 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
 /// fallback, §5.4), or a second pool-enabled session in one process (M2.3
 /// serves exactly one; multi-session arrives with M4's global registration).
 /// Whether the process-global hooks are registered (review H-10 guard).
+/// Bumps the policy decode step: `Session` calls this after every successful
+/// `llama_decode` (§6.2 as amended: a step is one decode call, prefill chunks
+/// included). No-op while hooks are unregistered (self-check decodes).
+pub(crate) fn advance_decode_step() {
+    if let Some(h) = HANDLE.get() {
+        h.policy.step.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn hooks_registered() -> bool {
     HANDLE.get().is_some()
 }
@@ -815,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_books_recency_and_turn_flag_bumps_step_once_per_burst() {
+    fn notify_books_recency_at_the_current_decode_step() {
         let pq = PolicyQueryState::new(2, 4, false);
         // Notify before any query: defensive ignore.
         pq.note_access(0);
@@ -823,33 +810,26 @@ mod tests {
 
         assert_eq!(pq.order_for(0, ExpertKind::Gate), vec![0, 1, 2, 3]);
         *pq.last_queried.lock().unwrap() = Some((0, ExpertKind::Gate));
+        pq.step.store(7, Ordering::Relaxed);
         for id in 0..4 {
             pq.note_access(id);
         }
         assert_eq!(
             pq.step.load(Ordering::Relaxed),
-            1,
-            "first notify of a turn bumps the step exactly once"
-        );
-        for id in 0..4 {
-            pq.note_access(id);
-        }
-        assert_eq!(
-            pq.step.load(Ordering::Relaxed),
-            1,
-            "same-burst notifies stay one turn"
+            7,
+            "notify never moves the step — Session's decode paths own it"
         );
         assert_eq!(
             pq.last_access.lock().unwrap()[&(0, ExpertKind::Gate)],
-            vec![Some(1); 4]
+            vec![Some(7); 4]
         );
 
-        // A later turn's notify rewrites recency and feeds the prefetcher.
-        pq.step.store(2, Ordering::Relaxed);
+        // A later step's notify rewrites recency and feeds the prefetcher.
+        pq.step.store(9, Ordering::Relaxed);
         pq.note_access(2);
         assert_eq!(
             pq.last_access.lock().unwrap()[&(0, ExpertKind::Gate)][2],
-            Some(2)
+            Some(9)
         );
         assert_eq!(
             pq.recent_union(1),
