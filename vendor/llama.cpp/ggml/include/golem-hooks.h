@@ -41,6 +41,14 @@ int32_t golem_tensor_expert_count(const void *tensor);
 /* 0 when count is 0; else bytes per expert (one ne[0]×ne[1] plane stride, nb[2]). */
 int32_t golem_tensor_expert_stride_bytes(const void *tensor);
 
+/* Force GPU offload of ops on host-resident weights below the upstream
+ * batch-32 threshold (review C-4): MUL_MAT_ID's batch is ne[2] = tokens, 1
+ * during decode, so without this experts compute on the CPU. Values ≤ 0
+ * restore the env/default behavior. Read once at device init — call before
+ * backend init. Implemented in ggml-backend.cpp (backend-agnostic); the
+ * CUDA/HIP device init consults it. */
+void golem_set_expert_offload_min_batch(int n);
+
 /* --- P2/P4: persistent device expert-copy cache (design sec 3.4). --- */
 
 /* Soft cap (bytes) for the device expert-copy cache; 0 = full capacity (never evict). Mutated over FFI by tests. */

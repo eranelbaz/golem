@@ -10,17 +10,10 @@ use golem_engine::config::EngineConfig;
 ///   split scheduler then copies the routed experts per step — the P1/P2
 ///   hook call-site (`ggml_backend_buffer_is_host` branch). With plain full
 ///   offload the experts fit on the GPU and no copies happen.
-/// - `GGML_OP_OFFLOAD_MIN_BATCH=1` (read once at device init, hence set here)
-///   lowers the op-offload threshold from the default 32: MUL_MAT_ID's batch
-///   size is `ne[2]` (tokens), 1 during decode, so without this the op stays
-///   on the CPU and the split copy path never runs at all.
-///
-/// Must be called before the first `Session::new` in the process (backend
-/// init reads the env).
+/// - The engine itself forces the op-offload threshold to 1 (review C-4):
+///   tests must NOT set `GGML_OP_OFFLOAD_MIN_BATCH`; a HIP test that passes
+///   without the env proves the engine sets it.
 pub fn offload_config() -> EngineConfig {
-    // SAFETY: single-threaded test setup; the value only feeds the GPU
-    // backend's device init below.
-    unsafe { std::env::set_var("GGML_OP_OFFLOAD_MIN_BATCH", "1") };
     EngineConfig {
         model_path: tiny_moe_path(),
         n_gpu_layers: 99,

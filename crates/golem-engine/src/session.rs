@@ -253,6 +253,13 @@ fn moe_buft_overrides(
 fn init_backend() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        // Engine invariant (review C-4, design §3.4): every expert MUL_MAT_ID
+        // runs on the GPU, never silently on the CPU. Upstream keeps ops on
+        // host-resident weights on the CPU below batch 32, and MUL_MAT_ID's
+        // batch is ne[2] = tokens (1 during decode), so force the threshold
+        // to 1. Read at device init — must precede llama_backend_init.
+        // SAFETY: FFI call into the vendored substrate; no invariants to uphold.
+        unsafe { raw::golem_set_expert_offload_min_batch(1) };
         // SAFETY: global one-time llama.cpp backend initialization; no invariants to uphold.
         unsafe { raw::llama_backend_init() };
     });

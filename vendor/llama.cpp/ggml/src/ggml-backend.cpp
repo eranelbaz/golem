@@ -2649,6 +2649,24 @@ void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
     golem_h_ctx                  = ctx;
 }
 
+/* Review C-4: process-lifetime override for the device backends' op-offload
+ * threshold; -1 = unset (env / 32 default). Device init reads it once. */
+static int golem_op_offload_min_batch_override = -1;
+
+void golem_set_expert_offload_min_batch(int n) {
+    golem_op_offload_min_batch_override = n;
+}
+
+// Declared `extern "C"` in the CUDA/HIP TUs (ggml-cuda.cu); the header does
+// not declare this internal helper, so pin the linkage here.
+extern "C" int golem_expert_offload_min_batch(int default_value);
+
+int golem_expert_offload_min_batch(int default_value) {
+    return golem_op_offload_min_batch_override >= 0
+        ? golem_op_offload_min_batch_override
+        : default_value;
+}
+
 /* Expert weights in glm-arch MoE models are 3-D tensors whose names contain
  * the stem ffn_{gate,up,down}_exps as a whole name segment, optionally
  * followed by ".weight" (runtime ggml names: blk.%d.ffn_*_exps.weight;

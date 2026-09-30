@@ -189,8 +189,17 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
                 .ok()
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| DEFAULT_AMDGPU_TARGET.to_string());
+            // CMake's HIP-language setup needs the ROCm root to emit `-x
+            // hip`; without it clang compiles .cu as CUDA and rejects gfx1100.
+            let rocm_root = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
             cfg.define("GGML_HIP", "ON")
-                .define("AMDGPU_TARGETS", amdgpu_target)
+                .env("ROCM_PATH", &rocm_root)
+                .define("CMAKE_HIP_COMPILER_ROCM_ROOT", &rocm_root)
+                .define("AMDGPU_TARGETS", &amdgpu_target)
+                // CMake ≥ 4 HIP-language builds read this, not the legacy
+                // AMDGPU_TARGETS; without it clang falls back to CUDA arch
+                // probing and rejects gfx1100.
+                .define("CMAKE_HIP_ARCHITECTURES", &amdgpu_target)
                 .define("CMAKE_HIP_COMPILER", ROCM_HIP_COMPILER);
         }
         other => unreachable!("detect_backend only yields cpu|hip, got {other:?}"),
