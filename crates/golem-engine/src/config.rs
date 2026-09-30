@@ -31,11 +31,11 @@ pub struct EngineConfig {
     /// (T4 invariant). The CLI computes a suggestion but always passes an
     /// explicit whole-GiB value.
     pub ram_experts_gib: u64,
-    /// Soft cap for the P2 device expert-copy cache, in experts (§3.4). The
-    /// byte budget is `n × expert_stride`, set when the first expert tensor is
-    /// registered (the stride is only knowable from a live tensor). **0 =
-    /// unlimited** (the default): the device cache keeps every copied expert
-    /// and never evicts.
+    /// Per-(layer, kind) device expert-slab size, in experts (§3.4 as amended
+    /// for the slot-indirected cache). **0 (the default) = derive from free
+    /// VRAM at pool enable** (half of free, bounded; never unlimited —
+    /// unbounded slabs OOM the 24 GiB card on the real model). A routed set
+    /// larger than K aborts loudly (D-7).
     pub device_cache_experts: u32,
 }
 

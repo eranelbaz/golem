@@ -303,7 +303,7 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
     if code != 0 {
         return Err(EngineError::Decode(code));
     }
-    // Review H-2 (quality pass): llama_decode is async w.r.t. the GPU —
+    // The lease-release contract (C-2): llama_decode is async w.r.t. the GPU —
     // synchronize before returning so the expert-copy leases released at the
     // next compute can never outlive an in-flight DMA. Sampling reads logits
     // through getters that synchronize, but decode paths without sampling
@@ -345,7 +345,7 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         if code != 0 {
             return Err(EngineError::Decode(code));
         }
-        // H-2: synchronize before the logits getter and the next compute's
+        // C-2: synchronize before the logits getter and the next compute's
         // lease release (see decode_and_synchronize above).
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
@@ -646,7 +646,7 @@ impl Session {
                 // 1 = no KV slot left (ctx too small for the prompt); the rest fatal alike.
                 return Err(EngineError::Decode(code));
             }
-            // H-2: synchronize (see decode helper above).
+            // C-2: synchronize (see decode helper above).
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += len;
@@ -718,7 +718,7 @@ impl Session {
             if code != 0 {
                 return Err(EngineError::Decode(code));
             }
-            // H-2: synchronize (see decode helper above).
+            // C-2: synchronize (see decode helper above).
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += 1;

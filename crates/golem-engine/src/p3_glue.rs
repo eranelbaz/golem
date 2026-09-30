@@ -422,12 +422,20 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // entries from an earlier in-process model — the invalidation seam).
     // SAFETY: FFI call, no invariants.
     unsafe { raw::golem_reset_device_cache() };
-    // Review M-13/C-3: the device-cache budget IS a per-(layer, kind) expert
-    // count — the slab is per tensor and the count is geometry-independent,
-    // so it is set once here (0 = unlimited, the default).
+    // The device-cache budget IS a per-(layer, kind) expert count (M-13/C-3).
+    // It is never "unlimited": device allocations are bounded by the VRAM
+    // budget, never proportional to expert count (unbounded slabs are ≈184 GB
+    // on GLM-5.3-Flash — 126 live tensors × 289 planes × ≈5 MB — against a
+    // 24 GiB card). An explicit config value wins; otherwise K derives from
+    // the free VRAM at enable time (the model's non-expert weights are
+    // already resident, so what is free is what the slabs + KV + compute
+    // buffers must share), with half held back as growth headroom:
+    // K = free/2 / (n_layers × 3 kinds × slot_size) − 1 ≈ 8–9 on the target
+    // (≈6.2 GiB usable / (42 × 3 × 5.77 MB)).
+    let k = derive_device_cache_experts(config, geo.n_layers, geo.slot_size)?;
     // SAFETY: FFI setter, no invariants.
     unsafe {
-        raw::golem_set_device_cache_experts(config.device_cache_experts as i32);
+        raw::golem_set_device_cache_experts(k as i32);
     }
 
     // SAFETY: `handle` is leaked ('static) and never mutated after this, so
@@ -454,6 +462,40 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         "P3 RAM expert pool registered (hooks set for process lifetime)"
     );
     Ok(pool.stats.clone())
+}
+
+/// Per-(layer, kind) device-slab expert count for this pool (C-3). Explicit
+/// `device_cache_experts > 0` wins; otherwise derived from free VRAM. Never
+/// unlimited, never zero: a routed set larger than K aborts, so K = 0 could
+/// not decode at all.
+fn derive_device_cache_experts(
+    config: &EngineConfig,
+    #[cfg(golem_backend_hip)] n_layers: u32,
+    #[cfg(not(golem_backend_hip))] n_layers: u32,
+    #[cfg(golem_backend_hip)] slot_size: u64,
+    #[cfg(not(golem_backend_hip))] slot_size: u64,
+) -> Result<u32, EngineError> {
+    let _ = (n_layers, slot_size);
+    if config.device_cache_experts > 0 {
+        return Ok(config.device_cache_experts);
+    }
+    #[cfg(golem_backend_hip)]
+    if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
+        let slab_bytes_per_expert = u64::from(n_layers)
+            .saturating_mul(3)
+            .saturating_mul(slot_size);
+        // Half of free VRAM is slab budget; the rest is KV + compute-buffer
+        // growth headroom.
+        let usable = (free / 2) as u64;
+        let k = usable / slab_bytes_per_expert.max(1);
+        return u32::try_from(k.saturating_sub(1).clamp(1, u64::from(u32::MAX)))
+            .map_err(|_| EngineError::PoolInit("derived device_cache_experts > u32::MAX".into()));
+    }
+    Err(EngineError::PoolInit(
+        "device_cache_experts unset and no VRAM query available to derive a bounded \
+         slab budget — set device_cache_experts explicitly"
+            .into(),
+    ))
 }
 
 /// Loud terminal state for FFI-adjacent contract violations (Global
@@ -713,6 +755,22 @@ fn blk_of(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_cache_experts_explicit_wins_and_default_is_never_unbounded() {
+        let c = EngineConfig {
+            device_cache_experts: 7,
+            ..EngineConfig::default()
+        };
+        assert_eq!(derive_device_cache_experts(&c, 42, 5_777_000).unwrap(), 7);
+        // Default (0): derived, bounded, never 0. On the CPU backend there is
+        // no VRAM query, so derivation is a loud error, not an unbounded cap.
+        let r = derive_device_cache_experts(&EngineConfig::default(), 42, 5_777_000);
+        #[cfg(golem_backend_hip)]
+        assert!(r.unwrap() >= 1);
+        #[cfg(not(golem_backend_hip))]
+        assert!(r.is_err(), "no VRAM query: derivation must fail loudly");
+    }
 
     #[test]
     fn blk_prefix_parses_ggml_and_gguf_names() {
