@@ -1,7 +1,7 @@
 //! P3 FFI glue (§3.4): process-lifetime hook registration, the
 //! `ensure_host_resident` trampoline, and the per-tensor registration table.
 //!
-//! Hook lifecycle (Global Constraints): registered exactly ONCE per process
+//! Hook lifecycle: registered exactly ONCE per process
 //! via [`HANDLE`]; the pool handle is `Box::leak`ed and hooks are never
 //! unregistered — the C side stores the fn pointers in plain non-atomic
 //! statics, so any teardown could race a mid-flight callback (UB). The
@@ -19,7 +19,7 @@
 //!   stride == substrate stride per expert tensor; one pread byte-compared
 //!   against the loader-populated host bytes) run at that registration, where
 //!   the host buffer is guaranteed untouched by the pool — mismatch is a loud
-//!   abort (the void FFI ABI has no error return; Global Constraints).
+//!   abort (the void FFI ABI has no error return).
 //! - *Single-expert `ensure_range` calls:* the pager's copy closure fires
 //!   once per key with slot bytes only; the glue loops `first..=last` itself
 //!   so each copy knows its exact destination offset (plane `e` at
@@ -82,7 +82,7 @@ struct PoolHandle {
     /// P2/P4 policy state (order building + access bookkeeping), leaked
     /// alongside the handle and shared with the prefetch feed by reference.
     policy: &'static PolicyQueryState,
-    /// Leases held from the previous scheduler compute (review C-2): filled
+    /// Leases held from the previous scheduler compute: filled
     /// by `ensure_host_resident`, drained by `copy_done` at the start of the
     /// NEXT compute — the engine synchronizes after every decode
     /// (session.rs synchronizes after every decode), so the prior step's DMAs
@@ -239,7 +239,7 @@ fn build_order(last_access: &[Option<u64>], n_experts: usize, shuffle: bool) -> 
 }
 
 /// Rust-side permutation check (belt-and-suspenders; C validates the order
-/// authoritatively per Global Constraints).
+/// authoritatively per the placement policy).
 fn is_permutation(order: &[i32], n: usize) -> bool {
     order.len() == n && order.iter().all(|&i| i >= 0 && (i as usize) < n) && {
         let mut seen = vec![false; n];
@@ -272,7 +272,7 @@ pub(crate) fn hooks_registered() -> bool {
 /// # Errors
 /// GGUF/geometry failures, arena mmap/mlock failures (no silent unlocked
 /// fallback, §5.4), or a second pool-enabled session in one process (M2.3
-/// serves exactly one; multi-session arrives with M4's global registration).
+/// serves exactly one pool-enabled session per process).
 pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     debug_assert!(config.ram_experts_gib > 0, "enable() with pool disabled");
     if ENABLING
@@ -366,7 +366,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     }
 
     // M2.3 policy state: empty snapshot (nothing pinned/protected) until the
-    // M2.2-backed builder lands with M2.4's snapshot wiring.
+    // the placement-backed snapshot builder lands with the engine wiring.
     let snapshots = Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty())));
     let pool = ExpertPool::new(
         arena,
@@ -377,7 +377,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         geo.n_experts,
     );
 
-    // M2.4 P2 state: per-expert recency (never-accessed first, then
+    // P2 state: per-expert recency (never-accessed first, then
     // ascending last-access step) — pure recency order. The shuffle knob is
     // read exactly once per process here.
     let shuffle = std::env::var("GOLEM_TEST_SHUFFLE_ORDER").is_ok_and(|v| v != "0");
@@ -438,7 +438,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
 
     // SAFETY: `handle` is leaked ('static) and never mutated after this, so
     // the context pointer outlives every callback; all three are valid fn
-    // pointers (P2 policy_query / P4 notify_access wired with M2.4; the C
+    // pointers (P2 policy_query / P4 notify_access; the C
     // side's n_copies == 1 abort is the defense-in-depth — M2.3's config
     // cannot express pipeline parallelism or multi-GPU to pre-reject here).
     unsafe {
@@ -522,11 +522,11 @@ fn p3_fatal(context: String) -> ! {
 
 /// The P1 `ensure_host_resident` trampoline. Runs on the substrate decode
 /// thread; touches only the pool's own synchronization — no substrate state,
-/// no locks ordered with C code (T6-reviewed contract).
+/// no locks ordered with C code (the concurrency test model covers it).
 ///
 /// # Contract
 /// No input clamping: an out-of-range or inverted `[first_id, last_id]` is a
-/// contract violation → logged + `abort()` (Global Constraints). Non-expert
+/// contract violation → logged + `abort()`. Non-expert
 /// tensors return immediately (null-guard semantics upstream of the pool).
 pub(crate) extern "C" fn ensure_host_resident(
     ctx: *mut c_void,
@@ -556,7 +556,7 @@ pub(crate) extern "C" fn ensure_host_resident(
         std::slice::from_raw_parts_mut(out_ptrs, n)
     };
 
-    // Review C-2: the pool IS the H2D source. Claim + page-in each expert and
+    // The pool IS the H2D source. Claim + page-in each expert and
     // hand the slot pointer to C; the lease stays held (in `in_flight_leases`)
     // until `copy_done`, so eviction cannot recycle a slot mid-DMA.
     let (ptrs, leases) =
@@ -590,7 +590,7 @@ pub(crate) extern "C" fn ensure_host_resident(
     }
 }
 
-/// Review C-2: releases the host-pool leases of the previous compute. Runs
+/// Releases the host-pool leases of the previous compute. Runs
 /// at the START of a scheduler compute; the engine synchronizes after
 /// every decode, so its DMAs are complete.
 extern "C" fn copy_done(ctx: *mut c_void) {
@@ -633,7 +633,7 @@ extern "C" fn policy_query(ctx: *mut c_void, tensor: *const c_void, n_experts: i
     *h.policy.last_queried.lock().unwrap() = Some((entry.layer, entry.kind));
     let order = h.policy.order_for(entry.layer, entry.kind);
     // Belt-and-suspenders: C validates the permutation authoritatively
-    // (Global Constraints) and aborts on corruption; failing here yields a
+    // and aborts on corruption; failing here yields a
     // Rust-side message instead.
     if !is_permutation(&order, entry.n_experts as usize) {
         p3_fatal(format!(

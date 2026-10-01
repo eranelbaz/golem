@@ -164,7 +164,7 @@ pub fn load(config: &EngineConfig) -> Result<LoadedModel, EngineError> {
         params.n_gpu_layers = n_gpu_layers_i32(config.n_gpu_layers);
         // Review H-3: expert tensors must never be pre-faulted into the page
         // cache (186 GiB of MAP_POPULATE livelocked the kernel and flushed
-        // everything else). The pool pages them from the GGUF itself (C-2), so
+        // everything else). The pool pages them from the GGUF itself, so
         // mark them TENSOR_READ_LAZY in the arch (glm5next.cpp) and turn the
         // loader's on-demand mode on: non-expert weights (≈8.4 GiB) load
         // normally, expert ranges are mapped without populate.
@@ -304,7 +304,7 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         return Err(EngineError::Decode(code));
     }
     p3_glue::advance_decode_step();
-    // The lease-release contract (C-2): llama_decode is async w.r.t. the GPU —
+    // The lease-release contract: llama_decode is async w.r.t. the GPU —
     // synchronize before returning so the expert-copy leases released at the
     // next compute can never outlive an in-flight DMA. Sampling reads logits
     // through getters that synchronize, but decode paths without sampling
@@ -488,7 +488,7 @@ impl Session {
 
     /// The P3 slow-path counters when the RAM expert pool is enabled for this
     /// session; `None` when the pool is off (the default). Demand and prefetch
-    /// page-ins are counted separately (Global Constraints).
+    /// page-ins are counted separately (design §6.6).
     pub fn p3_stats(&self) -> Option<&P3Stats> {
         self.p3_stats.as_deref()
     }
@@ -649,7 +649,7 @@ impl Session {
                 return Err(EngineError::Decode(code));
             }
             p3_glue::advance_decode_step();
-            // C-2: synchronize (see decode helper above).
+            // synchronize (see decode helper above).
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += len;
@@ -722,7 +722,7 @@ impl Session {
                 return Err(EngineError::Decode(code));
             }
             p3_glue::advance_decode_step();
-            // C-2: synchronize (see decode helper above).
+            // synchronize (see decode helper above).
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += 1;

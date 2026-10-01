@@ -139,7 +139,7 @@ pub enum ClaimError {
     /// An expert evicted by this claim; its slot is reassigned to the
     /// claimer, whose I/O replaces the victim's bytes.
     Evicted(Evicted),
-    /// No evictable slot after a full CLOCK walk.
+    /// No evictable slot after bounded full CLOCK walks.
     Busy,
 }
 
@@ -248,11 +248,12 @@ impl ResidencyMap {
     ///
     /// No policy locks are taken while the shard lock is held; victim pick
     /// only reads the snapshot. When every candidate is protected (all slots
-    /// leased/pinned) the claim releases the lock, yields, and retries until a
-    /// lease holder makes progress — a lease is always dropped by its owner in
-    /// finite time, so the loop terminates.
+    /// leased/pinned) the claim yields and retries through a bounded number
+    /// of full CLOCK walks; if no victim appears it returns
+    /// [`ClaimError::Busy`] — leases are transient, so over-subscription is
+    /// a loud error, not an unbounded spin.
     ///
-    /// Every successful path (and `Err(Evicted)`) grants exactly one lease;
+    /// Every successful path (and `Err(ClaimError::Evicted)`) grants exactly one lease;
     /// the caller drops it via [`Self::release_lease`] after its copy, or
     /// [`Self::cancel_claim`] if its page-in fails.
     ///
@@ -467,8 +468,8 @@ impl ResidencyMap {
     }
 }
 
-/// P3 slow-path counters (Global Constraints: demand and prefetch counted
-/// separately; P4/M2.4 absorbs this block without renames).
+/// P3 slow-path counters (design §6.6: demand and prefetch counted
+/// separately).
 #[derive(Debug, Default)]
 pub struct P3Stats {
     /// Page-ins on the demand (decode) path.

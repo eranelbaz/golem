@@ -38,7 +38,7 @@ jobs:
       - run: cargo nextest run --workspace --success-output=immediate
       # T6 loom leg (§12.2): unfiltered — every non-model test is
       # #[cfg(not(loom))]-gated, so the whole crate must pass under loom.
-      # A filter here hid 7 broken tests once; don't reintroduce one.
+      # A filter here hid 8 broken tests once; don't reintroduce one.
       - name: T6 loom (placement pool)
         run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-placement --features loom
       # M1.4 parity-suite leg (stdlib driver): pytest file runs the in-script

@@ -50,7 +50,7 @@ impl SnapshotHandle {
 
 /// Demand-path failure: source read failed after bounded retries. The key's
 /// claim is cancelled (no ghost residency, slot recycled); the FFI layer
-/// aborts loudly on this (Global Constraints).
+/// aborts loudly on this.
 #[derive(Debug)]
 pub enum PoolError {
     /// Source read failed after bounded retries.
@@ -213,7 +213,7 @@ impl ExpertPool {
     }
 
     /// Claims one expert's slot, paging it in if needed, and returns the slot
-    /// index plus the UNDROPPED lease (review C-2: the caller keeps the lease
+    /// index plus the UNDROPPED lease (the caller keeps the lease
     /// until the host→device DMA is known complete, then drops it).
     fn claim_leased(
         &self,
@@ -258,7 +258,7 @@ impl ExpertPool {
         ))
     }
 
-    /// Review C-2: claims `[first, last]`, pages each expert in, and returns
+    /// Claims `[first, last]`, pages each expert in, and returns
     /// the pool-side host pointer per expert together with the held leases.
     /// The caller MUST drop the leases only after the device has consumed the
     /// bytes (the glue releases them from the `copy_done` hook).
