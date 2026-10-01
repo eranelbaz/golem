@@ -413,19 +413,28 @@ impl Policy {
                 vram_order.push(PolicyEntry { key: k, score });
                 continue;
             }
-            let tail = vram_order
-                .last()
+            // The weakest seat, not the last-pushed one: after a swap the
+            // challenger sits at the tail. Ties pick the higher key (rank order).
+            let (wi, weakest) = vram_order
+                .iter()
                 .copied()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.score.total_cmp(&b.score).then(b.key.cmp(&a.key)))
                 .expect("cap > 0 with a full order is non-empty");
-            // `tail.score > 0` rejects zero-score ties (0 ≥ 1.2·0 would
+            // `weakest.score > 0` rejects zero-score ties (0 ≥ 1.2·0 would
             // churn arbitrarily).
-            if tail.score > 0.0 && score >= SWAP_MARGIN * tail.score && dwell_ok(tail.key) {
-                in_order[tail.key] = false;
+            if weakest.score > 0.0 && score >= SWAP_MARGIN * weakest.score && dwell_ok(weakest.key)
+            {
+                in_order[weakest.key] = false;
                 in_order[k] = true;
-                vram_order.pop();
-                vram_order.push(PolicyEntry { key: k, score });
+                vram_order[wi] = PolicyEntry { key: k, score };
+            } else {
+                // Challengers arrive best-first and the weakest seat only
+                // strengthens on a swap: once one is rejected, all later are.
+                break;
             }
         }
+        vram_order.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.key.cmp(&b.key)));
         let mut promoted = vec![false; n];
         for e in &vram_order {
             if !resident(e.key, TIER_VRAM) {
@@ -829,6 +838,45 @@ mod tests {
         let out = p.pass(3000);
         assert_eq!(out.vram_order[0].key, 2, "1.3× challenger must swap");
         assert!(out.vram_evict_order.iter().any(|e| e.key == 0));
+    }
+
+    #[test]
+    fn each_challenger_faces_the_weakest_remaining_incumbent() {
+        // Cap 2, incumbents 100 and 200, challengers 300 and 250. 300 takes
+        // the 100 seat; 250 must then face the 200 incumbent (≥ 1.2×), not
+        // the just-seated 300 challenger.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 2,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        for (k, n) in [(0usize, 100u64), (1, 200)] {
+            p.apply_transition(k, Tier::Ram, true, 0);
+            p.apply_transition(k, Tier::Vram, true, 1);
+            for s in 0..n {
+                p.on_access(k, s);
+            }
+        }
+        for (k, n) in [(2usize, 300u64), (3, 250)] {
+            p.apply_transition(k, Tier::Ram, true, 0);
+            for s in 0..n {
+                p.on_access(k, 300 + s);
+            }
+        }
+        let out = p.pass(1000);
+        let order: Vec<_> = out.vram_order.iter().map(|e| e.key).collect();
+        assert_eq!(order, [2, 3], "both challengers swap, best-first");
+        let evict: Vec<_> = out.vram_evict_order.iter().map(|e| e.key).collect();
+        assert_eq!(evict, [0, 1], "both incumbents displaced, worst-first");
     }
 
     #[test]
