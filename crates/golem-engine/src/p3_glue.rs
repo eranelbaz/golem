@@ -26,6 +26,7 @@
 //!   `data + e·stride`), with no reliance on intra-range call ordering.
 #![allow(unsafe_code)]
 
+use golem_placement::pool::SlotClass;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -110,15 +111,16 @@ static ENABLING: AtomicBool = AtomicBool::new(false);
 /// evict-first order, plus the double-buffered order slices returned to C.
 ///
 /// Attribution: `notify_access` carries only the expert id, so accesses are
-/// booked under the (layer, kind) of the most recent `policy_query`. Exact
-/// for the current C call-site shape — C emits notify per routed expert
-/// inside the same policy_query-guarded block, single decode thread — M4's
+/// booked under the layer of the most recent `policy_query`. Exact for the
+/// current C call-site shape — C emits notify per routed expert inside the
+/// same policy_query-guarded block, single decode thread — M4's
 /// multi-context re-homing must pass tensor identity explicitly.
-type AccessMap = HashMap<(u32, ExpertKind), Vec<Option<u64>>>;
-
 struct PolicyQueryState {
-    /// (layer, kind) → per-expert last-access step; `None` = never accessed.
-    last_access: Mutex<AccessMap>,
+    /// Flat `layer × n_experts` last-access step; `None` = never accessed.
+    /// One row per layer, shared by all three of its tensors — the same order
+    /// is returned for gate/up/down, which the shared per-layer slot table
+    /// requires (D-11).
+    last_access: Mutex<Vec<Option<u64>>>,
     /// Decode-step counter: one `llama_decode` call = one step (§6.2 as
     /// amended — prefill chunks count as one step each), bumped by
     /// [`advance_decode_step`] from `Session`'s decode paths. Rust drives
@@ -131,8 +133,8 @@ struct PolicyQueryState {
     bufs: [Mutex<Vec<i32>>; 2],
     /// Index of the buffer currently exposed to C (`bufs` element).
     exposed: AtomicUsize,
-    /// Last (layer, kind) passed to policy_query; notify attribution key.
-    last_queried: Mutex<Option<(u32, ExpertKind)>>,
+    /// Last layer passed to policy_query; notify attribution key.
+    last_queried: Mutex<Option<u32>>,
     /// `GOLEM_TEST_SHUFFLE_ORDER`, read ONCE at enable; reverses the recency
     /// order to prove consumers are order-agnostic (any permutation is legal,
     /// invariant 4; tests/t3_cache_invariance.rs is the only setter).
@@ -144,7 +146,7 @@ struct PolicyQueryState {
 impl PolicyQueryState {
     fn new(n_layers: u32, n_experts: u32, shuffle: bool) -> Self {
         Self {
-            last_access: Mutex::new(HashMap::new()),
+            last_access: Mutex::new(vec![None; n_layers as usize * n_experts as usize]),
             step: AtomicU64::new(0),
             bufs: [Mutex::new(Vec::new()), Mutex::new(Vec::new())],
             exposed: AtomicUsize::new(0),
@@ -165,20 +167,16 @@ impl PolicyQueryState {
         self.bufs[next].lock().unwrap().as_ptr()
     }
 
-    /// Evict-first order for one (layer, kind): never-accessed experts
-    /// first, then ascending last-access step. First sight of a tensor seeds
-    /// its map entry with all-`None` (never accessed).
-    fn order_for(&self, layer: u32, kind: ExpertKind) -> Vec<i32> {
+    /// Evict-first order for one layer (shared by all three of its
+    /// tensors): never-accessed experts first, then ascending last-access
+    /// step.
+    fn order_for(&self, layer: u32) -> Vec<i32> {
         debug_assert!(
             layer < self.n_layers && self.n_experts > 0,
             "order requested outside the registered geometry"
         );
-        let hist = {
-            let mut map = self.last_access.lock().unwrap();
-            map.entry((layer, kind))
-                .or_insert_with(|| vec![None; self.n_experts as usize])
-                .clone()
-        };
+        let lo = layer as usize * self.n_experts as usize;
+        let hist = self.last_access.lock().unwrap()[lo..lo + self.n_experts as usize].to_vec();
         build_order(&hist, self.n_experts as usize, self.shuffle)
     }
 
@@ -186,36 +184,28 @@ impl PolicyQueryState {
     /// at the current decode step.
     fn note_access(&self, expert_id: i64) {
         let step = self.step.load(Ordering::Relaxed);
-        let Some((layer, kind)) = *self.last_queried.lock().unwrap() else {
+        let Some(layer) = *self.last_queried.lock().unwrap() else {
             return; // defensive: notify before any query — nothing to attribute
         };
-        if let Some(hist) = self.last_access.lock().unwrap().get_mut(&(layer, kind)) {
-            let e = expert_id as usize;
-            if e < hist.len() {
-                hist[e] = Some(step);
-            }
+        let e = expert_id as usize;
+        let idx = layer as usize * self.n_experts as usize + e;
+        let mut map = self.last_access.lock().unwrap();
+        if idx < map.len() {
+            map[idx] = Some(step);
         }
     }
 
-    /// §6.5 prefetch feed: union of accessed `(layer, expert)` units from the
-    /// last `k` steps. The three tensors of a layer book the same routed
-    /// experts, so duplicates collapse through a flat per-layer bitset —
-    /// no hash set on the feed path.
+    /// §6.5 prefetch feed: union of accessed `(layer, expert)` units from
+    /// the last `k` steps. Layer-major, expert-ascending order.
     fn recent_union(&self, k: usize) -> Vec<(u32, u32)> {
         let cutoff = self.step.load(Ordering::Relaxed).saturating_sub(k as u64);
-        let words = self.n_experts.div_ceil(64) as usize;
+        let n = self.n_experts as usize;
         let map = self.last_access.lock().unwrap();
         let mut out = Vec::new();
-        // Flat per-layer bitset over all layers: the three tensors of a layer
-        // book the same routed experts, so duplicates collapse to distinct
-        // experts only — no hash set on the feed path.
-        let mut seen = vec![0u64; self.n_layers as usize * words];
-        for (&(layer, _), hist) in map.iter() {
-            let row = &mut seen[layer as usize * words..(layer as usize + 1) * words];
-            for (e, s) in hist.iter().enumerate() {
-                if s.is_some_and(|step| step > cutoff) && row[e / 64] & (1 << (e % 64)) == 0 {
-                    row[e / 64] |= 1 << (e % 64);
-                    out.push((layer, e as u32));
+        for layer in 0..self.n_layers as usize {
+            for (e, s) in map[layer * n..(layer + 1) * n].iter().enumerate() {
+                if s.is_some_and(|step| step > cutoff) {
+                    out.push((layer as u32, e as u32));
                 }
             }
         }
@@ -334,31 +324,35 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         .map_err(|e| EngineError::PoolInit(e.to_string()))?
         .ok_or_else(|| EngineError::PoolInit("model has no expert tensors".into()))?;
 
-    // RAM slot size = the max unit size (all three planes of the largest
-    // layer); per-class slabs arrive with the multi-class layout.
-    let slot_size = usize::try_from(geo.max_unit())
-        .map_err(|_| EngineError::PoolInit("slot size > usize".into()))?;
     let n_layers = geo.n_layers();
     let pool_bytes = config
         .ram_experts_gib
         .checked_mul(1 << 30)
         .ok_or_else(|| EngineError::PoolInit("ram_experts_gib overflows bytes".into()))?;
-    let slots = pool_bytes / slot_size as u64;
-    let slots = u32::try_from(slots)
-        .map_err(|_| EngineError::PoolInit("slot count exceeds u32::MAX".into()))?;
-    if slots < n_layers {
-        return Err(EngineError::PoolInit(format!(
-            "pool of {slots} slots (ram_experts_gib = {}) cannot cover {n_layers} expert layers \
-             (one slot per layer minimum; plane stride {slot_size} B)",
-            config.ram_experts_gib
-        )));
+    // Device-slab pricing input: total unit bytes across the model — one
+    // slab slot costs Σ_layers unit bytes (D-11).
+    let slab = slab_bytes_per_expert(&geo);
+    let n_expert_used = metadata
+        .kv_u64(&format!("{arch}.expert_used_count"))
+        .ok_or_else(|| {
+            EngineError::PoolInit(format!("{arch}.expert_used_count missing from the GGUF"))
+        })?;
+    let n_expert_used = u32::try_from(n_expert_used)
+        .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
+    // Per-class RAM layout (D-2): each unit-size class gets slots
+    // proportional to its share of total unit bytes; remainder bytes are
+    // trimmed by integer division.
+    let classes = geo.classes();
+    let layout = class_layout(&classes, pool_bytes, n_expert_used)?;
+    let arena = golem_placement::pool::Arena::new(&layout)
+        .map_err(|e| EngineError::PoolInit(e.to_string()))?;
+    // Layer → class index, aligned with `layout`/`classes` ordering.
+    let mut class_of_layer = vec![0u8; n_layers as usize];
+    for (c, (_, layers)) in classes.iter().enumerate() {
+        for &l in layers {
+            class_of_layer[l as usize] = c as u8;
+        }
     }
-    // Remainder bytes are trimmed by integer division: pool_bytes is a
-    // multiple of slot_size again after this. Single class: every slot is
-    // one max-unit slot until the per-class layout lands (§5 amendment).
-    let arena =
-        golem_placement::pool::Arena::new(&[golem_placement::pool::SlotClass { slot_size, slots }])
-            .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
     // Design §3.5: mlock alone leaves the H2D copy pageable —
     // driver bounce buffers, ~half of PCIe bandwidth, not truly async, and
@@ -391,7 +385,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         snapshots,
         Arc::new(P3Stats::new()),
         geo.clone(),
-        vec![0; geo.n_layers() as usize],
+        class_of_layer,
     );
 
     // P2 state: per-expert recency (never-accessed first, then
@@ -447,7 +441,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         })?;
     let n_expert_used = u32::try_from(n_expert_used)
         .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
-    let k = derive_device_cache_experts(config, n_layers, slot_size as u64, n_expert_used)?;
+    let k = derive_device_cache_experts(config, slab, n_expert_used)?;
     // SAFETY: FFI setter, no invariants.
     unsafe {
         raw::golem_set_device_cache_experts(k as i32);
@@ -471,8 +465,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     tracing::info!(
         layers = n_layers,
         experts = geo.n_experts,
-        slot_size,
-        slots,
+        classes = ?layout,
         gib = config.ram_experts_gib,
         "P3 RAM expert pool registered (hooks set for process lifetime)"
     );
@@ -485,8 +478,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
 /// not decode at all.
 fn derive_device_cache_experts(
     #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] config: &EngineConfig,
-    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] n_layers: u32,
-    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] slot_size: u64,
+    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] slab_bytes_per_expert: u64,
     n_expert_used: u32,
 ) -> Result<u32, EngineError> {
     if config.device_cache_experts > 0 {
@@ -508,7 +500,7 @@ fn derive_device_cache_experts(
     }
     #[cfg(golem_backend_hip)]
     if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
-        return k_from_free_vram(free as u64, n_layers, slot_size, n_expert_used);
+        return k_from_free_vram(free as u64, slab_bytes_per_expert, n_expert_used);
     }
     Err(EngineError::PoolInit(
         "device_cache_experts unset and no VRAM query available to derive a bounded \
@@ -517,23 +509,68 @@ fn derive_device_cache_experts(
     ))
 }
 
+/// Device bytes one slab slot costs across the model: Σ_layers unit bytes —
+/// one routed expert touches one unit in EVERY expert layer (D-11).
+fn slab_bytes_per_expert(geo: &golem_placement::pool::PoolGeometry) -> u64 {
+    geo.layers.iter().map(|l| l.bytes()).sum()
+}
+
+/// Per-class slot counts: class c gets ⌊pool_bytes × share_c / unit_c⌋
+/// slots, share_c = layers_c × unit_c / Σ_layers unit. Err when a class
+/// falls below layers_c × n_expert_used (one cold step leases that many
+/// units until the next compute's copy_done).
+fn class_layout(
+    classes: &[(u64, Vec<u32>)],
+    pool_bytes: u64,
+    n_expert_used: u32,
+) -> Result<Vec<SlotClass>, EngineError> {
+    let total_unit_bytes: u64 = classes
+        .iter()
+        .map(|&(unit, ref ls)| unit.saturating_mul(ls.len() as u64))
+        .sum();
+    let mut out = Vec::with_capacity(classes.len());
+    for &(unit, ref layers) in classes {
+        // u128 intermediates: pool_bytes × layers ≈ 65 GiB × 39 overflows
+        // nothing here, but pool_bytes × Σ unit does; share = layers/Σ unit
+        // and slots = ⌊pool_bytes × share / unit⌋ = ⌊pool_bytes × layers / Σ unit⌋
+        // (the unit cancels).
+        let slots =
+            u128::from(pool_bytes) * u128::from(layers.len() as u64) / u128::from(total_unit_bytes);
+        let slots = u32::try_from(slots)
+            .map_err(|_| EngineError::PoolInit("slot count exceeds u32::MAX".into()))?;
+        let floor = layers.len() as u64 * u64::from(n_expert_used);
+        if u64::from(slots) < floor {
+            return Err(EngineError::PoolInit(format!(
+                "RAM pool of {pool_bytes} B too small for the unit-size {unit} B class \
+                 ({} layers): {slots} slots < {floor} in flight ({} layers × \
+                 expert_used_count {n_expert_used}); raise ram_experts_gib",
+                layers.len(),
+                layers.len()
+            )));
+        }
+        out.push(SlotClass {
+            slot_size: usize::try_from(unit)
+                .map_err(|_| EngineError::PoolInit("slot size > usize".into()))?,
+            slots,
+        });
+    }
+    Ok(out)
+}
+
 /// Derived K from free VRAM: half is slab budget, the rest KV + compute-buffer
 /// growth headroom; `− 1` is per-slab headroom. Floored at top-k.
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 fn k_from_free_vram(
     free: u64,
-    n_layers: u32,
-    slot_size: u64,
+    slab_bytes_per_expert: u64,
     n_expert_used: u32,
 ) -> Result<u32, EngineError> {
-    let slab_bytes_per_expert = u64::from(n_layers)
-        .saturating_mul(3)
-        .saturating_mul(slot_size);
     let k = (free / 2) / slab_bytes_per_expert.max(1);
     let k = k.saturating_sub(1).clamp(1, i32::MAX as u64);
     if k < u64::from(n_expert_used) {
         return Err(EngineError::PoolInit(format!(
-            "free VRAM supports a slab of only {k} experts per (layer, kind), below \
+            "free VRAM {free} B supports a slab of only {k} experts per layer at \
+             {slab_bytes_per_expert} B per routed expert (Σ unit bytes), below \
              expert_used_count {n_expert_used} — even single-token decode would abort; \
              free VRAM or lower the resident set"
         )));
@@ -662,8 +699,8 @@ extern "C" fn policy_query(ctx: *mut c_void, tensor: *const c_void, n_experts: i
             entry.n_experts, entry.layer
         ));
     }
-    *h.policy.last_queried.lock().unwrap() = Some((entry.layer, entry.kind));
-    let order = h.policy.order_for(entry.layer, entry.kind);
+    *h.policy.last_queried.lock().unwrap() = Some(entry.layer);
+    let order = h.policy.order_for(entry.layer);
     // Belt-and-suspenders: C validates the permutation authoritatively
     // and aborts on corruption; failing here yields a
     // Rust-side message instead.
@@ -806,7 +843,7 @@ mod tests {
             ..EngineConfig::default()
         };
         assert_eq!(
-            derive_device_cache_experts(&c, 42, 5_777_000, 8).unwrap(),
+            derive_device_cache_experts(&c, 42 * 5_777_000, 8).unwrap(),
             9
         );
         // Explicit K below the model's top-k must fail at enable, not abort
@@ -815,13 +852,13 @@ mod tests {
             device_cache_experts: 7,
             ..EngineConfig::default()
         };
-        let err = derive_device_cache_experts(&c_small, 42, 5_777_000, 8).unwrap_err();
+        let err = derive_device_cache_experts(&c_small, 42 * 5_777_000, 8).unwrap_err();
         assert!(err.to_string().contains("expert_used_count"), "{err}");
         // Default (0): derived, bounded, never 0. On the CPU backend there is
         // no VRAM query, so derivation is a loud error, not an unbounded cap.
         #[cfg(not(golem_backend_hip))]
         assert!(
-            derive_device_cache_experts(&EngineConfig::default(), 42, 5_777_000, 8).is_err(),
+            derive_device_cache_experts(&EngineConfig::default(), 42 * 5_777_000, 8).is_err(),
             "no VRAM query: derivation must fail loudly"
         );
         // An explicit K that would wrap the i32 ABI is refused, not passed
@@ -830,24 +867,68 @@ mod tests {
             device_cache_experts: u32::MAX,
             ..EngineConfig::default()
         };
-        let err = derive_device_cache_experts(&c_huge, 42, 5_777_000, 8).unwrap_err();
+        let err = derive_device_cache_experts(&c_huge, 42 * 5_777_000, 8).unwrap_err();
         assert!(err.to_string().contains("i32::MAX"), "{err}");
     }
 
+    const Q4: u64 = 4_718_592;
+    const Q5: u64 = 5_767_168;
+    const Q6: u64 = 6_881_280;
+
+    fn glm_classes() -> Vec<(u64, Vec<u32>)> {
+        let std: Vec<u32> = (0..42).filter(|l| ![8, 9, 41].contains(l)).collect(); // blk 11/12/44 − 3
+        vec![
+            (Q4 + Q4 + Q5, std),
+            (Q4 + Q4 + Q6, vec![9, 41]),
+            (Q5 + Q5 + Q6, vec![8]),
+        ]
+    }
+
     #[test]
-    fn derived_k_matches_target_arithmetic_and_floors_at_top_k() {
-        // Target: ≈12.4 GiB free → 6.2 GiB slab budget / (42 × 3 × 5.77 MB)
-        // ≈ 9.15 → 9 − 1 = 8, exactly top-k.
-        let free = 2 * 6_657_000_000u64;
-        assert_eq!(k_from_free_vram(free, 42, 5_777_000, 8).unwrap(), 8);
-        // Any less free VRAM drops K below top-k: refused at enable.
-        let err = k_from_free_vram(free - 2 * 727_902_000, 42, 5_777_000, 8).unwrap_err();
-        assert!(err.to_string().contains("expert_used_count 8"), "{err}");
-        // Huge free VRAM stays within the i32 ABI.
+    fn class_layout_splits_the_pool_by_byte_share() {
+        let l = class_layout(&glm_classes(), 65 << 30, 8).unwrap();
         assert_eq!(
-            k_from_free_vram(u64::MAX, 1, 1, 8).unwrap(),
+            l.iter().map(|c| c.slots).collect::<Vec<_>>(),
+            [4_226, 216, 108]
+        );
+        // Floor: 1 GiB cannot hold 39 × 8 std units in flight.
+        let err = class_layout(&glm_classes(), 1 << 30, 8).unwrap_err();
+        assert!(err.to_string().contains("expert_used_count"), "{err}");
+    }
+
+    #[test]
+    fn derived_k_prices_a_slab_slot_by_per_layer_unit_bytes() {
+        let geo_bytes: u64 = glm_classes()
+            .iter()
+            .map(|(u, ls)| u * ls.len() as u64)
+            .sum();
+        assert_eq!(geo_bytes, 644_022_272);
+        // 6.657 GB slab budget / 644 MB = 10.34 → K = 9. Pricing by 42 × 3 × max
+        // stride (867 MB) gave 7.68 → K = 6 < top-k: enable refused the real model.
+        assert_eq!(
+            k_from_free_vram(2 * 6_657_000_000, geo_bytes, 8).unwrap(),
+            9
+        );
+        assert!(k_from_free_vram(2 * 6_657_000_000, 42 * 3 * Q6, 8).is_err());
+        // Huge free VRAM stays within the i32 ABI (≤ 0 reads as "full slab" in C).
+        assert_eq!(
+            k_from_free_vram(u64::MAX, geo_bytes, 8).unwrap(),
             i32::MAX as u32
         );
+    }
+
+    #[test]
+    fn policy_order_and_access_are_shared_by_the_layers_three_tensors() {
+        let p = PolicyQueryState::new(2, 4, false);
+        p.step.store(5, Ordering::Relaxed); // recent_union keeps steps > step − k
+        *p.last_queried.lock().unwrap() = Some(1); // last query: layer 1 (any kind)
+        p.note_access(2);
+        assert_eq!(
+            p.order_for(1),
+            vec![0, 1, 3, 2],
+            "expert 2 accessed → evicted last"
+        );
+        assert_eq!(p.recent_union(3), vec![(1, 2)]);
     }
 
     #[test]
@@ -897,10 +978,10 @@ mod tests {
         let pq = PolicyQueryState::new(2, 4, false);
         // Notify before any query: defensive ignore.
         pq.note_access(0);
-        assert!(pq.last_access.lock().unwrap().is_empty());
+        assert!(pq.last_access.lock().unwrap().iter().all(Option::is_none));
 
-        assert_eq!(pq.order_for(0, ExpertKind::Gate), vec![0, 1, 2, 3]);
-        *pq.last_queried.lock().unwrap() = Some((0, ExpertKind::Gate));
+        assert_eq!(pq.order_for(0), vec![0, 1, 2, 3]);
+        *pq.last_queried.lock().unwrap() = Some(0);
         pq.step.store(7, Ordering::Relaxed);
         for id in 0..4 {
             pq.note_access(id);
@@ -910,18 +991,12 @@ mod tests {
             7,
             "notify never moves the step — Session's decode paths own it"
         );
-        assert_eq!(
-            pq.last_access.lock().unwrap()[&(0, ExpertKind::Gate)],
-            vec![Some(7); 4]
-        );
+        assert_eq!(&pq.last_access.lock().unwrap()[0..4], &[Some(7); 4]);
 
         // A later step's notify rewrites recency and feeds the prefetcher.
         pq.step.store(9, Ordering::Relaxed);
         pq.note_access(2);
-        assert_eq!(
-            pq.last_access.lock().unwrap()[&(0, ExpertKind::Gate)][2],
-            Some(9)
-        );
+        assert_eq!(pq.last_access.lock().unwrap()[2], Some(9));
         assert_eq!(
             pq.recent_union(1),
             vec![(0, 2)],
