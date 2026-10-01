@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
@@ -82,24 +83,26 @@ int main() {
         REQUIRE(copies.size() == 2, "unpadded run must not copy a tail");
     }
 
-    // Guard-page leg: two pages — the slot flush against a PROT_NONE guard
-    // page, and the slot ends the mapping. A padded run reading one byte
-    // past the slot faults (SIGSEGV without the fix).
+    // Guard-page leg: the slot ends flush against a PROT_NONE guard page,
+    // so a padded run reading one byte past the slot faults (SIGSEGV
+    // without the fix). Sized from the real page size, not expert_size.
     {
-        char *map = (char *) mmap(nullptr, 2 * expert_size, PROT_READ | PROT_WRITE,
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        const size_t body = (expert_size + page - 1) / page * page;
+        char *map = (char *) mmap(nullptr, body + page, PROT_READ | PROT_WRITE,
                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         REQUIRE(map != MAP_FAILED, "mmap failed");
-        char *slot = map;
-        char *guard = map + expert_size;
+        char *guard = map + body;
+        char *slot = guard - expert_size;
         memset(slot, 0x5a, expert_size);
-        REQUIRE(mprotect(guard, expert_size, PROT_NONE) == 0, "mprotect failed");
+        REQUIRE(mprotect(guard, page, PROT_NONE) == 0, "mprotect failed");
         std::vector<char> dst(expert_size + padding, 0);
         const void *ptrs[1] = {slot};
         golem_copy_pooled_expert_run(dst.data(), 0, expert_size, padding, ptrs, 1,
                                      memcpy_set, nullptr);
         REQUIRE((unsigned char) dst[expert_size] == 0x5a,
                 "padding tail must hold the last expert's own bytes");
-        munmap(map, 2 * expert_size);
+        munmap(map, body + page);
     }
 
     if (g_failures != 0) {
