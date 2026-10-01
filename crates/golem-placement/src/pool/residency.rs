@@ -280,7 +280,11 @@ impl ResidencyMap {
             // the scan — the free list is a leaf, and the sweep takes shard
             // locks one at a time under its own mutex.
             drop(sh);
-            let acquired = match self.free_slots.lock().unwrap().pop() {
+            // Bind the pop outside the match: a match-scrutinee temporary
+            // lives to the end of the match, which would hold the free-list
+            // guard across the CLOCK sweep below.
+            let popped = self.free_slots.lock().unwrap().pop();
+            let acquired = match popped {
                 Some(slot) => Some((slot, None)),
                 None => self.clock_evict(snapshot).map(|(v, s)| (s, Some(v))),
             };
