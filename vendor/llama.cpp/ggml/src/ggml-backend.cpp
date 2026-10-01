@@ -33,6 +33,7 @@
 
 static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
 static int golem_expert_stem_kind(const char *name); // defined in the P1 section (used at split time by the device slab)
+static int golem_tensor_blk(const char *name); // defined in the P1 section (layer key of the shared slot table)
 
 // Golem: copy a pooled expert run slot by slot. The padding tail (MMQ
 // non-NaN guard after the last routed expert) is a separate copy of the LAST
@@ -82,6 +83,9 @@ const golem_device_cache_stats *golem_get_device_cache_stats(void) { return &gol
 namespace golem { // named (not anonymous): golem_dc_step is linked from the ctest fuzz TU
 static std::mutex                                         golem_dc_mutex;
 static std::unordered_map<const void *, GolemSlabEntry> golem_dc; // key: HOST weights tensor data ptr (the stable identity; device cpy addresses alias across splits - each split's copy tensor can reuse the same device address, which reset every entry and defeated all reuse)
+// D-11: one slot table per expert layer, shared by its gate/up/down slabs (same
+// routed ids); keyed by the blk number parsed from the tensor name.
+static std::unordered_map<int, GolemLayerSlots> golem_layers;
 } // namespace golem
 
 void golem_reset_device_cache(void) {
@@ -97,6 +101,7 @@ void golem_reset_device_cache(void) {
         }
     }
     golem::golem_dc.clear();
+    golem::golem_layers.clear();
 }
 
 #ifdef __APPLE__
@@ -1958,6 +1963,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         {
                             std::lock_guard<std::mutex> lk(golem::golem_dc_mutex);
                             golem::GolemSlabEntry &st = golem::golem_dc[input->data];
+                            // D-11: the three planes of a layer consume the same routed
+                            // ids, so slot assignment + eviction run once per layer; the
+                            // table lives past any single slab's (re)allocation.
+                            const int golem_kind = golem_expert_stem_kind(input->name);
+                            GGML_ASSERT(golem_kind != 0);
+                            golem::GolemLayerSlots &L = golem::golem_layers[golem_tensor_blk(input->name)];
                             // (Re)allocate the slab + remapped-ids tensor on
                             // fingerprint change. The slab is zeroed once (the
                             // padding slot must stay non-NaN); its plane bytes
@@ -1986,6 +1997,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 st.K = K;
                                 st.n_experts = (int32_t) n_expert;
                                 st.expert_size = expert_size;
+                                // The slab's device bytes are gone: this plane must
+                                // re-copy everything on its next step.
+                                golem::golem_layer_invalidate(L, golem_kind - 1);
                             }
                             // Remapped-ids device tensor: resized on ids-shape
                             // change (slot validity is independent of it).
@@ -2011,9 +2025,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                             // Slab step: decide skips/copies/evictions + remap.
                             std::vector<std::pair<int32_t, int32_t>> pending; // (slot, expert id)
-                            dc = golem::golem_slab_step(st, routed, ids.data(),
-                                (int64_t) ids.size(), order, K, (int32_t) n_expert, expert_size,
-                                input->data,
+                            dc = golem::golem_slab_step(L, golem_kind - 1, routed, ids.data(),
+                                (int64_t) ids.size(), order, K, (int32_t) n_expert, st.remap,
                                 [&](int32_t slot, int32_t id) { pending.emplace_back(slot, id); });
 
                             // Physical writes: page the pool (ensure_host_resident out_ptrs), then one
@@ -2838,6 +2851,18 @@ int golem_expert_offload_min_batch(int default_value) {
  * for padded/non-contiguous tensors, where recomputing from ne is not).
  * Fused ffn_gate_up_exps is deliberately excluded — P2
  * splits routed gate/up/down ranges independently. */
+/* Layer number of a runtime tensor name ("blk.%d...."); the layer key of the
+ * shared per-layer device slot table. Aborts on a name without the blk.N.
+ * segment — expert tensors always carry it (GGML_TOKEN/MTP layers never reach
+ * this path). */
+static int golem_tensor_blk(const char *name) {
+    const char *p = strstr(name, "blk.");
+    if (p == NULL) {
+        GGML_ABORT("golem P2: expert tensor name without blk.N. segment: %s", name);
+    }
+    return atoi(p + 4);
+}
+
 static int golem_name_ends_with(const char *name, const char *suffix) {
     size_t nl = strlen(name), sl = strlen(suffix);
     return nl >= sl && strcmp(name + nl - sl, suffix) == 0;

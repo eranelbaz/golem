@@ -1,14 +1,15 @@
-// Golem P2 v2 fuzz (design §3.4 v2): exercises the shared SLOT-INDIRECTED device
-// cache state machine (ggml/src/golem-device-cache.hpp — the exact template
-// the split scheduler runs) for the invariants that matter now:
+// Golem P2 v3 fuzz (design §3.4 v3, D-11): exercises the shared SLOT-INDIRECTED
+// device cache state machine (ggml/src/golem-device-cache.hpp — the exact
+// template the split scheduler runs) for the invariants that matter now:
 //   1. bit ⇒ current: after a step, every routed expert's remapped slot holds
 //      the host's current generation of that expert.
 //   2. remap soundness: every remapped value is in [0, K), and ids outside the
 //      routed set never appear (they cannot — routed covers the ids bitset).
 //   3. victim choice (order permutation / routed set) never changes routed
 //      coverage; budget overflow with routed > K aborts loudly.
-// plus stale-entry invalidation (fingerprint mismatch ⇒ reset) and
-// malformed-order aborts (duplicate / out-of-range / NULL).
+//   4. per-layer sharing (D-11): the three planes (gate/up/down) of one layer
+//      share one slot table — an eviction happens once per layer, not once per
+//      plane, and each plane keeps its own validity bits.
 //
 // Aborts are asserted in fork()ed children (GGML_ABORT raises SIGABRT).
 #include "golem-device-cache.hpp"
@@ -21,8 +22,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
-
-using golem::GolemSlabEntry;
 
 namespace {
 
@@ -52,10 +51,61 @@ struct Shadow {
 int main() {
     std::mt19937_64 rng(0x676f6c656d); // "golem"
 
+    {   // leg: one eviction serves all three planes; later planes only copy.
+        golem::GolemLayerSlots L;
+        std::vector<int32_t> remap, order = {0, 1, 2, 3};
+        const int32_t K = 2, n = 4;
+        auto step = [&](int kind, std::vector<int32_t> routed) {
+            std::vector<int32_t> ids = routed;
+            return golem::golem_slab_step_nop(L, kind, routed, ids.data(), (int64_t) ids.size(),
+                                              order.data(), K, n, remap);
+        };
+        for (int k = 0; k < 3; ++k) step(k, {0, 1});            // warm: experts 0,1 in slots
+        auto g = step(0, {2, 3});                                // gate evicts 0 and 1
+        GGML_ASSERT(g.evicted == 2 && g.copied == 2);
+        std::vector<int32_t> gate_remap = remap;
+        auto u = step(1, {2, 3});
+        auto d = step(2, {2, 3});
+        GGML_ASSERT(u.evicted == 0 && d.evicted == 0);           // shared table: no re-eviction
+        GGML_ASSERT(u.copied == 2 && d.copied == 2);             // their bits were cleared by gate
+        GGML_ASSERT(remap == gate_remap);                        // same slots for every plane
+        auto u2 = step(1, {2, 3});
+        GGML_ASSERT(u2.copied == 0 && u2.skipped == 2);
+    }
+    {   // leg: invalidating one slab re-copies only that plane.
+        golem::GolemLayerSlots L;
+        std::vector<int32_t> remap, order = {0, 1, 2, 3};
+        auto step = [&](int kind, int32_t K) {
+            std::vector<int32_t> routed = {0, 1}, ids = routed;
+            return golem::golem_slab_step_nop(L, kind, routed, ids.data(), 2, order.data(), K, 4, remap);
+        };
+        for (int k = 0; k < 3; ++k) step(k, 2);
+        golem::golem_layer_invalidate(L, 2);
+        auto d = step(2, 2);
+        GGML_ASSERT(d.copied == 2 && d.skipped == 0);
+        auto g = step(0, 2);
+        GGML_ASSERT(g.copied == 0 && g.skipped == 2);
+    }
+    {   // leg: a K change resets every plane's validity (no stale bit survives re-mapping).
+        golem::GolemLayerSlots L;
+        std::vector<int32_t> remap, order = {0, 1, 2, 3};
+        auto step = [&](int kind, int32_t K, std::vector<int32_t> routed) {
+            std::vector<int32_t> ids = routed;
+            return golem::golem_slab_step_nop(L, kind, routed, ids.data(), (int64_t) ids.size(),
+                                              order.data(), K, 4, remap);
+        };
+        for (int k = 0; k < 3; ++k) step(k, 3, {0, 1, 2});
+        for (int k = 0; k < 3; ++k) {
+            auto c = step(k, 2, {0, 1});
+            GGML_ASSERT(c.copied == 2 && c.skipped == 0);
+        }
+    }
+
     const int32_t n = 8;
     const int32_t K = 3;
-    GolemSlabEntry st;
+    golem::GolemLayerSlots L;
     Shadow sh(n, K);
+    std::vector<int32_t> remap;
 
     for (int step = 0; step < 500; ++step) {
         // Random routed subset, size 1..K.
@@ -69,8 +119,8 @@ int main() {
 
         // Host mutates experts that are NOT cached-current.
         for (int32_t id = 0; id < n; ++id) {
-            const int32_t s = st.slot_of.empty() ? -1 : st.slot_of[id];
-            const bool current = s != -1 && ggml_bitset_get(st.valid.data(), s);
+            const int32_t s = L.slot_of.empty() ? -1 : L.slot_of[id];
+            const bool current = s != -1 && ggml_bitset_get(L.valid[0].data(), s);
             if (!current && rng() % 3 == 0) ++sh.host_gen[id];
         }
 
@@ -83,30 +133,29 @@ int main() {
         std::vector<int32_t> ids = routed;
         std::shuffle(ids.begin(), ids.end(), rng);
 
-        const auto before_valid = st.valid;
-        const auto before_slot_of = st.slot_of;
+        const auto before_valid = L.valid[0];
+        const auto before_slot_of = L.slot_of;
 
-        const auto dc = golem::golem_slab_step_nop(st, routed, ids.data(),
-            (int64_t) ids.size(), order.data(), K, n, /*expert_size*/ 2048,
-            /*host_data*/ &step);
+        const auto dc = golem::golem_slab_step_nop(L, 0, routed, ids.data(),
+            (int64_t) ids.size(), order.data(), K, n, remap);
 
         // Invariant 1+2: remap sound and routed coverage.
-        REQUIRE((int64_t) st.remap.size() == (int64_t) ids.size(),
-                "step %d: remap size %zu != ids %lld", step, st.remap.size(),
+        REQUIRE((int64_t) remap.size() == (int64_t) ids.size(),
+                "step %d: remap size %zu != ids %lld", step, remap.size(),
                 (long long) ids.size());
         for (size_t i = 0; i < ids.size(); ++i) {
             const int32_t v = ids[i];
-            REQUIRE(st.remap[i] >= 0 && st.remap[i] < K,
-                    "step %d: remap[%zu]=%d out of [0,%d)", step, i, st.remap[i], K);
-            REQUIRE(st.slot_of[v] == st.remap[i],
+            REQUIRE(remap[i] >= 0 && remap[i] < K,
+                    "step %d: remap[%zu]=%d out of [0,%d)", step, i, remap[i], K);
+            REQUIRE(L.slot_of[v] == remap[i],
                     "step %d: remap[%zu]=%d != slot_of[%d]=%d", step, i,
-                    st.remap[i], v, st.slot_of[v]);
+                    remap[i], v, L.slot_of[v]);
             REQUIRE(dc.skipped + dc.copied >= (uint64_t) routed.size(), "accounting underflow");
         }
         // Routed coverage: every routed expert has a valid slot after the step.
         for (int32_t id : routed) {
-            const int32_t s = st.slot_of[id];
-            REQUIRE(s >= 0 && s < K && ggml_bitset_get(st.valid.data(), s),
+            const int32_t s = L.slot_of[id];
+            REQUIRE(s >= 0 && s < K && ggml_bitset_get(L.valid[0].data(), s),
                     "step %d: routed expert %d has no valid slot", step, id);
         }
         // Evictions only ever stole from non-routed experts.
@@ -118,40 +167,31 @@ int main() {
                 (unsigned long long) dc.copied, (unsigned long long) dc.skipped,
                 routed.size());
 
+        // Eviction coherence: a slot stolen from a non-routed owner has its bit
+        // cleared and the owner's assignment removed (owner_of is the inverse
+        // of slot_of over live assignments).
+        for (int32_t s = 0; s < K; ++s) {
+            const int32_t o = L.owner_of[s];
+            if (o != -1) {
+                REQUIRE(L.slot_of[o] == s, "owner_of/slot_of diverge at slot %d", s);
+            }
+        }
+        for (int32_t id = 0; id < n; ++id) {
+            const int32_t s = L.slot_of[id];
+            if (s != -1) REQUIRE(L.owner_of[s] == id, "slot_of/owner_of diverge at expert %d", id);
+        }
+
         (void) before_valid;
         (void) before_slot_of;
     }
 
-    // Stale-entry reset: a fingerprint change must clear slot assignments.
-    {
-        GolemSlabEntry st;
-        std::vector<int32_t> routed = {0};
-        std::vector<int32_t> ids = {0};
-        std::vector<int32_t> order(n);
-        for (int32_t i = 0; i < n; ++i) order[i] = i;
-        golem::golem_slab_step_nop(st, routed, ids.data(), 1, order.data(), K, n, 2048,
-                                   (void *) 0x1);
-        REQUIRE(st.slot_of[0] != -1, "warm entry: expert 0 must be assigned");
-        golem::golem_slab_step_nop(st, routed, ids.data(), 1, order.data(), K, n, 2048,
-                                   (void *) 0x2);
-        // owner mismatch → reset; slot_of must be re-derived from scratch
-        // (expert 0 staged again ⇒ copied ≥ 1 checked via return below).
-        const auto dc = golem::golem_slab_step_nop(st, routed, ids.data(), 1, order.data(), K,
-                                                   n, 2048, (void *) 0x2);
-        REQUIRE(dc.skipped == 1,
-                "same owner twice: second step must skip (got copied %llu skipped %llu)",
-                (unsigned long long) dc.copied, (unsigned long long) dc.skipped);
-    }
-
     // Abort: routed set larger than K (loud failure, never a silent wrong remap).
     if (fork() == 0) {
-        GolemSlabEntry st;
-        std::vector<int32_t> routed(n);
-        std::vector<int32_t> ids(n);
-        for (int32_t i = 0; i < n; ++i) { routed[i] = i; ids[i] = i; }
-        std::vector<int32_t> order(n);
-        for (int32_t i = 0; i < n; ++i) order[i] = i;
-        golem::golem_slab_step_nop(st, routed, ids.data(), n, order.data(), K, n, 2048, nullptr);
+        golem::GolemLayerSlots L2;
+        std::vector<int32_t> remap2, order(n);
+        std::vector<int32_t> routed(n), ids(n);
+        for (int32_t i = 0; i < n; ++i) { routed[i] = i; ids[i] = i; order[i] = i; }
+        golem::golem_slab_step_nop(L2, 0, routed, ids.data(), n, order.data(), K, n, remap2);
         _exit(0); // should not survive
     } else {
         int status = 0;
@@ -162,11 +202,9 @@ int main() {
 
     // Abort: duplicate order.
     if (fork() == 0) {
-        GolemSlabEntry st;
-        std::vector<int32_t> routed = {0};
-        std::vector<int32_t> ids = {0};
-        std::vector<int32_t> order(n, 0); // duplicates
-        golem::golem_slab_step_nop(st, routed, ids.data(), 1, order.data(), K, n, 2048, nullptr);
+        golem::GolemLayerSlots L2;
+        std::vector<int32_t> remap2, routed = {0}, ids = {0}, order(n, 0); // duplicates
+        golem::golem_slab_step_nop(L2, 0, routed, ids.data(), 1, order.data(), K, n, remap2);
         _exit(0);
     } else {
         int status = 0;

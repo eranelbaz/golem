@@ -65,10 +65,11 @@ void golem_set_expert_offload_min_batch(int n);
 
 /* --- P2/P4: slot-indirected device expert cache (design sec 3.4 v2). --- */
 
-/* Per-tensor expert-slot budget for the device cache, in EXPERTS: a
- * count per (layer, kind), never a byte cap derived from one tensor's
- * stride. 0 = unlimited (a full-size slab). Mutated over FFI by
- * tests and set once by the engine at pool enable. */
+/* Expert-slot budget for the device cache, in EXPERTS: a count per
+ * layer (one slot table shared by the layer's three expert tensors),
+ * never a byte cap derived from one tensor's stride. 0 = unlimited (a
+ * full-size slab). Mutated over FFI by tests and set once by the
+ * engine at pool enable. */
 void golem_set_device_cache_experts(int32_t k);
 /* Current budget (0 = unlimited). */
 int32_t golem_device_cache_experts(void);
