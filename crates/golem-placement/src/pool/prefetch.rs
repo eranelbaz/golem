@@ -266,7 +266,10 @@ mod tests {
         }
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn prefetch_pages_missing_experts_and_stops_on_drop() {
         let source = StdArc::new(GateSource::new((u32::MAX, ExpertKind::Gate, u32::MAX)));
         let pool = test_pool(8, arc_dyn(source.clone()));
@@ -281,7 +284,10 @@ mod tests {
         drop(handle); // stop + join — returns promptly (bounded park)
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn prefetch_yields_to_demand() {
         // Demand page-in of expert 7 blocks inside the source, holding
         // `demand_inflight` > 0; a queued prefetch key must NOT be read until

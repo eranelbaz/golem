@@ -36,10 +36,11 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --success-output=immediate
-      # T6 loom leg (§12.2): filtered to the pool's loom-written tests only —
-      # other placement tests are not written against loom primitives.
+      # T6 loom leg (§12.2): unfiltered — every non-model test is
+      # #[cfg(not(loom))]-gated, so the whole crate must pass under loom.
+      # A filter here hid 7 broken tests once; don't reintroduce one.
       - name: T6 loom (placement pool)
-        run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-placement --features loom -E 'test(t6) or test(concurrent_claim)'
+        run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-placement --features loom
       # M1.4 parity-suite leg (stdlib driver): pytest file runs the in-script
       # selftest through the real xtask comparator. Must stay after the
       # workspace build so target/debug/xtask exists (no cargo-run fallback).

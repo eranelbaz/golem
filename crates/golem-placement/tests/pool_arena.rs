@@ -36,7 +36,10 @@ impl golem_placement::pool::ExpertSource for ByteSource {
     }
 }
 
+// Sequential unit test over loom-primitive pool types: needs no exploration
+// (the t6 model covers the interleavings) and cannot run outside `model()`.
 #[test]
+#[cfg(not(loom))]
 fn arena_locks_and_slots_are_disjoint() {
     let slot_size = 16 * 32 * 4; // n_ff_exp * n_embd * F32 (tiny-moe plane)
     let pool = ExpertPool::new(

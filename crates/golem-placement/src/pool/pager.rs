@@ -418,7 +418,10 @@ mod tests {
         )
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn miss_pages_in_then_hit_is_fast() {
         let pool = test_pool(2);
         pool.ensure_range(true, 0, ExpertKind::Gate, 3, 3, &mut |_| {})
@@ -436,7 +439,10 @@ mod tests {
         );
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn full_pool_evicts_atomically_and_refills_same_slot() {
         let pool = test_pool(1);
         pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut |_| {})
@@ -451,7 +457,10 @@ mod tests {
         assert_eq!(pool.slot_bytes_under(&lease)[0], 1);
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn source_error_propagates_and_pool_stays_usable() {
         let slot_size = 64;
         let arena = Arena::new(slot_size * 2, slot_size).unwrap();
@@ -484,7 +493,10 @@ mod tests {
         assert_eq!(pool.slot_bytes_under(&lease)[0], 3);
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn range_with_mixed_states_counts_per_key() {
         let pool = test_pool(4);
         pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut |_| {})
@@ -504,7 +516,10 @@ mod tests {
         );
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn snapshot_updates_are_visible_to_the_next_range() {
         let pool = test_pool(2);
         pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut |_| {})
