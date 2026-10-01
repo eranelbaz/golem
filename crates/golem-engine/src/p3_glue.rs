@@ -379,7 +379,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         source.clone(),
         snapshots,
         Arc::new(P3Stats::new()),
-        geo.n_layers(),
+        vec![0; geo.n_layers() as usize],
         geo.n_experts,
     );
 

@@ -56,8 +56,8 @@ fn arena_locks_and_slots_are_disjoint() {
         arc_dyn(std::sync::Arc::new(ByteSource)),
         Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
         Arc::new(P3Stats::new()),
-        1, // n_layers
-        2, // n_experts
+        vec![0; 1], // class_of_layer
+        2,          // n_experts
     );
 
     // Page in experts 0 and 1 of layer 0; each fills its own slot.

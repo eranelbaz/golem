@@ -46,7 +46,7 @@ fn loom_pool() -> Arc<ExpertPool> {
         arc_dyn(std::sync::Arc::new(ProvenanceSource)),
         Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
         Arc::new(P3Stats::new()),
-        1,
+        vec![0; 1],
         2,
     )
 }

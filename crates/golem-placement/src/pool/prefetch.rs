@@ -252,7 +252,7 @@ mod tests {
             source,
             Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
             Arc::new(P3Stats::new()),
-            1,
+            vec![0; 1],
             8,
         )
     }

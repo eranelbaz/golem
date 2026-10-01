@@ -130,20 +130,26 @@ impl fmt::Debug for ExpertPool {
 }
 
 impl ExpertPool {
-    /// Assembles a pool over `n_layers` × `n_experts` experts and the arena's
-    /// slot count.
+    /// Assembles a pool over `class_of_layer.len()` × `n_experts` experts;
+    /// each layer claims slots only from its arena class (D-2).
     pub fn new(
         arena: Arena,
         source: Arc<dyn ExpertSource>,
         snapshots: Arc<SnapshotHandle>,
         stats: Arc<P3Stats>,
-        n_layers: u32,
+        class_of_layer: Vec<u8>,
         n_experts: u32,
     ) -> Arc<Self> {
-        let slots = arena.slot_count();
+        let n_classes = class_of_layer
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |c| usize::from(c) + 1);
+        let class_slots: Vec<std::ops::Range<u32>> =
+            (0..n_classes).map(|c| arena.class_range(c)).collect();
         Arc::new(Self {
             arena: Arc::new(arena),
-            residency: Arc::new(ResidencyMap::new(n_layers, n_experts, slots)),
+            residency: Arc::new(ResidencyMap::new(class_of_layer, n_experts, class_slots)),
             stats,
             demand_inflight: super::primitives::AtomicUsize::new(0),
             source,
@@ -433,7 +439,7 @@ mod tests {
             source,
             Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
             Arc::new(P3Stats::new()),
-            1,
+            vec![0; 1],
             8,
         )
     }
@@ -496,7 +502,7 @@ mod tests {
             source,
             Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
             Arc::new(P3Stats::new()),
-            1,
+            vec![0; 1],
             8,
         );
         assert!(
