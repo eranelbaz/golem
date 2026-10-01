@@ -2,7 +2,7 @@
 //! at per-plane file offsets derived from a tensor-table walk. Multi-replica
 //! striping, CRC verification, and failover are M3.1/M3.3.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -13,19 +13,64 @@ use golem_gguf::{data_section_offset, ggml_row_bytes, tensor_entries};
 
 use super::residency::ExpertKind;
 
-/// Pool geometry derived from the expert plane table (§5.4): a uniform slot
-/// size (the max plane stride — per-kind strides may diverge on quants), the
-/// dense-lead-adjusted layer/expert counts, and total expert bytes.
+/// One expert layer's unit (§6.1): gate, up, down planes packed at fixed
+/// offsets inside one slot — the unit of residency is `(layer, expert)`, and
+/// one fill/lease/eviction covers all three planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitLayout {
+    /// Plane byte strides, indexed by `ExpertKind::ordinal()`.
+    pub stride: [u64; 3],
+    /// Plane offsets inside the slot: 0, gate, gate + up.
+    pub offset: [u64; 3],
+}
+
+impl UnitLayout {
+    /// Total unit bytes (Σ stride).
+    pub fn bytes(&self) -> u64 {
+        self.stride.iter().sum()
+    }
+
+    /// `(offset, stride)` of one plane inside the slot.
+    pub fn plane(&self, kind: ExpertKind) -> (u64, u64) {
+        (self.offset[kind.ordinal()], self.stride[kind.ordinal()])
+    }
+}
+
+/// Pool geometry derived from the expert plane table (§5.4): per-layer unit
+/// layouts (dense-lead-adjusted, MTP excluded), the dense-lead-adjusted
+/// layer/expert counts, and total expert bytes. RAM slot sizing is per unit
+/// class (review D-2, §5 pool amendment), so no single slot size here — the
+/// arena sizes each class by `max_unit()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolGeometry {
-    /// Max plane stride in bytes — the arena slot size.
-    pub slot_size: u64,
-    /// Expert layer count (dense lead excluded).
-    pub n_layers: u32,
+    /// Per-layer unit layout, indexed by dense-lead-adjusted layer.
+    pub layers: Vec<UnitLayout>,
     /// Experts per layer (uniform; the loader enforces cross-tensor equality).
     pub n_experts: u32,
     /// Sum over planes of `stride × n_experts` — total pageable expert bytes.
     pub expert_bytes: u64,
+}
+
+impl PoolGeometry {
+    /// Expert layer count (dense lead excluded).
+    pub fn n_layers(&self) -> u32 {
+        self.layers.len() as u32
+    }
+
+    /// Largest unit in bytes — the arena's uniform slot size.
+    pub fn max_unit(&self) -> u64 {
+        self.layers.iter().map(UnitLayout::bytes).max().unwrap_or(0)
+    }
+
+    /// Distinct unit sizes ascending, with the layers of each — the per-class
+    /// slab partition (D-2).
+    pub fn classes(&self) -> Vec<(u64, Vec<u32>)> {
+        let mut by_size: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        for (layer, l) in self.layers.iter().enumerate() {
+            by_size.entry(l.bytes()).or_default().push(layer as u32);
+        }
+        by_size.into_iter().collect()
+    }
 }
 
 /// Reads one expert plane from a byte source.
@@ -76,6 +121,12 @@ pub enum SourceError {
         /// Offending tensor name.
         name: String,
     },
+    /// A live expert layer lacks one of the three planes, so it cannot form a
+    /// residency unit (§6.1).
+    IncompleteLayer {
+        /// Dense-lead-adjusted layer missing a plane.
+        layer: u32,
+    },
 }
 
 impl fmt::Display for SourceError {
@@ -90,6 +141,9 @@ impl fmt::Display for SourceError {
                 write!(f, "tensor {name}: unknown ggml type {ggml_type}")
             }
             Self::StrideOverflow { name } => write!(f, "tensor {name}: plane stride overflow"),
+            Self::IncompleteLayer { layer } => {
+                write!(f, "expert layer {layer} is missing one of gate/up/down")
+            }
         }
     }
 }
@@ -132,27 +186,64 @@ fn blk_of(name: &str) -> Option<u32> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
 
-impl GgufPreadSource {
-    /// Aggregate pool geometry over the walked expert planes, or `None` when
-    /// the model carries no expert tensors.
-    pub fn geometry(&self) -> Option<PoolGeometry> {
-        let mut slot_size = 0u64;
-        let mut n_layers = 0u32;
-        let mut n_experts = 0u32;
-        let mut expert_bytes = 0u64;
-        for (&(layer, _), p) in &self.planes {
-            slot_size = slot_size.max(p.stride);
-            n_layers = n_layers.max(layer + 1);
-            n_experts = n_experts.max(p.n_experts);
-            expert_bytes =
-                expert_bytes.checked_add(p.stride.checked_mul(u64::from(p.n_experts))?)?;
+/// Pure geometry over a walked plane table: one `UnitLayout` per layer in
+/// `ExpertKind::ALL` order, every live layer complete (§6.1). Empty table →
+/// an empty geometry, which `GgufPreadSource::geometry` surfaces as `None`.
+fn geometry_of(planes: &HashMap<(u32, ExpertKind), Plane>) -> Result<PoolGeometry, SourceError> {
+    let n_layers = planes.keys().map(|&(l, _)| l + 1).max().unwrap_or(0);
+    let n_experts = planes.values().map(|p| p.n_experts).max().unwrap_or(0);
+    let mut expert_bytes = 0u64;
+    let mut layers = Vec::with_capacity(n_layers as usize);
+    for layer in 0..n_layers {
+        let mut stride = [0u64; 3];
+        for (i, s) in stride.iter_mut().enumerate() {
+            let kind = ExpertKind::ALL[i];
+            let p = planes
+                .get(&(layer, kind))
+                .ok_or(SourceError::IncompleteLayer { layer })?;
+            *s = p.stride;
+            expert_bytes = expert_bytes
+                .checked_add(p.stride.checked_mul(u64::from(p.n_experts)).ok_or(
+                    SourceError::StrideOverflow {
+                        name: tensor_name(layer, kind),
+                    },
+                )?)
+                .ok_or(SourceError::StrideOverflow {
+                    name: tensor_name(layer, kind),
+                })?;
         }
-        (slot_size > 0).then_some(PoolGeometry {
-            slot_size,
-            n_layers,
-            n_experts,
-            expert_bytes,
-        })
+        let gate_up = stride[0]
+            .checked_add(stride[1])
+            .ok_or(SourceError::StrideOverflow {
+                name: tensor_name(layer, ExpertKind::Up),
+            })?;
+        layers.push(UnitLayout {
+            stride,
+            offset: [0, stride[0], gate_up],
+        });
+    }
+    Ok(PoolGeometry {
+        layers,
+        n_experts,
+        expert_bytes,
+    })
+}
+
+/// Tensor name of one expert plane, for error reports.
+fn tensor_name(layer: u32, kind: ExpertKind) -> String {
+    let stem = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"][kind.ordinal()];
+    format!("blk.{layer}.{stem}.weight")
+}
+
+impl GgufPreadSource {
+    /// Aggregate pool geometry over the walked expert planes: `Ok(None)` when
+    /// the model carries no expert tensors, an error when a live layer cannot
+    /// form a unit.
+    pub fn geometry(&self) -> Result<Option<PoolGeometry>, SourceError> {
+        if self.planes.is_empty() {
+            return Ok(None);
+        }
+        geometry_of(&self.planes).map(Some)
     }
 
     /// Opens the shard set rooted at `path` and walks every shard's GGUF
@@ -438,15 +529,63 @@ mod tests {
     #[test]
     fn geometry_aggregates_the_expert_plane_table() {
         let src = GgufPreadSource::open(&fixture(), 1).unwrap();
-        let g = src.geometry().unwrap();
-        assert_eq!(g.n_layers, 1, "tiny-moe: blk.1 is the only expert layer");
+        let g = src.geometry().unwrap().unwrap();
+        assert_eq!(g.n_layers(), 1, "tiny-moe: blk.1 is the only expert layer");
         assert_eq!(g.n_experts, 8);
-        assert_eq!(g.slot_size, (PLANE_ELEMS * 4) as u64);
+        assert_eq!(g.max_unit(), 3 * (PLANE_ELEMS * 4) as u64);
+        assert_eq!(g.layers[0].offset, [0, 2048, 4096]);
         assert_eq!(
             g.expert_bytes,
             3 * 8 * (PLANE_ELEMS * 4) as u64,
             "3 kinds × 8 experts × plane stride"
         );
+    }
+
+    #[test]
+    fn geometry_packs_three_planes_per_unit_and_groups_classes() {
+        let paths = xtask::shape_moe::cached_fixture();
+        let g = GgufPreadSource::open(&paths[0], 1)
+            .unwrap()
+            .geometry()
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.n_layers(), 3, "blk 1..=3 live, blk 4 MTP excluded");
+        assert_eq!(g.layers[0].offset, [0, 144 * 32, 2 * 144 * 32]);
+        assert_eq!(
+            g.layers.iter().map(UnitLayout::bytes).collect::<Vec<_>>(),
+            [14_848, 15_936, 17_984]
+        );
+        assert_eq!(g.max_unit(), 17_984);
+        assert_eq!(
+            g.classes(),
+            vec![(14_848, vec![0]), (15_936, vec![1]), (17_984, vec![2])]
+        );
+    }
+
+    #[test]
+    fn geometry_rejects_a_layer_missing_a_plane() {
+        // Unit residency needs all three planes per live layer.
+        let planes = [(0u32, ExpertKind::Gate), (0, ExpertKind::Up)];
+        assert!(matches!(
+            geometry_of(&planes_fixture(&planes)),
+            Err(SourceError::IncompleteLayer { layer: 0 })
+        ));
+    }
+
+    fn planes_fixture(spec: &[(u32, ExpertKind)]) -> HashMap<(u32, ExpertKind), Plane> {
+        spec.iter()
+            .map(|&(layer, kind)| {
+                (
+                    (layer, kind),
+                    Plane {
+                        shard: 0,
+                        base: 0,
+                        stride: 128,
+                        n_experts: 8,
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -463,9 +602,9 @@ mod tests {
     fn split_source_walks_all_shards_and_excludes_mtp() {
         let paths = xtask::shape_moe::cached_fixture();
         let src = GgufPreadSource::open(&paths[0], 1).unwrap();
-        let g = src.geometry().unwrap();
+        let g = src.geometry().unwrap().unwrap();
         // blk.4 is the MTP/NextN block (nextn_predict_layers = 1): excluded.
-        assert_eq!(g.n_layers, 3, "MTP expert block must not join the pool");
+        assert_eq!(g.n_layers(), 3, "MTP expert block must not join the pool");
         assert_eq!(g.n_experts, 64);
         let (base_g, s_gate) = src.plane(0, ExpertKind::Gate, 0).unwrap();
         let (_, s_up) = src.plane(0, ExpertKind::Up, 0).unwrap();

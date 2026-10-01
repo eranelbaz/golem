@@ -320,22 +320,26 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     );
     let geo = source
         .geometry()
+        .map_err(|e| EngineError::PoolInit(e.to_string()))?
         .ok_or_else(|| EngineError::PoolInit("model has no expert tensors".into()))?;
 
-    let slot_size = usize::try_from(geo.slot_size)
+    // RAM slot size stays the max plane stride; per-class slabs arrive with
+    // the multi-class arena.
+    let slot_size = usize::try_from(geo.layers.iter().flat_map(|l| l.stride).max().unwrap_or(0))
         .map_err(|_| EngineError::PoolInit("slot size > usize".into()))?;
+    let n_layers = geo.n_layers();
     let pool_bytes = config
         .ram_experts_gib
         .checked_mul(1 << 30)
         .ok_or_else(|| EngineError::PoolInit("ram_experts_gib overflows bytes".into()))?;
-    let slots = pool_bytes / geo.slot_size;
+    let slots = pool_bytes / slot_size as u64;
     let slots = u32::try_from(slots)
         .map_err(|_| EngineError::PoolInit("slot count exceeds u32::MAX".into()))?;
-    if slots < geo.n_layers {
+    if slots < n_layers {
         return Err(EngineError::PoolInit(format!(
-            "pool of {slots} slots (ram_experts_gib = {}) cannot cover {} expert layers \
+            "pool of {slots} slots (ram_experts_gib = {}) cannot cover {n_layers} expert layers \
              (one slot per layer minimum; plane stride {slot_size} B)",
-            config.ram_experts_gib, geo.n_layers
+            config.ram_experts_gib
         )));
     }
     // Remainder bytes are trimmed by integer division: pool_bytes is a
@@ -373,7 +377,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         source.clone(),
         snapshots,
         Arc::new(P3Stats::new()),
-        geo.n_layers,
+        geo.n_layers(),
         geo.n_experts,
     );
 
@@ -382,14 +386,14 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // read exactly once per process here.
     let shuffle = std::env::var("GOLEM_TEST_SHUFFLE_ORDER").is_ok_and(|v| v != "0");
     let policy: &'static PolicyQueryState = Box::leak(Box::new(PolicyQueryState::new(
-        geo.n_layers,
+        n_layers,
         geo.n_experts,
         shuffle,
     )));
     let prefetch = spawn_prefetch(pool.clone(), Arc::new(PolicyFeed(policy)), PREFETCH_K);
 
     let handle: &'static PoolHandle = Box::leak(Box::new(PoolHandle {
-        n_layers: geo.n_layers,
+        n_layers: geo.n_layers(),
         dense_lead,
         prefetch,
         source,
@@ -430,7 +434,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         })?;
     let n_expert_used = u32::try_from(n_expert_used)
         .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
-    let k = derive_device_cache_experts(config, geo.n_layers, geo.slot_size, n_expert_used)?;
+    let k = derive_device_cache_experts(config, n_layers, slot_size as u64, n_expert_used)?;
     // SAFETY: FFI setter, no invariants.
     unsafe {
         raw::golem_set_device_cache_experts(k as i32);
@@ -452,7 +456,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     }
 
     tracing::info!(
-        layers = geo.n_layers,
+        layers = n_layers,
         experts = geo.n_experts,
         slot_size,
         slots,

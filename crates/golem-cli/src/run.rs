@@ -188,7 +188,7 @@ fn expert_plane_bytes(model: &Path) -> Result<u64, Box<dyn Error>> {
         .kv_u64(&format!("{arch}.leading_dense_block_count"))
         .unwrap_or(0) as u32;
     let src = GgufPreadSource::open(model, dense_lead)?;
-    Ok(src.geometry().map(|g| g.expert_bytes).unwrap_or(0))
+    Ok(src.geometry()?.map(|g| g.expert_bytes).unwrap_or(0))
 }
 
 fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
