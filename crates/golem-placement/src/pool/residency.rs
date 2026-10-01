@@ -274,12 +274,13 @@ impl ResidencyMap {
     ) -> Result<Claim, ClaimError> {
         let li = layer as usize;
         let i = self.local(kind, expert);
-        // Bounded starvation guard: a sweep that finds no victim means every
-        // slot is leased or snapshot-protected. Leases are transient, so a
-        // bounded number of full CLOCK walks (each ≤ SWEEP_BUDGET keys) is
-        // enough to make progress; beyond that the pool is over-subscribed
-        // and the caller gets a loud busy error instead of an unbounded spin.
-        let starve_bound = self.total_keys / SWEEP_BUDGET + 2;
+        // Bounded starvation guard: CLOCK finds a victim within two full laps
+        // (the first may only clear second-chance bits), each lap
+        // ⌈total_keys / SWEEP_BUDGET⌉ sweeps. Beyond that every slot is
+        // leased or snapshot-protected — leases are transient, so the pool is
+        // over-subscribed and the caller gets a loud busy error instead of an
+        // unbounded spin.
+        let starve_bound = 2 * self.total_keys.div_ceil(SWEEP_BUDGET) + 1;
         let mut starved = 0usize;
         loop {
             let mut sh = self.shards[li].shard.lock().unwrap();
@@ -779,6 +780,30 @@ mod tests {
             m.claim(0, ExpertKind::Gate, 2, &snap),
             Err(ClaimError::Busy)
         );
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn victim_needing_two_clock_laps_is_found_not_busy() {
+        // 4 × 3 × 344 = 4128 keys; the only resident is the last key, with
+        // its second-chance bit set. Lap 1 clears it, lap 2 takes it:
+        // 8256 keys = 9 sweeps of SWEEP_BUDGET, which a one-lap bound
+        // (4128 / 1024 + 2 = 6) reported as Busy.
+        let m = ResidencyMap::new(4, 344, 1);
+        let snap = PolicySnapshot::test_empty();
+        let last = (3, ExpertKind::Down, 343);
+        m.claim(last.0, last.1, last.2, &snap).unwrap();
+        m.finish_fill(last.0, last.1, last.2);
+        assert!(matches!(
+            m.claim(last.0, last.1, last.2, &snap).unwrap(),
+            Claim::Resident { .. }
+        ));
+        m.release_lease(last.0, last.1, last.2);
+        m.release_lease(last.0, last.1, last.2);
+        let ClaimError::Evicted(e) = m.claim(0, ExpertKind::Gate, 0, &snap).unwrap_err() else {
+            panic!("expected eviction")
+        };
+        assert_eq!((e.victim.layer, e.victim.kind, e.victim.expert), last);
     }
 
     #[test]
