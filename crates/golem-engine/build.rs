@@ -1,5 +1,5 @@
 //! Re-exports the substrate backend as a compile-time cfg so HIP-only FFI
-//! (GPU-pinned host memory, review H-4) compiles only where the HIP runtime
+//! (GPU-pinned host memory, §3.5) compiles only where the HIP runtime
 //! is actually linked.
 
 fn main() {

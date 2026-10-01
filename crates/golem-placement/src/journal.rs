@@ -1,6 +1,6 @@
 //! Placement journal (§11): a fixed-capacity ring buffer of per-step
 //! records with a durable text serialization, used for warm start
-//! (`seed_from_journal`, M2.5 Task 3).
+//! (`seed_from_journal`, §6.3).
 
 use crate::{PlacementConfig, Tier};
 use std::io::{self, Write};

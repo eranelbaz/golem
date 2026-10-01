@@ -241,8 +241,8 @@ pub struct TensorEntry {
     pub ggml_type: u32,
 }
 
-/// Routed-expert plane kind. One matcher for C and Rust semantics (review
-/// C-1/M-9): the exact stem `ffn_{gate,up,down}_exps` at a name-segment
+/// Routed-expert plane kind. One matcher for C and Rust semantics
+/// (§6.6): the exact stem `ffn_{gate,up,down}_exps` at a name-segment
 /// boundary, optionally followed by `.weight`. Everything else — the router
 /// `ffn_gate_inp`, dense `ffn_gate`, and loader-created `.scale` variants — is
 /// not an expert plane. Fused `ffn_gate_up_exps` is excluded (P2 splits

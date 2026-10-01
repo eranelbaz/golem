@@ -252,11 +252,11 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
         .allowlist_function("llama_.*")
         .allowlist_function("golem_.*")
-        // GPU-offload plumbing (M1.4 Task 3): the `-ncmoe`-equivalent buft
+        // GPU-offload plumbing: the `-ncmoe`-equivalent buft
         // overrides pin expert tensors to the CPU buffer type by handle; the
         // loader compares overrides against exactly this pointer.
         .allowlist_function("ggml_backend_cpu_buffer_type")
-        // T1 op-parity leg (M1.4 Task 4): the minimal ggml FFI surface for
+        // T1 op-parity leg: the minimal ggml FFI surface for
         // golem-engine/src/parity_op.rs (design §13: raw ggml FFI is confined
         // to that module, so the bindings stay as narrow as possible).
         // Context lifecycle:
@@ -274,11 +274,11 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .allowlist_function("ggml_type_size")
         .allowlist_function("ggml_blck_size")
         // The op itself plus graph build; compute goes through the backend
-        // registry below (Task 4a), so no CPU-only compute entry is bound.
+        // registry below, so no CPU-only compute entry is bound.
         .allowlist_function("ggml_mul_mat_id")
         .allowlist_function("ggml_new_graph")
         .allowlist_function("ggml_build_forward_expand")
-        // Backend-registry compute (M1.4 Task 4a): the op must run on the
+        // Backend-registry compute: the op must run on the
         // HIP device when the binary is HIP-linked, so compute goes through
         // the device registry instead of the CPU-only path above.
         .allowlist_function("ggml_backend_dev_by_type")
@@ -305,7 +305,7 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .allowlist_type("ggml_cgraph")
         .allowlist_type("ggml_init_params")
         .allowlist_type("ggml_status")
-        // Opaque backend-registry handles + device-type enum (Task 4a):
+        // Opaque backend-registry handles + device-type enum:
         .allowlist_type("ggml_backend")
         .allowlist_type("ggml_backend_dev")
         .allowlist_type("ggml_backend_buffer")

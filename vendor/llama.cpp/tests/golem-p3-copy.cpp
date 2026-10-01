@@ -1,4 +1,4 @@
-// Golem C-2 regression: the pooled-run copy never reads past the last
+// Golem pooled-copy regression: the pooled-run copy never reads past the last
 // expert's slot. Slots are exactly expert_size whenever expert_size is the
 // pool's max stride, so the old single copy of expert_size + padding from the
 // last slot read 512 B past it — normally the neighbour slot, and past the

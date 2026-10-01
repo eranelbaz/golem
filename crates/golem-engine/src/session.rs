@@ -162,7 +162,7 @@ pub fn load(config: &EngineConfig) -> Result<LoadedModel, EngineError> {
         // SAFETY: returns llama.cpp's default model params by value.
         let mut params = unsafe { raw::llama_model_default_params() };
         params.n_gpu_layers = n_gpu_layers_i32(config.n_gpu_layers);
-        // Review H-3: expert tensors must never be pre-faulted into the page
+        // AGENTS.md hot path: expert tensors must never be pre-faulted into the page
         // cache (186 GiB of MAP_POPULATE livelocked the kernel and flushed
         // everything else). The pool pages them from the GGUF itself, so
         // mark them TENSOR_READ_LAZY in the arch (glm5next.cpp) and turn the
@@ -260,7 +260,7 @@ fn moe_buft_overrides(
 fn init_backend() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // Engine invariant (review C-4, design §3.4): every expert MUL_MAT_ID
+        // Engine invariant (design §3.4, I2): every expert MUL_MAT_ID
         // runs on the GPU, never silently on the CPU. Upstream keeps ops on
         // host-resident weights on the CPU below batch 32, and MUL_MAT_ID's
         // batch is ne[2] = tokens (1 during decode), so force the threshold
@@ -459,7 +459,7 @@ impl Session {
         let p3_stats = if config.ram_experts_gib > 0 {
             Some(p3_glue::enable(config)?)
         } else {
-            // Review H-10: the hooks are process-global and never
+            // The hooks are process-global and never
             // unregistered (no safe quiescence point). If a pooled session
             // already registered them, a later pool-off session's decode
             // would be served from THAT pool — its tensor table keyed by
@@ -624,7 +624,7 @@ impl Session {
             {
                 // SAFETY: slots 0..len are within the chunk_cap-sized allocation;
                 // every used slot is fully written before decode (llama_batch_init
-                // mallocs and does not zero — Task 4 probe precedent).
+                // mallocs and does not zero).
                 let b = &mut batch.inner;
                 for (i, &t) in chunk.iter().enumerate() {
                     // Logits only on the final token of the final chunk: that
@@ -792,7 +792,7 @@ impl Drop for Sampler {
 /// longest valid UTF-8 prefix; an incomplete trailing sequence stays pending
 /// until more bytes arrive (`std::str::from_utf8`: `valid_up_to` for the flush
 /// length, `error_len == None` = keep the tail). Invalid bytes surface as
-/// U+FFFD (`from_utf8_lossy` semantics). Byte-buffered because Task 0's
+/// U+FFFD (`from_utf8_lossy` semantics). Byte-buffered because a
 /// byte-fallback vocab legitimately splits multi-byte characters across pieces;
 /// per-piece lossy conversion would corrupt them.
 fn emit_valid_prefix(pending: &mut Vec<u8>, out: &mut String, bytes: &[u8]) {
@@ -834,7 +834,7 @@ fn flush_utf8_tail(pending: &mut Vec<u8>, out: &mut String) {
 
 /// Writes one slot of the malloc'd batch buffer: token, position, single-sequence
 /// id 0, and the logits flag. llama_batch_init mallocs and does not zero, so
-/// every used slot must be written before decode (Task 4 probe precedent).
+/// every used slot must be written before decode.
 ///
 /// # Safety
 /// `i` must be below the `n_tokens` the `Batch` was initialized with.

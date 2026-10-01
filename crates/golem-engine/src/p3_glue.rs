@@ -12,8 +12,8 @@
 //! during `load()`'s decode self-check, so registration cross-checks still
 //! fail the load loudly.
 //!
-//! Deviations from the plan sketch (protocol step 7):
-//! - *Lazy registration:* the plan's load-time tensor walk is not expressible
+//! Registration shape:
+//! - *Lazy registration:* a load-time tensor walk is not expressible
 //!   through the frozen ABI (no enumeration API); the table is built at first
 //!   callback per tensor instead. The load-time cross-checks (source plane
 //!   stride == substrate stride per expert tensor; one pread byte-compared
@@ -111,7 +111,7 @@ static ENABLING: AtomicBool = AtomicBool::new(false);
 ///
 /// Attribution: `notify_access` carries only the expert id, so accesses are
 /// booked under the (layer, kind) of the most recent `policy_query`. Exact
-/// for the current C call-site shape — Task 1 emits notify per routed expert
+/// for the current C call-site shape — C emits notify per routed expert
 /// inside the same policy_query-guarded block, single decode thread — M4's
 /// multi-context re-homing must pass tensor identity explicitly.
 type AccessMap = HashMap<(u32, ExpertKind), Vec<Option<u64>>>;
@@ -752,7 +752,7 @@ impl PoolHandle {
             p3_fatal(format!("P3: verification pread failed for {name}: {e}"));
         }
         // SAFETY: the weights buffer holds n_experts·stride fully populated
-        // bytes from `data` (deviation 1: loader-owned host weights), and
+        // bytes from `data` (loader-owned host weights), and
         // `t.data` is non-null for a loaded weights tensor.
         let host = unsafe { std::slice::from_raw_parts(t.data as *const u8, stride) };
         if host != disk.as_slice() {

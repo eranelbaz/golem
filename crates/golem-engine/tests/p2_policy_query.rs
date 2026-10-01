@@ -3,7 +3,7 @@
 //! persistent device cache skips re-routed experts on an identical second
 //! turn (P4 counters expose the traffic through `Session::device_cache_stats`).
 //! The permutation seam test registers its own recording hooks over the
-//! pool-off offload config (C engages P2 on hook presence alone — Task 1's
+//! pool-off offload config (C engages P2 on hook presence alone — the
 //! call-site); the counters test drives the engine-registered hooks (pool
 //! on). Runs only where a GPU split exists (feature `hip-tests`, HIP CI
 //! job); CPU builds never enter the split-scheduler expert-copy path.
@@ -57,7 +57,7 @@ fn policy_query_is_consulted_with_valid_permutations() {
         _last: i32,
         _ptrs: *mut *const libc::c_void,
     ) {
-        // ABI v2 (C-2): the substrate copies from the returned pointers; these
+        // ABI v2: the substrate copies from the returned pointers; these
         // hook-level tests don't page from a pool, so serve one static buffer.
         const SRC: [u8; 65536] = [0u8; 65536];
         let src = SRC.as_ptr() as *const libc::c_void;
@@ -81,7 +81,7 @@ fn policy_query_is_consulted_with_valid_permutations() {
 
     // Pool OFF (engine registers nothing): these hooks stand in for the
     // engine's, isolating the C call-site seam. P2 engages because BOTH
-    // policy_query and ensure_host_resident are non-null (Task 1 contract).
+    // policy_query and ensure_host_resident are non-null (call-site contract).
     let cfg = common::offload::offload_config();
     let mut session = Session::new(&cfg).unwrap();
     let out = chat(&mut session, "Hello");
@@ -122,7 +122,7 @@ fn device_cache_skips_on_second_identical_turn() {
     let mut session = match Session::new(&cfg) {
         Ok(s) => s,
         Err(e) if e.to_string().contains("mlock") => {
-            // A failed precondition FAILS (review H-7): an early return reads
+            // A failed precondition FAILS (AGENTS.md Evidence): an early return reads
             // as a pass to the harness. Opt-in skip only via explicit env.
             assert!(
                 std::env::var("GOLEM_ALLOW_SKIP").as_deref() == Ok("1"),

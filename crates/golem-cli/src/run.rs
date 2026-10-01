@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn run_args_map_offload_and_threads_flags_into_config() {
-        // The Task 7 hardware HIP leg: n_gpu_layers=99, fa=ON, -ncmoe 45, t16.
+        // The hardware HIP leg config: n_gpu_layers=99, fa=ON, -ncmoe 45, t16.
         let args = parse_run_args(&[
             "run",
             "model.gguf",

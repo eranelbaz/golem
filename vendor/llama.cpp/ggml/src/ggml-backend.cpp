@@ -32,9 +32,9 @@
 #include "golem-hooks.h"
 
 static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
-static int golem_expert_stem_kind(const char *name); // defined in the P1 section (used at split time, C-3)
+static int golem_expert_stem_kind(const char *name); // defined in the P1 section (used at split time by the device slab)
 
-// Golem C-2: copy a pooled expert run slot by slot. The padding tail (MMQ
+// Golem: copy a pooled expert run slot by slot. The padding tail (MMQ
 // non-NaN guard after the last routed expert) is a separate copy of the LAST
 // routed expert's own first bytes — never an overrun of its slot, which is
 // exactly expert_size when expert_size is the pool's max stride and the slot
@@ -1479,7 +1479,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
-                            // Golem C-3/H-5: when golem hooks own the copy
+                            // Golem device slab: when golem hooks own the copy
                             // path, a routed-expert weights tensor feeding
                             // MUL_MAT_ID never uses the compute-buffer cpy —
                             // the data lives in a persistent per-entry device
@@ -1742,7 +1742,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
-    // Golem C-2: release the host-pool leases taken during the PREVIOUS
+    // Golem: release the host-pool leases taken during the PREVIOUS
     // compute. The engine (golem session loop) synchronizes after every
     // decode, so those copies are complete; the leases must survive until
     // here so eviction cannot recycle a slot mid-DMA.
@@ -1866,7 +1866,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding_len = (last_id < n_expert - 1 && pad_ok) ? padding : 0;
 
                         if (golem_h_ensure_host_resident != NULL) {
-                            // Golem C-2: the RAM pool is the H2D source — the
+                            // Golem: the RAM pool is the H2D source — the
                             // loader's expert bytes may be a read-only file
                             // mmap. Expert slots are independent allocations,
                             // so copy per expert; the 512 B non-NaN MMQ tail
@@ -2018,7 +2018,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 input->data,
                                 [&](int32_t slot, int32_t id) { pending.emplace_back(slot, id); });
 
-                            // Physical writes: page the pool (C-2 API), then one
+                            // Physical writes: page the pool (ensure_host_resident out_ptrs), then one
                             // async copy per staged slot.
                             for (const auto &pr : pending) {
                                 const void *ptr = NULL;
@@ -2806,7 +2806,7 @@ void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
     golem_h_ctx                  = ctx;
 }
 
-/* Review C-4: process-lifetime override for the device backends' op-offload
+/* Golem (design I2): process-lifetime override for the device backends' op-offload
  * threshold; -1 = unset (env / 32 default). Device init reads it once. */
 static int golem_op_offload_min_batch_override = -1;
 

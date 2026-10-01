@@ -1,4 +1,4 @@
-//! Review C-4: the engine (not the test) forces every expert MUL_MAT_ID onto
+//! Design I2: the engine (not the test) forces every expert MUL_MAT_ID onto
 //! the GPU. This suite deliberately does NOT set `GGML_OP_OFFLOAD_MIN_BATCH`:
 //! with host-resident experts at decode batch 1, the split-copy path (and so
 //! the P3 hook) only fires when the op ran on the GPU. If it ran on the CPU,
@@ -38,6 +38,6 @@ fn expert_matmul_runs_on_gpu_without_env_override() {
     assert!(
         demand > 0,
         "no expert copies served ⇒ MUL_MAT_ID stayed on the CPU \
-         (silent I2 violation, review C-4): {stats:?}"
+         (silent I2 violation): {stats:?}"
     );
 }

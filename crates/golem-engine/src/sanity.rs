@@ -13,7 +13,7 @@ const EXPERT_SUFFIXES: [&str; 3] = ["gate", "up", "down"];
 type Experts<'a> = BTreeMap<u32, BTreeMap<&'a str, &'a TensorMeta>>;
 
 /// Parses `blk.<N>.ffn_<gate|up|down>_exps` (optionally `.weight`) into
-/// `(layer, suffix)` via the one shared matcher (review C-1/M-9); everything
+/// `(layer, suffix)` via the one shared matcher (§6.6); everything
 /// else — router, dense FFN, `.scale` variants — is not an expert plane.
 fn parse_expert_name(name: &str) -> Option<(u32, &'static str)> {
     let kind = ExpertKind::from_tensor_name(name)?;
@@ -120,8 +120,8 @@ fn layer_list(layers: &[u32]) -> String {
 }
 
 /// Expert-bearing layers must form a contiguous run `L..=block_count -
-/// nextn_predict_layers - 1` (dense lead first, MTP/NextN block excluded:
-/// review R-2); without the KV, observed layers must at least be contiguous.
+/// nextn_predict_layers - 1` (dense lead first, MTP/NextN block excluded,
+/// §3.4); without the KV, observed layers must at least be contiguous.
 /// Every covered layer must carry all three suffixes.
 fn check_coverage(metadata: &GgufMetadata, experts: &Experts) -> Result<(), EngineError> {
     let observed: Vec<u32> = experts.keys().copied().collect();
@@ -224,7 +224,7 @@ fn check_cross_layer_uniformity(experts: &Experts) -> Result<(), EngineError> {
 /// [`EngineError::UnsupportedModel`] with the offending names and shapes.
 pub fn check(metadata: &GgufMetadata) -> Result<(), EngineError> {
     // The MTP/NextN block is skipped at load and carries its own expert set;
-    // it never counts toward the expected live run (review R-2).
+    // it never counts toward the expected live run.
     let nextn = nextn_layers(metadata)?.unwrap_or(0);
     let mtp_from = (nextn > 0)
         .then(|| {
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn mtp_block_is_excluded_from_expected_run() {
         // Real-model shape: blk.45 (NextN/MTP) carries experts but is skipped
-        // at load, so the live run ends at block_count − nextn (review R-2).
+        // at load, so the live run ends at block_count − nextn.
         let mut m = valid_meta();
         m.kvs.push((
             "glm4moe.nextn_predict_layers".to_string(),

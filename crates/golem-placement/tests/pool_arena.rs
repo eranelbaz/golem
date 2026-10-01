@@ -1,5 +1,5 @@
 //! mlock slot arena acceptance (§5.4): locked pages, disjoint slots. Fill and
-//! read go through the residency capability tokens (review H-1): `&mut` needs
+//! read go through the residency capability tokens (§6.6): `&mut` needs
 //! a `FillClaim`, shared reads need a `Lease` — neither is constructible
 //! outside the residency map / pager, so the round trip runs through
 //! [`ExpertPool`].

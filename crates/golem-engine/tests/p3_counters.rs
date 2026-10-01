@@ -1,4 +1,4 @@
-//! P3 acceptance (Task 5): counters move across cold→warm decode, and pool-on
+//! P3 acceptance: counters move across cold→warm decode, and pool-on
 //! output is byte-for-byte deterministic across identical runs (§7.4 batch=1
 //! determinism — the real correctness gate: catches wrong plane addressing,
 //! kind mix-ups, and torn copies that counters-only tests cannot). The second
@@ -37,7 +37,7 @@ fn p3_counters_move_and_output_is_deterministic() {
     let mut on = match Session::new(&cfg) {
         Ok(s) => s,
         Err(e) if e.to_string().contains("mlock") => {
-            // A failed precondition FAILS (review H-7): an early return reads
+            // A failed precondition FAILS (AGENTS.md Evidence): an early return reads
             // as a pass to the harness. Opt-in skip only via explicit env.
             assert!(
                 std::env::var("GOLEM_ALLOW_SKIP").as_deref() == Ok("1"),
@@ -101,14 +101,14 @@ fn p3_counters_move_and_output_is_deterministic() {
     // within a session (asserted above via the warm turn); cross-session
     // bitwise equality is NOT a GPU guarantee — benign logit ties flip when
     // buffer layouts differ (the T2 logit-gap story), and this assertion was
-    // never actually exercised on HIP before H-7 (it skipped).
+    // never actually exercised on HIP while it skipped-as-passed.
     //
-    // Review H-10: a second session in this process — pooled or not — must
+    // A second session in this process — pooled or not — must
     // be refused: the hooks are process-global and would serve the old
     // model's pool bytes to a new model's recycled tensor addresses.
     let off = Session::new(&common::offload::offload_config());
     assert!(
         off.is_err(),
-        "a second session in a hook-owning process must be refused (H-10)"
+        "a second session in a hook-owning process must be refused"
     );
 }

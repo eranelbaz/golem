@@ -156,7 +156,7 @@ fn register_p2_hooks(shuffle: bool) {
         _last: i32,
         _ptrs: *mut *const libc::c_void,
     ) {
-        // ABI v2 (C-2): the substrate copies from the returned pointers; these
+        // ABI v2: the substrate copies from the returned pointers; these
         // hook-level tests don't page from a pool, so serve one static buffer.
         const SRC: [u8; 65536] = [0u8; 65536];
         let src = SRC.as_ptr() as *const libc::c_void;
@@ -204,8 +204,8 @@ fn register_p2_hooks(shuffle: bool) {
 }
 
 fn set_budget(experts: i32) {
-    // SAFETY: FFI setter, no invariants (0 = unlimited; review M-13: the
-    // budget is a per-tensor expert COUNT — C-3's slab is sized from it).
+    // SAFETY: FFI setter, no invariants (0 = unlimited; the
+    // budget is a per-tensor expert COUNT — the slab is sized from it).
     unsafe { golem_llama_sys::raw::golem_set_device_cache_experts(experts) };
 }
 

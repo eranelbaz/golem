@@ -23,7 +23,7 @@ fn ensure_host_resident_fires_on_offload_decode() {
         last: i32,
         _ptrs: *mut *const libc::c_void,
     ) {
-        // ABI v2 (C-2): the substrate copies from the returned pointers; these
+        // ABI v2: the substrate copies from the returned pointers; these
         // hook-level tests don't page from a pool, so serve one static buffer.
         const SRC: [u8; 65536] = [0u8; 65536];
         let src = SRC.as_ptr() as *const libc::c_void;

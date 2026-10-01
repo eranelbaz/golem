@@ -149,7 +149,7 @@ impl Arena {
     }
 
     /// Base pointer and byte length of the whole arena, for GPU pinning
-    /// (review H-4) and metrics; the arena keeps ownership.
+    /// (§3.5) and metrics; the arena keeps ownership.
     pub fn as_ptr_range(&self) -> (*mut u8, usize) {
         (self.ptr(), self.len)
     }
@@ -159,7 +159,7 @@ impl Arena {
     }
 
     /// Read slot bytes, under a live [`Lease`](super::pager::Lease) on the
-    /// key mapped to `i` (review H-1: the lease is the capability; only the
+    /// key mapped to `i` (the lease is the capability; only the
     /// pager constructs leases, so a shared read is unreachable without one).
     ///
     /// # Panics
@@ -186,7 +186,7 @@ impl Arena {
     // Filled-claim exclusivity contract documented above, which the residency
     // map's claim + fill gate enforce.
     /// Mutable slot view for the page-in path, under the exclusive
-    /// [`FillClaim`](super::residency::FillClaim) (review H-1).
+    /// [`FillClaim`](super::residency::FillClaim).
     ///
     /// # Panics
     /// Panics when `i >= slot_count` or the claim names another slot.

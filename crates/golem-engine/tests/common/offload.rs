@@ -10,7 +10,7 @@ use golem_engine::config::EngineConfig;
 ///   split scheduler then copies the routed experts per step — the P1/P2
 ///   hook call-site (`ggml_backend_buffer_is_host` branch). With plain full
 ///   offload the experts fit on the GPU and no copies happen.
-/// - The engine itself forces the op-offload threshold to 1 (review C-4):
+/// - The engine itself forces the op-offload threshold to 1 (design I2):
 ///   tests must NOT set `GGML_OP_OFFLOAD_MIN_BATCH`; a HIP test that passes
 ///   without the env proves the engine sets it.
 pub fn offload_config() -> EngineConfig {

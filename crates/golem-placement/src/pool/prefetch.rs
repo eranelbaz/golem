@@ -23,7 +23,7 @@ pub const PREFETCH_K: usize = 3;
 
 /// Recent-access source (the surface P4's `notify_access` call-site will
 /// feed). Injected implementations back the M2.3 tests; the engine wires an
-/// empty feed until that call-site exists (Global Constraints deviation 2).
+/// empty feed until that call-site exists.
 pub trait AccessFeed: Send + Sync {
     /// The union of the last `k` steps' accessed keys. The pool filters
     /// already-resident keys itself; returned keys may repeat across calls.

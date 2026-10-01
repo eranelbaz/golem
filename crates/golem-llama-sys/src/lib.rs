@@ -47,7 +47,7 @@ pub mod raw {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-/// GPU-pinned host memory (review H-4): register/deregister an mlock'd host
+/// GPU-pinned host memory (§3.5): register/deregister an mlock'd host
 /// range with the HIP runtime so `hipMemcpyAsync` from it is truly async and
 /// runs at full PCIe bandwidth instead of through driver bounce buffers.
 /// Only available when the substrate backend is HIP; callers gate on
@@ -71,7 +71,7 @@ pub mod pinned {
 
     /// Registers `[ptr, ptr+len)` as pinned. Errors surfaced verbatim (HIP
     /// result codes); a failed registration must abort the caller's startup —
-    /// silently-degraded PCIe bandwidth is exactly the failure H-4 bans.
+    /// silently-degraded PCIe bandwidth is exactly what §3.5 bans.
     ///
     /// # Safety
     /// `ptr` must be a live, page-aligned host allocation of exactly `len`

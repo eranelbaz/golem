@@ -143,7 +143,7 @@ int main() {
                 (unsigned long long) dc.copied, (unsigned long long) dc.skipped);
     }
 
-    // Abort: routed set larger than K (D-7's loud failure).
+    // Abort: routed set larger than K (loud failure, never a silent wrong remap).
     if (fork() == 0) {
         GolemSlabEntry st;
         std::vector<int32_t> routed(n);

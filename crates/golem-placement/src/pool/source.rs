@@ -156,11 +156,11 @@ impl GgufPreadSource {
     }
 
     /// Opens the shard set rooted at `path` and walks every shard's GGUF
-    /// tensor table (review C-5: split GGUFs, where the first shard can be
+    /// tensor table (split GGUFs, where the first shard can be
     /// metadata-only). Sibling shards are discovered by rewriting the
     /// `-NNNNN-of-MMMMM.gguf` suffix per `split.count`. Expert layers are
     /// numbered EXCLUDING the dense lead AND the trailing MTP/NextN blocks
-    /// (review R-2): pool layer = gguf blk − `n_dense_lead`, live only for
+    /// (§3.4): pool layer = gguf blk − `n_dense_lead`, live only for
     /// `n_dense_lead ≤ blk < block_count − nextn_predict_layers`.
     ///
     /// # Errors
@@ -202,7 +202,7 @@ impl GgufPreadSource {
                 }
                 if let Some(mtp_from) = mtp_from {
                     if u64::from(blk) >= mtp_from {
-                        continue; // MTP/NextN block: skipped at load (R-2)
+                        continue; // MTP/NextN block: skipped at load
                     }
                 }
                 let stride = ggml_row_bytes(e.ggml_type, e.dims[0])
@@ -274,7 +274,7 @@ fn shard_path(first: &Path, no: u64, count: u64) -> Result<PathBuf, SourceError>
     Ok(first.with_file_name(format!("{base}-{:0width$}-of-{counts}{ext_dot}", no + 1)))
 }
 
-/// Retry bound for EINTR / short reads (Global Constraints: bounded, then
+/// Retry bound for EINTR / short reads (bounded, then
 /// surface the failure — the FFI layer aborts loudly).
 const READ_RETRIES: usize = 64;
 
@@ -465,10 +465,7 @@ mod tests {
         let src = GgufPreadSource::open(&paths[0], 1).unwrap();
         let g = src.geometry().unwrap();
         // blk.2 is the MTP/NextN block (nextn_predict_layers = 1): excluded.
-        assert_eq!(
-            g.n_layers, 1,
-            "MTP expert block must not join the pool (R-2)"
-        );
+        assert_eq!(g.n_layers, 1, "MTP expert block must not join the pool");
         assert_eq!(g.n_experts, 64);
         let (base_g, s_gate) = src.plane(0, ExpertKind::Gate, 0).unwrap();
         let (_, s_up) = src.plane(0, ExpertKind::Up, 0).unwrap();

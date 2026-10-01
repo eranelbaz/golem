@@ -34,7 +34,7 @@ fn expert_metadata_derived_from_tensor_dims() {
         );
         let dense = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "ffn_down");
         assert_eq!(golem_tensor_expert_count(dense.cast()), 0);
-        // Loader-created .scale variants are not expert planes (review C-1/M-9).
+        // Loader-created .scale variants are not expert planes (one shared matcher, §6.6).
         let scale = new_tensor_3d(&ctx, test_type(), 64, 32, 8, "blk.0.ffn_gate_exps.scale");
         assert_eq!(golem_tensor_expert_count(scale.cast()), 0);
         assert_eq!(golem_tensor_expert_stride_bytes(dense.cast()), 0);
@@ -56,6 +56,6 @@ fn register_null_hooks_smoke() {
     unsafe {
         golem_register_hooks(None, None, None, None, std::ptr::null_mut());
         // No assertion beyond "does not crash + links": the unset state is
-        // byte-identity-proven by Task 4's dump gate.
+        // byte-identity-proven by the parity dump gate.
     }
 }
