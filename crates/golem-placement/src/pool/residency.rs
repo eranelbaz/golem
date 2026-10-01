@@ -130,6 +130,19 @@ pub enum Claim {
     },
 }
 
+/// Why a claim did not return a slot. `Evicted`: the victim's slot is the
+/// claimer's and its I/O replaces the victim's bytes. `Busy`: every slot is
+/// leased or snapshot-protected after bounded CLOCK walks — transient by
+/// contract (leases release); the pool must not be over-subscribed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimError {
+    /// An expert evicted by this claim; its slot is reassigned to the
+    /// claimer, whose I/O replaces the victim's bytes.
+    Evicted(Evicted),
+    /// No evictable slot after a full CLOCK walk.
+    Busy,
+}
+
 /// An expert evicted by this claim; its slot is reassigned to the claimer,
 /// whose I/O replaces the victim's bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,9 +268,16 @@ impl ResidencyMap {
         kind: ExpertKind,
         expert: u32,
         snapshot: &PolicySnapshot,
-    ) -> Result<Claim, Evicted> {
+    ) -> Result<Claim, ClaimError> {
         let li = layer as usize;
         let i = self.local(kind, expert);
+        // Bounded starvation guard: a sweep that finds no victim means every
+        // slot is leased or snapshot-protected. Leases are transient, so a
+        // bounded number of full CLOCK walks (each ≤ SWEEP_BUDGET keys) is
+        // enough to make progress; beyond that the pool is over-subscribed
+        // and the caller gets a loud busy error instead of an unbounded spin.
+        let starve_bound = self.total_keys / SWEEP_BUDGET + 2;
+        let mut starved = 0usize;
         loop {
             let mut sh = self.shards[li].shard.lock().unwrap();
             if Self::bit_test(&sh.bits, i) {
@@ -265,6 +285,7 @@ impl ResidencyMap {
                     sh = self.shards[li].fill_cv.wait(sh).unwrap();
                 }
                 if Self::bit_test(&sh.bits, i) {
+                    debug_assert!(sh.leases[i] < u16::MAX, "lease count overflow");
                     sh.leases[i] += 1;
                     Self::ref_set(&mut sh.ref_bits, i);
                     return Ok(Claim::Resident {
@@ -286,7 +307,13 @@ impl ResidencyMap {
             let popped = self.free_slots.lock().unwrap().pop();
             let acquired = match popped {
                 Some(slot) => Some((slot, None)),
-                None => self.clock_evict(snapshot).map(|(v, s)| (s, Some(v))),
+                None => {
+                    starved += 1;
+                    if starved > starve_bound {
+                        return Err(ClaimError::Busy);
+                    }
+                    self.clock_evict(snapshot).map(|(v, s)| (s, Some(v)))
+                }
             };
             let (slot, victim) = match acquired {
                 Some(x) => x,
@@ -295,6 +322,7 @@ impl ResidencyMap {
                     continue;
                 }
             };
+            starved = 0;
             sh = self.shards[li].shard.lock().unwrap();
             if Self::bit_test(&sh.bits, i) {
                 // A concurrent claimer filled this key while we hunted for a
@@ -310,13 +338,14 @@ impl ResidencyMap {
             Self::bit_set(&mut sh.bits, i);
             // Reference bit stays clear on first fill: a key evicts on its
             // first sweep unless it was re-touched (Resident) in between.
+            debug_assert!(sh.leases[i] < u16::MAX, "lease count overflow");
             sh.leases[i] += 1;
             if let Some(victim) = victim {
-                return Err(Evicted {
+                return Err(ClaimError::Evicted(Evicted {
                     victim,
                     slot,
                     claim: FillClaim { slot },
-                });
+                }));
             }
             return Ok(Claim::Filled {
                 slot,
@@ -536,7 +565,9 @@ mod tests {
         m.release_lease(0, ExpertKind::Gate, 0);
         m.release_lease(0, ExpertKind::Gate, 1);
         snap.lease(0, ExpertKind::Gate, 0); // simulate an outstanding lease on expert 0
-        let e = m.claim(0, ExpertKind::Gate, 2, &snap).unwrap_err();
+        let ClaimError::Evicted(e) = m.claim(0, ExpertKind::Gate, 2, &snap).unwrap_err() else {
+            panic!("expected eviction")
+        };
         assert_eq!(e.victim.expert, 1, "leased expert 0 must never be picked");
         assert!(!m.is_resident(0, ExpertKind::Gate, 1), "victim bit cleared");
         assert!(m.is_resident(0, ExpertKind::Gate, 2), "claimer flipped");
@@ -662,7 +693,7 @@ mod tests {
             m.finish_fill(0, ExpertKind::Gate, 2);
             m.release_lease(0, ExpertKind::Gate, 2);
             let c = colds[(round % 3) as usize];
-            if let Err(evicted) = m.claim(0, ExpertKind::Gate, c, &snap) {
+            if let Err(ClaimError::Evicted(evicted)) = m.claim(0, ExpertKind::Gate, c, &snap) {
                 assert_ne!(
                     evicted.victim.expert, 2,
                     "round {round}: the hot expert was evicted"
@@ -689,7 +720,9 @@ mod tests {
         m.finish_fill(1, ExpertKind::Down, 0);
         m.release_lease(1, ExpertKind::Gate, 0);
         m.release_lease(1, ExpertKind::Down, 0);
-        let e = m.claim(1, ExpertKind::Gate, 1, &snap).unwrap_err();
+        let ClaimError::Evicted(e) = m.claim(1, ExpertKind::Gate, 1, &snap).unwrap_err() else {
+            panic!("expected eviction")
+        };
         assert_eq!(
             (e.victim.kind, e.victim.expert),
             (ExpertKind::Down, 0),
@@ -707,13 +740,35 @@ mod tests {
         m.finish_fill(1, ExpertKind::Up, 0);
         m.release_lease(1, ExpertKind::Gate, 1);
         m.release_lease(1, ExpertKind::Up, 0);
-        let e = m.claim(1, ExpertKind::Gate, 2, &snap).unwrap_err();
+        let ClaimError::Evicted(e) = m.claim(1, ExpertKind::Gate, 2, &snap).unwrap_err() else {
+            panic!("expected eviction")
+        };
         assert_eq!(
             (e.victim.kind, e.victim.expert),
             (ExpertKind::Up, 0),
             "snapshot-leased (1, Gate, 1) must never be picked"
         );
         assert!(m.is_resident(1, ExpertKind::Gate, 1), "lease held");
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn claim_on_fully_protected_pool_returns_busy_not_infinite_spin() {
+        let m = ResidencyMap::new(1, 2, 2);
+        let mut snap = PolicySnapshot::test_empty();
+        // Fill both slots and protect every resident.
+        for e in [0u32, 1] {
+            m.claim(0, ExpertKind::Gate, e, &snap).unwrap();
+            m.finish_fill(0, ExpertKind::Gate, e);
+            m.release_lease(0, ExpertKind::Gate, e);
+            snap.lease(0, ExpertKind::Gate, e);
+        }
+        // No free slot, no evictable victim: bounded walks, then a typed
+        // busy error instead of spinning forever.
+        assert_eq!(
+            m.claim(0, ExpertKind::Gate, 2, &snap),
+            Err(ClaimError::Busy)
+        );
     }
 
     #[test]

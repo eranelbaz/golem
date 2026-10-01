@@ -21,6 +21,7 @@ pub use arena::Arena;
 pub use pager::{ExpertPool, Lease, PoolError, SnapshotHandle};
 pub use prefetch::{AccessFeed, GATE_CAPACITY, PREFETCH_K, PrefetchHandle, spawn_prefetch};
 pub use residency::{
-    Claim, Evicted, ExpertKind, P3Stats, PolicySnapshot, ResidencyMap, Victim, key_index,
+    Claim, ClaimError, Evicted, ExpertKind, P3Stats, PolicySnapshot, ResidencyMap, Victim,
+    key_index,
 };
 pub use source::{ExpertSource, GgufPreadSource, PoolGeometry, SourceError};

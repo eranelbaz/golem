@@ -4,6 +4,9 @@
 //! outside the residency map / pager, so the round trip runs through
 //! [`ExpertPool`].
 
+// cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
+#![allow(unexpected_cfgs)]
+
 use golem_gguf::ExpertKind;
 use golem_placement::pool::primitives::{Arc, arc_dyn};
 use golem_placement::pool::{Arena, ExpertPool, P3Stats, PolicySnapshot, SnapshotHandle};

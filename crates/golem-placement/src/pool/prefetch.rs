@@ -5,6 +5,9 @@
 //! call-site (P4 owns it), so the production feed is empty and real inputs
 //! arrive with M2.4 — the mechanism here is proven against injected feeds.
 
+// cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
+#![allow(unexpected_cfgs)]
+
 use std::time::Duration;
 
 use super::pager::ExpertPool;

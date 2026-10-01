@@ -3,15 +3,20 @@
 //! while its lease is held — the P3 callback body. Eviction happens inside
 //! [`ResidencyMap::claim`] (victim pick + bit clear + slot reassignment, one
 //! shard-lock critical section); a claim grant on ANY path — `Filled`,
-//! `Resident`, or `Err(Evicted)` — carries one lease, so a key being filled or
+//! `Resident`, or `Err(ClaimError::Evicted)` — carries one lease, so a key being filled or
 //! copied can never be picked as a victim and its slot can never be handed to
 //! another claimer.
+
+// cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
+#![allow(unexpected_cfgs)]
 
 use std::fmt;
 
 use super::arena::Arena;
 use super::primitives::{Arc, AtomicUsize, Ordering};
-use super::residency::{Claim, ExpertKind, FillClaim, P3Stats, PolicySnapshot, ResidencyMap};
+use super::residency::{
+    Claim, ClaimError, ExpertKind, FillClaim, P3Stats, PolicySnapshot, ResidencyMap,
+};
 use super::source::ExpertSource;
 
 /// Lock-free-ish read handle over the current [`PolicySnapshot`] (rebuilt by
@@ -47,14 +52,27 @@ impl SnapshotHandle {
 /// claim is cancelled (no ghost residency, slot recycled); the FFI layer
 /// aborts loudly on this (Global Constraints).
 #[derive(Debug)]
-pub struct PoolError {
-    /// The failing source error.
-    pub source: std::io::Error,
+pub enum PoolError {
+    /// Source read failed after bounded retries.
+    Source {
+        /// The failing source error.
+        source: std::io::Error,
+    },
+    /// Every slot is leased or snapshot-protected after bounded CLOCK walks
+    /// — the pool is over-subscribed; leases are transient, so this is a
+    /// loud contract violation, not a wait.
+    Busy,
 }
 
 impl fmt::Display for PoolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "expert page-in failed: {}", self.source)
+        match self {
+            PoolError::Source { source } => write!(f, "expert page-in failed: {source}"),
+            PoolError::Busy => write!(
+                f,
+                "expert pool busy: no evictable slot — pool over-subscribed"
+            ),
+        }
     }
 }
 
@@ -142,7 +160,7 @@ impl ExpertPool {
     /// then run `copy` ONCE per key while its lease is held; `copy` receives
     /// the slot bytes. This is the P3 callback body.
     ///
-    /// Per key: `claim` → on `Err(Evicted)` the returned slot is filled (I/O
+    /// Per key: `claim` → on `Err(ClaimError::Evicted)` the returned slot is filled (I/O
     /// outside all locks) → copy under the claim's lease → lease dropped.
     /// Stats are per key (`demand`/`!demand` counted separately; Global
     /// Constraints), never per range.
@@ -214,7 +232,7 @@ impl ExpertPool {
                 self.page_in(demand, layer, kind, expert, slot, Some(claim))?;
                 (slot, None)
             }
-            Err(evicted) => {
+            Err(ClaimError::Evicted(evicted)) => {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                 self.page_in(
                     demand,
@@ -226,6 +244,7 @@ impl ExpertPool {
                 )?;
                 (evicted.slot, None)
             }
+            Err(ClaimError::Busy) => return Err(PoolError::Busy),
         };
         Ok((
             slot,
@@ -311,7 +330,7 @@ impl ExpertPool {
             Err(source) => {
                 self.residency.cancel_claim(layer, kind, expert);
                 self.stats.source_errors.fetch_add(1, Ordering::Relaxed);
-                Err(PoolError { source })
+                Err(PoolError::Source { source })
             }
         }
     }
@@ -326,7 +345,8 @@ impl ExpertPool {
         let snapshot = PolicySnapshot::test_empty();
         let slot = match self.residency.claim(layer, kind, expert, &snapshot) {
             Ok(Claim::Resident { slot }) | Ok(Claim::Filled { slot, .. }) => slot,
-            Err(evicted) => evicted.slot,
+            Err(ClaimError::Evicted(evicted)) => evicted.slot,
+            Err(ClaimError::Busy) => panic!("test lease on an over-subscribed pool"),
         };
         Lease {
             map: self.residency.clone(),
