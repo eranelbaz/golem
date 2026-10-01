@@ -1,6 +1,7 @@
 // Golem policy-hook ABI + expert-metadata queries (Golem patch P1).
-// Part of the vendored ggml include tree; the ABI is frozen so Rust-side
-// code does not churn. Wired into ggml-backend.cpp by P1.
+// Part of the vendored ggml include tree; the ABI is versioned — a change
+// updates the Rust bindings and both sides together. Wired into
+// ggml-backend.cpp by P1.
 #ifndef GOLEM_HOOKS_H
 #define GOLEM_HOOKS_H
 
@@ -55,24 +56,24 @@ int32_t golem_tensor_expert_count(const void *tensor);
 int32_t golem_tensor_expert_stride_bytes(const void *tensor);
 
 /* Force GPU offload of ops on host-resident weights below the upstream
- * batch-32 threshold (the review): MUL_MAT_ID's batch is ne[2] = tokens, 1
+ * batch-32 threshold (design I2): MUL_MAT_ID's batch is ne[2] = tokens, 1
  * during decode, so without this experts compute on the CPU. Values ≤ 0
  * restore the env/default behavior. Read once at device init — call before
  * backend init. Implemented in ggml-backend.cpp (backend-agnostic); the
  * CUDA/HIP device init consults it. */
 void golem_set_expert_offload_min_batch(int n);
 
-/* --- P2/P4: slot-indirected device expert cache (the review; design sec 3.4 v2). --- */
+/* --- P2/P4: slot-indirected device expert cache (design sec 3.4 v2). --- */
 
-/* Per-tensor expert-slot budget for the device cache, in EXPERTS (review
- * M-13: a count per (layer, kind), never a byte cap derived from one
- * tensor's stride). 0 = unlimited (a full-size slab). Mutated over FFI by
+/* Per-tensor expert-slot budget for the device cache, in EXPERTS: a
+ * count per (layer, kind), never a byte cap derived from one tensor's
+ * stride. 0 = unlimited (a full-size slab). Mutated over FFI by
  * tests and set once by the engine at pool enable. */
 void golem_set_device_cache_experts(int32_t k);
 /* Current budget (0 = unlimited). */
 int32_t golem_device_cache_experts(void);
 
-/* Clear the device cache map - the invalidation/multi-model seam (also Task 4's cold-start lever). */
+/* Clear the device cache map - the invalidation/multi-model seam (also the cold-start lever). */
 void golem_reset_device_cache(void);
 
 /* P4 counters. Opaque here (C++ side keeps the members atomic); each member is a lock-free 8-byte counter read by Rust as u64. */

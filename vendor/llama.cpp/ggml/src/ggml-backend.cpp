@@ -64,7 +64,7 @@ static void * golem_h_ctx = NULL;
 
 // --- golem P2/P4: persistent device expert-copy cache (design sec 3.4). Engages ONLY when policy_query is registered; otherwise the copy path below is byte-identical to upstream (T4 invariant).
 // (C++17 TU: std::atomic instead of C11 _Atomic - same lock-free ABI.)
-static std::atomic<int> golem_h_device_cache_experts{0}; // 0 = unlimited (full-size); mutated over FFI (the review: the budget IS a per-(layer, kind) expert count)
+static std::atomic<int> golem_h_device_cache_experts{0}; // 0 = unlimited (full-size); mutated over FFI; the budget is a per-(layer, kind) expert count
 void golem_set_device_cache_experts(int32_t k) { golem_h_device_cache_experts.store(k, std::memory_order_relaxed); }
 int32_t golem_device_cache_experts(void) { return golem_h_device_cache_experts.load(std::memory_order_relaxed); }
 
@@ -87,9 +87,7 @@ static std::unordered_map<const void *, GolemSlabEntry> golem_dc; // key: HOST w
 void golem_reset_device_cache(void) {
     std::lock_guard<std::mutex> lk(golem::golem_dc_mutex);
     // Free the remapped-ids device regions with their entries — the
-    // invalidation seam is also the reclamation point (model reload). The
-    // slab itself is the scheduler's cpy tensor: owned by the graph, freed
-    // with it (the review: no owned twin anymore).
+    // invalidation seam is also the reclamation point (model reload).
     for (auto & kv : golem::golem_dc) {
         if (kv.second.ids_buf != nullptr) {
             ggml_backend_buffer_free(kv.second.ids_buf);

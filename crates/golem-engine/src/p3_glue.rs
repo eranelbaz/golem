@@ -6,7 +6,7 @@
 //! unregistered — the C side stores the fn pointers in plain non-atomic
 //! statics, so any teardown could race a mid-flight callback (UB). The
 //! registration table fills lazily on the first callback per expert tensor
-//! (the frozen P1 ABI exposes expert metadata per tensor but no model-tensor
+//! (the P1 ABI exposes expert metadata per tensor but no model-tensor
 //! enumeration, so data pointers are only knowable when the substrate hands
 //! the tensor to the callback). On a GPU split these first callbacks fire
 //! during `load()`'s decode self-check, so registration cross-checks still
@@ -14,7 +14,7 @@
 //!
 //! Registration shape:
 //! - *Lazy registration:* a load-time tensor walk is not expressible
-//!   through the frozen ABI (no enumeration API); the table is built at first
+//!   through the P1 ABI (no enumeration API); the table is built at first
 //!   callback per tensor instead. The load-time cross-checks (source plane
 //!   stride == substrate stride per expert tensor; one pread byte-compared
 //!   against the loader-populated host bytes) run at that registration, where
@@ -126,8 +126,8 @@ struct PolicyQueryState {
     /// replaced collapsed a whole chat turn into one step.
     step: AtomicU64,
     /// Double-buffered order slices: the slice returned to C stays valid
-    /// until the next policy_query call (frozen-buffer contract, Global
-    /// Constraints; C consumes it within the same copy step).
+    /// until the next policy_query call (frozen-buffer contract,
+    /// golem-hooks.h; C consumes it within the same copy step).
     bufs: [Mutex<Vec<i32>>; 2],
     /// Index of the buffer currently exposed to C (`bufs` element).
     exposed: AtomicUsize,
@@ -524,8 +524,8 @@ fn k_from_free_vram(
     Ok(k as u32)
 }
 
-/// Loud terminal state for FFI-adjacent contract violations (Global
-/// Constraints: the void ABI leaves no non-silent failure path; corrupt-weight
+/// Loud terminal state for FFI-adjacent contract violations (the void ABI
+/// leaves no non-silent failure path; corrupt-weight
 /// decode is worse than a dead process — documented, deliberate).
 fn p3_fatal(context: String) -> ! {
     // stderr is the one channel always available in an abort path (tracing

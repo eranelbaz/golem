@@ -65,7 +65,7 @@ struct GolemSlabCounters {
 // - Every routed expert gets a valid slot: free first, else evict the first
 //   non-routed assigned expert in `order` (policy-driven victim). Routed set
 //   larger than K cannot be staged → GGML_ABORT (fail-loud; prefill slab
-//   sizing is design D-7, deferred to M3.5).
+//   sizing is design §2.4, deferred to M3.5).
 // - on_copy(slot, id): physical host→device write of expert `id`'s plane into
 //   `slot`. Called once per non-current routed expert.
 // - st.remap = the remapped ids (same element order/count as `ids`), ready
@@ -145,7 +145,7 @@ GolemSlabCounters golem_slab_step(GolemSlabEntry &st, const std::vector<int32_t>
             // K smaller than the routed set: the ids cannot be staged. Fail
             // loud — silently dropping an expert would corrupt decode.
             GGML_ABORT("golem P2 slab: routed set (%d) exceeds slots (K=%d); "
-                       "raise --vram-experts or lower the ubatch (design D-7)",
+                       "raise --vram-experts or lower the ubatch (design sec 2.4 prefill)",
                        (int) routed.size(), (int) K);
         }
         // Stealing a slot may orphan its previous owner's assignment; the

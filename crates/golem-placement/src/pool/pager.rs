@@ -104,7 +104,7 @@ impl Drop for Lease {
 }
 
 /// The RAM expert pool: arena + residency map + source + snapshots + stats,
-/// `Arc`-shared with the FFI glue and the prefetcher (Tasks 5–6).
+/// `Arc`-shared with the FFI glue and the prefetcher.
 pub struct ExpertPool {
     /// Locked slot arena.
     pub arena: Arc<Arena>,
@@ -162,8 +162,8 @@ impl ExpertPool {
     ///
     /// Per key: `claim` → on `Err(ClaimError::Evicted)` the returned slot is filled (I/O
     /// outside all locks) → copy under the claim's lease → lease dropped.
-    /// Stats are per key (`demand`/`!demand` counted separately; Global
-    /// Constraints), never per range.
+    /// Stats are per key (`demand`/`!demand` counted separately, §6.6),
+    /// never per range.
     ///
     /// # Errors
     /// Source failure after bounded retries; the claim is cancelled first (no

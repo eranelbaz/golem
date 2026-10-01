@@ -1,4 +1,4 @@
-//! Journal warm-start seeding (§6.3, M2.5 task 3): replay a recorded trace
+//! Journal warm-start seeding (§6.3): replay a recorded trace
 //! into a fresh policy with a step gap and check the seeded ranking against
 //! an independent replay of the same trace. The xorshift trace generator is
 //! duplicated from `tests/properties.rs` (its helpers are private to that
