@@ -464,26 +464,29 @@ mod tests {
         let paths = xtask::shape_moe::cached_fixture();
         let src = GgufPreadSource::open(&paths[0], 1).unwrap();
         let g = src.geometry().unwrap();
-        // blk.2 is the MTP/NextN block (nextn_predict_layers = 1): excluded.
-        assert_eq!(g.n_layers, 1, "MTP expert block must not join the pool");
+        // blk.4 is the MTP/NextN block (nextn_predict_layers = 1): excluded.
+        assert_eq!(g.n_layers, 3, "MTP expert block must not join the pool");
         assert_eq!(g.n_experts, 64);
         let (base_g, s_gate) = src.plane(0, ExpertKind::Gate, 0).unwrap();
         let (_, s_up) = src.plane(0, ExpertKind::Up, 0).unwrap();
         let (_, s_down) = src.plane(0, ExpertKind::Down, 0).unwrap();
         assert_eq!(
             (s_gate, s_up, s_down),
-            (144 * 32, 176 * 32, 210 * 32),
-            "mixed K-quant rows × ne1 = 32"
+            (144 * 32, 144 * 32, 176 * 32),
+            "blk 1 unit class: Q4/Q4/Q5 rows × ne1 = 32"
         );
         assert_eq!(
             g.expert_bytes,
-            64 * (144 + 176 + 210) * 32,
-            "3 planes × 64 experts, per-kind strides"
+            64 * (14_848 + 15_936 + 17_984),
+            "3 layers × 3 planes × 64 experts, per-unit bytes"
         );
         // Metadata-only shard 1 holds no planes; all bytes live in shard 2.
         let mut buf = vec![0u8; 144 * 32];
         src.read_expert(0, ExpertKind::Gate, 63, &mut buf).unwrap();
-        assert!(buf.iter().all(|&b| b == 0xA5), "read from the data shard");
+        assert!(
+            buf.iter().all(|&b| b == xtask::shape_moe::fill_byte(1, 0)),
+            "read from the data shard, gate provenance byte"
+        );
         let _ = base_g;
     }
 
