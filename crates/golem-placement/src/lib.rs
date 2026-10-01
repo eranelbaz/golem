@@ -377,49 +377,56 @@ impl Policy {
             step.saturating_sub(self.states[k].last_transition_step) > cfg.min_dwell_steps
         };
 
-        // Promotion is a relative swap margin (§6.3 as amended — D-9): a RAM
-        // candidate enters the VRAM order while there is room, and once the
-        // cap is full it displaces the weakest resident only when its score
-        // beats that resident by ≥ 20% (and the resident's min-dwell has
-        // expired). Absolute thresholds cannot separate hot from cold here:
-        // the steady-state score of an average expert is p·H ≈ 14 at
+        // Promotion is a two-phase relative-swap rule (§6.3 as amended):
+        // the order is seeded with current VRAM residents first (best-first,
+        // up to the cap), then a dwell-expired RAM candidate fills any
+        // remaining room and, at a full cap, displaces the weakest seeded
+        // resident only when its score beats that resident by ≥ 20% (and
+        // the resident's min-dwell has expired). Seeding residents before
+        // considering challengers is what makes the margin real hysteresis
+        // against incumbents — a single rank-sorted iteration can never
+        // reach the swap branch because every earlier entry scored at
+        // least as high. Absolute thresholds cannot separate hot from cold
+        // here: the steady-state score of an average expert is p·H ≈ 14 at
         // H = 512, an order of magnitude above any fixed θ.
         const SWAP_MARGIN: f64 = 1.2;
         let mut vram_order: Vec<PolicyEntry> = Vec::with_capacity(cfg.vram_experts_max);
         let mut in_order = vec![false; n];
-        for &(_, k) in &rank {
-            let eligible = resident(k, TIER_VRAM) || (resident(k, TIER_RAM) && dwell_ok(k));
-            if !eligible || in_order[k] {
+        // Phase 1: incumbents keep their seats.
+        for &(score, k) in &rank {
+            if vram_order.len() == cfg.vram_experts_max {
+                break;
+            }
+            if resident(k, TIER_VRAM) {
+                in_order[k] = true;
+                vram_order.push(PolicyEntry { key: k, score });
+            }
+        }
+        // Phase 2: challengers. The margin strictly beats 1.2·0 to reject
+        // zero-score ties (which would churn arbitrarily); the swap
+        // transiently leaves a displaced resident in VRAM past the cap
+        // until its eviction lands — bounded by D_min, and the real P2
+        // slab (K slots) enforces the hard budget at promotion time.
+        for &(score, k) in &rank {
+            if cfg.vram_experts_max == 0 || in_order[k] || !resident(k, TIER_RAM) || !dwell_ok(k) {
                 continue;
             }
             if vram_order.len() < cfg.vram_experts_max {
                 in_order[k] = true;
-                vram_order.push(PolicyEntry {
-                    key: k,
-                    score: self.states[k].score,
-                });
+                vram_order.push(PolicyEntry { key: k, score });
                 continue;
             }
-            // Full: consider a swap against the weakest entry in the order.
-            let Some(tail) = vram_order.last().copied() else {
-                unreachable!("order is at capacity, so non-empty");
-            };
-            // The strict > rejects zero-score ties (0 >= 1.2·0 would churn
-            // arbitrarily); the swap transiently leaves a displaced resident
-            // in VRAM past the cap until its eviction lands — bounded by
-            // D_min, and the real P2 slab (K slots, C-3) enforces the hard
-            // budget at promotion time.
-            if self.states[k].score > tail.score
-                && self.states[k].score >= SWAP_MARGIN * tail.score
-                && (resident(k, TIER_VRAM) || dwell_ok(tail.key))
-            {
+            let tail = vram_order
+                .last()
+                .copied()
+                .expect("cap > 0 with a full order is non-empty");
+            // `tail.score > 0` rejects zero-score ties (0 ≥ 1.2·0 would
+            // churn arbitrarily).
+            if tail.score > 0.0 && score >= SWAP_MARGIN * tail.score && dwell_ok(tail.key) {
                 in_order[tail.key] = false;
                 in_order[k] = true;
                 vram_order.pop();
-                vram_order.push(PolicyEntry {
-                    key: k,
-                    score: self.states[k].score,
-                });
+                vram_order.push(PolicyEntry { key: k, score });
             }
         }
         let mut promoted = vec![false; n];
@@ -780,6 +787,74 @@ mod tests {
         );
         p.apply_transition(0, Tier::Vram, true, 300);
         assert!(p.residency(0, Tier::Vram));
+    }
+
+    #[test]
+    fn swap_margin_is_real_hysteresis_against_incumbents() {
+        // Cap 1 fully occupied by a VRAM resident: the swap branch must be
+        // reachable through the full-cap path — a 1.1× challenger is
+        // rejected, a 1.3× one swaps after the incumbent's min-dwell. A
+        // huge half-life makes decay ≈ 1, so scores are access counts.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 1,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        // Resident: score 100 at the pass step.
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        for s in 0..100 {
+            p.on_access(0, s);
+        }
+        // Challenger, RAM-resident, score 110 < 1.2 × 100: rejected. Access
+        // steps must stay above the first pass (pass sweeps all stamps).
+        p.apply_transition(1, Tier::Ram, true, 0);
+        for s in 1000..1110 {
+            p.on_access(1, s);
+        }
+        let out = p.pass(1000);
+        assert_eq!(out.vram_order[0].key, 0, "1.1× challenger must not swap");
+        assert!(out.vram_evict_order.iter().all(|e| e.key != 0));
+        // Challenger, score 130 ≥ 1.2 × 100, incumbent dwell expired: swaps.
+        p.apply_transition(2, Tier::Ram, true, 0);
+        for s in 2000..2130 {
+            p.on_access(2, s);
+        }
+        let out = p.pass(3000);
+        assert_eq!(out.vram_order[0].key, 2, "1.3× challenger must swap");
+        assert!(out.vram_evict_order.iter().any(|e| e.key == 0));
+    }
+
+    #[test]
+    fn zero_vram_cap_yields_empty_order_no_panic() {
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 0,
+                ram_slots: 8,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        let out = p.pass(10_000);
+        assert!(out.vram_order.is_empty());
+        // A resident nobody keeps must be an eviction candidate, not a panic.
+        assert_eq!(out.vram_evict_order.first().map(|e| e.key), Some(0));
     }
 
     #[test]
