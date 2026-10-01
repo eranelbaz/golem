@@ -417,9 +417,18 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // the free VRAM at enable time (the model's non-expert weights are
     // already resident, so what is free is what the slabs + KV + compute
     // buffers must share), with half held back as growth headroom:
-    // K = free/2 / (n_layers × 3 kinds × slot_size) − 1 ≈ 8–9 on the target
-    // (≈6.2 GiB usable / (42 × 3 × 5.77 MB)).
-    let k = derive_device_cache_experts(config, geo.n_layers, geo.slot_size)?;
+    // K = free/2 / (n_layers × 3 kinds × slot_size) − 1 = 8 on the target
+    // (≈6.2 GiB usable / (42 × 3 × 5.77 MB) ≈ 9.15, minus the − 1 headroom).
+    // K is floored at the model's top-k (expert_used_count): a routed set
+    // larger than K aborts mid-decode, so a smaller K must fail at enable.
+    let n_expert_used = metadata
+        .kv_u64(&format!("{arch}.expert_used_count"))
+        .ok_or_else(|| {
+            EngineError::PoolInit(format!("{arch}.expert_used_count missing from the GGUF"))
+        })?;
+    let n_expert_used = u32::try_from(n_expert_used)
+        .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
+    let k = derive_device_cache_experts(config, geo.n_layers, geo.slot_size, n_expert_used)?;
     // SAFETY: FFI setter, no invariants.
     unsafe {
         raw::golem_set_device_cache_experts(k as i32);
@@ -456,15 +465,20 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
 /// unlimited, never zero: a routed set larger than K aborts, so K = 0 could
 /// not decode at all.
 fn derive_device_cache_experts(
-    config: &EngineConfig,
-    #[cfg(golem_backend_hip)] n_layers: u32,
-    #[cfg(not(golem_backend_hip))] n_layers: u32,
-    #[cfg(golem_backend_hip)] slot_size: u64,
-    #[cfg(not(golem_backend_hip))] slot_size: u64,
+    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] config: &EngineConfig,
+    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] n_layers: u32,
+    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] slot_size: u64,
+    n_expert_used: u32,
 ) -> Result<u32, EngineError> {
-    let _ = (n_layers, slot_size);
     if config.device_cache_experts > 0 {
-        return Ok(config.device_cache_experts);
+        let k = config.device_cache_experts;
+        if k < n_expert_used {
+            return Err(EngineError::PoolInit(format!(
+                "device_cache_experts {k} < expert_used_count {n_expert_used} — a routed \
+                 set larger than K aborts mid-decode; raise the explicit K"
+            )));
+        }
+        return Ok(k);
     }
     #[cfg(golem_backend_hip)]
     if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
@@ -475,7 +489,15 @@ fn derive_device_cache_experts(
         // growth headroom.
         let usable = (free / 2) as u64;
         let k = usable / slab_bytes_per_expert.max(1);
-        return u32::try_from(k.saturating_sub(1).clamp(1, u64::from(u32::MAX)))
+        let k = k.saturating_sub(1).clamp(1, u64::from(u32::MAX));
+        if k < u64::from(n_expert_used) {
+            return Err(EngineError::PoolInit(format!(
+                "free VRAM supports a slab of only {k} experts per (layer, kind), below \
+                 expert_used_count {n_expert_used} — even single-token decode would abort; \
+                 free VRAM or lower the resident set"
+            )));
+        }
+        return u32::try_from(k)
             .map_err(|_| EngineError::PoolInit("derived device_cache_experts > u32::MAX".into()));
     }
     Err(EngineError::PoolInit(
@@ -746,13 +768,24 @@ mod tests {
     #[test]
     fn device_cache_experts_explicit_wins_and_default_is_never_unbounded() {
         let c = EngineConfig {
+            device_cache_experts: 9,
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            derive_device_cache_experts(&c, 42, 5_777_000, 8).unwrap(),
+            9
+        );
+        // Explicit K below the model's top-k must fail at enable, not abort
+        // on the first decode (a routed set larger than K aborts).
+        let c_small = EngineConfig {
             device_cache_experts: 7,
             ..EngineConfig::default()
         };
-        assert_eq!(derive_device_cache_experts(&c, 42, 5_777_000).unwrap(), 7);
+        let err = derive_device_cache_experts(&c_small, 42, 5_777_000, 8).unwrap_err();
+        assert!(err.to_string().contains("expert_used_count"), "{err}");
         // Default (0): derived, bounded, never 0. On the CPU backend there is
         // no VRAM query, so derivation is a loud error, not an unbounded cap.
-        let r = derive_device_cache_experts(&EngineConfig::default(), 42, 5_777_000);
+        let r = derive_device_cache_experts(&EngineConfig::default(), 42, 5_777_000, 8);
         #[cfg(golem_backend_hip)]
         assert!(r.unwrap() >= 1);
         #[cfg(not(golem_backend_hip))]
