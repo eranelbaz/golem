@@ -197,18 +197,29 @@ impl PolicyQueryState {
         }
     }
 
-    /// §6.5 prefetch feed: union of accesses from the last `k` steps.
-    fn recent_union(&self, k: usize) -> Vec<(u32, ExpertKind, u32)> {
+    /// §6.5 prefetch feed: union of accessed `(layer, expert)` units from the
+    /// last `k` steps. The three tensors of a layer book the same routed
+    /// experts, so duplicates collapse through a flat per-layer bitset —
+    /// no hash set on the feed path.
+    fn recent_union(&self, k: usize) -> Vec<(u32, u32)> {
         let cutoff = self.step.load(Ordering::Relaxed).saturating_sub(k as u64);
+        let words = self.n_experts.div_ceil(64) as usize;
         let map = self.last_access.lock().unwrap();
-        map.iter()
-            .flat_map(|(&(layer, kind), hist)| {
-                hist.iter().enumerate().filter_map(move |(e, s)| {
-                    s.filter(|&step| step > cutoff)
-                        .map(|_| (layer, kind, e as u32))
-                })
-            })
-            .collect()
+        let mut out = Vec::new();
+        // Flat per-layer bitset over all layers: the three tensors of a layer
+        // book the same routed experts, so duplicates collapse to distinct
+        // experts only — no hash set on the feed path.
+        let mut seen = vec![0u64; self.n_layers as usize * words];
+        for (&(layer, _), hist) in map.iter() {
+            let row = &mut seen[layer as usize * words..(layer as usize + 1) * words];
+            for (e, s) in hist.iter().enumerate() {
+                if s.is_some_and(|step| step > cutoff) && row[e / 64] & (1 << (e % 64)) == 0 {
+                    row[e / 64] |= 1 << (e % 64);
+                    out.push((layer, e as u32));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -323,9 +334,9 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         .map_err(|e| EngineError::PoolInit(e.to_string()))?
         .ok_or_else(|| EngineError::PoolInit("model has no expert tensors".into()))?;
 
-    // RAM slot size stays the max plane stride; per-class slabs arrive with
-    // the multi-class arena.
-    let slot_size = usize::try_from(geo.layers.iter().flat_map(|l| l.stride).max().unwrap_or(0))
+    // RAM slot size = the max unit size (all three planes of the largest
+    // layer); per-class slabs arrive with the multi-class layout.
+    let slot_size = usize::try_from(geo.max_unit())
         .map_err(|_| EngineError::PoolInit("slot size > usize".into()))?;
     let n_layers = geo.n_layers();
     let pool_bytes = config
@@ -344,7 +355,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     }
     // Remainder bytes are trimmed by integer division: pool_bytes is a
     // multiple of slot_size again after this. Single class: every slot is
-    // one max-stride unit until the per-class layout lands (§5 amendment).
+    // one max-unit slot until the per-class layout lands (§5 amendment).
     let arena =
         golem_placement::pool::Arena::new(&[golem_placement::pool::SlotClass { slot_size, slots }])
             .map_err(|e| EngineError::PoolInit(e.to_string()))?;
@@ -379,8 +390,8 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         source.clone(),
         snapshots,
         Arc::new(P3Stats::new()),
+        geo.clone(),
         vec![0; geo.n_layers() as usize],
-        geo.n_experts,
     );
 
     // P2 state: per-expert recency (never-accessed first, then
@@ -625,7 +636,7 @@ extern "C" fn copy_done(ctx: *mut c_void) {
 struct PolicyFeed(&'static PolicyQueryState);
 
 impl AccessFeed for PolicyFeed {
-    fn take_union(&self, k: usize) -> Vec<(u32, ExpertKind, u32)> {
+    fn take_union(&self, k: usize) -> Vec<(u32, u32)> {
         self.0.recent_union(k)
     }
 }
@@ -913,7 +924,7 @@ mod tests {
         );
         assert_eq!(
             pq.recent_union(1),
-            vec![(0, ExpertKind::Gate, 2)],
+            vec![(0, 2)],
             "only the newest step is in the last-1 union"
         );
         assert!(

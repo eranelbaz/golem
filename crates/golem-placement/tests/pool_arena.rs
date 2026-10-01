@@ -10,7 +10,7 @@
 use golem_gguf::ExpertKind;
 use golem_placement::pool::primitives::{Arc, arc_dyn};
 use golem_placement::pool::{
-    Arena, ExpertPool, P3Stats, PolicySnapshot, SlotClass, SnapshotHandle,
+    Arena, ExpertPool, P3Stats, PolicySnapshot, PoolGeometry, SlotClass, SnapshotHandle, UnitLayout,
 };
 
 /// Deterministic 1-byte-per-expert source: expert `e` of layer 0 reads as
@@ -46,18 +46,25 @@ impl golem_placement::pool::ExpertSource for ByteSource {
 #[test]
 #[cfg(not(loom))]
 fn arena_locks_and_slots_are_disjoint() {
-    let slot_size = 16 * 32 * 4; // n_ff_exp * n_embd * F32 (tiny-moe plane)
+    let plane = (16 * 32 * 4) as u64; // n_ff_exp * n_embd * F32 (tiny-moe plane)
     let pool = ExpertPool::new(
         Arena::new(&[SlotClass {
-            slot_size,
+            slot_size: 3 * plane as usize, // one slot = one gate/up/down unit (D-11)
             slots: 4,
         }])
         .expect("mlock may fail on low RLIMIT_MEMLOCK"),
         arc_dyn(std::sync::Arc::new(ByteSource)),
         Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
         Arc::new(P3Stats::new()),
+        PoolGeometry {
+            layers: vec![UnitLayout {
+                stride: [plane; 3],
+                offset: [0, plane, 2 * plane],
+            }],
+            n_experts: 2,
+            expert_bytes: 0,
+        },
         vec![0; 1], // class_of_layer
-        2,          // n_experts
     );
 
     // Page in experts 0 and 1 of layer 0; each fills its own slot.
