@@ -480,33 +480,48 @@ fn derive_device_cache_experts(
                  set larger than K aborts mid-decode; raise the explicit K"
             )));
         }
+        // The C ABI takes an i32 and reads any value ≤ 0 as "full slab";
+        // a wrapped cast would silently become the unbounded allocation.
+        if i32::try_from(k).is_err() {
+            return Err(EngineError::PoolInit(format!(
+                "device_cache_experts {k} exceeds i32::MAX"
+            )));
+        }
         return Ok(k);
     }
     #[cfg(golem_backend_hip)]
     if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
-        let slab_bytes_per_expert = u64::from(n_layers)
-            .saturating_mul(3)
-            .saturating_mul(slot_size);
-        // Half of free VRAM is slab budget; the rest is KV + compute-buffer
-        // growth headroom.
-        let usable = (free / 2) as u64;
-        let k = usable / slab_bytes_per_expert.max(1);
-        let k = k.saturating_sub(1).clamp(1, u64::from(u32::MAX));
-        if k < u64::from(n_expert_used) {
-            return Err(EngineError::PoolInit(format!(
-                "free VRAM supports a slab of only {k} experts per (layer, kind), below \
-                 expert_used_count {n_expert_used} — even single-token decode would abort; \
-                 free VRAM or lower the resident set"
-            )));
-        }
-        return u32::try_from(k)
-            .map_err(|_| EngineError::PoolInit("derived device_cache_experts > u32::MAX".into()));
+        return k_from_free_vram(free as u64, n_layers, slot_size, n_expert_used);
     }
     Err(EngineError::PoolInit(
         "device_cache_experts unset and no VRAM query available to derive a bounded \
          slab budget — set device_cache_experts explicitly"
             .into(),
     ))
+}
+
+/// Derived K from free VRAM: half is slab budget, the rest KV + compute-buffer
+/// growth headroom; `− 1` is per-slab headroom. Floored at top-k.
+#[cfg_attr(not(golem_backend_hip), allow(dead_code))]
+fn k_from_free_vram(
+    free: u64,
+    n_layers: u32,
+    slot_size: u64,
+    n_expert_used: u32,
+) -> Result<u32, EngineError> {
+    let slab_bytes_per_expert = u64::from(n_layers)
+        .saturating_mul(3)
+        .saturating_mul(slot_size);
+    let k = (free / 2) / slab_bytes_per_expert.max(1);
+    let k = k.saturating_sub(1).clamp(1, i32::MAX as u64);
+    if k < u64::from(n_expert_used) {
+        return Err(EngineError::PoolInit(format!(
+            "free VRAM supports a slab of only {k} experts per (layer, kind), below \
+             expert_used_count {n_expert_used} — even single-token decode would abort; \
+             free VRAM or lower the resident set"
+        )));
+    }
+    Ok(k as u32)
 }
 
 /// Loud terminal state for FFI-adjacent contract violations (Global
@@ -787,11 +802,35 @@ mod tests {
         assert!(err.to_string().contains("expert_used_count"), "{err}");
         // Default (0): derived, bounded, never 0. On the CPU backend there is
         // no VRAM query, so derivation is a loud error, not an unbounded cap.
-        let r = derive_device_cache_experts(&EngineConfig::default(), 42, 5_777_000, 8);
-        #[cfg(golem_backend_hip)]
-        assert!(r.unwrap() >= 1);
         #[cfg(not(golem_backend_hip))]
-        assert!(r.is_err(), "no VRAM query: derivation must fail loudly");
+        assert!(
+            derive_device_cache_experts(&EngineConfig::default(), 42, 5_777_000, 8).is_err(),
+            "no VRAM query: derivation must fail loudly"
+        );
+        // An explicit K that would wrap the i32 ABI is refused, not passed
+        // through as "full slab".
+        let c_huge = EngineConfig {
+            device_cache_experts: u32::MAX,
+            ..EngineConfig::default()
+        };
+        let err = derive_device_cache_experts(&c_huge, 42, 5_777_000, 8).unwrap_err();
+        assert!(err.to_string().contains("i32::MAX"), "{err}");
+    }
+
+    #[test]
+    fn derived_k_matches_target_arithmetic_and_floors_at_top_k() {
+        // Target: ≈12.4 GiB free → 6.2 GiB slab budget / (42 × 3 × 5.77 MB)
+        // ≈ 9.15 → 9 − 1 = 8, exactly top-k.
+        let free = 2 * 6_657_000_000u64;
+        assert_eq!(k_from_free_vram(free, 42, 5_777_000, 8).unwrap(), 8);
+        // Any less free VRAM drops K below top-k: refused at enable.
+        let err = k_from_free_vram(free - 2 * 727_902_000, 42, 5_777_000, 8).unwrap_err();
+        assert!(err.to_string().contains("expert_used_count 8"), "{err}");
+        // Huge free VRAM stays within the i32 ABI.
+        assert_eq!(
+            k_from_free_vram(u64::MAX, 1, 1, 8).unwrap(),
+            i32::MAX as u32
+        );
     }
 
     #[test]
