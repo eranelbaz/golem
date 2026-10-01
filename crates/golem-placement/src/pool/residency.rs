@@ -1,6 +1,6 @@
 //! Residency map + P3 counters (§6.6): (layer, expert) unit → slot with
 //! in-flight leases and atomic claim-time eviction. One unit is an expert's
-//! gate, up and down planes co-allocated in one slot (D-11): one key is
+//! gate, up and down planes co-allocated in one slot (§3.4 v3): one key is
 //! claimed, filled, leased and evicted as a whole.
 
 // `cfg(loom)` is swapped via RUSTFLAGS by the T6 loom leg (declared in
@@ -79,7 +79,7 @@ struct ShardLock {
 
 /// Residency map over all expert layers: `(layer, expert) → slot` with
 /// in-flight leases and atomic claim-time eviction (§6.6). Slots are carved
-/// into size classes (D-2); a layer's keys claim, fill and evict only inside
+/// into size classes (§5 pool amendment); a layer's keys claim, fill and evict only inside
 /// `class_of_layer[layer]`'s slot range — no class borrows another's slot.
 ///
 /// Lock order (acyclic): `sweep` → shard; the per-class free stacks share one
@@ -194,13 +194,29 @@ impl ResidencyMap {
         n_experts: u32,
         class_slots: Vec<std::ops::Range<u32>>,
     ) -> Self {
+        // Fail loudly on inconsistent inputs: a class with no layers would
+        // divide by zero in `clock_evict`, and a layer naming a missing class
+        // would silently strand its keys.
         let n_layers = class_of_layer.len() as u32;
-        debug_assert!(n_layers > 0 && n_experts > 0);
-        debug_assert!(!class_slots.is_empty(), "a pool without slots cannot serve");
+        assert!(
+            n_layers > 0 && n_experts > 0,
+            "a pool without layers or experts cannot serve"
+        );
+        assert!(!class_slots.is_empty(), "a pool without slots cannot serve");
         let n_classes = class_slots.len();
         let mut class_layers = vec![Vec::new(); n_classes];
         for (l, &c) in class_of_layer.iter().enumerate() {
+            assert!(
+                (c as usize) < n_classes,
+                "layer {l} names class {c}, but only {n_classes} classes exist"
+            );
             class_layers[c as usize].push(l as u32);
+        }
+        for (c, layers) in class_layers.iter().enumerate() {
+            assert!(
+                !layers.is_empty(),
+                "class {c} has slots but serves no layers — clock_evict would divide by zero"
+            );
         }
         let class_keys: Vec<usize> = class_layers
             .iter()

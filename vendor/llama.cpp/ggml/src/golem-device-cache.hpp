@@ -1,5 +1,5 @@
 // Golem patch P2 v3 (design §3.4 v3): SLOT-INDIRECTED device expert cache,
-// one slot table per expert layer shared by its gate/up/down tensors (D-11).
+// one slot table per expert layer shared by its gate/up/down tensors (§3.4 v3).
 // Included by BOTH ggml-backend.cpp (split-scheduler copy path) and
 // tests/golem-p2-cache.cpp (fuzz harness): a single shared definition —
 // hand-copied declarations would be an ODR drift (silent wrong-layout crash).

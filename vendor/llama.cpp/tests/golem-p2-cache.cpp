@@ -1,4 +1,4 @@
-// Golem P2 v3 fuzz (design §3.4 v3, D-11): exercises the shared SLOT-INDIRECTED
+// Golem P2 v3 fuzz (design §3.4 v3): exercises the shared SLOT-INDIRECTED
 // device cache state machine (ggml/src/golem-device-cache.hpp — the exact
 // template the split scheduler runs) for the invariants that matter now:
 //   1. bit ⇒ current: after a step, every routed expert's remapped slot holds
@@ -7,7 +7,7 @@
 //      routed set never appear (they cannot — routed covers the ids bitset).
 //   3. victim choice (order permutation / routed set) never changes routed
 //      coverage; budget overflow with routed > K aborts loudly.
-//   4. per-layer sharing (D-11): the three planes (gate/up/down) of one layer
+//   4. per-layer sharing (§3.4 v3): the three planes (gate/up/down) of one layer
 //      share one slot table — an eviction happens once per layer, not once per
 //      plane, and each plane keeps its own validity bits.
 //

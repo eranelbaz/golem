@@ -133,7 +133,8 @@ impl fmt::Debug for ExpertPool {
 
 impl ExpertPool {
     /// Assembles a pool over `geometry.layers.len()` × `geometry.n_experts`
-    /// expert units; each layer claims slots only from its arena class (D-2).
+    /// expert units; each layer claims slots only from its arena class
+    /// (§5 pool amendment).
     pub fn new(
         arena: Arena,
         source: Arc<dyn ExpertSource>,
@@ -348,7 +349,7 @@ impl ExpertPool {
         let unit = &self.geometry.layers[layer as usize];
         // One disk→pool copy per unit: three preads straight into the
         // claimed slot's plane sub-slices (split from the single slot_mut
-        // borrow — no bounce buffer, D-11).
+        // borrow — no bounce buffer, §3.4 v3).
         let slot_bytes = self.arena.slot_mut(slot, &fill_claim);
         let result: std::io::Result<()> = 'fill: {
             let (gate, rest) = slot_bytes.split_at_mut(unit.offset[1] as usize);

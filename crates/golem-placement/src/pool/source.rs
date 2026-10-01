@@ -39,7 +39,7 @@ impl UnitLayout {
 /// Pool geometry derived from the expert plane table (§5.4): per-layer unit
 /// layouts (dense-lead-adjusted, MTP excluded), the dense-lead-adjusted
 /// layer/expert counts, and total expert bytes. RAM slot sizing is per unit
-/// class (review D-2, §5 pool amendment), so no single slot size here — the
+/// class (§5 pool amendment), so no single slot size here — the
 /// arena sizes each class by `max_unit()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolGeometry {
@@ -63,7 +63,7 @@ impl PoolGeometry {
     }
 
     /// Distinct unit sizes ascending, with the layers of each — the per-class
-    /// slab partition (D-2).
+    /// slab partition (§5 pool amendment).
     pub fn classes(&self) -> Vec<(u64, Vec<u32>)> {
         let mut by_size: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         for (layer, l) in self.layers.iter().enumerate() {
@@ -606,7 +606,7 @@ mod tests {
         // blk.4 is the MTP/NextN block (nextn_predict_layers = 1): excluded.
         assert_eq!(g.n_layers(), 3, "MTP expert block must not join the pool");
         assert_eq!(g.n_experts, 64);
-        let (base_g, s_gate) = src.plane(0, ExpertKind::Gate, 0).unwrap();
+        let (_, s_gate) = src.plane(0, ExpertKind::Gate, 0).unwrap();
         let (_, s_up) = src.plane(0, ExpertKind::Up, 0).unwrap();
         let (_, s_down) = src.plane(0, ExpertKind::Down, 0).unwrap();
         assert_eq!(
@@ -626,7 +626,6 @@ mod tests {
             buf.iter().all(|&b| b == xtask::shape_moe::fill_byte(1, 0)),
             "read from the data shard, gate provenance byte"
         );
-        let _ = base_g;
     }
 
     #[test]

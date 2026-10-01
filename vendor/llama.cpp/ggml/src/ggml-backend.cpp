@@ -83,7 +83,7 @@ const golem_device_cache_stats *golem_get_device_cache_stats(void) { return &gol
 namespace golem { // named (not anonymous): golem_dc_step is linked from the ctest fuzz TU
 static std::mutex                                         golem_dc_mutex;
 static std::unordered_map<const void *, GolemSlabEntry> golem_dc; // key: HOST weights tensor data ptr (the stable identity; device cpy addresses alias across splits - each split's copy tensor can reuse the same device address, which reset every entry and defeated all reuse)
-// D-11: one slot table per expert layer, shared by its gate/up/down slabs (same
+// Design §3.4 v3: one slot table per expert layer, shared by its gate/up/down slabs (same
 // routed ids); keyed by the blk number parsed from the tensor name.
 static std::unordered_map<int, GolemLayerSlots> golem_layers;
 } // namespace golem
@@ -1963,7 +1963,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         {
                             std::lock_guard<std::mutex> lk(golem::golem_dc_mutex);
                             golem::GolemSlabEntry &st = golem::golem_dc[input->data];
-                            // D-11: the three planes of a layer consume the same routed
+                            // §3.4 v3: the three planes of a layer consume the same routed
                             // ids, so slot assignment + eviction run once per layer; the
                             // table lives past any single slab's (re)allocation.
                             const int golem_kind = golem_expert_stem_kind(input->name);

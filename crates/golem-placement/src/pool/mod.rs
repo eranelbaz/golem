@@ -1,5 +1,5 @@
 //! RAM expert pool (§5.4, §6.5, §6.6): residency map keyed (layer, expert)
-//! — one slot per unit covering gate/up/down (D-11) — with in-flight leases
+//! — one slot per unit covering gate/up/down (§3.4 v3) — with in-flight leases
 //! and claim-time atomic eviction, the mlock'd per-class slot arena, the
 //! GGUF pread expert source, and the demand pager.
 //!

@@ -140,12 +140,12 @@ impl Arena {
             });
         }
         let mut regions = Vec::with_capacity(classes.len());
-        let (mut first, mut offset, mut len) = (0u32, 0usize, 0usize);
+        let (mut first, mut offset) = (0u32, 0usize);
         for c in classes {
             let bytes = c
                 .slot_size
                 .checked_mul(c.slots as usize)
-                .and_then(|b| len.checked_add(b))
+                .and_then(|b| offset.checked_add(b))
                 .ok_or(ArenaError::InvalidLayout {
                     pool_bytes: usize::MAX,
                     slot_size: c.slot_size,
@@ -158,9 +158,8 @@ impl Arena {
             });
             first += c.slots;
             offset = bytes;
-            len = bytes;
         }
-        let pool_bytes = len;
+        let pool_bytes = offset;
         // SAFETY: no pointer inputs; anonymous private mapping with no file
         // descriptor. MAP_NORESERVE keeps the address-space reservation from
         // committing swap up front (§5.4) — pages fault in on demand.
@@ -228,13 +227,11 @@ impl Arena {
     /// parked until the fill is reported done, after which this `&mut` has
     /// ended and only shared `&` reads remain.
     ///
-    /// # Panics
-    /// Panics when `i >= slot_count`.
+    /// Mutable slot view for the page-in path, under the exclusive
+    /// [`FillClaim`](super::residency::FillClaim).
     // &self → &mut [u8] is the point: the aliasing rule it relies on is the
     // Filled-claim exclusivity contract documented above, which the residency
     // map's claim + fill gate enforce.
-    /// Mutable slot view for the page-in path, under the exclusive
-    /// [`FillClaim`](super::residency::FillClaim).
     ///
     /// # Panics
     /// Panics when `i >= slot_count` or the claim names another slot.

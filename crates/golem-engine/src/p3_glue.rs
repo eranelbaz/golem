@@ -119,7 +119,7 @@ struct PolicyQueryState {
     /// Flat `layer × n_experts` last-access step; `None` = never accessed.
     /// One row per layer, shared by all three of its tensors — the same order
     /// is returned for gate/up/down, which the shared per-layer slot table
-    /// requires (D-11).
+    /// requires (§3.4 v3).
     last_access: Mutex<Vec<Option<u64>>>,
     /// Decode-step counter: one `llama_decode` call = one step (§6.2 as
     /// amended — prefill chunks count as one step each), bumped by
@@ -187,6 +187,11 @@ impl PolicyQueryState {
         let Some(layer) = *self.last_queried.lock().unwrap() else {
             return; // defensive: notify before any query — nothing to attribute
         };
+        // Negative ids are never routed; reject before the usize cast would
+        // wrap them past the guard below.
+        if expert_id < 0 {
+            return;
+        }
         let e = expert_id as usize;
         let idx = layer as usize * self.n_experts as usize + e;
         let mut map = self.last_access.lock().unwrap();
@@ -330,7 +335,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         .checked_mul(1 << 30)
         .ok_or_else(|| EngineError::PoolInit("ram_experts_gib overflows bytes".into()))?;
     // Device-slab pricing input: total unit bytes across the model — one
-    // slab slot costs Σ_layers unit bytes (D-11).
+    // slab slot costs Σ_layers unit bytes (§3.4 v3).
     let slab = slab_bytes_per_expert(&geo);
     let n_expert_used = metadata
         .kv_u64(&format!("{arch}.expert_used_count"))
@@ -339,7 +344,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         })?;
     let n_expert_used = u32::try_from(n_expert_used)
         .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
-    // Per-class RAM layout (D-2): each unit-size class gets slots
+    // Per-class RAM layout (§5 pool amendment): each unit-size class gets slots
     // proportional to its share of total unit bytes; remainder bytes are
     // trimmed by integer division.
     let classes = geo.classes();
@@ -421,7 +426,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // entries from an earlier in-process model — the invalidation seam).
     // SAFETY: FFI call, no invariants.
     unsafe { raw::golem_reset_device_cache() };
-    // The device-cache budget is a per-(layer, kind) expert count, never a
+    // The device-cache budget is a per-layer expert count, never a
     // byte cap on whichever tensor registers first.
     // It is never "unlimited": device allocations are bounded by the VRAM
     // budget, never proportional to expert count (unbounded slabs are ≈184 GB
@@ -430,17 +435,12 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // the free VRAM at enable time (the model's non-expert weights are
     // already resident, so what is free is what the slabs + KV + compute
     // buffers must share), with half held back as growth headroom:
-    // K = free/2 / (n_layers × 3 kinds × slot_size) − 1 = 8 on the target
-    // (≈6.2 GiB usable / (42 × 3 × 5.77 MB) ≈ 9.15, minus the − 1 headroom).
+    // K = free/2 / Σ_layers unit bytes − 1 = 9 on the target
+    // (Σ unit bytes = 644,022,272 across 3 stride classes; ≈6.657 GB usable
+    // / 644 MB ≈ 10.34, minus the − 1 headroom). Pricing by 42 × 3 × max
+    // stride instead gave K = 6 < top-k, refusing the real model at enable.
     // K is floored at the model's top-k (expert_used_count): a routed set
     // larger than K aborts mid-decode, so a smaller K must fail at enable.
-    let n_expert_used = metadata
-        .kv_u64(&format!("{arch}.expert_used_count"))
-        .ok_or_else(|| {
-            EngineError::PoolInit(format!("{arch}.expert_used_count missing from the GGUF"))
-        })?;
-    let n_expert_used = u32::try_from(n_expert_used)
-        .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
     let k = derive_device_cache_experts(config, slab, n_expert_used)?;
     // SAFETY: FFI setter, no invariants.
     unsafe {
@@ -472,7 +472,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     Ok(pool.stats.clone())
 }
 
-/// Per-(layer, kind) device-slab expert count for this pool. Explicit
+/// Per-layer device-slab expert count for this pool. Explicit
 /// `device_cache_experts > 0` wins; otherwise derived from free VRAM. Never
 /// unlimited, never zero: a routed set larger than K aborts, so K = 0 could
 /// not decode at all.
@@ -510,7 +510,7 @@ fn derive_device_cache_experts(
 }
 
 /// Device bytes one slab slot costs across the model: Σ_layers unit bytes —
-/// one routed expert touches one unit in EVERY expert layer (D-11).
+/// one routed expert touches one unit in EVERY expert layer (§3.4 v3).
 fn slab_bytes_per_expert(geo: &golem_placement::pool::PoolGeometry) -> u64 {
     geo.layers.iter().map(|l| l.bytes()).sum()
 }
