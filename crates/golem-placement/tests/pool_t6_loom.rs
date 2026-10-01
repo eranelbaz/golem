@@ -8,7 +8,7 @@
 use golem_placement::pool::primitives::arc_dyn;
 use golem_placement::pool::primitives::{self, Arc};
 use golem_placement::pool::{
-    Arena, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, SnapshotHandle,
+    Arena, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, SlotClass, SnapshotHandle,
 };
 
 use std::io;
@@ -36,7 +36,11 @@ impl golem_placement::pool::ExpertSource for ProvenanceSource {
 /// 1-slot pool over 2 experts of one kind.
 fn loom_pool() -> Arc<ExpertPool> {
     let slot_size = 8;
-    let arena = Arena::new(slot_size, slot_size).unwrap();
+    let arena = Arena::new(&[SlotClass {
+        slot_size,
+        slots: 1,
+    }])
+    .unwrap();
     ExpertPool::new(
         arena,
         arc_dyn(std::sync::Arc::new(ProvenanceSource)),

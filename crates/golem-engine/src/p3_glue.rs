@@ -343,9 +343,11 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         )));
     }
     // Remainder bytes are trimmed by integer division: pool_bytes is a
-    // multiple of slot_size again after this.
-    let arena = golem_placement::pool::Arena::new(slots as usize * slot_size, slot_size)
-        .map_err(|e| EngineError::PoolInit(e.to_string()))?;
+    // multiple of slot_size again after this. Single class: every slot is
+    // one max-stride unit until the per-class layout lands (§5 amendment).
+    let arena =
+        golem_placement::pool::Arena::new(&[golem_placement::pool::SlotClass { slot_size, slots }])
+            .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
     // Design §3.5: mlock alone leaves the H2D copy pageable —
     // driver bounce buffers, ~half of PCIe bandwidth, not truly async, and

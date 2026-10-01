@@ -323,7 +323,7 @@ impl ExpertPool {
                 counter.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .bytes_paged
-                    .fetch_add(self.arena.slot_size() as u64, Ordering::Relaxed);
+                    .fetch_add(self.arena.slot_size_of(slot) as u64, Ordering::Relaxed);
                 Ok(())
             }
             Err(source) => {
@@ -364,6 +364,7 @@ impl ExpertPool {
 
 #[cfg(test)]
 mod tests {
+    use crate::pool::SlotClass;
     use std::collections::HashMap;
     use std::io;
 
@@ -424,7 +425,7 @@ mod tests {
 
     fn test_pool(slots: u32) -> Arc<ExpertPool> {
         let slot_size = 64;
-        let arena = Arena::new(slot_size * slots as usize, slot_size).unwrap();
+        let arena = Arena::new(&[SlotClass { slot_size, slots }]).unwrap();
         let source: Arc<dyn ExpertSource> =
             arc_dyn(std::sync::Arc::new(FakeSource::new(slot_size)));
         ExpertPool::new(
@@ -482,7 +483,11 @@ mod tests {
     #[cfg(not(loom))]
     fn source_error_propagates_and_pool_stays_usable() {
         let slot_size = 64;
-        let arena = Arena::new(slot_size * 2, slot_size).unwrap();
+        let arena = Arena::new(&[SlotClass {
+            slot_size,
+            slots: 2,
+        }])
+        .unwrap();
         let fake = FakeSource::new(slot_size);
         fake.fail_on(0, ExpertKind::Gate, 2, 1);
         let source: Arc<dyn ExpertSource> = arc_dyn(std::sync::Arc::new(fake));

@@ -1,5 +1,8 @@
+#![allow(unexpected_cfgs)]
+
 //! mlock'd RAM expert slot arena (§5.4): `mmap(MAP_ANONYMOUS|MAP_NORESERVE)`
-//! locked into physical memory, carved into equal slots. Slots are handed out
+//! locked into physical memory, carved into per-class slot regions — one run
+//! of equal slots per distinct slot size (§5 pool amendment). Slots are handed out
 //! exclusively by [`super::residency::ResidencyMap`] claims + leases; the
 //! arena itself never coordinates access.
 //!
@@ -10,11 +13,20 @@ use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 
+/// One run of equal slots inside the arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotClass {
+    /// Slot size in bytes for every slot of this class.
+    pub slot_size: usize,
+    /// Number of slots in this class.
+    pub slots: u32,
+}
+
 /// Arena construction/mapping failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArenaError {
-    /// `pool_bytes == 0`, `slot_size == 0`, `pool_bytes % slot_size != 0`, or
-    /// slot count exceeds `u32::MAX`.
+    /// Empty class list, a zero slot size or slot count, total slot count
+    /// above `u32::MAX`, or total byte size overflow.
     InvalidLayout {
         /// Rejected pool size.
         pool_bytes: usize,
@@ -60,7 +72,8 @@ fn last_errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-/// A locked slot arena. `len` bytes, `slots` slots of `slot_size` bytes.
+/// A locked slot arena: `len` bytes carved into per-class slot regions — one
+/// run of equal slots per distinct slot size (§5 pool amendment).
 ///
 /// # Safety contract (Send/Sync)
 /// `&Arena` hands out `&[u8]`/`&mut [u8]` views of slots, but exclusivity is
@@ -72,12 +85,24 @@ fn last_errno() -> i32 {
 /// claims park until the gate opens) — `slot_mut`'s `&mut` is truly exclusive
 /// during the fill, and `slot`'s `&` readers all start after it. The arena
 /// itself never hands out overlapping views across different slots — slots
-/// are disjoint by construction.
+/// are disjoint across classes by construction (class regions are contiguous
+/// and non-overlapping, and a slot never spans its region's end).
 pub struct Arena {
     base: NonZeroUsize,
     len: usize,
-    slot_size: usize,
+    /// Per-class layout in class order; class `c` covers global slot ids
+    /// `[first, first + slots)` at byte offset `offset` from `base`.
+    classes: Vec<ClassRegion>,
     slots: u32,
+}
+
+/// Fixed-size layout record for one class, built once at construction.
+#[derive(Debug)]
+struct ClassRegion {
+    first: u32,
+    slots: u32,
+    slot_size: usize,
+    offset: usize,
 }
 
 // SAFETY: the arena is an owned raw allocation with no interior mutability;
@@ -92,26 +117,50 @@ impl fmt::Debug for Arena {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Arena")
             .field("len", &self.len)
-            .field("slot_size", &self.slot_size)
             .field("slots", &self.slots)
+            .field("classes", &self.classes)
             .finish_non_exhaustive()
     }
 }
 
 impl Arena {
-    /// Maps `pool_bytes` anonymous + `MAP_NORESERVE` and locks it with
-    /// `mlock`. Fails rather than mapping unlocked (§5.4).
-    pub fn new(pool_bytes: usize, slot_size: usize) -> Result<Self, ArenaError> {
-        if pool_bytes == 0
-            || slot_size == 0
-            || pool_bytes % slot_size != 0
-            || pool_bytes / slot_size > u32::MAX as usize
+    /// Maps `Σ slot_size × slots` anonymous + `MAP_NORESERVE` and locks it
+    /// with `mlock`; class `c`'s slots are global ids
+    /// `[first_c, first_c + slots_c)`, laid out contiguously in class order.
+    /// Fails rather than mapping unlocked (§5.4).
+    pub fn new(classes: &[SlotClass]) -> Result<Self, ArenaError> {
+        if classes.is_empty()
+            || classes.iter().any(|c| c.slot_size == 0 || c.slots == 0)
+            || classes.iter().map(|c| c.slots as u64).sum::<u64>() > u32::MAX as u64
         {
+            let (slot_size, slots) = classes.first().map_or((0, 0), |c| (c.slot_size, c.slots));
             return Err(ArenaError::InvalidLayout {
-                pool_bytes,
+                pool_bytes: slots as usize * slot_size,
                 slot_size,
             });
         }
+        let mut regions = Vec::with_capacity(classes.len());
+        let (mut first, mut offset, mut len) = (0u32, 0usize, 0usize);
+        for c in classes {
+            let bytes = c
+                .slot_size
+                .checked_mul(c.slots as usize)
+                .and_then(|b| len.checked_add(b))
+                .ok_or(ArenaError::InvalidLayout {
+                    pool_bytes: usize::MAX,
+                    slot_size: c.slot_size,
+                })?;
+            regions.push(ClassRegion {
+                first,
+                slots: c.slots,
+                slot_size: c.slot_size,
+                offset,
+            });
+            first += c.slots;
+            offset = bytes;
+            len = bytes;
+        }
+        let pool_bytes = len;
         // SAFETY: no pointer inputs; anonymous private mapping with no file
         // descriptor. MAP_NORESERVE keeps the address-space reservation from
         // committing swap up front (§5.4) — pages fault in on demand.
@@ -143,8 +192,8 @@ impl Arena {
         Ok(Self {
             base: NonZeroUsize::new(base).expect("mmap never returns NULL"),
             len: pool_bytes,
-            slot_size,
-            slots: (pool_bytes / slot_size) as u32,
+            slots: first,
+            classes: regions,
         })
     }
 
@@ -167,10 +216,9 @@ impl Arena {
     pub fn slot(&self, i: u32, lease: &crate::pool::pager::Lease) -> &[u8] {
         assert!(i < self.slots);
         assert_eq!(lease.slot(), i, "slot read under a lease for another slot");
+        let n = self.slot_size_of(i);
         // SAFETY: i < slots ⇒ in-bounds; the lease excludes writers (§6.6).
-        unsafe {
-            std::slice::from_raw_parts(self.ptr().add(i as usize * self.slot_size), self.slot_size)
-        }
+        unsafe { std::slice::from_raw_parts(self.ptr().add(self.offset_of(i)), n) }
     }
 
     /// Mutable slot view for the page-in path. Caller must hold the `Filled`
@@ -200,12 +248,8 @@ impl Arena {
         // SAFETY: same bounds as `slot`; exclusivity comes from the Filled
         // claim — the residency map guarantees no other writer or reader for
         // this slot until the claim is released.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.ptr().add(i as usize * self.slot_size),
-                self.slot_size,
-            )
-        }
+        let n = self.slot_size_of(i);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr().add(self.offset_of(i)), n) }
     }
 
     /// Number of slots.
@@ -213,9 +257,37 @@ impl Arena {
         self.slots
     }
 
-    /// Slot size in bytes.
-    pub fn slot_size(&self) -> usize {
-        self.slot_size
+    /// Index of the class owning global slot `i` (binary search over the
+    /// fixed per-class table — no allocation, no linear scan).
+    ///
+    /// # Panics
+    /// Panics when `i >= slot_count`.
+    pub fn class_of(&self, i: u32) -> usize {
+        assert!(i < self.slots);
+        self.classes.partition_point(|c| c.first <= i) - 1
+    }
+
+    /// Global slot ids owned by class `c`.
+    ///
+    /// # Panics
+    /// Panics when `c >= classes.len()`.
+    pub fn class_range(&self, c: usize) -> std::ops::Range<u32> {
+        let r = &self.classes[c];
+        r.first..r.first + r.slots
+    }
+
+    /// Slot size in bytes of global slot `i`.
+    ///
+    /// # Panics
+    /// Panics when `i >= slot_count`.
+    pub fn slot_size_of(&self, i: u32) -> usize {
+        self.classes[self.class_of(i)].slot_size
+    }
+
+    /// Byte offset of slot `i` from the arena base.
+    fn offset_of(&self, i: u32) -> usize {
+        let c = &self.classes[self.class_of(i)];
+        c.offset + (i - c.first) as usize * c.slot_size
     }
 }
 
@@ -228,5 +300,34 @@ impl Drop for Arena {
             libc::munlock(self.ptr() as *const libc::c_void, self.len);
             libc::munmap(self.ptr() as *mut libc::c_void, self.len);
         }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    fn arena() -> Arena {
+        Arena::new(&[
+            SlotClass {
+                slot_size: 4096,
+                slots: 3,
+            },
+            SlotClass {
+                slot_size: 6144,
+                slots: 2,
+            },
+        ])
+        .expect("mlock may fail on low RLIMIT_MEMLOCK")
+    }
+
+    #[test]
+    fn class_regions_are_contiguous_and_non_overlapping() {
+        let a = arena();
+        assert_eq!(a.offset_of(0), 0);
+        assert_eq!(a.offset_of(2), 2 * 4096);
+        assert_eq!(a.offset_of(3), 3 * 4096, "class 1 starts after class 0");
+        assert_eq!(a.offset_of(4), 3 * 4096 + 6144);
+        assert_eq!(a.offset_of(4) + 6144, a.len, "last slot ends the arena");
     }
 }

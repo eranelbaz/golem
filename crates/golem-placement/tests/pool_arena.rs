@@ -9,7 +9,9 @@
 
 use golem_gguf::ExpertKind;
 use golem_placement::pool::primitives::{Arc, arc_dyn};
-use golem_placement::pool::{Arena, ExpertPool, P3Stats, PolicySnapshot, SnapshotHandle};
+use golem_placement::pool::{
+    Arena, ExpertPool, P3Stats, PolicySnapshot, SlotClass, SnapshotHandle,
+};
 
 /// Deterministic 1-byte-per-expert source: expert `e` of layer 0 reads as
 /// `0xAA + e`; other layers fail (out of scope).
@@ -46,7 +48,11 @@ impl golem_placement::pool::ExpertSource for ByteSource {
 fn arena_locks_and_slots_are_disjoint() {
     let slot_size = 16 * 32 * 4; // n_ff_exp * n_embd * F32 (tiny-moe plane)
     let pool = ExpertPool::new(
-        Arena::new(slot_size * 4, slot_size).expect("mlock may fail on low RLIMIT_MEMLOCK"),
+        Arena::new(&[SlotClass {
+            slot_size,
+            slots: 4,
+        }])
+        .expect("mlock may fail on low RLIMIT_MEMLOCK"),
         arc_dyn(std::sync::Arc::new(ByteSource)),
         Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
         Arc::new(P3Stats::new()),
@@ -82,5 +88,41 @@ fn arena_locks_and_slots_are_disjoint() {
 
 #[test]
 fn arena_rejects_zero() {
-    assert!(Arena::new(0, 4096).is_err());
+    assert!(Arena::new(&[]).is_err());
+    assert!(
+        Arena::new(&[SlotClass {
+            slot_size: 0,
+            slots: 1
+        }])
+        .is_err()
+    );
+    assert!(
+        Arena::new(&[SlotClass {
+            slot_size: 4096,
+            slots: 0
+        }])
+        .is_err()
+    );
+}
+
+#[test]
+#[cfg(not(loom))]
+fn class_regions_are_disjoint_and_sized_per_class() {
+    let a = Arena::new(&[
+        SlotClass {
+            slot_size: 4096,
+            slots: 3,
+        },
+        SlotClass {
+            slot_size: 6144,
+            slots: 2,
+        },
+    ])
+    .expect("mlock may fail on low RLIMIT_MEMLOCK");
+    assert_eq!(a.slot_count(), 5);
+    assert_eq!(a.class_range(0), 0..3);
+    assert_eq!(a.class_range(1), 3..5);
+    assert_eq!(a.as_ptr_range().1, 3 * 4096 + 2 * 6144);
+    assert_eq!((a.slot_size_of(2), a.slot_size_of(3)), (4096, 6144));
+    assert_eq!((a.class_of(2), a.class_of(3)), (0, 1));
 }

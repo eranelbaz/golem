@@ -17,7 +17,7 @@ pub mod prefetch;
 mod residency;
 mod source;
 
-pub use arena::Arena;
+pub use arena::{Arena, SlotClass};
 pub use pager::{ExpertPool, Lease, PoolError, SnapshotHandle};
 pub use prefetch::{AccessFeed, GATE_CAPACITY, PREFETCH_K, PrefetchHandle, spawn_prefetch};
 pub use residency::{

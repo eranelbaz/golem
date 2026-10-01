@@ -163,7 +163,7 @@ mod tests {
     use crate::pool::pager::SnapshotHandle;
     use crate::pool::primitives::arc_dyn;
     use crate::pool::residency::PolicySnapshot;
-    use crate::pool::{Arena, ExpertPool, ExpertSource, P3Stats};
+    use crate::pool::{Arena, ExpertPool, ExpertSource, P3Stats, SlotClass};
 
     /// Feed backed by a queue; `take_union` drains up to `k` keys.
     struct QueueFeed {
@@ -246,7 +246,7 @@ mod tests {
 
     fn test_pool(slots: u32, source: Arc<dyn ExpertSource>) -> Arc<ExpertPool> {
         let slot_size = 64;
-        let arena = Arena::new(slot_size * slots as usize, slot_size).unwrap();
+        let arena = Arena::new(&[SlotClass { slot_size, slots }]).unwrap();
         ExpertPool::new(
             arena,
             source,
