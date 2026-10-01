@@ -37,7 +37,7 @@ pub struct EngineConfig {
     /// for the slot-indirected cache). **0 (the default) = derive from free
     /// VRAM at pool enable** (half of free, bounded; never unlimited —
     /// unbounded slabs OOM the 24 GiB card on the real model). A routed set
-    /// larger than K aborts loudly (D-7).
+    /// larger than K aborts loudly; K is floored at the model's top-k.
     pub device_cache_experts: u32,
 }
 

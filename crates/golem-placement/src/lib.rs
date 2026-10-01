@@ -141,11 +141,8 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Feasibility check at load time (§6.4, caps only — user decision O3):
-    /// rejects caps that cannot fit their byte budgets. Byte checks run
-    /// first; count rejections use the `max_bytes_per_expert = 0` sentinel
-    /// (safe because a genuine byte failure cannot occur when the caller
-    /// passes 0).
+    /// Feasibility check at load time (§6.4, caps only): rejects caps that
+    /// cannot fit their byte budgets at `max_bytes_per_expert` bytes each.
     ///
     /// # Panics
     /// Panics if `half_life_steps <= 0` or non-finite (would produce NaN

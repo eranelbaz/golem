@@ -347,8 +347,8 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
             return Err(EngineError::Decode(code));
         }
         p3_glue::advance_decode_step();
-        // C-2: synchronize before the logits getter and the next compute's
-        // lease release (see decode_and_synchronize above).
+        // synchronize before the logits getter and the next compute's lease
+        // release (the first decode of decode_self_check establishes this).
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
 

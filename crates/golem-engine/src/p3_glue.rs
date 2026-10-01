@@ -85,7 +85,8 @@ struct PoolHandle {
     /// Leases held from the previous scheduler compute (review C-2): filled
     /// by `ensure_host_resident`, drained by `copy_done` at the start of the
     /// NEXT compute — the engine synchronizes after every decode
-    /// (session.rs, review H-2), so the prior step's DMAs are complete.
+    /// (session.rs synchronizes after every decode), so the prior step's DMAs
+    /// are complete.
     in_flight_leases: Mutex<Vec<golem_placement::pool::Lease>>,
 }
 
@@ -248,15 +249,6 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
     }
 }
 
-/// Builds the RAM expert pool for `config` (which must set
-/// `ram_experts_gib > 0`) and registers the P3 hooks for the process
-/// lifetime. Returns the pool's counters for [`crate::session::Session::
-/// p3_stats`].
-///
-/// # Errors
-/// GGUF/geometry failures, arena mmap/mlock failures (no silent unlocked
-/// fallback, §5.4), or a second pool-enabled session in one process (M2.3
-/// serves exactly one; multi-session arrives with M4's global registration).
 /// Bumps the policy decode step: `Session` calls this after every successful
 /// `llama_decode` (§6.2 as amended: a step is one decode call, prefill chunks
 /// included). No-op while hooks are unregistered (self-check decodes).
@@ -272,6 +264,15 @@ pub(crate) fn hooks_registered() -> bool {
     HANDLE.get().is_some()
 }
 
+/// Builds the RAM expert pool for `config` (which must set
+/// `ram_experts_gib > 0`) and registers the P3 hooks for the process
+/// lifetime. Returns the pool's counters for [`crate::session::Session::
+/// p3_stats`].
+///
+/// # Errors
+/// GGUF/geometry failures, arena mmap/mlock failures (no silent unlocked
+/// fallback, §5.4), or a second pool-enabled session in one process (M2.3
+/// serves exactly one; multi-session arrives with M4's global registration).
 pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     debug_assert!(config.ram_experts_gib > 0, "enable() with pool disabled");
     if ENABLING
@@ -342,7 +343,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     let arena = golem_placement::pool::Arena::new(slots as usize * slot_size, slot_size)
         .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
-    // Review H-4 (design §3.5): mlock alone leaves the H2D copy pageable —
+    // Design §3.5: mlock alone leaves the H2D copy pageable —
     // driver bounce buffers, ~half of PCIe bandwidth, not truly async, and
     // PCIe is the §2.4 bottleneck. Register the arena with the HIP runtime;
     // a failed registration is a startup failure, never a silent downgrade.
@@ -409,7 +410,8 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // entries from an earlier in-process model — the invalidation seam).
     // SAFETY: FFI call, no invariants.
     unsafe { raw::golem_reset_device_cache() };
-    // The device-cache budget IS a per-(layer, kind) expert count (M-13/C-3).
+    // The device-cache budget is a per-(layer, kind) expert count, never a
+    // byte cap on whichever tensor registers first.
     // It is never "unlimited": device allocations are bounded by the VRAM
     // budget, never proportional to expert count (unbounded slabs are ≈184 GB
     // on GLM-5.3-Flash — 126 live tensors × 288 experts × ≈5 MB — against a
@@ -460,7 +462,7 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     Ok(pool.stats.clone())
 }
 
-/// Per-(layer, kind) device-slab expert count for this pool (C-3). Explicit
+/// Per-(layer, kind) device-slab expert count for this pool. Explicit
 /// `device_cache_experts > 0` wins; otherwise derived from free VRAM. Never
 /// unlimited, never zero: a routed set larger than K aborts, so K = 0 could
 /// not decode at all.
@@ -590,7 +592,7 @@ pub(crate) extern "C" fn ensure_host_resident(
 
 /// Review C-2: releases the host-pool leases of the previous compute. Runs
 /// at the START of a scheduler compute; the engine synchronizes after
-/// every decode (review H-2), so its DMAs are complete.
+/// every decode, so its DMAs are complete.
 extern "C" fn copy_done(ctx: *mut c_void) {
     // SAFETY: ctx was installed by `enable` as a leaked `&'static PoolHandle`.
     let h = unsafe { &*(ctx as *const PoolHandle) };
