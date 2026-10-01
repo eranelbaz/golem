@@ -132,14 +132,16 @@ pub enum Claim {
 
 /// Why a claim did not return a slot. `Evicted`: the victim's slot is the
 /// claimer's and its I/O replaces the victim's bytes. `Busy`: every slot is
-/// leased or snapshot-protected after bounded CLOCK walks — transient by
-/// contract (leases release); the pool must not be over-subscribed.
+/// leased or snapshot-protected after bounded CLOCK walks, or the key's lease
+/// count is saturated — transient by contract (leases release); the pool must
+/// not be over-subscribed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimError {
     /// An expert evicted by this claim; its slot is reassigned to the
     /// claimer, whose I/O replaces the victim's bytes.
     Evicted(Evicted),
-    /// No evictable slot after bounded full CLOCK walks.
+    /// No evictable slot after bounded full CLOCK walks, or `u16::MAX`
+    /// outstanding leases on the key.
     Busy,
 }
 
@@ -286,7 +288,12 @@ impl ResidencyMap {
                     sh = self.shards[li].fill_cv.wait(sh).unwrap();
                 }
                 if Self::bit_test(&sh.bits, i) {
-                    debug_assert!(sh.leases[i] < u16::MAX, "lease count overflow");
+                    // Saturated lease count: a wrap to 0 would make a leased
+                    // key evictable under in-flight readers. Transient like
+                    // every other Busy — leases release.
+                    if sh.leases[i] == u16::MAX {
+                        return Err(ClaimError::Busy);
+                    }
                     sh.leases[i] += 1;
                     Self::ref_set(&mut sh.ref_bits, i);
                     return Ok(Claim::Resident {
@@ -339,7 +346,9 @@ impl ResidencyMap {
             Self::bit_set(&mut sh.bits, i);
             // Reference bit stays clear on first fill: a key evicts on its
             // first sweep unless it was re-touched (Resident) in between.
-            debug_assert!(sh.leases[i] < u16::MAX, "lease count overflow");
+            // A non-resident key holds no leases (eviction and cancel clear
+            // the bit only at zero), so this cannot overflow.
+            debug_assert_eq!(sh.leases[i], 0, "non-resident key with leases");
             sh.leases[i] += 1;
             if let Some(victim) = victim {
                 return Err(ClaimError::Evicted(Evicted {
@@ -770,6 +779,21 @@ mod tests {
             m.claim(0, ExpertKind::Gate, 2, &snap),
             Err(ClaimError::Busy)
         );
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn saturated_lease_count_is_busy_not_a_wrap() {
+        let m = ResidencyMap::new(1, 2, 2);
+        let snap = PolicySnapshot::test_empty();
+        m.claim(0, ExpertKind::Gate, 0, &snap).unwrap();
+        m.finish_fill(0, ExpertKind::Gate, 0);
+        m.shards[0].shard.lock().unwrap().leases[0] = u16::MAX;
+        assert_eq!(
+            m.claim(0, ExpertKind::Gate, 0, &snap),
+            Err(ClaimError::Busy)
+        );
+        assert_eq!(m.shards[0].shard.lock().unwrap().leases[0], u16::MAX);
     }
 
     #[test]
