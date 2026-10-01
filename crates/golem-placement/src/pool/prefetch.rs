@@ -1,9 +1,8 @@
 //! §6.5 prefetch: background page-ins fed by an injected access-set source,
 //! demand-priority gated (rounds skip while demand page-ins are in flight)
 //! and capacity gated ([`GATE_CAPACITY`] = `io_threads - 1` at the §5.4
-//! default). Substrate-inert in M2.3: the vendored C has no `notify_access`
-//! call-site (P4 owns it), so the production feed is empty and real inputs
-//! arrive with M2.4 — the mechanism here is proven against injected feeds.
+//! default). The engine's feed is P4's `notify_access` recency (golem-engine
+//! `PolicyFeed`); tests prove the mechanism against injected feeds.
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
 #![allow(unexpected_cfgs)]
@@ -21,9 +20,8 @@ pub const GATE_CAPACITY: usize = 4;
 /// Access-set union depth (§6.5: union of the last k steps).
 pub const PREFETCH_K: usize = 3;
 
-/// Recent-access source (the surface P4's `notify_access` call-site will
-/// feed). Injected implementations back the M2.3 tests; the engine wires an
-/// empty feed until that call-site exists.
+/// Recent-access source: the engine backs it with P4's `notify_access`
+/// recency; tests inject their own.
 pub trait AccessFeed: Send + Sync {
     /// The union of the last `k` steps' accessed keys. The pool filters
     /// already-resident keys itself; returned keys may repeat across calls.
