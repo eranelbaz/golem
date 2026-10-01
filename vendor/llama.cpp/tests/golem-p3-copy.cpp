@@ -12,7 +12,7 @@
 #include <vector>
 
 void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
-                                  size_t padding_end, const void *const *ptrs, size_t n,
+                                  size_t padding_len, const void *const *ptrs, size_t n,
                                   void (*set_fn)(void *dst, const void *src, size_t dst_off,
                                                  size_t len, void *ud),
                                   void *ud);
@@ -82,21 +82,24 @@ int main() {
         REQUIRE(copies.size() == 2, "unpadded run must not copy a tail");
     }
 
-    // Guard-page leg: the last slot ends the arena mapping; a padded run must
-    // not read a byte past it (SIGSEGV without the fix).
+    // Guard-page leg: two pages — the slot flush against a PROT_NONE guard
+    // page, and the slot ends the mapping. A padded run reading one byte
+    // past the slot faults (SIGSEGV without the fix).
     {
-        char *slot = (char *) mmap(nullptr, expert_size, PROT_READ | PROT_WRITE,
-                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        REQUIRE(slot != MAP_FAILED, "mmap failed");
+        char *map = (char *) mmap(nullptr, 2 * expert_size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        REQUIRE(map != MAP_FAILED, "mmap failed");
+        char *slot = map;
+        char *guard = map + expert_size;
         memset(slot, 0x5a, expert_size);
-        REQUIRE(mprotect(slot, expert_size, PROT_READ) == 0, "mprotect failed");
+        REQUIRE(mprotect(guard, expert_size, PROT_NONE) == 0, "mprotect failed");
         std::vector<char> dst(expert_size + padding, 0);
         const void *ptrs[1] = {slot};
         golem_copy_pooled_expert_run(dst.data(), 0, expert_size, padding, ptrs, 1,
                                      memcpy_set, nullptr);
         REQUIRE((unsigned char) dst[expert_size] == 0x5a,
                 "padding tail must hold the last expert's own bytes");
-        munmap(slot, expert_size);
+        munmap(map, 2 * expert_size);
     }
 
     if (g_failures != 0) {

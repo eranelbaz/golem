@@ -42,7 +42,7 @@ static int golem_expert_stem_kind(const char *name); // defined in the P1 sectio
 // scheduler passes ggml_backend_tensor_set_async bound to the split backend).
 typedef void (*golem_set_copy_fn)(void *dst, const void *src, size_t dst_off, size_t len, void *ud);
 void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
-                                  size_t padding_end, const void *const *ptrs, size_t n,
+                                  size_t padding_len, const void *const *ptrs, size_t n,
                                   golem_set_copy_fn set_fn, void *ud) {
     if (n == 0) {
         return;
@@ -52,8 +52,8 @@ void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert
         set_fn(dst, ptrs[i], off, expert_size, ud);
         off += expert_size;
     }
-    if (padding_end != 0) {
-        set_fn(dst, ptrs[n - 1], off, padding_end, ud);
+    if (padding_len != 0) {
+        set_fn(dst, ptrs[n - 1], off, padding_len, ud);
     }
 }
 
@@ -1863,7 +1863,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = (last_id < n_expert - 1 && pad_ok) ? padding : 0;
+                        const size_t padding_len = (last_id < n_expert - 1 && pad_ok) ? padding : 0;
 
                         if (golem_h_ensure_host_resident != NULL) {
                             // Golem C-2: the RAM pool is the H2D source — the
@@ -1880,7 +1880,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             const size_t n = last_id - first_id + 1;
                             if (golem_ptrs.size() < n) golem_ptrs.resize(n);
                             golem_h_ensure_host_resident(golem_h_ctx, input, first_id, last_id, golem_ptrs.data());
-                            golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_end,
+                            golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
                                 golem_ptrs.data(), n,
                                 [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
                                     ggml_backend_tensor_set_async((ggml_backend_t) ud, (ggml_tensor *) dst, src, dst_off, len);
@@ -1893,7 +1893,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                            expert_size_copy + padding_len);
                     };
                     auto copy_experts = [&](int32_t first_id, int32_t last_id, bool pad_ok) {
                         copy_experts_to(input_cpy, first_id, last_id, pad_ok);
