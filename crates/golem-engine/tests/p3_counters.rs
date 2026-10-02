@@ -38,8 +38,7 @@ fn p3_counters_move_and_output_is_deterministic() {
     // precondition (RLIMIT_MEMLOCK below the pool) FAILS — an early return
     // reads as a pass to the harness (AGENTS.md Evidence, H-7).
     let mut on = Session::new(&cfg).expect("session with pooled offload");
-    let out_on = chat(&mut on, "Hello");
-    eprintln!("DBG on1={out_on:?}");
+    let _ = chat(&mut on, "Hello");
     {
         let mut o2 = String::new();
         on.chat_turn(
@@ -50,7 +49,6 @@ fn p3_counters_move_and_output_is_deterministic() {
             &mut |p| o2.push_str(p),
         )
         .unwrap();
-        eprintln!("DBG on2={o2:?}");
     }
 
     let stats = on.p3_stats().expect("pool enabled ⇒ stats present");

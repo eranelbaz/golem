@@ -399,8 +399,10 @@ impl Policy {
                 vram_order.push(PolicyEntry { key: k, score });
             }
         }
-        // Phase 2: challengers. The margin strictly beats 1.2·0 to reject
-        // zero-score ties (which would churn arbitrarily); the swap
+        // Phase 2: challengers. The margin is relative (`score >= 1.2·incumbent`),
+        // so a 0.0-score incumbent is displaced only through the dwell
+        // tie-break (`dwell_ok(weakest.key)`): the margin is vacuous there
+        // (0 ≥ 1.2·0) and min-dwell is what bounds the churn. The swap
         // transiently leaves a displaced resident in VRAM past the cap
         // until its eviction lands — bounded by D_min, and the real P2
         // slab (K slots) enforces the hard budget at promotion time.
@@ -421,10 +423,10 @@ impl Policy {
                 .enumerate()
                 .min_by(|(_, a), (_, b)| a.score.total_cmp(&b.score).then(b.key.cmp(&a.key)))
                 .expect("cap > 0 with a full order is non-empty");
-            // `weakest.score > 0` rejects zero-score ties (0 ≥ 1.2·0 would
-            // churn arbitrarily).
-            if weakest.score > 0.0 && score >= SWAP_MARGIN * weakest.score && dwell_ok(weakest.key)
-            {
+            // A 0.0-score incumbent can only be displaced via the dwell
+            // tie-break (its margin comparison is vacuous at 0 ≥ 1.2·0);
+            // min-dwell on the seat bounds the churn.
+            if score >= SWAP_MARGIN * weakest.score && dwell_ok(weakest.key) {
                 in_order[weakest.key] = false;
                 in_order[k] = true;
                 vram_order[wi] = PolicyEntry { key: k, score };
@@ -880,6 +882,41 @@ mod tests {
     }
 
     #[test]
+    fn zero_score_incumbent_leaves_via_dwell_tie_break() {
+        // Cap 1 held by a never-accessed (0.0-score) VRAM resident. Its
+        // margin comparison is vacuous (0 ≥ 1.2·0), so displacement goes
+        // through the min-dwell tie-break: no swap while its dwell runs,
+        // swap once expired.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 1,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        // Challenger: RAM-resident, score 1.
+        p.apply_transition(1, Tier::Ram, true, 0);
+        p.on_access(1, 1000);
+        let out = p.pass(5);
+        assert_eq!(out.vram_order[0].key, 0, "incumbent dwell has not expired");
+        let out = p.pass(1000);
+        assert_eq!(
+            out.vram_order[0].key, 1,
+            "0.0-score incumbent displaced after dwell"
+        );
+        assert!(out.vram_evict_order.iter().any(|e| e.key == 0));
+    }
+
+    #[test]
     fn zero_vram_cap_yields_empty_order_no_panic() {
         let mut p = Policy::new(
             PlacementConfig {
@@ -1056,6 +1093,9 @@ mod tests {
             p.apply_transition(k, Tier::Ram, true, 0);
         }
         p.apply_transition(1, Tier::Vram, true, 1);
+        // Scored: a 0.0-score VRAM incumbent would now be displacable via
+        // the dwell tie-break, and this test is about RAM eviction supply.
+        p.on_access(1, 9998);
         p.on_access(2, 9999); // hottest RAM resident → promoted, not evictable
         let out = p.pass(10_000);
         assert!(

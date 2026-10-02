@@ -154,6 +154,9 @@ fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
     } else {
         u64::MAX
     });
+    // .max(1): a sub-GiB suggestion would print `--ram-experts-gib 0`, which
+    // disables the pool entirely — suggest the smallest workable pool instead.
+    let suggest_gib = (suggest / (1 << 30)).max(1);
 
     if let Some(limit) = memlock_limit() {
         if want_bytes > limit {
@@ -161,7 +164,7 @@ fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
                 "error: --ram-experts-gib {gib} needs {want_bytes} B locked but RLIMIT_MEMLOCK \
                  is {limit} B.\nRaise it: `ulimit -l unlimited` (or systemd `LimitMEMLOCK=\
                  infinity`), or size the pool down, e.g. --ram-experts-gib {}",
-                suggest / (1 << 30)
+                suggest_gib
             );
             std::process::exit(1);
         }
@@ -171,7 +174,7 @@ fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
             "error: --ram-experts-gib {gib} wants {want_bytes} B but only {free} B is free \
              (cap: 75% of free RAM).\nSuggested size: --ram-experts-gib {} (expert bytes: \
              {expert_bytes} B)",
-            suggest / (1 << 30)
+            suggest_gib
         );
         std::process::exit(1);
     }

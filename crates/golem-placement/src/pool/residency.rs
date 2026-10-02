@@ -439,15 +439,19 @@ impl ResidencyMap {
                 hand.hand = idx + 1;
                 continue;
             }
+            // Snapshot-excluded keys are never victims: test them before
+            // the CLOCK ref-bit flip, or an excluded key loses its
+            // second chance and stays demoted forever (it can't be picked
+            // to earn the bit back).
+            let expert = c as u32;
+            if snapshot.excludes(li as u32, expert) {
+                drop(sh);
+                continue;
+            }
             if Self::ref_test(&sh.ref_bits, c) {
                 Self::ref_clear(&mut sh.ref_bits, c);
                 drop(sh);
                 hand.hand = idx + 1;
-                continue;
-            }
-            let expert = c as u32;
-            if snapshot.excludes(li as u32, expert) {
-                drop(sh);
                 continue;
             }
             let slot = sh.slot_of[c] as u32;
@@ -501,10 +505,12 @@ impl ResidencyMap {
         sh.leases[i] = sh.leases[i].saturating_sub(1);
     }
 
-    /// Abandon a failed page-in: drops the claim's lease and, when no other
-    /// lease remains, clears the key's residency and returns the slot to its
-    /// class's free list — no ghost residency, no leaked slot. Also clears the
-    /// fill gate and wakes claimers parked on it (they re-claim fresh).
+    /// Abandon a failed page-in: drops the claim's lease — by contract the
+    /// only one on the key (concurrent claimers park on the fill gate until
+    /// this cancel or the fill completes) — clears the key's residency and
+    /// returns the slot to its class's free list: no ghost residency, no
+    /// leaked slot. Also clears the fill gate and wakes claimers parked on
+    /// it (they re-claim fresh).
     pub fn cancel_claim(&self, layer: u32, expert: u32) {
         let li = layer as usize;
         let freed = {
@@ -513,14 +519,11 @@ impl ResidencyMap {
             debug_assert!(sh.leases[i] > 0, "cancel without a lease");
             Self::bit_clear(&mut sh.filling, i);
             sh.leases[i] = sh.leases[i].saturating_sub(1);
-            if sh.leases[i] == 0 {
-                Self::bit_clear(&mut sh.bits, i);
-                let s = sh.slot_of[i];
-                sh.slot_of[i] = -1;
-                (s >= 0).then_some(s as u32)
-            } else {
-                None
-            }
+            debug_assert_eq!(sh.leases[i], 0, "cancel_claim holds the only lease");
+            Self::bit_clear(&mut sh.bits, i);
+            let s = sh.slot_of[i];
+            sh.slot_of[i] = -1;
+            (s >= 0).then_some(s as u32)
             // Shard guard dropped before the leaf free list.
         };
         if let Some(s) = freed {

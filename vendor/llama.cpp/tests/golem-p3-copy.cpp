@@ -12,11 +12,7 @@
 #include <unistd.h>
 #include <vector>
 
-void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
-                                  size_t padding_len, const void *const *ptrs, size_t n,
-                                  void (*set_fn)(void *dst, const void *src, size_t dst_off,
-                                                 size_t len, void *ud),
-                                  void *ud);
+#include "golem-p3-copy.h"
 
 namespace {
 

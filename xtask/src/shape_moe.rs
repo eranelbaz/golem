@@ -1,8 +1,8 @@
-//! Shape-realistic split-GGUF fixture (review §6 "Weakness 2"): 2 shards with
-//! a metadata-only shard 1, `.weight` expert names, mixed Q4_K/Q5_K/Q6_K
-//! expert planes of differing strides, 64 experts, and an MTP/NextN expert
-//! layer that pool geometry must exclude (review R-2). Not loadable by the
-//! substrate — this fixture exercises byte-source/preflight paths only.
+//! Shape-realistic split-GGUF fixture: 2 shards with a metadata-only shard 1,
+//! `.weight` expert names, mixed Q4_K/Q5_K/Q6_K expert planes of differing
+//! strides, 64 experts, and an MTP/NextN expert layer that pool geometry must
+//! exclude from its layer list. Not loadable by the substrate — this fixture
+//! exercises byte-source/preflight paths only.
 
 use std::io::Write;
 use std::path::PathBuf;

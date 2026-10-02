@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "golem-p3-copy.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -35,13 +36,9 @@ static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
 static int golem_expert_stem_kind(const char *name); // defined in the P1 section (used at split time by the device slab)
 static int golem_tensor_blk(const char *name); // defined in the P1 section (layer key of the shared slot table)
 
-// Golem: copy a pooled expert run slot by slot. The padding tail (MMQ
-// non-NaN guard after the last routed expert) is a separate copy of the LAST
-// routed expert's own first bytes — never an overrun of its slot, which is
-// exactly expert_size when expert_size is the pool's max stride and the slot
-// may sit at the end of the arena mapping. set_fn issues one copy (the
-// scheduler passes ggml_backend_tensor_set_async bound to the split backend).
-typedef void (*golem_set_copy_fn)(void *dst, const void *src, size_t dst_off, size_t len, void *ud);
+// Golem: copy a pooled expert run slot by slot (P3copy): the plan and its
+// slot-overrun invariant are documented in golem-p3-copy.h (shared with the
+// vendored regression test).
 void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
                                   size_t padding_len, const void *const *ptrs, size_t n,
                                   golem_set_copy_fn set_fn, void *ud) {

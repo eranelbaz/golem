@@ -380,9 +380,12 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_include_directories(golem-p2-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
     # Golem C-2 regression: pooled-run copy never reads past the last slot
-    # (padding tail = separate copy of the last expert's own bytes).
+    # (padding tail = separate copy of the last expert's own bytes). The
+    # shared prototype lives in ggml/src (golem-p3-copy.h); golem_copy_
+    # pooled_expert_run is defined in ggml-backend.cpp -> link ggml.
     llama_build_and_test(golem-p3-copy.cpp)
     target_link_libraries(golem-p3-copy PRIVATE ggml)
+    target_include_directories(golem-p3-copy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
