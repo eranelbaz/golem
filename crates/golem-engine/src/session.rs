@@ -442,6 +442,21 @@ impl Session {
     /// [`FALLBACK_CHAT_TEMPLATE`]), and validates it with a 1-message probe apply:
     /// apply failure → `TemplateApply(code)`; empty/unusable → `TemplateUnavailable`.
     pub fn new(config: &EngineConfig) -> Result<Self, EngineError> {
+        // The hooks are process-global and never unregistered (no safe
+        // quiescence point), so they must be checked BEFORE `load`: the load's
+        // decode self-check would otherwise decode through a stale hook set —
+        // a second model's tensors keyed by recycled host addresses are served
+        // the OLD model's pooled bytes (p3_fatal abort instead of `Err`).
+        // Covers both pool-off and pool-on second sessions; one pool owner per
+        // process, a second model needs a second process (design §9.3 as built).
+        if p3_glue::hooks_registered() {
+            return Err(EngineError::PoolInit(
+                "a pool-enabled session owns this process's expert hooks; \
+                 another model in the same process would be served the old \
+                 model's bytes — use a second process"
+                    .into(),
+            ));
+        }
         let loaded = load(config)?;
         let template_src = loaded
             .model()
@@ -466,21 +481,6 @@ impl Session {
         let p3 = if config.ram_experts_gib > 0 {
             Some(p3_glue::enable(config)?)
         } else {
-            // The hooks are process-global and never
-            // unregistered (no safe quiescence point). If a pooled session
-            // already registered them, a later pool-off session's decode
-            // would be served from THAT pool — its tensor table keyed by
-            // recycled host addresses — silently paging the OLD model's
-            // bytes into the new model. One pool owner per process; a second
-            // model needs a second process (design §9.3 as built).
-            if p3_glue::hooks_registered() {
-                return Err(EngineError::PoolInit(
-                    "a pool-enabled session owns this process's expert hooks; \
-                     another model in the same process would be served the old \
-                     model's bytes — use a second process"
-                        .into(),
-                ));
-            }
             None
         };
 
