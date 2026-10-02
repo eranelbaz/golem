@@ -23,8 +23,8 @@ pub use golem_gguf::ExpertKind;
 /// policy state — `claim` receives a snapshot built before the shard lock is
 /// taken; the shard lock stays leaf-most.
 ///
-/// Pool-local for M2.3 (`test_empty`/`pin`/`lease` helpers); the M2.2-backed
-/// builder lands with the engine wiring.
+/// Built today only by `test_empty`/`lease`; a placement-backed builder
+/// feeds it once the policy scorer drives the pool.
 #[derive(Debug, Clone, Default)]
 pub struct PolicySnapshot {
     protected: HashSet<Key>,
@@ -328,7 +328,11 @@ impl ResidencyMap {
         // ⌈class_keys / SWEEP_BUDGET⌉ sweeps over the claimer's own class.
         // Beyond that every slot in the class is leased or snapshot-protected
         // — leases are transient, so the class is over-subscribed and the
-        // caller gets a loud busy error instead of an unbounded spin.
+        // caller gets a loud busy error instead of an unbounded spin. The
+        // bound assumes ref bits stay cleared; concurrent `Resident` hits
+        // re-set them, so a re-touch storm can surface `Busy` early — the P3
+        // caller aborts on it, which the class floor (layers × K slots)
+        // keeps out of reach for one decode thread.
         let starve_bound = 2 * self.class_keys[class].div_ceil(SWEEP_BUDGET) + 1;
         let mut starved = 0usize;
         loop {

@@ -1,6 +1,6 @@
 //! Expert source seam (§5.4 byte source, v1): one GGUF replica path, `pread`
 //! at per-plane file offsets derived from a tensor-table walk. Multi-replica
-//! striping, CRC verification, and failover are M3.1/M3.3.
+//! striping, CRC verification, and failover belong to golem-store.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -109,7 +109,7 @@ pub enum SourceError {
         /// Offending tensor name.
         String,
     ),
-    /// A ggml type without a block layout in M2.3's table.
+    /// A ggml type without a block layout in the pool's type table.
     UnknownGgmlType {
         /// Offending tensor name.
         name: String,
@@ -275,7 +275,9 @@ impl GgufPreadSource {
             })
             .transpose()?;
 
-        let mut files = Vec::with_capacity(split_count as usize);
+        // Untrusted header value: bound the up-front reservation; a bogus
+        // count fails on the first missing shard instead.
+        let mut files = Vec::with_capacity((split_count as usize).min(64));
         let mut planes = HashMap::new();
         for shard in 0..split_count {
             let shard_path = shard_path(path, shard, split_count)?;
@@ -399,7 +401,8 @@ impl ExpertSource for GgufPreadSource {
             ));
         }
         let plane = &mut into[..stride];
-        let mut off = p.base + u64::from(expert) * p.stride;
+        let start = p.base + u64::from(expert) * p.stride;
+        let mut off = start;
         let mut done = 0usize;
         for _ in 0..READ_RETRIES {
             // Safe pread wrapper (FileExt::read_at): does not move the cursor,
@@ -419,6 +422,7 @@ impl ExpertSource for GgufPreadSource {
             done += n;
             off += n as u64;
             if done == plane.len() {
+                super::arena::drop_page_cache(&self.files[p.shard], start, stride);
                 return Ok(());
             }
         }

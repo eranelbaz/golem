@@ -1,4 +1,4 @@
-//! Randomized-trace acceptance properties (board task M2.2):
+//! Randomized-trace acceptance properties of the placement policy:
 //! hottest keys resident · no thrash under oscillation · budget never exceeded.
 //!
 //! Deterministic xorshift PRNG, no `rand` dependency. The executor applies
@@ -57,7 +57,7 @@ impl Executor {
         }
         let mut ram = (0..p.len()).filter(|&k| p.residency(k, Tier::Ram)).count();
         // consume order: evict before promote — promoting into a full device
-        // budget is the failure mode P2 must avoid (M2.3 inherits this sequence)
+        // budget is the failure mode P2 must avoid (the pool consumes in this order)
         for e in out.ram_evict_order.iter() {
             if ram <= p.config().ram_slots {
                 break;

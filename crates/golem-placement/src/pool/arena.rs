@@ -68,6 +68,24 @@ impl fmt::Display for ArenaError {
 
 impl std::error::Error for ArenaError {}
 
+/// Drops `[off, off + len)` of `file` from the page cache once its bytes
+/// sit in a pool slot: expert bytes must never stay double-cached (§5.4;
+/// 172.8 GiB of experts vs 93 GiB RAM). Advisory — a failure leaves only a
+/// cache-pressure cost, never wrong bytes, so it is not an error.
+pub(crate) fn drop_page_cache(file: &std::fs::File, off: u64, len: usize) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: posix_fadvise takes a live fd (borrowed from `file` for the
+    // call) and plain integers; it touches no Rust-visible memory.
+    unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            off as libc::off_t,
+            len as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        );
+    }
+}
+
 fn last_errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
@@ -75,7 +93,7 @@ fn last_errno() -> i32 {
 /// A locked slot arena: `len` bytes carved into per-class slot regions — one
 /// run of equal slots per distinct slot size (§5 pool amendment).
 ///
-/// # Safety contract (Send/Sync)
+/// # Safety contract (shared access)
 /// `&Arena` hands out `&[u8]`/`&mut [u8]` views of slots, but exclusivity is
 /// granted ONLY by the residency map: one lease = one reader of one slot, and
 /// the filler holds the claim (granted at `claim`, exclusive against eviction)
@@ -104,14 +122,6 @@ struct ClassRegion {
     slot_size: usize,
     offset: usize,
 }
-
-// SAFETY: the arena is an owned raw allocation with no interior mutability;
-// every byte access goes through the claim/lease exclusivity contract above
-// (one writer per slot between claim and residency flip, lease-counted
-// readers after it), which upholds aliasing rules for the `&[u8]`/`&mut [u8]`
-// views this type vends.
-unsafe impl Send for Arena {}
-unsafe impl Sync for Arena {}
 
 impl fmt::Debug for Arena {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

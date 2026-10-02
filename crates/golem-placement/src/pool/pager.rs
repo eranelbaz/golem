@@ -84,6 +84,9 @@ impl std::error::Error for PoolError {}
 #[derive(Debug)]
 pub struct Lease {
     map: Arc<ResidencyMap>,
+    /// Keeps the mapping alive while raw slot pointers handed out with this
+    /// lease (`ensure_range_leased`) may still be read by an in-flight H2D.
+    _arena: Arc<Arena>,
     layer: u32,
     expert: u32,
     slot: u32,
@@ -275,6 +278,7 @@ impl ExpertPool {
             slot,
             Lease {
                 map: self.residency.clone(),
+                _arena: self.arena.clone(),
                 layer,
                 expert,
                 slot,
@@ -408,6 +412,7 @@ impl ExpertPool {
         };
         Lease {
             map: self.residency.clone(),
+            _arena: self.arena.clone(),
             layer,
             expert,
             slot,
