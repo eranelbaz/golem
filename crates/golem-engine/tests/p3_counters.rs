@@ -34,23 +34,10 @@ fn p3_counters_move_and_output_is_deterministic() {
     // Pool ON (1 GiB pool for tiny-moe's 3·8 planes of 2048 B):
     let mut cfg = common::offload::offload_config();
     cfg.ram_experts_gib = 1;
-    let mut on = match Session::new(&cfg) {
-        Ok(s) => s,
-        Err(e) if e.to_string().contains("mlock") => {
-            // A failed precondition FAILS (AGENTS.md Evidence): an early return reads
-            // as a pass to the harness. Opt-in skip only via explicit env.
-            assert!(
-                std::env::var("GOLEM_ALLOW_SKIP").as_deref() == Ok("1"),
-                "precondition failed: RLIMIT_MEMLOCK below the pool size                  (ram_experts_gib=1); raise memlock or set GOLEM_ALLOW_SKIP=1 to opt out: {e}"
-            );
-            eprintln!(
-                "SKIPPED: RLIMIT_MEMLOCK below the pool size (ram_experts_gib=1); \
-                 run on a machine with unlimited memlock (HIP CI job): {e}"
-            );
-            return;
-        }
-        Err(e) => panic!("session with pooled offload failed: {e}"),
-    };
+    // Pool ON (1 GiB pool for tiny-moe's 3·8 planes of 2048 B). A failed
+    // precondition (RLIMIT_MEMLOCK below the pool) FAILS — an early return
+    // reads as a pass to the harness (AGENTS.md Evidence, H-7).
+    let mut on = Session::new(&cfg).expect("session with pooled offload");
     let out_on = chat(&mut on, "Hello");
     eprintln!("DBG on1={out_on:?}");
     {

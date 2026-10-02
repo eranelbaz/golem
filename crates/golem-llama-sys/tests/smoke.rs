@@ -3,8 +3,8 @@
 #[allow(dead_code)] // conformance helpers shared with ci_key/pin_gate_conformance
 mod common;
 
+use golem_llama_sys::Backend;
 use golem_llama_sys::raw::*;
-use golem_llama_sys::{Backend, substrate_backend};
 
 const _BACKEND_GUARDS_EXHAUSTIVE: () = match Backend::Cpu {
     Backend::Cpu => (),
@@ -107,20 +107,14 @@ fn assert_decode_sane(token: llama_token, logits: &[f32]) {
     );
 }
 
-fn skip_backend_not_built() {
-    eprintln!(
-        "SKIPPED (GOLEM_LLAMA_SYS_BACKEND={:?}, substrate={:?}): zero assertions executed",
-        std::env::var("GOLEM_LLAMA_SYS_BACKEND").as_deref(),
-        substrate_backend()
-    );
-}
-
+/// Backend-specific smoke: each variant is `#[cfg]`-gated on the substrate
+/// the package was built against (`golem_backend_hip`, emitted by build.rs),
+/// so the harness never sees a mismatching variant as `ok` — under the wrong
+/// backend the test simply does not exist (B6/H-7: no env-less early-return
+/// skip-as-pass).
+#[cfg(not(golem_backend_hip))]
 #[test]
 fn greedy_decode_is_deterministic() {
-    if substrate_backend() != Backend::Cpu {
-        skip_backend_not_built();
-        return;
-    }
     let [(t1, l1), (t2, l2)] = two_context_greedy_decode();
     assert_decode_sane(t1, &l1);
     assert_decode_sane(t2, &l2);
@@ -131,12 +125,9 @@ fn greedy_decode_is_deterministic() {
     );
 }
 
+#[cfg(golem_backend_hip)]
 #[test]
 fn hip_decode_runs() {
-    if substrate_backend() != Backend::Hip {
-        skip_backend_not_built();
-        return;
-    }
     let [(t1, l1), (t2, l2)] = two_context_greedy_decode();
     assert_decode_sane(t1, &l1);
     assert_decode_sane(t2, &l2);

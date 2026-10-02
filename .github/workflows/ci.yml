@@ -89,3 +89,7 @@ jobs:
       # B5: pooled-vs-unpooled CLI comparison — needs the built `golem`
       # binary, so it lives in golem-cli (engine tests can't see CARGO_BIN_EXE).
       - run: cargo nextest run -p golem-cli --features hip-tests
+      # B6: backend-gated FFI smoke — under the HIP substrate only
+      # `hip_decode_runs` compiles (the CPU variant is cfg'd out, never a
+      # reported-ok skip).
+      - run: cargo nextest run -p golem-llama-sys
