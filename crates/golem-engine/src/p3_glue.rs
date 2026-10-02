@@ -197,17 +197,16 @@ impl PolicyQueryState {
         let Some(layer) = *self.last_queried.lock().unwrap() else {
             return; // defensive: notify before any query — nothing to attribute
         };
-        // Negative ids are never routed; reject before the usize cast would
-        // wrap them past the guard below.
-        if expert_id < 0 {
+        // Out-of-range ids are never routed by C (compute_splits masks ids to
+        // [0, n_expert) before notify_access); reject before the usize cast
+        // would wrap negatives and before id == n_experts could spill into the
+        // next layer's row.
+        if expert_id < 0 || expert_id as u64 >= self.n_experts as u64 {
             return;
         }
         let e = expert_id as usize;
         let idx = layer as usize * self.n_experts as usize + e;
-        let mut map = self.last_access.lock().unwrap();
-        if idx < map.len() {
-            map[idx] = Some(step);
-        }
+        self.last_access.lock().unwrap()[idx] = Some(step);
     }
 
     /// §6.5 prefetch feed: union of accessed `(layer, expert)` units from
@@ -1063,6 +1062,28 @@ mod tests {
         assert!(
             pq.recent_union(0).is_empty(),
             "k = 0 excludes everything (cutoff = current step)"
+        );
+    }
+
+    #[test]
+    fn out_of_range_id_never_spills_into_the_next_layer() {
+        let pq = PolicyQueryState::new(2, 4, false);
+        *pq.last_queried.lock().unwrap() = Some(0);
+        pq.step.store(3, Ordering::Relaxed);
+        // id == n_experts would have passed the old idx < map.len() guard and
+        // booked layer 1's row 0.
+        pq.note_access(4);
+        pq.note_access(-1);
+        pq.note_access(100);
+        assert!(
+            pq.last_access.lock().unwrap().iter().all(Option::is_none),
+            "out-of-range ids are rejected, not wrapped into the next layer"
+        );
+        pq.note_access(3);
+        assert_eq!(
+            pq.last_access.lock().unwrap()[3],
+            Some(3),
+            "max valid id still books"
         );
     }
 }

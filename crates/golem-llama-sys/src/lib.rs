@@ -55,10 +55,9 @@ pub mod raw {
 /// is visible to all HIP contexts in the process.
 #[cfg(golem_backend_hip)]
 pub mod pinned {
-    // hipHostRegisterPortable = 0x01; hipHostRegisterUnregister = 0x03 (the
-    // flag used with hipHostUnregister, per hip_runtime_api.h).
+    // hipHostRegisterPortable = 0x01 (hip_runtime_api.h; registration takes
+    // no unregister flag — hipHostUnregister takes none).
     const HIP_HOST_REGISTER_PORTABLE: std::ffi::c_uint = 0x01;
-    const HIP_HOST_REGISTER_UNREGISTER: std::ffi::c_uint = 0x03;
 
     unsafe extern "C" {
         fn hipHostRegister(
@@ -90,9 +89,6 @@ pub mod pinned {
         let r = unsafe { hipHostUnregister(ptr as *mut _) };
         if r == 0 { Ok(()) } else { Err(r) }
     }
-
-    /// Flag value for [`hip_host_unregister`] callers that need it.
-    pub const UNREGISTER_FLAG: std::ffi::c_uint = HIP_HOST_REGISTER_UNREGISTER;
 
     /// `(free, total)` device bytes (`hipMemGetInfo`). `None` when the HIP
     /// runtime reports an error — callers must then refuse to derive a device
