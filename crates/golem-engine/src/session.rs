@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::sync::{Arc, Once};
+use std::sync::Once;
 
 use golem_llama_sys::raw;
 use golem_llama_sys::{Backend, substrate_backend};
@@ -422,12 +422,12 @@ pub struct Session {
     config: EngineConfig,
     template: CString,
     last_prompt_tokens: Vec<raw::llama_token>,
-    /// P3 counters when the RAM expert pool is enabled (nonzero
+    /// P3 pool state when the RAM expert pool is enabled (nonzero
     /// `ram_experts_gib`); `None` keeps flagless runs pristine (hooks unset,
     /// T4). The pool itself lives in the process-lifetime leaked hook handle;
-    /// this is only the stats view, so no drop-order coupling with the
-    /// substrate.
-    p3_stats: Option<Arc<P3Stats>>,
+    /// this is only the stats/geometry view, so no drop-order coupling with
+    /// the substrate.
+    p3: Option<p3_glue::PoolEnable>,
 }
 
 impl Session {
@@ -456,7 +456,7 @@ impl Session {
         // config asks for it. Registration happens for the process lifetime
         // (leaked handle); a second pool-enabled session in one process is a
         // loud error (see p3_glue::enable).
-        let p3_stats = if config.ram_experts_gib > 0 {
+        let p3 = if config.ram_experts_gib > 0 {
             Some(p3_glue::enable(config)?)
         } else {
             // The hooks are process-global and never
@@ -482,7 +482,7 @@ impl Session {
             config: config.clone(),
             template,
             last_prompt_tokens: Vec::new(),
-            p3_stats,
+            p3,
         })
     }
 
@@ -490,7 +490,7 @@ impl Session {
     /// session; `None` when the pool is off (the default). Demand and prefetch
     /// page-ins are counted separately (design §6.6).
     pub fn p3_stats(&self) -> Option<&P3Stats> {
-        self.p3_stats.as_deref()
+        self.p3.as_ref().map(|p| p.stats.as_ref())
     }
 
     /// The tokenized prompt of the most recent `chat_turn` (post-render,
@@ -513,7 +513,7 @@ impl Session {
     /// `None` unless this session drives the pooled GPU split — the only P2
     /// call-site (hooks registered + offload requested).
     pub fn device_cache_stats(&self) -> Option<DeviceCacheStats> {
-        if !self.offloaded() || self.p3_stats.is_none() {
+        if !self.offloaded() || self.p3.is_none() {
             return None;
         }
         // SAFETY: FFI getter; the returned pointer is a process-lifetime
@@ -606,9 +606,11 @@ impl Session {
         let prompt_len = prompt.len();
 
         let n_ctx = self.config.n_ctx as usize;
-        // Chunks of min(batch_tokens, n_ctx - 1): one KV slot stays free so the
-        // first generated token always has a position to decode into.
-        let chunk_cap = (self.config.batch_tokens as usize).min(n_ctx.saturating_sub(1));
+        let chunk_cap = prefill_chunk_cap(
+            self.config.batch_tokens as usize,
+            n_ctx,
+            self.p3.as_ref().map(|p| (p.device_cache_experts, p.top_k)),
+        );
         if chunk_cap == 0 {
             // n_ctx <= 1 cannot fit even one prompt token — llama_decode would
             // return 1; fail with that same code instead of chunking by zero.
@@ -705,7 +707,7 @@ impl Session {
                 scratch.clear();
             }
             generated += 1;
-            // One KV slot stays free (chunk_cap = min(batch_tokens, n_ctx - 1));
+            // One KV slot stays free (chunk_cap ≤ min(batch_tokens, n_ctx - 1));
             // never decode at pos >= n_ctx - 1.
             if n_past >= n_ctx - 1 || generated >= self.config.n_predict {
                 break;
@@ -1027,6 +1029,22 @@ fn skip_ratio(bytes_copied: u64, bytes_skipped: u64) -> f64 {
     }
 }
 
+/// Prefill chunk length in tokens. Base cap `min(batch_tokens, n_ctx - 1)`:
+/// one KV slot stays free so the first generated token always has a position
+/// to decode into. With the expert pool on (§2.4), also capped at
+/// `max(1, K / top_k)`: one chunk routes at most `cap × top_k` distinct
+/// experts per layer and the device slab has K slots — a larger routed set
+/// aborts mid-decode. A chunk ≤ n_ubatch is exactly one ubatch, so one
+/// `llama_decode` stays one ubatch and the context needs no re-creation;
+/// `n_batch`/`n_ubatch` are deliberately untouched.
+fn prefill_chunk_cap(batch_tokens: usize, n_ctx: usize, pool: Option<(u32, u32)>) -> usize {
+    let mut cap = batch_tokens.min(n_ctx.saturating_sub(1));
+    if let Some((k, top_k)) = pool {
+        cap = cap.min((k as usize / top_k.max(1) as usize).max(1));
+    }
+    cap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,5 +1112,25 @@ mod tests {
         assert!(out.is_empty());
         emit_valid_prefix(&mut pending, &mut out, &[0xA0]);
         assert_eq!(out, "\u{4f60}"); // 你 — assembled across two pieces
+    }
+
+    #[test]
+    fn prefill_chunk_cap_is_max_one_k_over_top_k_when_pooled() {
+        // The cap is the §2.4 routed-set bound: one chunk routes at most
+        // cap × top_k distinct experts per layer against K slab slots.
+        // Target shape: K = 10, top-k = 8 → 1 token per chunk (the real-model
+        // repro); K = 64, top-k = 8 → 8.
+        assert_eq!(prefill_chunk_cap(512, 4096, Some((10, 8))), 1);
+        assert_eq!(prefill_chunk_cap(512, 4096, Some((64, 8))), 8);
+        // Base cap (pool off): min(batch_tokens, n_ctx - 1).
+        assert_eq!(prefill_chunk_cap(512, 4096, None), 512);
+        assert_eq!(prefill_chunk_cap(512, 64, None), 63);
+        // Pool cap never raises the base cap, and never yields 0.
+        assert_eq!(prefill_chunk_cap(4, 4096, Some((64, 8))), 4);
+        assert_eq!(prefill_chunk_cap(512, 4096, Some((0, 8))), 1);
+        // tiny-moe cannot trigger the slab abort this cap prevents: it has
+        // n_expert 8 and its K clamps to 8, so even a full-batch chunk of
+        // 8 tokens at top-k ≤ 8 routes at most 8 ≤ K experts per layer.
+        assert_eq!(prefill_chunk_cap(8, 4096, Some((8, 8))), 1);
     }
 }

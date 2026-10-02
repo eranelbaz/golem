@@ -270,16 +270,29 @@ pub(crate) fn hooks_registered() -> bool {
     HANDLE.get().is_some()
 }
 
+/// P3 pool facts the session needs past enable (§2.4): a prefill chunk's
+/// routed set is at most `chunk_tokens × top_k` distinct experts per layer
+/// and must fit the `device_cache_experts`-slot slab, so the chunk is capped
+/// at `max(1, device_cache_experts / top_k)` tokens.
+pub(crate) struct PoolEnable {
+    /// Pool counters for [`crate::session::Session::p3_stats`].
+    pub stats: Arc<P3Stats>,
+    /// Device slab slots per layer, as priced at enable (§3.4 v3).
+    pub device_cache_experts: u32,
+    /// Model routed top-k (`expert_used_count`).
+    pub top_k: u32,
+}
+
 /// Builds the RAM expert pool for `config` (which must set
 /// `ram_experts_gib > 0`) and registers the P3 hooks for the process
-/// lifetime. Returns the pool's counters for [`crate::session::Session::
-/// p3_stats`].
+/// lifetime. Returns the pool's counters plus the slab/routing geometry the
+/// session needs to bound a prefill chunk (§2.4).
 ///
 /// # Errors
 /// GGUF/geometry failures, arena mmap/mlock failures (no silent unlocked
 /// fallback, §5.4), or a second pool-enabled session in one process (M2.3
 /// serves exactly one pool-enabled session per process).
-pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
+pub(crate) fn enable(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
     debug_assert!(config.ram_experts_gib > 0, "enable() with pool disabled");
     if ENABLING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -297,7 +310,7 @@ pub(crate) fn enable(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError>
     result
 }
 
-fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
+fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
     if HANDLE.get().is_some() {
         return Err(EngineError::PoolInit(
             "a pool-enabled session already exists (one per process in M2.3)".into(),
@@ -357,8 +370,8 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // (Σ unit bytes = 644,022,272 across 3 stride classes; ≈6.657 GB usable
     // / 644 MB ≈ 10.34, minus the − 1 headroom). Pricing by 42 × 3 × max
     // stride instead gave K = 6 < top-k, refusing the real model at enable.
-    // K is floored at the model's top-k (expert_used_count): a routed set
-    // larger than K aborts mid-decode, so a smaller K must fail at enable.
+    // K is rejected below the model's top-k (expert_used_count): a routed
+    // set larger than K aborts mid-decode, so a smaller K must fail at enable.
     let k = derive_device_cache_experts(config, slab, n_expert_used)?;
     // Per-class RAM layout (§5 pool amendment): each unit-size class gets slots
     // proportional to its share of total unit bytes; remainder bytes are
@@ -472,7 +485,11 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         gib = config.ram_experts_gib,
         "P3 RAM expert pool registered (hooks set for process lifetime)"
     );
-    Ok(pool.stats.clone())
+    Ok(PoolEnable {
+        stats: pool.stats.clone(),
+        device_cache_experts: k,
+        top_k: n_expert_used,
+    })
 }
 
 /// Per-layer device-slab expert count for this pool. Explicit
@@ -563,7 +580,8 @@ fn class_layout(
 }
 
 /// Derived K from free VRAM: half is slab budget, the rest KV + compute-buffer
-/// growth headroom; `− 1` is per-slab headroom. Floored at top-k.
+/// growth headroom; `− 1` is per-slab headroom. Rejected below top-k — a
+/// routed set larger than K aborts mid-decode, it is never floored.
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 fn k_from_free_vram(
     free: u64,
