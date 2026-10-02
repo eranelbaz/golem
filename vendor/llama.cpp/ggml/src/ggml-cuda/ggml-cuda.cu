@@ -1,6 +1,6 @@
 #include "ggml-cuda.h"
 
-// Golem C-4 threshold override + D-8 graphs gate (defined in ggml-backend.cpp).
+// Golem expert-offload threshold override + graphs gate (defined in ggml-backend.cpp).
 extern "C" int golem_expert_offload_min_batch(int default_value);
 extern "C" int golem_graphs_disabled(void);
 #include "ggml-impl.h"
@@ -5552,9 +5552,6 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
     }
 }
 
-// Golem C-4 threshold override (defined in ggml-backend.cpp, golem-hooks.h).
-extern "C" int golem_expert_offload_min_batch(int default_value);
-
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
@@ -5729,7 +5726,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
-            // Golem C-4: the engine forces expert MUL_MAT_ID onto the GPU by
+            // Golem: the engine forces expert MUL_MAT_ID onto the GPU by
             // overriding the threshold (golem-hooks.h); env stays as fallback.
             const int min_batch_size = golem_expert_offload_min_batch(
                 getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32);
