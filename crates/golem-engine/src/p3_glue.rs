@@ -8,9 +8,10 @@
 //! registration table fills lazily on the first callback per expert tensor
 //! (the P1 ABI exposes expert metadata per tensor but no model-tensor
 //! enumeration, so data pointers are only knowable when the substrate hands
-//! the tensor to the callback). On a GPU split these first callbacks fire
-//! during `load()`'s decode self-check, so registration cross-checks still
-//! fail the load loudly.
+//! the tensor to the callback). `enable` runs after `load()` returns, so the
+//! first callbacks fire on the first decode — a GPU split registers every
+//! expert tensor on that step, and any cross-check mismatch aborts loudly
+//! there (the void FFI ABI has no error return).
 //!
 //! Registration shape:
 //! - *Lazy registration:* a load-time tensor walk is not expressible
@@ -733,9 +734,11 @@ impl AccessFeed for PolicyFeed {
 /// The P2 `policy_query` trampoline: returns the evict-first expert order
 /// for `tensor` as a permutation of `0..n_experts`, valid until the next
 /// call (frozen-buffer contract). First expert-tensor sight flows through
-/// the full `entry_for` validate-and-cross-check path — within one copy step
-/// C calls policy_query BEFORE ensure_host_resident, so the first expert
-/// tensor ever seen arrives HERE first; no abort on first sight.
+/// the full `entry_for` validate-and-cross-check path — per copy step
+/// (verified: `ggml_backend_sched_compute_splits`, P2 v2 branch) C calls
+/// policy_query, then per-slot ensure_host_resident, then notify_access —
+/// so the first expert tensor ever seen arrives HERE, already registered
+/// before any ensure_host_resident cross-check can abort on first sight.
 extern "C" fn policy_query(ctx: *mut c_void, tensor: *const c_void, n_experts: i32) -> *const i32 {
     // SAFETY: ctx was installed by `enable` as a leaked `&'static PoolHandle`
     // and is never mutated afterwards; it outlives every callback.
@@ -778,10 +781,12 @@ extern "C" fn notify_access(ctx: *mut c_void, expert_id: i64) {
 impl PoolHandle {
     /// Registered entry for `tensor`, registering it on first sight.
     ///
-    /// First sight = the substrate's first `ensure_host_resident` call for
-    /// this tensor, which precedes any host-byte read and happens while the
-    /// loader-populated weights buffer is still pristine — exactly the window
-    /// the load-time cross-checks need.
+    /// First sight = the first callback for this tensor: `policy_query`
+    /// when P2 is active (it precedes `ensure_host_resident` in
+    /// `ggml_backend_sched_compute_splits`), else `ensure_host_resident`.
+    /// Either way the callback runs while the loader-populated weights
+    /// buffer is still pristine — exactly the window the load-time
+    /// cross-checks need.
     fn entry_for(&self, tensor: *const c_void) -> Option<TensorEntry> {
         if tensor.is_null() {
             return None;

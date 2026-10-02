@@ -81,7 +81,7 @@ mod tests {
         assert_eq!(c.ram_experts_gib, 0, "RAM expert pool defaults off (T4)");
         assert_eq!(
             c.device_cache_experts, 0,
-            "device cache defaults to unlimited (never evicts)"
+            "0 = unset: the engine derives a bounded K from free VRAM at enable"
         );
     }
 }
