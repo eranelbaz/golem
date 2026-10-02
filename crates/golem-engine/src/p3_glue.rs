@@ -121,9 +121,9 @@ struct PolicyQueryState {
     /// is returned for gate/up/down, which the shared per-layer slot table
     /// requires (§3.4 v3).
     last_access: Mutex<Vec<Option<u64>>>,
-    /// Decode-step counter: one `llama_decode` call = one step (§6.2 as
-    /// amended — prefill chunks count as one step each), bumped by
-    /// [`advance_decode_step`] from `Session`'s decode paths. Rust drives
+    /// Decode-step counter: one post-prefill trunk `llama_decode` = one step
+    /// (§6.2: prefill chunks are excluded from scoring), bumped by
+    /// [`advance_decode_step`] from `Session`'s generation decode. Rust drives
     /// decode, so Rust owns the step — the wall-clock turn heuristic this
     /// replaced collapsed a whole chat turn into one step.
     step: AtomicU64,
@@ -256,12 +256,21 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
 }
 
 /// Bumps the policy decode step: `Session` calls this after every successful
-/// `llama_decode` (§6.2 as amended: a step is one decode call, prefill chunks
-/// included). No-op while hooks are unregistered (self-check decodes).
+/// trunk decode (§6.2: prefill chunks are excluded from scoring — a prefill
+/// ubatch routes nearly every expert and would flatten the scores). No-op
+/// while hooks are unregistered (self-check decodes).
 pub(crate) fn advance_decode_step() {
     if let Some(h) = HANDLE.get() {
         h.policy.step.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Test seam: the live policy decode step (0 while hooks are unregistered).
+#[cfg(test)]
+pub(crate) fn decode_step_for_test() -> u64 {
+    HANDLE
+        .get()
+        .map_or(0, |h| h.policy.step.load(Ordering::Relaxed))
 }
 
 /// Whether the process-global hooks are registered (a second pool-enabled

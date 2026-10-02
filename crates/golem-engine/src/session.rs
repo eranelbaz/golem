@@ -668,7 +668,9 @@ impl Session {
                 unsafe { raw::llama_synchronize(ctx.as_ptr()) };
                 return Err(EngineError::Decode(code));
             }
-            p3_glue::advance_decode_step();
+            // §6.2: prefill chunks are NOT policy steps — a prefill ubatch
+            // routes nearly every expert and would flatten the scores, so
+            // only the generation decodes below advance the step.
             // synchronize (see decode helper above).
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
@@ -1157,5 +1159,52 @@ mod tests {
         // n_expert 8 and its K clamps to 8, so even a full-batch chunk of
         // 8 tokens at top-k ≤ 8 routes at most 8 ≤ K experts per layer.
         assert_eq!(prefill_chunk_cap(8, 4096, Some((8, 8))), 1);
+    }
+
+    /// §6.2: prefill chunks are excluded from policy-step scoring — a prefill
+    /// ubatch routes nearly every expert and would flatten the scores. A
+    /// multi-chunk prefill must leave the step counter untouched; before this
+    /// was fixed, each chunk advanced it once. `n_predict = 0` makes the turn
+    /// prefill-only, isolating the prefill path from generation decodes.
+    /// Pool-enabled, so the chunk cap comes from the real pooled geometry
+    /// (CPU needs the explicit `device_cache_experts`; no VRAM query to
+    /// derive it). Preconditions fail loudly — no skip (evidence rule).
+    #[test]
+    fn multi_chunk_prefill_advances_the_policy_step_zero_times() {
+        let cfg = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ram_experts_gib: 1,
+            device_cache_experts: 8, // tiny-moe: K=8, top_k=2 → cap 4.
+            n_predict: 0,
+            ..EngineConfig::default()
+        };
+        let mut s = Session::new(&cfg).expect("pooled CPU session loads tiny-moe");
+        let (k, top_k) =
+            s.p3.as_ref()
+                .map(|p| (p.device_cache_experts, p.top_k))
+                .expect("pool enabled for this session");
+        let cap = prefill_chunk_cap(
+            cfg.batch_tokens as usize,
+            cfg.n_ctx as usize,
+            Some((k, top_k)),
+        );
+        let turns = [ChatTurn {
+            role: "user",
+            content: "one two three four five six seven eight nine ten eleven twelve",
+        }];
+        let mut out = String::new();
+        s.chat_turn(&turns, &mut |piece| out.push_str(piece))
+            .expect("prefill-only turn succeeds");
+        let tokens = s.last_prompt_tokens().len();
+        assert!(
+            tokens >= 2 * cap,
+            "precondition: prompt must span ≥2 prefill chunks (cap {cap}, tokens {tokens})"
+        );
+        assert!(out.is_empty(), "n_predict = 0 generates nothing");
+        assert_eq!(
+            p3_glue::decode_step_for_test(),
+            0,
+            "multi-chunk prefill must not advance the policy step (§6.2)"
+        );
     }
 }
