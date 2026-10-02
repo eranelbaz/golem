@@ -228,7 +228,11 @@ pub fn check(metadata: &GgufMetadata) -> Result<(), EngineError> {
     let nextn = nextn_layers(metadata)?.unwrap_or(0);
     let mtp_from = (nextn > 0)
         .then(|| {
-            let bc = block_count(metadata)?.expect("nextn without block_count");
+            let bc = block_count(metadata)?.ok_or_else(|| {
+                EngineError::UnsupportedModel(
+                    "nextn_predict_layers present without block_count".into(),
+                )
+            })?;
             if nextn > bc {
                 return Err(EngineError::UnsupportedModel(format!(
                     "nextn_predict_layers {nextn} > block_count {bc}"
@@ -378,6 +382,18 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k.ends_with("nextn_predict_layers"))
         );
+    }
+
+    #[test]
+    fn nextn_without_block_count_is_an_error_not_a_panic() {
+        let mut m = valid_meta();
+        m.kvs.retain(|(k, _)| k != "glm4moe.block_count");
+        m.kvs.push((
+            "glm4moe.nextn_predict_layers".to_string(),
+            GgufValue::U32(1),
+        ));
+        let err = check(&m).unwrap_err();
+        assert!(matches!(err, EngineError::UnsupportedModel(_)));
     }
 
     #[test]

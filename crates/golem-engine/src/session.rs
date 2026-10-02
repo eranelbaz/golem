@@ -423,7 +423,7 @@ fn ffi_messages(messages: &[ChatTurn<'_>]) -> Result<Vec<ChatMessageFFI>, Engine
 }
 
 /// A loaded model bound to its resolved chat template, driving one decode slot
-/// (M1.3: stateless per turn — every `chat_turn` re-prefills the full transcript).
+/// (stateless per turn — every `chat_turn` re-prefills the full transcript).
 pub struct Session {
     loaded: LoadedModel,
     config: EngineConfig,
