@@ -301,6 +301,10 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
     // SAFETY: ctx is a live llama_context; batch arrays are allocated and fully written.
     let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
     if code != 0 {
+        // Synchronize first: the failed decode may have launched a compute whose
+        // expert-copy leases release only at the next compute (§2.4).
+        // SAFETY: ctx is live.
+        unsafe { raw::llama_synchronize(ctx.as_ptr()) };
         return Err(EngineError::Decode(code));
     }
     p3_glue::advance_decode_step();
@@ -344,6 +348,9 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         // SAFETY: same invariants as the first decode; batch arrays are still alive.
         let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
         if code != 0 {
+            // Synchronize first: see the first decode's error path above.
+            // SAFETY: ctx is live.
+            unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             return Err(EngineError::Decode(code));
         }
         p3_glue::advance_decode_step();
@@ -618,6 +625,9 @@ impl Session {
         }
 
         let mut batch = Batch::init(chunk_cap as i32, 0, 1);
+        // One llama_decode must carry exactly one ubatch (the C lease-release
+        // contract, §2.4): n_ubatch is a load-time constant (§4.2), fetched once.
+        let n_ubatch = unsafe { raw::llama_n_ubatch(ctx.as_ptr()) } as usize;
         let mut n_past: usize = 0;
         let mut last_chunk_len = 0;
         for chunk in prompt.chunks(chunk_cap) {
@@ -645,9 +655,17 @@ impl Session {
                 b.n_tokens = len as i32;
             }
             // SAFETY: ctx is a live context; batch slots 0..n_tokens fully written.
+            debug_assert!(
+                len <= n_ubatch,
+                "prefill chunk must be exactly one ubatch (lease-release contract, §2.4)"
+            );
             let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
             if code != 0 {
                 // 1 = no KV slot left (ctx too small for the prompt); the rest fatal alike.
+                // Synchronize first: the failed decode may have launched a compute
+                // whose expert-copy leases release only at the next compute.
+                // SAFETY: ctx is live.
+                unsafe { raw::llama_synchronize(ctx.as_ptr()) };
                 return Err(EngineError::Decode(code));
             }
             p3_glue::advance_decode_step();
@@ -719,8 +737,15 @@ impl Session {
                 b.n_tokens = 1;
             }
             // SAFETY: same invariants as the prefill decode.
+            debug_assert!(
+                1 <= n_ubatch,
+                "one decode step = one ubatch (lease-release contract, §2.4)"
+            );
             let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
             if code != 0 {
+                // Synchronize first: see the prefill decode's error path.
+                // SAFETY: ctx is live.
+                unsafe { raw::llama_synchronize(ctx.as_ptr()) };
                 return Err(EngineError::Decode(code));
             }
             p3_glue::advance_decode_step();

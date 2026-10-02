@@ -1746,9 +1746,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     // Golem: release the host-pool leases taken during the PREVIOUS
-    // compute. The engine (golem session loop) synchronizes after every
-    // decode, so those copies are complete; the leases must survive until
-    // here so eviction cannot recycle a slot mid-DMA.
+    // compute. Precondition: every llama_decode holds exactly one ubatch
+    // (the engine caps its prefill chunk at n_ubatch) and synchronizes
+    // before returning — including on a decode error — so those copies
+    // are complete; the leases must survive until here so eviction
+    // cannot recycle a slot mid-DMA.
     if (golem_h_copy_done != NULL) {
         golem_h_copy_done(golem_h_ctx);
     }
