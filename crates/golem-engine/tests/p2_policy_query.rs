@@ -52,17 +52,26 @@ fn policy_query_is_consulted_with_valid_permutations() {
     }
     extern "C" fn on_ensure(
         _ctx: *mut libc::c_void,
-        _tensor: *const libc::c_void,
-        _first: i32,
-        _last: i32,
-        _ptrs: *mut *const libc::c_void,
+        tensor: *const libc::c_void,
+        first: i32,
+        last: i32,
+        ptrs: *mut *const libc::c_void,
     ) {
-        // ABI v2: the substrate copies from the returned pointers; these
-        // hook-level tests don't page from a pool, so serve one static buffer.
-        const SRC: [u8; 65536] = [0u8; 65536];
-        let src = SRC.as_ptr() as *const libc::c_void;
-        for i in 0..((_last - _first + 1) as usize) {
-            unsafe { *_ptrs.add(i) = src };
+        // ABI v2: the substrate copies from the returned pointers, so serve
+        // the tensor's REAL per-expert planes — the same bytes the unpooled
+        // upstream path reads (`input->data + id·nb[2]`). One shared static
+        // would hand every expert zero bytes, making misplaced planes
+        // undetectable by any output assertion.
+        // SAFETY: `tensor` is the substrate's expert tensor, valid for the
+        // call; only `data` is read, and the per-expert stride comes from
+        // the substrate's own metadata query (nb[2], see golem-hooks.h).
+        let base = unsafe { (*tensor.cast::<golem_llama_sys::raw::ggml_tensor>()).data };
+        let stride =
+            unsafe { golem_llama_sys::raw::golem_tensor_expert_stride_bytes(tensor) } as usize;
+        for e in first..=last {
+            unsafe {
+                *ptrs.add((e - first) as usize) = base.byte_add(e as usize * stride).cast();
+            }
         }
     }
 
