@@ -50,8 +50,9 @@ impl PolicySnapshot {
 }
 
 /// One expert layer's residency state (§6.6): resident bits, lease counts and
-/// slot assignment for this layer's keys. The slot free list and the CLOCK
-/// hand are global (§6.6: one pool, no per-layer quota), so a shard's critical
+/// slot assignment for this layer's keys. The slot free lists and CLOCK
+/// hands are per class, shared by every layer of the class (§6.6: no
+/// per-layer quota), so a shard's critical
 /// section covers only `{bit flip, slot_of, lease grant/release}`.
 #[derive(Debug)]
 struct Shard {
@@ -218,6 +219,14 @@ impl ResidencyMap {
                 "class {c} has slots but serves no layers — clock_evict would divide by zero"
             );
         }
+        for (a, ra) in class_slots.iter().enumerate() {
+            for rb in &class_slots[a + 1..] {
+                assert!(
+                    ra.end <= rb.start || rb.end <= ra.start,
+                    "class slot ranges {ra:?} and {rb:?} overlap"
+                );
+            }
+        }
         let class_keys: Vec<usize> = class_layers
             .iter()
             .map(|ls| ls.len() * Self::keys_per_layer(n_experts))
@@ -345,8 +354,8 @@ impl ResidencyMap {
                 // fresh (the slot is back on the free list).
             }
             // Falling through holds no state that needs the shard lock.
-            // One global pool: take a free slot if any; else run the global
-            // CLOCK. The shard guard stays dropped across the free list and
+            // Take a free slot of the layer's class if any; else run that
+            // class's CLOCK. The shard guard stays dropped across the free list and
             // the scan — the free list is a leaf, and the sweep takes shard
             // locks one at a time under its own mutex.
             drop(sh);
@@ -493,8 +502,8 @@ impl ResidencyMap {
     }
 
     /// Abandon a failed page-in: drops the claim's lease and, when no other
-    /// lease remains, clears the key's residency and returns the slot to the
-    /// global free list — no ghost residency, no leaked slot. Also clears the
+    /// lease remains, clears the key's residency and returns the slot to its
+    /// class's free list — no ghost residency, no leaked slot. Also clears the
     /// fill gate and wakes claimers parked on it (they re-claim fresh).
     pub fn cancel_claim(&self, layer: u32, expert: u32) {
         let li = layer as usize;
@@ -815,14 +824,21 @@ mod tests {
 
     #[test]
     #[cfg(not(loom))] // loom primitives require a model() context
+    #[should_panic(expected = "overlap")]
+    fn overlapping_class_slot_ranges_are_rejected() {
+        ResidencyMap::new(vec![0, 1], 8, vec![0..4, 3..6]);
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
     fn victim_needing_two_clock_laps_is_found_not_busy() {
-        // 4 × 3 × 344 = 4128 keys; the only resident is the last key, with
+        // 4 × 1032 = 4128 keys; the only resident is the last key, with
         // its second-chance bit set. Lap 1 clears it, lap 2 takes it:
         // 8256 keys = 9 sweeps of SWEEP_BUDGET, which a one-lap bound
         // (4128 / 1024 + 2 = 6) reported as Busy.
-        let m = ResidencyMap::new(vec![0; 4], 344, vec![0..1]);
+        let m = ResidencyMap::new(vec![0; 4], 1032, vec![0..1]);
         let snap = PolicySnapshot::test_empty();
-        let last = (3, 343);
+        let last = (3, 1031);
         m.claim(last.0, last.1, &snap).unwrap();
         m.finish_fill(last.0, last.1);
         assert!(matches!(

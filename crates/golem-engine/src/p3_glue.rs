@@ -344,18 +344,37 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
         })?;
     let n_expert_used = u32::try_from(n_expert_used)
         .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
+    // The device-cache budget is a per-layer expert count, never a
+    // byte cap on whichever tensor registers first.
+    // It is never "unlimited": device allocations are bounded by the VRAM
+    // budget, never proportional to expert count (unbounded slabs are ≈184 GB
+    // on GLM-5.3-Flash — 126 live tensors × 288 experts × ≈5 MB — against a
+    // 24 GiB card). An explicit config value wins; otherwise K derives from
+    // the free VRAM at enable time (the model's non-expert weights are
+    // already resident, so what is free is what the slabs + KV + compute
+    // buffers must share), with half held back as growth headroom:
+    // K = free/2 / Σ_layers unit bytes − 1 = 9 on the target
+    // (Σ unit bytes = 644,022,272 across 3 stride classes; ≈6.657 GB usable
+    // / 644 MB ≈ 10.34, minus the − 1 headroom). Pricing by 42 × 3 × max
+    // stride instead gave K = 6 < top-k, refusing the real model at enable.
+    // K is floored at the model's top-k (expert_used_count): a routed set
+    // larger than K aborts mid-decode, so a smaller K must fail at enable.
+    let k = derive_device_cache_experts(config, slab, n_expert_used)?;
     // Per-class RAM layout (§5 pool amendment): each unit-size class gets slots
     // proportional to its share of total unit bytes; remainder bytes are
     // trimmed by integer division.
     let classes = geo.classes();
-    let layout = class_layout(&classes, pool_bytes, n_expert_used)?;
+    // C clamps the slab to n_experts, so that is the per-layer staging bound.
+    let layout = class_layout(&classes, pool_bytes, k.min(geo.n_experts))?;
     let arena = golem_placement::pool::Arena::new(&layout)
         .map_err(|e| EngineError::PoolInit(e.to_string()))?;
     // Layer → class index, aligned with `layout`/`classes` ordering.
     let mut class_of_layer = vec![0u8; n_layers as usize];
     for (c, (_, layers)) in classes.iter().enumerate() {
+        let c = u8::try_from(c)
+            .map_err(|_| EngineError::PoolInit("more than 256 unit-size classes".into()))?;
         for &l in layers {
-            class_of_layer[l as usize] = c as u8;
+            class_of_layer[l as usize] = c;
         }
     }
 
@@ -426,22 +445,6 @@ fn enable_inner(config: &EngineConfig) -> Result<Arc<P3Stats>, EngineError> {
     // entries from an earlier in-process model — the invalidation seam).
     // SAFETY: FFI call, no invariants.
     unsafe { raw::golem_reset_device_cache() };
-    // The device-cache budget is a per-layer expert count, never a
-    // byte cap on whichever tensor registers first.
-    // It is never "unlimited": device allocations are bounded by the VRAM
-    // budget, never proportional to expert count (unbounded slabs are ≈184 GB
-    // on GLM-5.3-Flash — 126 live tensors × 288 experts × ≈5 MB — against a
-    // 24 GiB card). An explicit config value wins; otherwise K derives from
-    // the free VRAM at enable time (the model's non-expert weights are
-    // already resident, so what is free is what the slabs + KV + compute
-    // buffers must share), with half held back as growth headroom:
-    // K = free/2 / Σ_layers unit bytes − 1 = 9 on the target
-    // (Σ unit bytes = 644,022,272 across 3 stride classes; ≈6.657 GB usable
-    // / 644 MB ≈ 10.34, minus the − 1 headroom). Pricing by 42 × 3 × max
-    // stride instead gave K = 6 < top-k, refusing the real model at enable.
-    // K is floored at the model's top-k (expert_used_count): a routed set
-    // larger than K aborts mid-decode, so a smaller K must fail at enable.
-    let k = derive_device_cache_experts(config, slab, n_expert_used)?;
     // SAFETY: FFI setter, no invariants.
     unsafe {
         raw::golem_set_device_cache_experts(k as i32);
@@ -517,12 +520,14 @@ fn slab_bytes_per_expert(geo: &golem_placement::pool::PoolGeometry) -> u64 {
 
 /// Per-class slot counts: class c gets ⌊pool_bytes × share_c / unit_c⌋
 /// slots, share_c = layers_c × unit_c / Σ_layers unit. Err when a class
-/// falls below layers_c × n_expert_used (one cold step leases that many
-/// units until the next compute's copy_done).
+/// falls below layers_c × k, k = min(K, n_experts): P2 stages at most k
+/// routed experts per layer (more aborts in C, design §2.4 prefill), and one
+/// step's leases live until the next compute's copy_done, so one step pins
+/// at most that many units.
 fn class_layout(
     classes: &[(u64, Vec<u32>)],
     pool_bytes: u64,
-    n_expert_used: u32,
+    k: u32,
 ) -> Result<Vec<SlotClass>, EngineError> {
     let total_unit_bytes: u64 = classes
         .iter()
@@ -538,12 +543,12 @@ fn class_layout(
             u128::from(pool_bytes) * u128::from(layers.len() as u64) / u128::from(total_unit_bytes);
         let slots = u32::try_from(slots)
             .map_err(|_| EngineError::PoolInit("slot count exceeds u32::MAX".into()))?;
-        let floor = layers.len() as u64 * u64::from(n_expert_used);
+        let floor = layers.len() as u64 * u64::from(k);
         if u64::from(slots) < floor {
             return Err(EngineError::PoolInit(format!(
                 "RAM pool of {pool_bytes} B too small for the unit-size {unit} B class \
                  ({} layers): {slots} slots < {floor} in flight ({} layers × \
-                 expert_used_count {n_expert_used}); raise ram_experts_gib",
+                 device_cache_experts {k}); raise ram_experts_gib",
                 layers.len(),
                 layers.len()
             )));
@@ -886,14 +891,19 @@ mod tests {
 
     #[test]
     fn class_layout_splits_the_pool_by_byte_share() {
-        let l = class_layout(&glm_classes(), 65 << 30, 8).unwrap();
+        let l = class_layout(&glm_classes(), 65 << 30, 9).unwrap();
         assert_eq!(
             l.iter().map(|c| c.slots).collect::<Vec<_>>(),
             [4_226, 216, 108]
         );
-        // Floor: 1 GiB cannot hold 39 × 8 std units in flight.
-        let err = class_layout(&glm_classes(), 1 << 30, 8).unwrap_err();
-        assert!(err.to_string().contains("expert_used_count"), "{err}");
+        // Floor: 1 GiB cannot hold 39 × 9 std units in flight.
+        let err = class_layout(&glm_classes(), 1 << 30, 9).unwrap_err();
+        assert!(err.to_string().contains("device_cache_experts 9"), "{err}");
+        // The floor is priced by K, not top-k: this pool gives std 312 slots
+        // = 39 × 8 (fits K = 8) < 39 × 9 = 351 (refused at K = 9).
+        let pool = 312u64 * 644_022_272 / 39 + (1 << 20);
+        assert!(class_layout(&glm_classes(), pool, 8).is_ok());
+        assert!(class_layout(&glm_classes(), pool, 9).is_err());
     }
 
     #[test]

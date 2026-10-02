@@ -39,8 +39,8 @@ impl UnitLayout {
 /// Pool geometry derived from the expert plane table (§5.4): per-layer unit
 /// layouts (dense-lead-adjusted, MTP excluded), the dense-lead-adjusted
 /// layer/expert counts, and total expert bytes. RAM slot sizing is per unit
-/// class (§5 pool amendment), so no single slot size here — the
-/// arena sizes each class by `max_unit()`.
+/// class (§5 pool amendment), so no single slot size here — each class's
+/// slot size is its own unit bytes (see [`Self::classes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolGeometry {
     /// Per-layer unit layout, indexed by dense-lead-adjusted layer.
@@ -57,7 +57,7 @@ impl PoolGeometry {
         self.layers.len() as u32
     }
 
-    /// Largest unit in bytes — the arena's uniform slot size.
+    /// Largest unit in bytes (the largest class's slot size).
     pub fn max_unit(&self) -> u64 {
         self.layers.iter().map(UnitLayout::bytes).max().unwrap_or(0)
     }

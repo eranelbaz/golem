@@ -135,7 +135,7 @@ impl Arena {
         {
             let (slot_size, slots) = classes.first().map_or((0, 0), |c| (c.slot_size, c.slots));
             return Err(ArenaError::InvalidLayout {
-                pool_bytes: slots as usize * slot_size,
+                pool_bytes: (slots as usize).saturating_mul(slot_size),
                 slot_size,
             });
         }
@@ -226,9 +226,6 @@ impl Arena {
     /// only lease, and the fill-completion gate keeps every other claimer
     /// parked until the fill is reported done, after which this `&mut` has
     /// ended and only shared `&` reads remain.
-    ///
-    /// Mutable slot view for the page-in path, under the exclusive
-    /// [`FillClaim`](super::residency::FillClaim).
     // &self → &mut [u8] is the point: the aliasing rule it relies on is the
     // Filled-claim exclusivity contract documented above, which the residency
     // map's claim + fill gate enforce.

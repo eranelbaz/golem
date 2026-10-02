@@ -395,12 +395,15 @@ impl ExpertPool {
     /// Production reads happen only inside the copy closure.
     ///
     /// # Panics
-    /// Panics when the key is not resident (the caller claimed it away).
+    /// Panics when the key is not resident — a fresh claim would leave it
+    /// mid-fill and park every later claimer.
     pub fn lease_for_test(&self, layer: u32, expert: u32) -> Lease {
         let snapshot = PolicySnapshot::test_empty();
         let slot = match self.residency.claim(layer, expert, &snapshot) {
-            Ok(Claim::Resident { slot }) | Ok(Claim::Filled { slot, .. }) => slot,
-            Err(ClaimError::Evicted(evicted)) => evicted.slot,
+            Ok(Claim::Resident { slot }) => slot,
+            Ok(Claim::Filled { .. }) | Err(ClaimError::Evicted(_)) => {
+                panic!("lease_for_test on a non-resident unit")
+            }
             Err(ClaimError::Busy) => panic!("test lease on an over-subscribed pool"),
         };
         Lease {
