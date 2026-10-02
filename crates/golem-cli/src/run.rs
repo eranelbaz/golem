@@ -32,11 +32,12 @@ pub struct RunArgs {
     /// Context size in KV cache slots (engine §7.2 default: 256).
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(2..))]
     pub ctx: u32,
-    /// Decode threads (engine §7.2 default: 1). The M1.4 calibration matrix
-    /// runs reference-vs-reference legs at differing thread counts
-    /// (cpu-t16 vs cpu-t4), so the suite driver injects this flag per leg.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    pub threads: u32,
+    /// Decode threads (engine §7.2 default: logical CPUs / 2, min 1). The
+    /// M1.4 calibration matrix runs reference-vs-reference legs at differing
+    /// thread counts (cpu-t16 vs cpu-t4), so the suite driver injects this
+    /// flag per leg.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub threads: Option<u32>,
     /// Model layers to offload to the GPU (`EngineConfig::n_gpu_layers`):
     /// 0 keeps the whole model on CPU (the CI-leg default); the hardware HIP
     /// parity leg uses 99. Without this knob a "hip"-labeled binary would
@@ -75,18 +76,19 @@ impl RunArgs {
     /// `n_gpu_layers`, `--flash-attn` → `flash_attn_on`, `--cpu-moe-layers`
     /// → `cpu_moe_layers`. Everything else stays at the engine default.
     pub fn to_config(&self) -> EngineConfig {
+        let default = EngineConfig::default();
         EngineConfig {
             model_path: self.model.clone(),
             n_ctx: self.ctx,
             n_predict: self.n_predict,
-            threads: self.threads,
+            threads: self.threads.unwrap_or(default.threads),
             n_gpu_layers: self.n_gpu_layers,
             flash_attn_on: self.flash_attn,
             cpu_moe_layers: self.cpu_moe_layers,
             // Fractional GiB floor to the engine's whole-GiB unit; a value in
             // (0, 1) therefore disables the pool — the help text says so.
             ram_experts_gib: self.ram_experts_gib.unwrap_or(0.0).max(0.0) as u64,
-            ..EngineConfig::default()
+            ..default
         }
     }
 }
@@ -542,7 +544,13 @@ mod tests {
         assert_eq!(config.model_path, PathBuf::from("model.gguf"));
         assert_eq!(config.n_ctx, 256);
         assert_eq!(config.n_predict, 64);
-        assert_eq!(config.threads, 1, "engine §7.2 default");
+        // No --threads flag → the engine default (logical CPUs / 2, min 1),
+        // never the old hardcoded 1 that overrode it.
+        assert_eq!(
+            config.threads,
+            EngineConfig::default().threads,
+            "no flag → engine default threads"
+        );
         assert_eq!(config.n_gpu_layers, 0, "default offloads nothing");
         assert!(
             !config.flash_attn_on,
@@ -597,7 +605,7 @@ mod tests {
         assert_eq!(config.cpu_moe_layers, None);
 
         let config = parse_run_args(&["run", "m.gguf", "--n-gpu-layers", "7"]).to_config();
-        assert_eq!(config.threads, 1);
+        assert_eq!(config.threads, EngineConfig::default().threads);
         assert_eq!(config.n_gpu_layers, 7);
         assert!(!config.flash_attn_on);
         assert_eq!(config.cpu_moe_layers, None);
