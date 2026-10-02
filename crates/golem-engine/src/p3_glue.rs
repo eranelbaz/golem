@@ -91,14 +91,6 @@ struct PoolHandle {
     in_flight_leases: Mutex<Vec<golem_placement::pool::Lease>>,
 }
 
-// SAFETY: `data` pointers point into the substrate's host weights buffer,
-// which is process-lifetime by hook-lifecycle decree (leaked handle, hooks
-// never unregistered ⇒ the model is never freed while a callback can run);
-// entries are only added through the owning mutex. Every other field is
-// plain owned data, so `PoolHandle` crossing threads upholds aliasing rules.
-unsafe impl Send for PoolHandle {}
-unsafe impl Sync for PoolHandle {}
-
 /// Process-lifetime registration: set once, read forever, never torn down.
 static HANDLE: OnceLock<&'static PoolHandle> = OnceLock::new();
 
