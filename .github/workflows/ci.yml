@@ -67,7 +67,7 @@ jobs:
           cargo build -p golem-cli
           scripts/t4_gate.sh --upstream-tests target/debug/golem /tmp/tiny-moe.gguf
 
-  # M2.3 P3 functional acceptance (Tasks 1/5/6 tests): the split-scheduler
+  # P3 functional acceptance: the split-scheduler
   # expert-copy path only executes where a GPU split exists, so this leg runs
   # on the self-hosted HIP runner; CPU CI never reaches it. No HIP runner is
   # registered yet, so the job is workflow_dispatch-only — PR CI stays green
@@ -85,7 +85,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run -p golem-engine --features hip-tests -E 'test(p3_) or test(t3_) or test(policy_query_) or test(device_cache_)'
+      # Unfiltered: every hip-tests-gated test (incl. the GPU-offload and
+      # second-session invariants) must run, never be filtered out.
+      - run: cargo nextest run -p golem-engine --features hip-tests
       # Pooled-vs-unpooled CLI comparison — needs the built `golem`
       # binary, so it lives in golem-cli (engine tests can't see CARGO_BIN_EXE).
       - run: cargo nextest run -p golem-cli --features hip-tests

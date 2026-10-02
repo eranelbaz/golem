@@ -85,8 +85,8 @@ fn put_kv(out: &mut Vec<u8>, kv: &GgufKv) {
 }
 
 /// Returns the byte offset of the tensor-data section (aligned table end).
-/// Fails with `InvalidData` if `ggml_type != GGML_TYPE_F32` or a payload is not
-/// exactly `dims.product() * 4` bytes.
+/// Fails with `InvalidData` if a payload's length does not match its
+/// `ggml_type`'s row bytes × rows.
 pub fn write_gguf(
     w: &mut impl Write,
     kvs: &[GgufKv],

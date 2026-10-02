@@ -6,7 +6,7 @@
 //! - T1: `golem-parity-op` v1 (header + per-expert-id checksum rows) written
 //!   by the `parity-op` leg.
 //!
-//! Verdict semantics (M1.4 plan Global Constraints): per position, tokens are
+//! Verdict semantics: per position, tokens are
 //! compared first. On divergence, the divergence is *tolerated* iff
 //! `min(gap_a, gap_b) < epsilon` where `gap = top1 - top2` at that position
 //! in each leg (strict `<`: `gap == epsilon` diverges). The verdict for a
