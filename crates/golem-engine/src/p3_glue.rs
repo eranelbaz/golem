@@ -107,6 +107,24 @@ static HANDLE: OnceLock<&'static PoolHandle> = OnceLock::new();
 /// of racing [`HANDLE`] and leaking a built arena + prefetch thread.
 static ENABLING: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide count of live [`crate::session::Session`]s. Off-then-on
+/// guard: once ANY session exists, [`enable`] refuses — a pool registered
+/// under a live session would retroactively route that session's decodes
+/// through the new hooks (the first session's next decode would page from a
+/// pool built for a different model).
+static LIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Marks a successfully constructed session (called by `Session::new`).
+pub(crate) fn session_opened() {
+    LIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Marks a dropped session (called by `Session::drop`).
+pub(crate) fn session_closed() {
+    let prev = LIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(prev > 0, "session_closed without a matching session_opened");
+}
+
 /// P2 policy state (§3.4): per-expert last-access steps feeding the
 /// evict-first order, plus the double-buffered order slices returned to C.
 ///
@@ -303,6 +321,17 @@ pub(crate) struct PoolEnable {
 /// serves exactly one pool-enabled session per process).
 pub(crate) fn enable(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
     debug_assert!(config.ram_experts_gib > 0, "enable() with pool disabled");
+    // Refuse BEFORE allocating anything: a pool enabled while any session is
+    // live would silently re-route that session's subsequent decodes through
+    // the new hooks (process-global, never unregistered).
+    if LIVE_SESSIONS.load(Ordering::SeqCst) > 0 {
+        return Err(EngineError::PoolInit(
+            "a session already exists in this process; enabling the expert pool \
+             now would re-route its decodes through the new hooks — enable the \
+             pool at construction of the FIRST session"
+                .into(),
+        ));
+    }
     if ENABLING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()

@@ -437,6 +437,14 @@ pub struct Session {
     p3: Option<p3_glue::PoolEnable>,
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Pairs with session_opened in `new`; keeps the p3_glue live-session
+        // guard exact (enable refuses only while a session is actually live).
+        p3_glue::session_closed();
+    }
+}
+
 impl Session {
     /// Loads per `config`, resolves the chat template (model-embedded, else
     /// [`FALLBACK_CHAT_TEMPLATE`]), and validates it with a 1-message probe apply:
@@ -484,12 +492,15 @@ impl Session {
             None
         };
 
-        Ok(Session {
-            loaded,
-            config: config.clone(),
-            template,
-            last_prompt_tokens: Vec::new(),
-            p3,
+        Ok({
+            p3_glue::session_opened();
+            Session {
+                loaded,
+                config: config.clone(),
+                template,
+                last_prompt_tokens: Vec::new(),
+                p3,
+            }
         })
     }
 
@@ -1159,6 +1170,39 @@ mod tests {
         // n_expert 8 and its K clamps to 8, so even a full-batch chunk of
         // 8 tokens at top-k ≤ 8 routes at most 8 ≤ K experts per layer.
         assert_eq!(prefill_chunk_cap(8, 4096, Some((8, 8))), 1);
+    }
+
+    /// H-10 off-then-on guard: `enable` must refuse while ANY session is
+    /// live, and must succeed once the last one dropped (counter back to 0).
+    /// CPU-testable: a pool-off tiny-moe session loads without hooks, and a
+    /// pooled enable with an explicit K works on CPU (see
+    /// `multi_chunk_prefill_advances_the_policy_step_zero_times`). Success
+    /// after drop registers the hooks for the process lifetime — nextest runs
+    /// each test in its own process, so no other test observes that state.
+    #[test]
+    fn enable_refused_while_any_session_is_live_and_allowed_once_all_dropped() {
+        let model = xtask::tiny_moe::cached_fixture();
+        let pooled = EngineConfig {
+            model_path: model,
+            ram_experts_gib: 1,
+            device_cache_experts: 8, // tiny-moe: K=8 ≥ top_k=2
+            ..EngineConfig::default()
+        };
+        let plain = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let s = Session::new(&plain).expect("pool-off session loads");
+        let err = match p3_glue::enable(&pooled) {
+            Err(e) => e,
+            Ok(_) => panic!("enable must refuse while a session is live"),
+        };
+        assert!(
+            err.to_string().contains("session already exists"),
+            "refusal must name the live-session guard: {err}"
+        );
+        drop(s);
+        p3_glue::enable(&pooled).expect("enable succeeds once no session is live");
     }
 
     /// §6.2: prefill chunks are excluded from policy-step scoring — a prefill
