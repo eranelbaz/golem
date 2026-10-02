@@ -31,12 +31,11 @@ fn chat(session: &mut Session, prompt: &str) -> String {
 
 #[test]
 fn p3_counters_move_and_output_is_deterministic() {
-    // Pool ON (1 GiB pool for tiny-moe's 3·8 planes of 2048 B):
     let mut cfg = common::offload::offload_config();
     cfg.ram_experts_gib = 1;
     // Pool ON (1 GiB pool for tiny-moe's 3·8 planes of 2048 B). A failed
     // precondition (RLIMIT_MEMLOCK below the pool) FAILS — an early return
-    // reads as a pass to the harness (AGENTS.md Evidence, H-7).
+    // reads as a pass to the harness (AGENTS.md Evidence).
     let mut on = Session::new(&cfg).expect("session with pooled offload");
     let _ = chat(&mut on, "Hello");
     {

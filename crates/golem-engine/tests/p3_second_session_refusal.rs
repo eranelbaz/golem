@@ -1,4 +1,4 @@
-//! H-10 regression: the second-session refusal must run BEFORE `load()` —
+//! The second-session refusal must run BEFORE `load()` —
 //! a different model's load decodes its self-check through the stale hook
 //! set (tensor table keyed by recycled host addresses, host bytes diverging
 //! from the old pool) and dies in `p3_fatal` instead of returning `Err`.

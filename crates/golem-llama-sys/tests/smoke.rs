@@ -110,7 +110,7 @@ fn assert_decode_sane(token: llama_token, logits: &[f32]) {
 /// Backend-specific smoke: each variant is `#[cfg]`-gated on the substrate
 /// the package was built against (`golem_backend_hip`, emitted by build.rs),
 /// so the harness never sees a mismatching variant as `ok` — under the wrong
-/// backend the test simply does not exist (B6/H-7: no env-less early-return
+/// backend the test simply does not exist (no env-less early-return
 /// skip-as-pass).
 #[cfg(not(golem_backend_hip))]
 #[test]

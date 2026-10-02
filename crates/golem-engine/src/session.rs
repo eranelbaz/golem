@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 use golem_llama_sys::raw;
 use golem_llama_sys::{Backend, substrate_backend};
@@ -450,6 +450,10 @@ impl Session {
     /// [`FALLBACK_CHAT_TEMPLATE`]), and validates it with a 1-message probe apply:
     /// apply failure → `TemplateApply(code)`; empty/unusable → `TemplateUnavailable`.
     pub fn new(config: &EngineConfig) -> Result<Self, EngineError> {
+        // Serializes construction so `p3_glue::enable`'s live-session check
+        // cannot race a concurrent pool-off `new` that has not yet counted.
+        static CONSTRUCT: Mutex<()> = Mutex::new(());
+        let _construct = CONSTRUCT.lock().unwrap_or_else(|e| e.into_inner());
         // The hooks are process-global and never unregistered (no safe
         // quiescence point), so they must be checked BEFORE `load`: the load's
         // decode self-check would otherwise decode through a stale hook set —
@@ -751,7 +755,7 @@ impl Session {
             }
             // SAFETY: same invariants as the prefill decode.
             debug_assert!(
-                1 <= n_ubatch,
+                batch.inner.n_tokens as usize <= n_ubatch,
                 "one decode step = one ubatch (lease-release contract, §2.4)"
             );
             let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
@@ -1172,7 +1176,7 @@ mod tests {
         assert_eq!(prefill_chunk_cap(8, 4096, Some((8, 8))), 1);
     }
 
-    /// H-10 off-then-on guard: `enable` must refuse while ANY session is
+    /// Off-then-on guard: `enable` must refuse while ANY session is
     /// live, and must succeed once the last one dropped (counter back to 0).
     /// CPU-testable: a pool-off tiny-moe session loads without hooks, and a
     /// pooled enable with an explicit K works on CPU (see

@@ -1,4 +1,4 @@
-//! B5 acceptance: the RAM expert pool (P3) must not change decode output —
+//! The RAM expert pool (P3) must not change decode output —
 //! the same greedy prompt through the CLI binary is byte-identical with the
 //! pool off (`--ram-experts-gib 0`) and on (`--ram-experts-gib 1`). The
 //! P2/P3 hooks are process-global, so the comparison needs a second PROCESS

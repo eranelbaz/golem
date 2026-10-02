@@ -167,9 +167,10 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
             // per layer; the engine caps the prefill chunk at K/top-k so
             // this only fires on a mispriced K.
             GGML_ABORT("golem P2 slab: routed set (%d) exceeds slots (K=%d) — "
-                       "a prefill chunk over K/top-k tokens (or top-k x chunk "
-                       "over K) cannot be staged; lower the prefill chunk or "
-                       "raise device_cache_experts (design sec 2.4 prefill)",
+                       "a decode batch routed more distinct experts than the "
+                       "slab holds; the engine caps prefill chunks at K/top-k, "
+                       "so a caller bypassed that cap or K was mispriced "
+                       "(design sec 2.4 prefill)",
                        (int) routed.size(), (int) K);
         }
         L.slot_of[id] = s;
