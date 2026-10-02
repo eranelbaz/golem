@@ -35,7 +35,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --success-output=immediate
+      # Pool-enabled CPU tests mlock a 1 GiB arena (no unlocked fallback,
+      # §5.4); the hosted runner's default RLIMIT_MEMLOCK is far below that.
+      # Raise it on this step's shell so nextest and its children inherit it.
+      - run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo nextest run --workspace --success-output=immediate
       # T6 loom leg (§12.2): unfiltered — every non-model test is
       # #[cfg(not(loom))]-gated, so the whole crate must pass under loom.
       # A filter here hid 8 broken tests once; don't reintroduce one.
