@@ -11,6 +11,12 @@ publish = false
 name = "golem"
 path = "src/main.rs"
 
+[features]
+# Gates the HIP-only integration test (pooled_parity.rs): the split-
+# scheduler expert-copy path only runs where a GPU backend exists — same
+# gate as golem-engine's `hip-tests`.
+hip-tests = []
+
 [dependencies]
 clap = { workspace = true }
 golem-engine = { path = "../golem-engine" }

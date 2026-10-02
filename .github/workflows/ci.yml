@@ -86,3 +86,6 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run -p golem-engine --features hip-tests -E 'test(p3_) or test(t3_) or test(policy_query_) or test(device_cache_)'
+      # B5: pooled-vs-unpooled CLI comparison — needs the built `golem`
+      # binary, so it lives in golem-cli (engine tests can't see CARGO_BIN_EXE).
+      - run: cargo nextest run -p golem-cli --features hip-tests
