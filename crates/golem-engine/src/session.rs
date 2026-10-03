@@ -131,8 +131,22 @@ impl LoadedModel {
 
 /// Loads the model at `config.model_path`, creates a context with `config`-derived
 /// params, and runs the decode self-check probe before handing the handle back.
+///
+/// Refused once the process-global expert hooks are registered: the hooks are
+/// never unregistered, so the self-check decode (and any later decode) of
+/// another model would run through the first model's pool, keyed by recycled
+/// host tensor addresses. One hook-owning model per process; a second model
+/// needs a second process.
 pub fn load(config: &EngineConfig) -> Result<LoadedModel, EngineError> {
-    init_backend();
+    if p3_glue::hooks_registered() {
+        return Err(EngineError::PoolInit(
+            "a pool-enabled session owns this process's expert hooks; \
+             another model in the same process would be served the old \
+             model's bytes — use a second process"
+                .into(),
+        ));
+    }
+    init_backend(forces_expert_offload(config));
 
     // Fail fast, fail loud: refuse-to-start on a §4.3 violation before weights touch memory.
     let metadata = gguf::read_metadata(&config.model_path)?;
@@ -167,8 +181,11 @@ pub fn load(config: &EngineConfig) -> Result<LoadedModel, EngineError> {
         // everything else). The pool pages them from the GGUF itself, so
         // mark them TENSOR_READ_LAZY in the arch (glm5next.cpp) and turn the
         // loader's on-demand mode on: non-expert weights (≈8.4 GiB) load
-        // normally, expert ranges are mapped without populate.
-        params.lazy_mode = raw::llama_lazy_mode::LLAMA_LAZY_MODE_ON;
+        // normally, expert ranges are mapped without populate. Pool-off loads
+        // keep the loader default: nothing would page the lazy experts in.
+        if config.ram_experts_gib > 0 {
+            params.lazy_mode = raw::llama_lazy_mode::LLAMA_LAZY_MODE_ON;
+        }
         if !moe_overrides.is_empty() {
             params.tensor_buft_overrides = moe_overrides.as_ptr();
         }
@@ -256,17 +273,29 @@ fn moe_buft_overrides(
     (patterns, overrides)
 }
 
-/// `llama_backend_init` exactly once per process, however many models get loaded.
-fn init_backend() {
+/// Whether this config puts expert weights on the host (pool on, or experts
+/// pinned to CPU buffers) while the engine is expected to run their
+/// `MUL_MAT_ID` on the GPU (design §3.4, I2). Flagless runs keep upstream's
+/// op-offload threshold untouched.
+fn forces_expert_offload(config: &EngineConfig) -> bool {
+    config.ram_experts_gib > 0 || config.cpu_moe_layers.is_some_and(|n| n > 0)
+}
+
+/// `llama_backend_init` exactly once per process, however many models get
+/// loaded. The first load decides the op-offload threshold: it is read once at
+/// device init, so a later session cannot change it (a pooled session after a
+/// flagless one is caught at runtime by `check_pool_engaged`).
+fn init_backend(force_expert_offload: bool) {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // Engine invariant (design §3.4, I2): every expert MUL_MAT_ID
-        // runs on the GPU, never silently on the CPU. Upstream keeps ops on
-        // host-resident weights on the CPU below batch 32, and MUL_MAT_ID's
-        // batch is ne[2] = tokens (1 during decode), so force the threshold
-        // to 1. Read at device init — must precede llama_backend_init.
-        // SAFETY: FFI call into the vendored substrate; no invariants to uphold.
-        unsafe { raw::golem_set_expert_offload_min_batch(1) };
+        if force_expert_offload {
+            // Upstream keeps ops on host-resident weights on the CPU below
+            // batch 32, and MUL_MAT_ID's batch is ne[2] = tokens (1 during
+            // decode), so force the threshold to 1. Must precede
+            // llama_backend_init (read at device init).
+            // SAFETY: FFI call into the vendored substrate; no invariants to uphold.
+            unsafe { raw::golem_set_expert_offload_min_batch(1) };
+        }
         // SAFETY: global one-time llama.cpp backend initialization; no invariants to uphold.
         unsafe { raw::llama_backend_init() };
     });
@@ -307,7 +336,6 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
         return Err(EngineError::Decode(code));
     }
-    p3_glue::advance_decode_step();
     // The lease-release contract: llama_decode is async w.r.t. the GPU —
     // synchronize before returning so the expert-copy leases released at the
     // next compute can never outlive an in-flight DMA. Sampling reads logits
@@ -353,7 +381,6 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             return Err(EngineError::Decode(code));
         }
-        p3_glue::advance_decode_step();
         // synchronize before the logits getter and the next compute's lease
         // release (the first decode of decode_self_check establishes this).
         // SAFETY: ctx is live.
@@ -435,6 +462,9 @@ pub struct Session {
     /// this is only the stats/geometry view, so no drop-order coupling with
     /// the substrate.
     p3: Option<p3_glue::PoolEnable>,
+    /// Set once the first pooled offloaded decode has been checked for pool
+    /// traffic (see [`check_pool_engaged`]).
+    pool_verified: bool,
 }
 
 impl Drop for Session {
@@ -454,20 +484,12 @@ impl Session {
         // cannot race a concurrent pool-off `new` that has not yet counted.
         static CONSTRUCT: Mutex<()> = Mutex::new(());
         let _construct = CONSTRUCT.lock().unwrap_or_else(|e| e.into_inner());
-        // The hooks are process-global and never unregistered (no safe
-        // quiescence point), so they must be checked BEFORE `load`: the load's
-        // decode self-check would otherwise decode through a stale hook set —
-        // a second model's tensors keyed by recycled host addresses are served
-        // the OLD model's pooled bytes (p3_fatal abort instead of `Err`).
-        // Covers both pool-off and pool-on second sessions; one pool owner per
-        // process, a second model needs a second process (design §9.3 as built).
-        if p3_glue::hooks_registered() {
-            return Err(EngineError::PoolInit(
-                "a pool-enabled session owns this process's expert hooks; \
-                 another model in the same process would be served the old \
-                 model's bytes — use a second process"
-                    .into(),
-            ));
+        // Both refusals precede `load` so they cost no model load: a pool
+        // enabled under a live session would re-route its decodes, and `load`
+        // itself refuses a second model once the (never-unregistered) hooks
+        // exist.
+        if config.ram_experts_gib > 0 {
+            p3_glue::refuse_if_session_live()?;
         }
         let loaded = load(config)?;
         let template_src = loaded
@@ -504,6 +526,7 @@ impl Session {
                 template,
                 last_prompt_tokens: Vec::new(),
                 p3,
+                pool_verified: false,
             }
         })
     }
@@ -618,7 +641,7 @@ impl Session {
 
         let vocab = self.loaded.model().vocab();
         // add_special = true: the fallback chatml renders no BOS text, so this
-        // yields exactly one BOS (templates embedding BOS are an M2.x concern).
+        // yields exactly one BOS.
         // SAFETY: vocab is live; rendered is valid for its byte length.
         let prompt = unsafe { tokenize_prompt(vocab, &rendered, true, true)? };
         if prompt.is_empty() {
@@ -642,9 +665,12 @@ impl Session {
         let mut batch = Batch::init(chunk_cap as i32, 0, 1);
         // One llama_decode must carry exactly one ubatch (the C lease-release
         // contract, §2.4): n_ubatch is a load-time constant (§4.2), fetched once.
+        // SAFETY: ctx is a live context.
         let n_ubatch = unsafe { raw::llama_n_ubatch(ctx.as_ptr()) } as usize;
         let mut n_past: usize = 0;
         let mut last_chunk_len = 0;
+        // §6.2: prefill routes nearly every expert; keep it out of recency.
+        let prefill = p3_glue::PrefillScope::enter();
         for chunk in prompt.chunks(chunk_cap) {
             let len = chunk.len();
             let is_final_chunk = n_past + len == prompt_len;
@@ -669,11 +695,11 @@ impl Session {
                 }
                 b.n_tokens = len as i32;
             }
-            // SAFETY: ctx is a live context; batch slots 0..n_tokens fully written.
             debug_assert!(
                 len <= n_ubatch,
                 "prefill chunk must be exactly one ubatch (lease-release contract, §2.4)"
             );
+            // SAFETY: ctx is a live context; batch slots 0..n_tokens fully written.
             let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
             if code != 0 {
                 // 1 = no KV slot left (ctx too small for the prompt); the rest fatal alike.
@@ -692,6 +718,14 @@ impl Session {
             n_past += len;
             last_chunk_len = len;
         }
+        drop(prefill);
+
+        if !self.pool_verified && self.offloaded() && substrate_backend() == Backend::Hip {
+            if let Some(p3) = &self.p3 {
+                check_pool_engaged(&p3.stats)?;
+                self.pool_verified = true;
+            }
+        }
 
         if self.config.n_predict == 0 {
             return Ok(0);
@@ -699,6 +733,7 @@ impl Session {
 
         // Parity recording needs the logits row length, which is the vocab size
         // (validated non-negative by the load-time decode self-check probe).
+        // SAFETY: vocab is live.
         let n_vocab = usize::try_from(unsafe { raw::llama_vocab_n_tokens(vocab) })
             .map_err(|_| EngineError::InvalidModel("vocab size is negative".to_owned()))?;
 
@@ -753,11 +788,11 @@ impl Session {
                 unsafe { fill_slot(b, 0, tok, n_past as raw::llama_pos, true) };
                 b.n_tokens = 1;
             }
-            // SAFETY: same invariants as the prefill decode.
             debug_assert!(
                 batch.inner.n_tokens as usize <= n_ubatch,
                 "one decode step = one ubatch (lease-release contract, §2.4)"
             );
+            // SAFETY: same invariants as the prefill decode.
             let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
             if code != 0 {
                 // Synchronize first: see the prefill decode's error path.
@@ -1035,6 +1070,25 @@ unsafe fn token_piece(vocab: *const raw::llama_vocab, token: raw::llama_token) -
     buf
 }
 
+/// Runtime proof of design I2 for a pooled offloaded run: after the first
+/// prefill, the pool must have served expert copies (`ensure_host_resident`
+/// fires only from the GPU split's expert-copy path). Zero traffic means the
+/// expert `MUL_MAT_ID` ran somewhere else — silently on the CPU, or the
+/// experts never left the device — and decoding on would be a silent
+/// violation.
+fn check_pool_engaged(stats: &P3Stats) -> Result<(), EngineError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if stats.demand_slow_pageins.load(Relaxed) + stats.fast_hits.load(Relaxed) == 0 {
+        return Err(EngineError::PoolInit(
+            "the expert pool served no copies during the first pooled prefill: expert \
+             MUL_MAT_ID is not running through the GPU split (CPU fallback, or experts \
+             already device-resident); refusing to decode silently off-pool"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// P4 device expert-copy cache counters (§3.4), read when the RAM expert pool
 /// is enabled and the config requests GPU offload (the split scheduler is the
 /// only P2 call-site).
@@ -1090,6 +1144,7 @@ fn prefill_chunk_cap(batch_tokens: usize, n_ctx: usize, pool: Option<(u32, u32)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn skip_ratio_math() {
@@ -1102,6 +1157,39 @@ mod tests {
         assert_eq!(stats.bytes_skipped, 3);
         assert_eq!(stats.evictions, 7);
         assert_eq!(stats.skip_ratio, 0.75);
+    }
+
+    #[test]
+    fn pool_engaged_check_rejects_zero_traffic_and_accepts_any() {
+        let stats = P3Stats::new();
+        let err = check_pool_engaged(&stats).unwrap_err();
+        assert!(matches!(err, EngineError::PoolInit(_)), "{err}");
+        stats.fast_hits.store(1, Ordering::Relaxed);
+        check_pool_engaged(&stats).unwrap();
+        let stats = P3Stats::new();
+        stats.demand_slow_pageins.store(1, Ordering::Relaxed);
+        check_pool_engaged(&stats).unwrap();
+    }
+
+    #[test]
+    fn expert_offload_is_forced_only_for_pool_or_cpu_moe_runs() {
+        let flagless = EngineConfig::default();
+        assert!(!forces_expert_offload(&flagless));
+        let cpu_moe_zero = EngineConfig {
+            cpu_moe_layers: Some(0),
+            ..EngineConfig::default()
+        };
+        assert!(!forces_expert_offload(&cpu_moe_zero));
+        let cpu_moe = EngineConfig {
+            cpu_moe_layers: Some(2),
+            ..EngineConfig::default()
+        };
+        assert!(forces_expert_offload(&cpu_moe));
+        let pooled = EngineConfig {
+            ram_experts_gib: 1,
+            ..EngineConfig::default()
+        };
+        assert!(forces_expert_offload(&pooled));
     }
 
     #[test]
@@ -1209,10 +1297,60 @@ mod tests {
         p3_glue::enable(&pooled).expect("enable succeeds once no session is live");
     }
 
+    /// Pool-on construction must be refused while another session is live
+    /// BEFORE any model load: the model path here does not exist, so a load
+    /// attempt would surface a GGUF error instead of the live-session refusal.
+    #[test]
+    fn pooled_new_is_refused_before_load_while_a_session_is_live() {
+        let plain = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let _live = Session::new(&plain).expect("pool-off session loads");
+        let pooled_missing_model = EngineConfig {
+            model_path: "/nonexistent/never-loaded.gguf".into(),
+            ram_experts_gib: 1,
+            device_cache_experts: 8,
+            ..EngineConfig::default()
+        };
+        let err = match Session::new(&pooled_missing_model) {
+            Err(e) => e,
+            Ok(_) => panic!("pool-on while a session is live must be refused"),
+        };
+        assert!(
+            matches!(&err, EngineError::PoolInit(m) if m.contains("session already exists")),
+            "must be the live-session refusal, not a load error: {err}"
+        );
+    }
+
+    /// `load` is public: once the process-global hooks are registered it must
+    /// refuse a further model itself, not rely on `Session::new`.
+    #[test]
+    fn load_is_refused_once_the_expert_hooks_are_registered() {
+        let pooled = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ram_experts_gib: 1,
+            device_cache_experts: 8,
+            ..EngineConfig::default()
+        };
+        p3_glue::enable(&pooled).expect("enable registers the hooks");
+        let plain = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let err = match load(&plain) {
+            Err(e) => e,
+            Ok(_) => panic!("load must refuse while the hooks are registered"),
+        };
+        assert!(
+            matches!(&err, EngineError::PoolInit(m) if m.contains("expert hooks")),
+            "{err}"
+        );
+    }
+
     /// §6.2: prefill chunks are excluded from policy-step scoring — a prefill
     /// ubatch routes nearly every expert and would flatten the scores. A
-    /// multi-chunk prefill must leave the step counter untouched; before this
-    /// was fixed, each chunk advanced it once. `n_predict = 0` makes the turn
+    /// multi-chunk prefill must leave the step counter untouched. `n_predict = 0` makes the turn
     /// prefill-only, isolating the prefill path from generation decodes.
     /// Pool-enabled, so the chunk cap comes from the real pooled geometry
     /// (CPU needs the explicit `device_cache_experts`; no VRAM query to

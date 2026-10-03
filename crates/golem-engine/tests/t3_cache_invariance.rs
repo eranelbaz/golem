@@ -22,30 +22,27 @@
 //! through the same FFI.
 //!
 //! Four states, each measured with `chat_turn_parity` (same decode path as
-//! `chat_turn`, records per-step token IDs):
+//! `chat_turn`, records per-step token IDs). The budget is a per-layer expert
+//! COUNT (`golem_set_device_cache_experts`); K = 2 is the smallest budget that
+//! holds one routed set (tiny-moe top-k = 2):
 //! - (b) cold start — runs FIRST: `Session::new`'s decode self-check warms
 //!   the cache, so `golem_reset_device_cache()` is called after session
 //!   build; the measured turn must copy on first touch and then reuse its
 //!   own copies (a state that only skips would be warm, a state that only
-//!   copies never engaged the cache).
-//! - (a) fully pre-promoted — unlimited budget, 4 warmup turns cache every
-//!   routed expert; the measured turn's delta skip_ratio must exceed 0.5.
-//! - (c) randomized eviction stress - budget = 1 expert's bytes (the tightest
-//!   non-degenerate budget; a 3-expert budget never evicts, since the routing
-//!   envelope is 3 and the soft cap is strict `>`) with the
-//!   test-only per-call order shuffle (`GOLEM_TEST_SHUFFLE_ORDER=1`, read
-//!   ONCE at setup; this file is its only setter); the measured turn must
-//!   evict.
-//! - (d) low budget — 1 expert's stride per tensor, the smallest
-//!   non-degenerate budget.
+//!   copies never engaged the cache). K = 8 = n_expert, identity order.
+//! - (a) fully pre-promoted — K = 8, 4 warmup turns cache every routed
+//!   expert; the measured turn's delta skip_ratio must exceed 0.5.
+//! - (c) low budget, K = 2, reset cold, per-call SHUFFLED policy order (any
+//!   permutation is legal, invariant 4).
+//! - (d) low budget, K = 2, reset cold, identity order.
+//!
+//! Evictions are not asserted: the synthetic router routes the same pair for
+//! every input, so no non-routed expert ever occupies a slot. The eviction
+//! walk is covered by the vendored ctest (tests/golem-p2-cache.cpp).
 //!
 //! The budget static is process-global: safe under nextest's per-test
 //! process isolation; a plain `cargo test` run would cross-contaminate —
-//! do not use it for this file. The stride is the tiny-moe expert-plane
-//! stride (`n_embd * n_ff_exp * sizeof(f32)` — the value
-//! `golem_tensor_expert_stride_bytes` reports for every F32 `ffn_*_exps`
-//! plane of this fixture: gate/up are `[n_embd, n_ff_exp, n_expert]`, down
-//! is `[n_ff_exp, n_embd, n_expert]`).
+//! do not use it for this file.
 #![cfg(feature = "hip-tests")]
 #![allow(unsafe_code)]
 mod common;
@@ -55,15 +52,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use golem_engine::config::EngineConfig;
 use golem_engine::parity::ParityStep;
 use golem_engine::session::{ChatTurn, Session};
-use xtask::tiny_moe::dims::{N_EMBD, N_FF_EXP};
 
 const PROMPT: &str = "T3 cache-invariance probe";
 const N_PREDICT: u32 = 32;
 const WARMUP_TURNS: usize = 4;
-
-fn expert_stride_bytes() -> u64 {
-    u64::from(N_EMBD) * u64::from(N_FF_EXP) * std::mem::size_of::<f32>() as u64
-}
 
 /// Offloaded pool-off config: every expert plane on host, attention on GPU —
 /// the split-scheduler expert-copy path engages (see `common::offload`).
@@ -100,17 +92,12 @@ fn raw_counters() -> [u64; 3] {
 struct Snapshot {
     copied: u64,
     skipped: u64,
-    evictions: u64,
 }
 
 impl Snapshot {
     fn now() -> Self {
-        let [copied, skipped, evictions] = raw_counters();
-        Self {
-            copied,
-            skipped,
-            evictions,
-        }
+        let [copied, skipped, _evictions] = raw_counters();
+        Self { copied, skipped }
     }
 
     fn copied_delta(&self, after: &Self) -> u64 {
@@ -119,10 +106,6 @@ impl Snapshot {
 
     fn skipped_delta(&self, after: &Self) -> u64 {
         after.skipped - self.skipped
-    }
-
-    fn evictions_delta(&self, after: &Self) -> u64 {
-        after.evictions - self.evictions
     }
 
     /// Delta skip ratio: skipped bytes / (skipped + copied) over the span.
@@ -138,16 +121,21 @@ impl Snapshot {
     }
 }
 
+/// Whether the registered `policy_query` hook returns a shuffled order.
+static SHUFFLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_shuffle(on: bool) {
+    SHUFFLE.store(on, Ordering::Relaxed);
+}
+
 /// Registers this test's P2 hooks: identity/shuffled policy order (any
-/// permutation is legal — invariant 4) and pass-through pager seams.
-/// Process-lifetime registration is fine: nextest isolates per-test
-/// processes, so these hooks only ever see this test's decode.
-fn register_p2_hooks(shuffle: bool) {
+/// permutation is legal — invariant 4; see [`set_shuffle`]) and pass-through
+/// pager seams. Process-lifetime registration is fine: nextest isolates
+/// per-test processes, so these hooks only ever see this test's decode.
+fn register_p2_hooks() {
     use std::sync::atomic::AtomicUsize;
 
-    static SHUFFLE: AtomicUsize = AtomicUsize::new(0);
     static CALL: AtomicUsize = AtomicUsize::new(0);
-    SHUFFLE.store(shuffle as usize, Ordering::Relaxed);
 
     extern "C" fn on_ensure(
         _ctx: *mut libc::c_void,
@@ -180,7 +168,7 @@ fn register_p2_hooks(shuffle: bool) {
     ) -> *const i32 {
         let n = n as usize;
         let mut order: Vec<i32> = (0..n as i32).collect();
-        if SHUFFLE.load(Ordering::Relaxed) == 1 {
+        if SHUFFLE.load(Ordering::Relaxed) {
             // rand-free LCG over the call counter: a fresh permutation per
             // query, so the C eviction walk hits varying victims.
             let mut lcg = (CALL.fetch_add(1, Ordering::Relaxed) as u64)
@@ -257,14 +245,11 @@ fn t3_four_cache_states_decode_identically() {
         .with_env_filter(tracing_subscriber::EnvFilter::try_new("info").unwrap())
         .try_init();
 
-    // The shuffle knob is read ONCE, here, before any decode (same
-    // read-once discipline as the engine policy state; this file is the
-    // knob's only setter). It only permutes the expert order C receives;
-    // any permutation is legal (invariant 4), so it must not change decode
-    // output — that is exactly what states (a)-(d) then prove end to end.
-    // SAFETY: single-threaded test setup, before any thread is spawned.
-    unsafe { std::env::set_var("GOLEM_TEST_SHUFFLE_ORDER", "1") };
-    register_p2_hooks(true);
+    register_p2_hooks();
+
+    // The pooled path aborts on an unset (K = 0) budget, and the session's
+    // load-time self-check already decodes through the hooks above.
+    set_budget(8);
 
     // Pool is off ⇒ no mlock failure path (that guard lives in the pooled tests).
     let mut session = Session::new(&config()).unwrap();
@@ -315,20 +300,15 @@ fn t3_four_cache_states_decode_identically() {
         warm0.skipped_delta(&warm1)
     );
 
-    // --- (c) 1-slot-pair budget (K = routed pair), shuffled order.
-    // The eviction walk itself is covered deterministically by the vendored
-    // ctest (tests/golem-p2-cache.cpp: soft-cap evictions, routed-expert
-    // protection). It cannot be fired from real decode on tiny-moe: the
-    // synthetic router routes the same pair for every input, so the valid
-    // set never contains a non-routed expert. What must hold here — and what
-    // only the full scheduler can prove — is that eviction-time state does
-    // not perturb decode (I1).
+    // --- (c) low budget (K = routed pair), shuffled policy order. Any
+    // permutation is legal (invariant 4), so it must not change decode output.
     set_budget(2);
-    reset_cache(); // the stress must start cold
+    set_shuffle(true);
+    reset_cache(); // must start cold
     let tokens_stress = greedy_tokens(&mut session);
 
-    // --- (d) low budget: K = routed pair.
-    set_budget(2);
+    // --- (d) low budget, identity order.
+    set_shuffle(false);
     reset_cache();
     let tokens_low = greedy_tokens(&mut session);
 
@@ -345,12 +325,12 @@ fn t3_four_cache_states_decode_identically() {
     );
     assert_eq!(
         tokens_cold, tokens_stress,
-        "state (b) cold vs state (c) eviction stress diverged — eviction \
-         or the padding rule corrupts decode"
+        "state (b) cold vs state (c) shuffled low budget diverged — the policy \
+         order or the padding rule corrupts decode"
     );
     assert_eq!(
         tokens_cold, tokens_low,
-        "state (b) cold vs state (d) low budget diverged — a one-expert \
+        "state (b) cold vs state (d) low budget diverged — a K = 2 \
          budget corrupts decode"
     );
 }

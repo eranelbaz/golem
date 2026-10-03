@@ -46,15 +46,32 @@ fn second_session_with_a_different_model_returns_err_before_load() {
     let _owner = Session::new(&cfg)
         .expect("pooled session must load (RLIMIT_MEMLOCK must allow the 1 GiB pool)");
 
-    // A DIFFERENT fixture: refused with Err(PoolInit) before `load` runs —
-    // under the old after-load check this decoded through the stale hooks and
-    // aborted the process (p3_fatal) instead of returning.
+    // A DIFFERENT fixture, pool ON: refused with Err(PoolInit) before the
+    // model loads (a live session already exists).
     let other = EngineConfig {
         model_path: second_fixture(),
         ram_experts_gib: 1,
         ..EngineConfig::default()
     };
     match Session::new(&other) {
+        Err(EngineError::PoolInit(msg)) => {
+            assert!(
+                msg.contains("session already exists"),
+                "refusal must name the live session: {msg}"
+            );
+        }
+        Err(e) => panic!("second session must be refused as PoolInit, got: {e}"),
+        Ok(_) => panic!("second session in a hook-owning process must be refused"),
+    }
+
+    // Pool OFF with a different model: `load` itself refuses once the hooks
+    // are registered — a load would decode through the stale hooks and abort
+    // the process (p3_fatal) instead of returning.
+    let other_off = EngineConfig {
+        model_path: second_fixture(),
+        ..EngineConfig::default()
+    };
+    match Session::new(&other_off) {
         Err(EngineError::PoolInit(msg)) => {
             assert!(
                 msg.contains("expert hooks"),

@@ -1,4 +1,4 @@
-//! Parity dump support (M1.4 T2 harness leg): the per-generation-step record
+//! Parity dump support (T2 harness leg): the per-generation-step record
 //! type and the top-2 logits fetch backing `Session::chat_turn_parity`.
 //! Raw llama.cpp FFI, mirroring session.rs's unsafe-allowed module style.
 #![allow(unsafe_code)]

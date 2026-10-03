@@ -1,4 +1,4 @@
-//! Load-time GGUF sanity checks (tech design §4.3, M1.3 subset).
+//! Load-time GGUF sanity checks (tech design §4.3 subset).
 
 use std::collections::BTreeMap;
 
@@ -127,13 +127,6 @@ fn check_coverage(metadata: &GgufMetadata, experts: &Experts) -> Result<(), Engi
     let observed: Vec<u32> = experts.keys().copied().collect();
     let nextn = nextn_layers(metadata)?;
     let block_count = block_count(metadata)?;
-    if let (Some(bc), Some(nextn)) = (block_count, nextn) {
-        if nextn > bc {
-            return Err(EngineError::UnsupportedModel(format!(
-                "nextn_predict_layers {nextn} > block_count {bc}"
-            )));
-        }
-    }
     let last_live = block_count.map(|bc| bc.saturating_sub(nextn.unwrap_or(0)));
     match last_live {
         Some(count) => {
@@ -218,7 +211,7 @@ fn check_cross_layer_uniformity(experts: &Experts) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Runs the M1.3 subset of the tech-design §4.3 sanity checks against parsed
+/// Runs the subset of the tech-design §4.3 sanity checks against parsed
 /// GGUF metadata: expert-tensor coverage, per-layer expert count, and
 /// cross-layer shape/dtype uniformity. Violations are
 /// [`EngineError::UnsupportedModel`] with the offending names and shapes.
@@ -226,7 +219,7 @@ pub fn check(metadata: &GgufMetadata) -> Result<(), EngineError> {
     // The MTP/NextN block is skipped at load and carries its own expert set;
     // it never counts toward the expected live run.
     let nextn = nextn_layers(metadata)?.unwrap_or(0);
-    let mtp_from = (nextn > 0)
+    let bounds = (nextn > 0)
         .then(|| {
             let bc = block_count(metadata)?.ok_or_else(|| {
                 EngineError::UnsupportedModel(
@@ -238,13 +231,24 @@ pub fn check(metadata: &GgufMetadata) -> Result<(), EngineError> {
                     "nextn_predict_layers {nextn} > block_count {bc}"
                 )));
             }
-            Ok((bc - nextn) as u32)
+            let to_u32 = |v: u64| {
+                u32::try_from(v).map_err(|_| {
+                    EngineError::UnsupportedModel(format!("block_count {bc} exceeds u32::MAX"))
+                })
+            };
+            Ok((to_u32(bc - nextn)?, to_u32(bc)?))
         })
         .transpose()?;
     let mut experts: Experts = BTreeMap::new();
     for tensor in &metadata.tensors {
         if let Some((layer, suffix)) = parse_expert_name(&tensor.name) {
-            if let Some(mtp_from) = mtp_from {
+            if let Some((mtp_from, bc)) = bounds {
+                if layer >= bc {
+                    return Err(EngineError::UnsupportedModel(format!(
+                        "{} is beyond block_count {bc}",
+                        tensor.name
+                    )));
+                }
                 if layer >= mtp_from {
                     continue;
                 }
@@ -348,9 +352,15 @@ mod tests {
 
     #[test]
     fn mtp_block_is_excluded_from_expected_run() {
-        // Real-model shape: blk.45 (NextN/MTP) carries experts but is skipped
-        // at load, so the live run ends at block_count − nextn.
+        // Real-model shape: the last block (NextN/MTP) is counted in
+        // block_count, carries experts, but is skipped at load, so the live
+        // run ends at block_count − nextn.
         let mut m = valid_meta();
+        m.kvs
+            .iter_mut()
+            .find(|(k, _)| k == "glm4moe.block_count")
+            .unwrap()
+            .1 = GgufValue::U32(3);
         m.kvs.push((
             "glm4moe.nextn_predict_layers".to_string(),
             GgufValue::U32(1),
@@ -372,8 +382,14 @@ mod tests {
             check(&m).is_ok(),
             "blk.2 = block_count − 1 is MTP: allowed to carry experts"
         );
-        // Same shape WITHOUT nextn KV: run must end at the last block.
+        // Same tensors WITHOUT nextn KV and a block_count that excludes
+        // blk.2: the run must end at the last block.
         m.kvs.pop();
+        m.kvs
+            .iter_mut()
+            .find(|(k, _)| k == "glm4moe.block_count")
+            .unwrap()
+            .1 = GgufValue::U32(2);
         let err = check(&m);
         assert!(
             err.is_err(),
@@ -382,6 +398,43 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k.ends_with("nextn_predict_layers"))
         );
+    }
+
+    #[test]
+    fn expert_layer_beyond_block_count_is_rejected_when_nextn_is_set() {
+        // block_count 2 → blocks 0..=1; an expert tensor at blk.5 is beyond
+        // it even though nextn would otherwise swallow it as "MTP".
+        let mut m = valid_meta();
+        m.kvs.push((
+            "glm4moe.nextn_predict_layers".to_string(),
+            GgufValue::U32(1),
+        ));
+        let t = expert_tensor(5, "gate", 8, 16, 32);
+        m.tensors.push(crate::gguf::TensorMeta {
+            name: t.name,
+            n_dims: t.n_dims,
+            ne: t.ne,
+            ggml_type: t.ggml_type,
+            offset: 0,
+        });
+        let err = check(&m).unwrap_err();
+        assert!(err.to_string().contains("beyond block_count"), "{err}");
+    }
+
+    #[test]
+    fn block_count_beyond_u32_is_rejected_not_truncated() {
+        let mut m = valid_meta();
+        m.kvs
+            .iter_mut()
+            .find(|(k, _)| k == "glm4moe.block_count")
+            .unwrap()
+            .1 = GgufValue::U64(u64::from(u32::MAX) + 3);
+        m.kvs.push((
+            "glm4moe.nextn_predict_layers".to_string(),
+            GgufValue::U32(1),
+        ));
+        let err = check(&m).unwrap_err();
+        assert!(err.to_string().contains("u32::MAX"), "{err}");
     }
 
     #[test]

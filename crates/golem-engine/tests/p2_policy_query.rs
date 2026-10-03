@@ -91,6 +91,10 @@ fn policy_query_is_consulted_with_valid_permutations() {
     // Pool OFF (engine registers nothing): these hooks stand in for the
     // engine's, isolating the C call-site seam. P2 engages because BOTH
     // policy_query and ensure_host_resident are non-null (call-site contract).
+    // The pooled path aborts on an unset (K = 0) budget, and the session's
+    // load-time self-check already decodes through these hooks.
+    // SAFETY: FFI setter, no invariants; K = n_expert of tiny-moe.
+    unsafe { golem_llama_sys::raw::golem_set_device_cache_experts(8) };
     let cfg = common::offload::offload_config();
     let mut session = Session::new(&cfg).unwrap();
     let out = chat(&mut session, "Hello");

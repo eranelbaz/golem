@@ -34,6 +34,13 @@ fn run_greedy(ram_experts_gib: &str) -> std::process::Output {
 
 #[test]
 fn pooled_and_unpooled_output_are_byte_identical() {
+    // On a CPU substrate the split-scheduler path never engages and the
+    // comparison would pass vacuously: fail loudly instead.
+    assert_eq!(
+        golem_llama_sys::substrate_backend(),
+        golem_llama_sys::Backend::Hip,
+        "hip-tests requires a HIP-built substrate (GOLEM_LLAMA_SYS_BACKEND=hip)"
+    );
     let off = run_greedy("0");
     let on = run_greedy("1");
     assert!(
