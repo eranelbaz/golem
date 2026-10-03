@@ -12,7 +12,7 @@ fn main() {
         Some("gen-shape-moe") => {
             let paths = shape_moe::cached_fixture();
             for p in paths {
-                println!("wrote {}", p.display());
+                println!("{}", p.display());
             }
         }
         Some("parity") => parity::run(args.collect()),

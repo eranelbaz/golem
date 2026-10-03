@@ -7,18 +7,18 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::Path;
 
-/// ggml tensor-type id — distinct namespace from the GGUF value-type tags in golem-gguf.
-pub const GGML_TYPE_F32: u32 = 0;
-// GGUF v3 value-type tags written by this generator.
-const GGUF_TYPE_U32: u32 = 4;
-const GGUF_TYPE_I32: u32 = 5;
-const GGUF_TYPE_F32: u32 = 6;
-const GGUF_TYPE_STR: u32 = 8;
-const GGUF_TYPE_ARR: u32 = 9;
+use golem_gguf::{
+    GGML_TYPE_F32, TYPE_ARRAY as GGUF_TYPE_ARR, TYPE_F32 as GGUF_TYPE_F32,
+    TYPE_I32 as GGUF_TYPE_I32, TYPE_STR as GGUF_TYPE_STR, TYPE_U16 as GGUF_TYPE_U16,
+    TYPE_U32 as GGUF_TYPE_U32,
+};
+
 const ALIGN: u64 = 32;
 
 pub enum GgufValue {
+    U16(u16),
     U32(u32),
+    I32(i32),
     F32(f32),
     Str(String),
     ArrI32(Vec<i32>),
@@ -29,7 +29,9 @@ pub enum GgufValue {
 impl GgufValue {
     fn tag(&self) -> u32 {
         match self {
+            GgufValue::U16(_) => GGUF_TYPE_U16,
             GgufValue::U32(_) => GGUF_TYPE_U32,
+            GgufValue::I32(_) => GGUF_TYPE_I32,
             GgufValue::F32(_) => GGUF_TYPE_F32,
             GgufValue::Str(_) => GGUF_TYPE_STR,
             GgufValue::ArrI32(_) | GgufValue::ArrF32(_) | GgufValue::ArrStr(_) => GGUF_TYPE_ARR,
@@ -57,7 +59,9 @@ fn put_kv(out: &mut Vec<u8>, kv: &GgufKv) {
     put_str(out, &kv.key);
     out.extend_from_slice(&kv.value.tag().to_le_bytes());
     match &kv.value {
+        GgufValue::U16(v) => out.extend_from_slice(&v.to_le_bytes()),
         GgufValue::U32(v) => out.extend_from_slice(&v.to_le_bytes()),
+        GgufValue::I32(v) => out.extend_from_slice(&v.to_le_bytes()),
         GgufValue::F32(v) => out.extend_from_slice(&v.to_le_bytes()),
         GgufValue::Str(s) => put_str(out, s),
         GgufValue::ArrI32(v) => {
@@ -175,20 +179,20 @@ pub fn read_arch(path: &Path) -> Result<String, String> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut r = BufReader::new(file);
 
-    let (_, _n_tensors, n_kv) = gg::read_header(&mut r).map_err(|e| e.0)?;
+    let (_, _n_tensors, n_kv) = gg::read_header(&mut r).map_err(|e| e.to_string())?;
 
     for _ in 0..n_kv {
-        let key = gg::read_string(&mut r).map_err(|e| e.0)?;
-        let tag = gg::read_u32(&mut r).map_err(|e| e.0)?;
+        let key = gg::read_string(&mut r).map_err(|e| e.to_string())?;
+        let tag = gg::read_u32(&mut r).map_err(|e| e.to_string())?;
         if key == ARCH_KEY {
             if tag != gg::TYPE_STR {
                 return Err(format!(
                     "{ARCH_KEY}: expected string value (type tag 8), got {tag}"
                 ));
             }
-            return gg::read_string(&mut r).map_err(|e| e.0);
+            return gg::read_string(&mut r).map_err(|e| e.to_string());
         }
-        gg::skip_value(&mut r, tag).map_err(|e| e.0)?;
+        gg::skip_value(&mut r, tag).map_err(|e| e.to_string())?;
     }
     Err(format!("missing {ARCH_KEY} KV"))
 }

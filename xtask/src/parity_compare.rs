@@ -283,7 +283,7 @@ pub struct T2Report {
     pub backends: Vec<String>,
     /// Max `|top1_a - top1_b|` over compared positions (pre-first-divergence
     /// per pair; cascade positions excluded). The GPU-kernel numerics bound
-    /// evidence for the M1 escalation (plan §OPEN Step B).
+    /// evidence for GPU-leg acceptance.
     pub max_logit_dev: f64,
     /// Optional GPU-kernel deviation bound (CLI `--gpu-dev-bound`).
     pub gpu_dev_bound: Option<f64>,
