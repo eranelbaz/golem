@@ -342,6 +342,9 @@ dependencies = [
 [[package]]
 name = "golem-gguf"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "golem-llama-sys"
@@ -359,6 +362,7 @@ dependencies = [
  "golem-gguf",
  "libc",
  "loom",
+ "thiserror",
  "tracing",
  "xtask",
 ]

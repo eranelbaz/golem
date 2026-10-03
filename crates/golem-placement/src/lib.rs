@@ -423,10 +423,10 @@ impl Policy {
                 .enumerate()
                 .min_by(|(_, a), (_, b)| a.score.total_cmp(&b.score).then(b.key.cmp(&a.key)))
                 .expect("cap > 0 with a full order is non-empty");
-            // A 0.0-score incumbent can only be displaced via the dwell
-            // tie-break (its margin comparison is vacuous at 0 ≥ 1.2·0);
-            // min-dwell on the seat bounds the churn.
-            if score >= SWAP_MARGIN * weakest.score && dwell_ok(weakest.key) {
+            // A never-accessed challenger (score 0) never swaps: 0 ≥ 1.2·0
+            // would otherwise churn zero-score seats. A 0.0-score incumbent
+            // yields to any positive challenger once its dwell expires.
+            if score > 0.0 && score >= SWAP_MARGIN * weakest.score && dwell_ok(weakest.key) {
                 in_order[weakest.key] = false;
                 in_order[k] = true;
                 vram_order[wi] = PolicyEntry { key: k, score };
@@ -465,7 +465,7 @@ impl Policy {
             if promoted[k] {
                 continue;
             }
-            // decision 5: min-dwell gates RAM eviction too
+            // min-dwell gates RAM eviction too
             if !dwell_ok(k) {
                 continue;
             }
@@ -879,6 +879,32 @@ mod tests {
         assert_eq!(order, [2, 3], "both challengers swap, best-first");
         let evict: Vec<_> = out.vram_evict_order.iter().map(|e| e.key).collect();
         assert_eq!(evict, [0, 1], "both incumbents displaced, worst-first");
+    }
+
+    #[test]
+    fn all_zero_scores_never_swap() {
+        // Cap 1 held by a 0.0-score resident, challenger also 0.0: 0 ≥ 1.2·0
+        // must not displace it even with the dwell long expired.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 1,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        p.apply_transition(1, Tier::Ram, true, 0);
+        let out = p.pass(1000);
+        assert_eq!(out.vram_order.len(), 1);
+        assert_eq!(out.vram_order[0].key, 0, "zero challenger must not swap");
     }
 
     #[test]

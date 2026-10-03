@@ -2,7 +2,7 @@
 //! type tags, bounded chunked reads, string decoding, and header prologue.
 //! Higher-level metadata parsing lives with each consumer.
 
-use std::fmt;
+use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 /// GGUF v3 value-type tags (ggml/include/gguf.h): 9 = array, 12 = f64.
@@ -39,20 +39,32 @@ pub const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 /// cannot drive a huge single allocation before the short read is detected.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// A GGUF parse failure, message-only.
-#[derive(Debug, Clone)]
-pub struct Error(pub String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+/// A GGUF parse failure.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Underlying I/O failure other than a short read.
+    #[error("GGUF I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The stream ended inside a header, KV, or tensor-table field.
+    #[error("truncated GGUF metadata")]
+    UnexpectedEof,
+    /// The first four bytes are not [`GGUF_MAGIC`].
+    #[error("bad magic {0:?} (expected \"GGUF\")")]
+    BadMagic(String),
+    /// Only GGUF version 3 is supported.
+    #[error("unsupported GGUF version {0} (expected 3)")]
+    Version(u32),
+    /// Structurally invalid content (bad tag, rank, alignment, UTF-8, ...).
+    #[error("{0}")]
+    Invalid(String),
 }
 
-impl std::error::Error for Error {}
-
 fn short_read(e: std::io::Error) -> Error {
-    Error(format!("truncated GGUF metadata: {e}"))
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        Error::UnexpectedEof
+    } else {
+        Error::Io(e)
+    }
 }
 
 /// Reads one little-endian byte.
@@ -114,7 +126,8 @@ pub fn discard(r: &mut impl Read, len: u64) -> Result<(), Error> {
 pub fn read_string(r: &mut impl Read) -> Result<String, Error> {
     let len = read_u64(r)?;
     let bytes = read_bytes(r, len)?;
-    String::from_utf8(bytes).map_err(|e| Error(format!("invalid UTF-8 in GGUF string: {e}")))
+    String::from_utf8(bytes)
+        .map_err(|e| Error::Invalid(format!("invalid UTF-8 in GGUF string: {e}")))
 }
 
 /// Consumes one KV value payload of type `tag` without materializing it.
@@ -133,7 +146,9 @@ pub fn skip_value(r: &mut impl Read, tag: u32) -> Result<(), Error> {
         TYPE_ARRAY => {
             let elem_tag = read_u32(r)?;
             if elem_tag == TYPE_ARRAY {
-                return Err(Error("nested GGUF arrays are not supported".into()));
+                return Err(Error::Invalid(
+                    "nested GGUF arrays are not supported".into(),
+                ));
             }
             let n = read_u64(r)?;
             for _ in 0..n {
@@ -141,7 +156,9 @@ pub fn skip_value(r: &mut impl Read, tag: u32) -> Result<(), Error> {
             }
             Ok(())
         }
-        other => Err(Error(format!("unknown GGUF value type tag {other}"))),
+        other => Err(Error::Invalid(format!(
+            "unknown GGUF value type tag {other}"
+        ))),
     }
 }
 
@@ -151,16 +168,13 @@ pub fn read_header(r: &mut impl Read) -> Result<(u32, u64, u64), Error> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).map_err(short_read)?;
     if magic != GGUF_MAGIC {
-        return Err(Error(format!(
-            "bad magic {:?} (expected \"GGUF\")",
-            String::from_utf8_lossy(&magic)
-        )));
+        return Err(Error::BadMagic(
+            String::from_utf8_lossy(&magic).into_owned(),
+        ));
     }
     let version = read_u32(r)?;
     if version != 3 {
-        return Err(Error(format!(
-            "unsupported GGUF version {version} (expected 3)"
-        )));
+        return Err(Error::Version(version));
     }
     let n_tensors = read_u64(r)?;
     let n_kv = read_u64(r)?;
@@ -194,9 +208,8 @@ pub const GGML_TYPE_Q5_K: u32 = 13;
 /// 6-bit K-quant, block 256.
 pub const GGML_TYPE_Q6_K: u32 = 14;
 
-/// (`elements_per_block`, `bytes_per_block`) for the types M2.3 reads. `None`
-/// for types without a fixed block layout — the full table lands with M3.1's
-/// store module.
+/// (`elements_per_block`, `bytes_per_block`) for the types the pool reads.
+/// `None` for types without a fixed block layout.
 #[must_use]
 pub fn ggml_type_block(ggml_type: u32) -> Option<(u64, u64)> {
     let (blck, size) = match ggml_type {
@@ -218,13 +231,16 @@ pub fn ggml_type_block(ggml_type: u32) -> Option<(u64, u64)> {
     Some((blck, size))
 }
 
-/// Bytes of one packed row of `ne0` elements (partial leading block rounds up,
-/// matching ggml row semantics). Quant strides are per-plane from this, never
-/// per-element F32 sizes.
+/// Bytes of one packed row of `ne0` elements. `None` for an unknown type or
+/// when `ne0` is not a whole number of blocks (ggml rejects such rows).
+/// Quant strides are per-plane from this, never per-element F32 sizes.
 #[must_use]
 pub fn ggml_row_bytes(ggml_type: u32, ne0: u64) -> Option<u64> {
     let (blck, size) = ggml_type_block(ggml_type)?;
-    Some(ne0.div_ceil(blck) * size)
+    if ne0 % blck != 0 {
+        return None;
+    }
+    (ne0 / blck).checked_mul(size)
 }
 
 /// One tensor-table row (gguf.h `gguf_tensor_info` projection).
@@ -235,11 +251,29 @@ pub struct TensorEntry {
     /// Data offset RELATIVE to the aligned tensor-data section start
     /// ([`data_section_offset`]).
     pub offset: u64,
+    /// Rank as stored in the file (1..=3).
+    pub n_dims: u32,
     /// First three dimensions; `0`-padded below rank 3.
     pub dims: [u64; 3],
     /// GGML element type tag ([`ggml_type_block`] interprets it).
     pub ggml_type: u32,
 }
+
+impl TensorEntry {
+    /// Expert plane kind, or `None` for non-expert names and for expert-named
+    /// tensors whose rank is not 3 (same rule as the C `golem_tensor_is_expert`).
+    #[must_use]
+    pub fn expert_kind(&self) -> Option<ExpertKind> {
+        if self.n_dims == 3 {
+            ExpertKind::from_tensor_name(&self.name)
+        } else {
+            None
+        }
+    }
+}
+
+/// Maximum tensor-name length in bytes, `GGML_MAX_NAME` minus the NUL.
+const MAX_TENSOR_NAME: usize = 63;
 
 /// Routed-expert plane kind. One matcher for C and Rust semantics
 /// (§6.6): the exact stem `ffn_{gate,up,down}_exps` at a name-segment
@@ -261,15 +295,15 @@ impl ExpertKind {
     /// All kinds, in ordinal order.
     pub const ALL: [ExpertKind; 3] = [Self::Gate, Self::Up, Self::Down];
 
-    /// Parses from a ggml or GGUF tensor name.
+    /// Parses from a ggml or GGUF tensor name. Names of `GGML_MAX_NAME` (64)
+    /// bytes or more cannot exist in ggml and never match.
     pub fn from_tensor_name(name: &str) -> Option<Self> {
+        if name.len() > MAX_TENSOR_NAME {
+            return None;
+        }
         let base = name.strip_suffix(".weight").unwrap_or(name);
-        for (stem, kind) in [
-            ("ffn_gate_exps", Self::Gate),
-            ("ffn_up_exps", Self::Up),
-            ("ffn_down_exps", Self::Down),
-        ] {
-            if let Some(prefix) = base.strip_suffix(stem) {
+        for kind in Self::ALL {
+            if let Some(prefix) = base.strip_suffix(kind.stem()) {
                 if prefix.is_empty() || prefix.ends_with('.') {
                     return Some(kind);
                 }
@@ -278,33 +312,65 @@ impl ExpertKind {
         None
     }
 
+    /// Tensor-name stem (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`).
+    pub fn stem(self) -> &'static str {
+        match self {
+            Self::Gate => "ffn_gate_exps",
+            Self::Up => "ffn_up_exps",
+            Self::Down => "ffn_down_exps",
+        }
+    }
+
     /// Flat ordinal (Gate=0, Up=1, Down=2).
     pub fn ordinal(self) -> usize {
         self as usize
     }
 }
 
-/// Walks the KV block, capturing `general.alignment` (default 32) and
-/// rejecting non-U32 or non-power-of-two values (gguf.h requirement).
-fn walk_kvs(r: &mut (impl Read + Seek), n_kv: u64) -> Result<u64, Error> {
+/// Walks the KV block once: integer/string values are returned, other tags
+/// are skipped. `general.alignment` (default 32) must be a power-of-two U32
+/// (gguf.h). Duplicate keys are rejected, as gguf.h does.
+fn walk_kvs(r: &mut (impl Read + Seek), n_kv: u64) -> Result<(u64, Vec<(String, KvVal)>), Error> {
     let mut alignment = 32u64;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
     for _ in 0..n_kv {
         let key = read_string(r)?;
+        if !seen.insert(key.clone()) {
+            return Err(Error::Invalid(format!("duplicate GGUF key {key}")));
+        }
         let tag = read_u32(r)?;
         if key == "general.alignment" {
             if tag != TYPE_U32 {
-                return Err(Error("general.alignment must be a U32".into()));
+                return Err(Error::Invalid("general.alignment must be a U32".into()));
             }
             let a = u64::from(read_u32(r)?);
             if a == 0 || !a.is_power_of_two() {
-                return Err(Error(format!("invalid general.alignment {a}")));
+                return Err(Error::Invalid(format!("invalid general.alignment {a}")));
             }
             alignment = a;
-        } else {
-            skip_value(r, tag)?;
+            out.push((key, KvVal::Int(a)));
+            continue;
         }
+        let val = match tag {
+            TYPE_U8 => KvVal::Int(u64::from(read_u8(r)?)),
+            TYPE_I8 => KvVal::Int(read_u8(r)? as i8 as u64),
+            TYPE_U16 => KvVal::Int(u64::from(read_u16(r)?)),
+            TYPE_I16 => KvVal::Int(read_u16(r)? as i16 as i64 as u64),
+            TYPE_U32 => KvVal::Int(u64::from(read_u32(r)?)),
+            TYPE_I32 => KvVal::Int(read_u32(r)? as i32 as i64 as u64),
+            TYPE_U64 => KvVal::Int(read_u64(r)?),
+            TYPE_I64 => KvVal::Int(read_u64(r)? as i64 as u64),
+            TYPE_BOOL => KvVal::Int(u64::from(read_u8(r)? != 0)),
+            TYPE_STR => KvVal::Str(read_string(r)?),
+            _ => {
+                skip_value(r, tag)?;
+                continue;
+            }
+        };
+        out.push((key, val));
     }
-    Ok(alignment)
+    Ok((alignment, out))
 }
 
 /// Reads the tensor-table rows following the KV block.
@@ -314,7 +380,7 @@ fn walk_table(r: &mut (impl Read + Seek), n_tensors: u64) -> Result<Vec<TensorEn
         let name = read_string(r)?;
         let n_dims = read_u32(r)?;
         if n_dims == 0 || n_dims > 3 {
-            return Err(Error(format!(
+            return Err(Error::Invalid(format!(
                 "tensor {name}: unsupported rank {n_dims} (expected 1..=3)"
             )));
         }
@@ -327,6 +393,7 @@ fn walk_table(r: &mut (impl Read + Seek), n_tensors: u64) -> Result<Vec<TensorEn
         out.push(TensorEntry {
             name,
             offset,
+            n_dims,
             dims,
             ggml_type,
         });
@@ -353,29 +420,7 @@ pub enum KvVal {
 pub fn read_kvs(r: &mut (impl Read + Seek)) -> Result<Vec<(String, KvVal)>, Error> {
     r.rewind().map_err(short_read)?;
     let (_, _, n_kv) = read_header(r)?;
-    let mut out = Vec::new();
-    for _ in 0..n_kv {
-        let key = read_string(r)?;
-        let tag = read_u32(r)?;
-        let val = match tag {
-            TYPE_U8 => KvVal::Int(u64::from(read_u8(r)?)),
-            TYPE_I8 => KvVal::Int(read_u8(r)? as i8 as u64),
-            TYPE_U16 => KvVal::Int(u64::from(read_u16(r)?)),
-            TYPE_I16 => KvVal::Int(read_u16(r)? as i16 as i64 as u64),
-            TYPE_U32 => KvVal::Int(u64::from(read_u32(r)?)),
-            TYPE_I32 => KvVal::Int(read_u32(r)? as i32 as i64 as u64),
-            TYPE_U64 => KvVal::Int(read_u64(r)?),
-            TYPE_I64 => KvVal::Int(read_u64(r)? as i64 as u64),
-            TYPE_BOOL => KvVal::Int(u64::from(read_u8(r)? != 0)),
-            TYPE_STR => KvVal::Str(read_string(r)?),
-            _ => {
-                skip_value(r, tag)?;
-                continue;
-            }
-        };
-        out.push((key, val));
-    }
-    Ok(out)
+    Ok(walk_kvs(r, n_kv)?.1)
 }
 
 /// Looks up an integer KV by exact key.
@@ -416,7 +461,7 @@ pub fn arch_kv_int(kvs: &[(String, KvVal)], suffix: &str) -> Option<u64> {
 pub fn data_section_offset(r: &mut (impl Read + Seek)) -> Result<u64, Error> {
     r.rewind().map_err(short_read)?;
     let (_, n_tensors, n_kv) = read_header(r)?;
-    let alignment = walk_kvs(r, n_kv)?;
+    let (alignment, _) = walk_kvs(r, n_kv)?;
     walk_table(r, n_tensors)?;
     let pos = r.stream_position().map_err(short_read)?;
     Ok(pos.div_ceil(alignment) * alignment)
@@ -427,8 +472,8 @@ pub fn data_section_offset(r: &mut (impl Read + Seek)) -> Result<u64, Error> {
 /// first.
 ///
 /// # Errors
-/// GGUF parse failures, or a tensor with rank outside 1..=3 (M2.3's readers
-/// are 3-dim; the general walker lands with M3.1's store).
+/// GGUF parse failures, or a tensor with rank outside 1..=3 (the table is
+/// projected onto three dims).
 pub fn tensor_entries(r: &mut (impl Read + Seek)) -> Result<Vec<TensorEntry>, Error> {
     r.rewind().map_err(short_read)?;
     let (_, n_tensors, n_kv) = read_header(r)?;
@@ -439,6 +484,14 @@ pub fn tensor_entries(r: &mut (impl Read + Seek)) -> Result<Vec<TensorEntry>, Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stem_round_trips_through_the_matcher() {
+        for kind in ExpertKind::ALL {
+            let name = format!("blk.3.{}.weight", kind.stem());
+            assert_eq!(ExpertKind::from_tensor_name(&name), Some(kind));
+        }
+    }
 
     #[test]
     fn expert_name_matcher_exact_stem_and_weight() {
@@ -482,18 +535,94 @@ mod tests {
         bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&7u32.to_le_bytes());
         assert_eq!(
-            skip_value(&mut &bytes[..], TYPE_ARRAY).unwrap_err().0,
+            skip_value(&mut &bytes[..], TYPE_ARRAY)
+                .unwrap_err()
+                .to_string(),
             "nested GGUF arrays are not supported"
         );
     }
 
     #[test]
     fn read_header_rejects_bad_magic_and_wrong_version() {
-        assert!(read_header(&mut &b"NOPE"[..]).is_err());
+        assert!(matches!(
+            read_header(&mut &b"NOPE\x03\0\0\0"[..]),
+            Err(Error::BadMagic(_))
+        ));
         let mut v2 = Vec::new();
         v2.extend_from_slice(b"GGUF");
         v2.extend_from_slice(&2u32.to_le_bytes());
-        assert!(read_header(&mut &v2[..]).is_err());
+        assert!(matches!(read_header(&mut &v2[..]), Err(Error::Version(2))));
+    }
+
+    #[test]
+    fn only_short_reads_map_to_truncation() {
+        assert!(matches!(
+            read_header(&mut &b"GGU"[..]),
+            Err(Error::UnexpectedEof)
+        ));
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk on fire"))
+            }
+        }
+        assert!(matches!(read_u32(&mut Broken), Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn expert_name_matcher_bounds_and_suffix() {
+        let long = format!("{}.ffn_gate_exps.weight", "b".repeat(43));
+        assert_eq!(long.len(), 64);
+        assert_eq!(
+            ExpertKind::from_tensor_name(&long),
+            None,
+            "64 bytes: too long"
+        );
+        let ok = format!("{}.ffn_gate_exps.weight", "b".repeat(42));
+        assert_eq!(ok.len(), 63);
+        assert_eq!(ExpertKind::from_tensor_name(&ok), Some(ExpertKind::Gate));
+        assert_eq!(ExpertKind::from_tensor_name("x_ffn_gate_exps"), None);
+        assert_eq!(
+            ExpertKind::from_tensor_name("blk.1.ffn_gate_exps.weight.weight"),
+            None
+        );
+    }
+
+    #[test]
+    fn expert_kind_requires_rank_3() {
+        let e = |n_dims| TensorEntry {
+            name: "blk.1.ffn_up_exps.weight".into(),
+            offset: 0,
+            n_dims,
+            dims: [32, 4, 0],
+            ggml_type: GGML_TYPE_F32,
+        };
+        assert_eq!(e(3).expert_kind(), Some(ExpertKind::Up));
+        assert_eq!(e(2).expert_kind(), None);
+    }
+
+    #[test]
+    fn row_bytes_requires_whole_blocks() {
+        assert_eq!(ggml_row_bytes(GGML_TYPE_Q4_0, 64), Some(36));
+        assert_eq!(ggml_row_bytes(GGML_TYPE_Q4_0, 30), None);
+        assert_eq!(ggml_row_bytes(GGML_TYPE_Q4_K, 257), None);
+    }
+
+    #[test]
+    fn duplicate_kv_keys_are_rejected() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&2u64.to_le_bytes());
+        for _ in 0..2 {
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(b"k");
+            b.extend_from_slice(&TYPE_U32.to_le_bytes());
+            b.extend_from_slice(&7u32.to_le_bytes());
+        }
+        let err = read_kvs(&mut std::io::Cursor::new(&b)).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     /// Minimal GGUF v3 bytes: `alignment` kv, one str kv, one 2-dim F32 tensor.
@@ -544,6 +673,7 @@ mod tests {
             TensorEntry {
                 name: "w.gt".into(),
                 offset: 64,
+                n_dims: 2,
                 dims: [32, 16, 0],
                 ggml_type: GGML_TYPE_F32,
             }
@@ -560,8 +690,8 @@ mod tests {
         assert_eq!(ggml_row_bytes(GGML_TYPE_Q8_0, 32), Some(34));
         assert_eq!(
             ggml_row_bytes(GGML_TYPE_Q4_0, 30),
-            Some(18),
-            "partial block rounds up"
+            None,
+            "partial block is not a valid row"
         );
         assert_eq!(ggml_row_bytes(99, 32), None, "unknown type has no layout");
         // Quant plane stride is per-plane, not per-element F32:

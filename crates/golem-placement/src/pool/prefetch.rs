@@ -1,7 +1,7 @@
 //! §6.5 prefetch: background page-ins fed by an injected access-set source,
-//! demand-priority gated (rounds skip while demand page-ins are in flight)
-//! and capacity gated ([`GATE_CAPACITY`] = `io_threads - 1` at the §5.4
-//! default). The engine's feed is P4's `notify_access` recency (golem-engine
+//! demand-priority gated (rounds skip while demand page-ins are in flight).
+//! One prefetch thread, so at most one prefetch page-in is ever in flight.
+//! The engine's feed is P4's `notify_access` recency (golem-engine
 //! `PolicyFeed`); tests prove the mechanism against injected feeds.
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
@@ -10,11 +10,7 @@
 use std::time::Duration;
 
 use super::pager::ExpertPool;
-use super::primitives::{Arc, AtomicBool, AtomicUsize, JoinHandle, Ordering, spawn};
-
-/// Max concurrent prefetch page-ins: `io_threads - 1` at the §5.4 default
-/// (io_threads = 5), so demand reads always keep I/O headroom.
-pub const GATE_CAPACITY: usize = 4;
+use super::primitives::{Arc, AtomicBool, JoinHandle, Ordering, spawn};
 
 /// Access-set union depth (§6.5: union of the last k steps).
 pub const PREFETCH_K: usize = 3;
@@ -28,43 +24,15 @@ pub trait AccessFeed: Send + Sync {
     fn take_union(&self, k: usize) -> Vec<(u32, u32)>;
 }
 
-/// Capacity gate over prefetch page-ins: in-flight accounting with a
-/// [`GATE_CAPACITY`] ceiling (`io_threads - 1`). Single prefetch thread
-/// today, so the observed maximum stays at 1; the accounting carries over to
-/// a sharded prefetcher without redesign.
-struct PrefetchGate {
-    in_flight: Arc<AtomicUsize>,
-    max_concurrent: Arc<AtomicUsize>,
-}
-
-impl PrefetchGate {
-    fn acquire(&self) {
-        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        self.max_concurrent.fetch_max(now, Ordering::Relaxed);
-    }
-
-    fn release(&self) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// Handle to the spawned prefetch thread. `stop()` signals; `Drop` signals
 /// and joins. The loop parks between empty rounds (25 ms bound) so stop
 /// latency is bounded by one park.
 pub struct PrefetchHandle {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    gate: PrefetchGate,
 }
 
 impl PrefetchHandle {
-    /// Highest number of concurrently in-flight prefetch page-ins ever
-    /// observed (never above [`GATE_CAPACITY`] — the demand-priority gate
-    /// assertion surface).
-    pub fn max_concurrent_prefetch(&self) -> usize {
-        self.gate.max_concurrent.load(Ordering::Relaxed)
-    }
-
     /// Signals the thread to stop (join happens on `Drop`).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -91,16 +59,8 @@ pub fn spawn_prefetch(
     k: usize,
 ) -> PrefetchHandle {
     let stop = Arc::new(AtomicBool::new(false));
-    let gate = PrefetchGate {
-        in_flight: Arc::new(AtomicUsize::new(0)),
-        max_concurrent: Arc::new(AtomicUsize::new(0)),
-    };
     let thread = {
         let stop = stop.clone();
-        let gate = PrefetchGate {
-            in_flight: gate.in_flight.clone(),
-            max_concurrent: gate.max_concurrent.clone(),
-        };
         spawn(move || {
             loop {
                 if stop.load(Ordering::Relaxed) {
@@ -125,10 +85,7 @@ pub fn spawn_prefetch(
                     if stop.load(Ordering::Relaxed) || pool.demand_inflight() > 0 {
                         break;
                     }
-                    gate.acquire();
-                    let result = pool.ensure_unit(false, layer, expert);
-                    gate.release();
-                    if let Err(e) = result {
+                    if let Err(e) = pool.ensure_unit(false, layer, expert) {
                         // Transient source trouble must not kill prefetching;
                         // `source_errors` already counted the failure.
                         tracing::warn!(layer, expert, error = %e, "prefetch page-in failed; continuing");
@@ -140,7 +97,6 @@ pub fn spawn_prefetch(
     PrefetchHandle {
         stop,
         thread: Some(thread),
-        gate,
     }
 }
 
@@ -262,7 +218,7 @@ mod tests {
         ExpertPool::new(
             arena,
             source,
-            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
             Arc::new(P3Stats::new()),
             geometry,
             vec![0; 1],
@@ -302,7 +258,7 @@ mod tests {
         // Demand page-in of expert 7 blocks inside the source, holding
         // `demand_inflight` > 0; a queued prefetch unit must NOT be read
         // until demand completes, and prefetch concurrency never exceeds
-        // the gate.
+        // (one prefetch thread, so no concurrency to bound).
         let source = StdArc::new(GateSource::new((0, 7)));
         let pool = test_pool(8, arc_dyn(source.clone()));
         let feed = StdArc::new(QueueFeed::new(vec![(0, 0)]));
@@ -334,10 +290,6 @@ mod tests {
         until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 2);
         assert_eq!(pool.stats.demand_slow_pageins.load(Ordering::Relaxed), 1);
         assert_eq!(pool.stats.prefetch_pageins.load(Ordering::Relaxed), 2);
-        assert!(
-            handle.max_concurrent_prefetch() <= GATE_CAPACITY,
-            "prefetch oversubscribed the gate"
-        );
         handle.stop();
     }
 }

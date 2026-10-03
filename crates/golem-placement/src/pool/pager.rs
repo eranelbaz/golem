@@ -15,15 +15,16 @@ use std::fmt;
 use super::arena::Arena;
 use super::primitives::{Arc, AtomicUsize, Ordering};
 use super::residency::{
-    Claim, ClaimError, ExpertKind, FillClaim, P3Stats, PolicySnapshot, ResidencyMap,
+    Claim, ClaimError, ExpertKind, FillClaim, P3Stats, PolicySnapshot, PoolConfigError,
+    ResidencyMap,
 };
 use super::source::{ExpertSource, PoolGeometry};
 
-/// Lock-free-ish read handle over the current [`PolicySnapshot`] (rebuilt by
-/// the placement thread each pass). Guarded by a primitives mutex — always
-/// taken OUTSIDE the residency shard lock, preserving the shard lock's
-/// leaf-most position (§6.6). (arc-swap-style interface; modeled under loom,
-/// so T6 explores snapshot reads exactly.)
+/// Read handle over the current [`PolicySnapshot`] (rebuilt by the placement
+/// thread each pass). Guarded by a primitives mutex held only for an `Arc`
+/// clone/swap, taken once per `ensure_*` call and always OUTSIDE the
+/// residency shard lock, preserving the shard lock's leaf-most position
+/// (§6.6). Modeled under loom, so T6 explores snapshot reads exactly.
 #[derive(Debug, Default)]
 pub struct SnapshotHandle {
     current: super::primitives::Mutex<Arc<PolicySnapshot>>,
@@ -37,7 +38,7 @@ impl SnapshotHandle {
         }
     }
 
-    /// The current snapshot (cheap `Arc` clone; never blocks the pager's I/O).
+    /// The current snapshot (cheap `Arc` clone; never held across I/O).
     pub fn current(&self) -> Arc<PolicySnapshot> {
         self.current.lock().unwrap().clone()
     }
@@ -93,9 +94,52 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// The slot this lease covers (capability check for [`Arena::slot`]).
+    /// The slot this lease covers.
     pub fn slot(&self) -> u32 {
         self.slot
+    }
+
+    /// Whether this lease pins a slot of `arena`.
+    pub(crate) fn is_for(&self, arena: &Arena) -> bool {
+        std::ptr::eq(&*self._arena, arena)
+    }
+
+    /// The slot's bytes (all three planes). The view borrows the lease, so it
+    /// cannot outlive it:
+    ///
+    /// ```compile_fail,E0505
+    /// # use golem_placement::pool::*;
+    /// # use golem_placement::pool::primitives::arc_dyn;
+    /// # struct Src;
+    /// # impl ExpertSource for Src {
+    /// #     fn read_expert(&self, _: u32, _: ExpertKind, _: u32, into: &mut [u8], _: usize)
+    /// #         -> std::io::Result<()> { into.fill(1); Ok(()) }
+    /// #     fn plane(&self, _: u32, _: ExpertKind, _: u32) -> Option<(u64, u64)> { None }
+    /// # }
+    /// # let arena = Arena::new(&[SlotClass { slot_size: 24, slots: 1 }]).unwrap();
+    /// # let geometry = PoolGeometry {
+    /// #     layers: vec![UnitLayout::new([8; 3], [None; 3]).unwrap()],
+    /// #     n_experts: 1,
+    /// #     expert_bytes: 0,
+    /// # };
+    /// # let pool = ExpertPool::try_new(
+    /// #     arena,
+    /// #     arc_dyn(std::sync::Arc::new(Src)),
+    /// #     std::sync::Arc::new(SnapshotHandle::new(std::sync::Arc::new(PolicySnapshot::empty()))),
+    /// #     std::sync::Arc::new(P3Stats::new()),
+    /// #     geometry,
+    /// #     vec![0],
+    /// # ).unwrap();
+    /// let mut leases = Vec::new();
+    /// pool.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut [std::ptr::null()], &mut leases)
+    ///     .unwrap();
+    /// let lease = leases.pop().unwrap();
+    /// let bytes = lease.bytes();
+    /// drop(lease);
+    /// assert_eq!(bytes[0], 1);
+    /// ```
+    pub fn bytes(&self) -> &[u8] {
+        self._arena.slot(self)
     }
 }
 
@@ -105,16 +149,22 @@ impl Drop for Lease {
     }
 }
 
+struct DemandGuard<'a>(&'a AtomicUsize);
+
+impl Drop for DemandGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The RAM expert pool: arena + residency map + source + snapshots + stats,
 /// `Arc`-shared with the FFI glue and the prefetcher.
 pub struct ExpertPool {
-    /// Locked slot arena.
-    pub arena: Arc<Arena>,
+    pub(crate) arena: Arc<Arena>,
     /// Per-layer gate/up/down unit layout (§6.1): plane offsets/strides
     /// inside a slot.
     pub geometry: PoolGeometry,
-    /// Residency state (§6.6).
-    pub residency: Arc<ResidencyMap>,
+    pub(crate) residency: Arc<ResidencyMap>,
     /// P3 counters.
     pub stats: Arc<P3Stats>,
     /// In-flight demand page-ins (§6.5 demand-priority signal): the
@@ -137,7 +187,55 @@ impl fmt::Debug for ExpertPool {
 impl ExpertPool {
     /// Assembles a pool over `geometry.layers.len()` × `geometry.n_experts`
     /// expert units; each layer claims slots only from its arena class
-    /// (§5 pool amendment).
+    /// (§5.4).
+    ///
+    /// # Errors
+    /// Inconsistent input: no layers or experts, `class_of_layer` and
+    /// `geometry.layers` of different length, or a layer naming a class the
+    /// arena does not have.
+    pub fn try_new(
+        arena: Arena,
+        source: Arc<dyn ExpertSource>,
+        snapshots: Arc<SnapshotHandle>,
+        stats: Arc<P3Stats>,
+        geometry: PoolGeometry,
+        class_of_layer: Vec<u8>,
+    ) -> Result<Arc<Self>, PoolConfigError> {
+        if class_of_layer.len() != geometry.layers.len() {
+            return Err(PoolConfigError::new(format!(
+                "{} layer classes for {} geometry layers",
+                class_of_layer.len(),
+                geometry.layers.len()
+            )));
+        }
+        if let Some(&c) = class_of_layer
+            .iter()
+            .find(|&&c| usize::from(c) >= arena.class_count())
+        {
+            return Err(PoolConfigError::new(format!(
+                "layer class {c} but the arena has {} classes",
+                arena.class_count()
+            )));
+        }
+        let class_slots = (0..arena.class_count())
+            .map(|c| arena.class_range(c))
+            .collect();
+        let residency = ResidencyMap::new(class_of_layer, geometry.n_experts, class_slots)?;
+        Ok(Arc::new(Self {
+            arena: Arc::new(arena),
+            geometry,
+            residency: Arc::new(residency),
+            stats,
+            demand_inflight: super::primitives::AtomicUsize::new(0),
+            source,
+            snapshots,
+        }))
+    }
+
+    /// [`Self::try_new`] for callers that treat bad input as a bug.
+    ///
+    /// # Panics
+    /// Panics on inconsistent input.
     pub fn new(
         arena: Arena,
         source: Arc<dyn ExpertSource>,
@@ -146,22 +244,21 @@ impl ExpertPool {
         geometry: PoolGeometry,
         class_of_layer: Vec<u8>,
     ) -> Arc<Self> {
-        let n_experts = geometry.n_experts;
-        let n_classes = class_of_layer
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, |c| usize::from(c) + 1);
-        let class_slots: Vec<std::ops::Range<u32>> =
-            (0..n_classes).map(|c| arena.class_range(c)).collect();
-        Arc::new(Self {
-            arena: Arc::new(arena),
-            geometry,
-            residency: Arc::new(ResidencyMap::new(class_of_layer, n_experts, class_slots)),
-            stats,
-            demand_inflight: super::primitives::AtomicUsize::new(0),
-            source,
-            snapshots,
+        Self::try_new(arena, source, snapshots, stats, geometry, class_of_layer)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Whether `(layer, expert)` is resident (filled or mid-fill).
+    pub fn is_resident(&self, layer: u32, expert: u32) -> bool {
+        self.residency.is_resident(layer, expert)
+    }
+
+    /// Counts one in-flight demand page-in until the guard drops (every
+    /// exit path, including unwinding).
+    fn demand_guard(&self, demand: bool) -> Option<DemandGuard<'_>> {
+        demand.then(|| {
+            self.demand_inflight.fetch_add(1, Ordering::Relaxed);
+            DemandGuard(&self.demand_inflight)
         })
     }
 
@@ -197,14 +294,8 @@ impl ExpertPool {
     ) -> Result<(), PoolError> {
         // The whole demand path — claims, I/O, copies — counts as in-flight
         // demand so the prefetcher's per-round check observes it (§6.5).
-        if demand {
-            self.demand_inflight.fetch_add(1, Ordering::Relaxed);
-        }
-        let result = self.ensure_range_inner(demand, layer, kind, first, last, copy);
-        if demand {
-            self.demand_inflight.fetch_sub(1, Ordering::Relaxed);
-        }
-        result
+        let _inflight = self.demand_guard(demand);
+        self.ensure_range_inner(demand, layer, kind, first, last, copy)
     }
 
     fn ensure_range_inner(
@@ -219,8 +310,8 @@ impl ExpertPool {
         debug_assert!(first <= last, "inverted range ({first}, {last})");
         let snapshot = self.snapshots.current();
         for expert in first..=last {
-            let (slot, lease) = self.claim_leased(demand, layer, expert, &snapshot)?;
-            copy(self.plane_bytes(layer, slot, &lease, kind));
+            let lease = self.claim_leased(demand, layer, expert, &snapshot)?;
+            copy(self.plane_bytes(layer, &lease, kind));
             drop(lease);
         }
         Ok(())
@@ -233,71 +324,55 @@ impl ExpertPool {
     /// Source failure after bounded retries (claim cancelled first) or an
     /// over-subscribed pool.
     pub fn ensure_unit(&self, demand: bool, layer: u32, expert: u32) -> Result<(), PoolError> {
-        if demand {
-            self.demand_inflight.fetch_add(1, Ordering::Relaxed);
-        }
-        let result = (|| {
-            let snapshot = self.snapshots.current();
-            let (_, lease) = self.claim_leased(demand, layer, expert, &snapshot)?;
-            drop(lease); // prefetch reads no bytes; the fill itself was the work
-            Ok(())
-        })();
-        if demand {
-            self.demand_inflight.fetch_sub(1, Ordering::Relaxed);
-        }
-        result
+        let _inflight = self.demand_guard(demand);
+        let snapshot = self.snapshots.current();
+        // Prefetch reads no bytes; the fill itself was the work.
+        drop(self.claim_leased(demand, layer, expert, &snapshot)?);
+        Ok(())
     }
 
-    /// Claims one expert's slot, paging it in if needed, and returns the slot
-    /// index plus the UNDROPPED lease (the caller keeps the lease
-    /// until the host→device DMA is known complete, then drops it).
+    /// Claims one expert's slot, paging it in if needed, and returns the
+    /// UNDROPPED lease (the caller keeps the lease until the host→device DMA
+    /// is known complete, then drops it).
     fn claim_leased(
         &self,
         demand: bool,
         layer: u32,
         expert: u32,
         snapshot: &PolicySnapshot,
-    ) -> Result<(u32, Lease), PoolError> {
-        let (slot, _claim) = match self.residency.claim(layer, expert, snapshot) {
+    ) -> Result<Lease, PoolError> {
+        let slot = match self.residency.claim(layer, expert, snapshot) {
             Ok(Claim::Resident { slot }) => {
                 self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
-                (slot, Option::<FillClaim>::None)
+                slot
             }
             Ok(Claim::Filled { slot, claim }) => {
-                self.page_in(demand, layer, expert, slot, Some(claim))?;
-                (slot, None)
+                self.page_in(demand, layer, expert, claim)?;
+                slot
             }
             Err(ClaimError::Evicted(evicted)) => {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                self.page_in(demand, layer, expert, evicted.slot, Some(evicted.claim))?;
-                (evicted.slot, None)
+                let slot = evicted.slot;
+                debug_assert_eq!(slot, evicted.victim.slot);
+                self.page_in(demand, layer, expert, evicted.claim)?;
+                slot
             }
             Err(ClaimError::Busy) => return Err(PoolError::Busy),
         };
-        Ok((
+        Ok(Lease {
+            map: self.residency.clone(),
+            _arena: self.arena.clone(),
+            layer,
+            expert,
             slot,
-            Lease {
-                map: self.residency.clone(),
-                _arena: self.arena.clone(),
-                layer,
-                expert,
-                slot,
-            },
-        ))
+        })
     }
 
     /// The `kind` plane's sub-slice of the unit's slot (§6.1 plane layout).
-    fn plane_bytes<'a>(
-        &'a self,
-        layer: u32,
-        slot: u32,
-        lease: &'a Lease,
-        kind: ExpertKind,
-    ) -> &'a [u8] {
+    fn plane_bytes<'l>(&self, layer: u32, lease: &'l Lease, kind: ExpertKind) -> &'l [u8] {
         let unit = &self.geometry.layers[layer as usize];
         let (off, stride) = unit.plane(kind);
-        let full = self.arena.slot(slot, lease);
-        &full[off as usize..(off + stride) as usize]
+        &lease.bytes()[off as usize..(off + stride) as usize]
     }
 
     /// Demand-claims `[first, last]`, pages each expert in, writes the pool-side
@@ -321,43 +396,36 @@ impl ExpertPool {
     ) -> Result<(), PoolError> {
         debug_assert!(first <= last, "inverted range ({first}, {last})");
         assert_eq!(ptrs.len(), (last - first + 1) as usize, "ptrs length");
-        self.demand_inflight.fetch_add(1, Ordering::Relaxed);
-        let result = (|| {
-            let snapshot = self.snapshots.current();
-            for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
-                let (slot, lease) = self.claim_leased(true, layer, expert, &snapshot)?;
-                *dst = self.plane_bytes(layer, slot, &lease, kind).as_ptr();
-                leases.push(lease);
-            }
-            Ok(())
-        })();
-        self.demand_inflight.fetch_sub(1, Ordering::Relaxed);
-        result
+        let _inflight = self.demand_guard(true);
+        let snapshot = self.snapshots.current();
+        for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
+            let lease = self.claim_leased(true, layer, expert, &snapshot)?;
+            *dst = self.plane_bytes(layer, &lease, kind).as_ptr();
+            leases.push(lease);
+        }
+        Ok(())
     }
 
     /// Fills one slot from the source. The `Filled`/evict claim left this key
-    /// mid-fill in the residency shard: the fill writes through the exclusive
-    /// gate, and only `finish_fill` (below, before the lease-held copy) lets
-    /// parked `Resident` claimers of this key read the slot. On failure:
-    /// cancel the claim's lease (residency bit cleared, slot recycled, gate
-    /// opened) and surface the error.
+    /// mid-fill in the residency shard: the fill writes through the claim's
+    /// exclusive view, and only `finish` (before the lease-held copy) lets
+    /// parked `Resident` claimers of this key read the slot. On failure the
+    /// claim is cancelled (residency bit cleared, slot recycled, gate opened)
+    /// and the error surfaces; a panic in the source cancels it via
+    /// `FillClaim::drop`.
     fn page_in(
         &self,
         demand: bool,
         layer: u32,
         expert: u32,
-        slot: u32,
-        claim: Option<FillClaim>,
+        mut claim: FillClaim<'_>,
     ) -> Result<(), PoolError> {
-        // The claim comes from claim() (Filled/Evicted both grant one) — the
-        // residency map is the only constructor (§6.6).
-        let fill_claim = claim.expect("page_in without a FillClaim (capability invariant)");
         let unit = &self.geometry.layers[layer as usize];
         // One disk→pool copy per unit: three reads straight into the
         // claimed slot's plane regions (split from the single slot_mut
-        // borrow — no bounce buffer, §3.4 v3; each region is sized for an
+        // borrow — no bounce buffer, §3.4; each region is sized for an
         // aligned direct read of its plane, §5.4).
-        let mut rest = self.arena.slot_mut(slot, &fill_claim);
+        let mut rest = self.arena.slot_mut(&mut claim);
         let result: std::io::Result<()> = 'fill: {
             for kind in ExpertKind::ALL {
                 let k = kind.ordinal();
@@ -374,7 +442,7 @@ impl ExpertPool {
         };
         match result {
             Ok(()) => {
-                self.residency.finish_fill(layer, expert);
+                claim.finish();
                 let counter = if demand {
                     &self.stats.demand_slow_pageins
                 } else {
@@ -389,28 +457,27 @@ impl ExpertPool {
             Err(source) => {
                 // Any plane failure aborts the whole unit: no ghost
                 // residency, the slot goes back to its class's free list.
-                self.residency.cancel_claim(layer, expert);
+                claim.cancel();
                 self.stats.source_errors.fetch_add(1, Ordering::Relaxed);
                 Err(PoolError::Source { source })
             }
         }
     }
 
-    /// Test-visible lease surface: claims + leases one key so its slot bytes
-    /// can be read via [`Self::slot_bytes_under`] outside `ensure_range`.
-    /// Production reads happen only inside the copy closure.
+    /// Leases a key that is already resident so its bytes can be read
+    /// outside `ensure_range`.
     ///
     /// # Panics
-    /// Panics when the key is not resident — a fresh claim would leave it
-    /// mid-fill and park every later claimer.
-    pub fn lease_for_test(&self, layer: u32, expert: u32) -> Lease {
-        let snapshot = PolicySnapshot::test_empty();
-        let slot = match self.residency.claim(layer, expert, &snapshot) {
-            Ok(Claim::Resident { slot }) => slot,
-            Ok(Claim::Filled { .. }) | Err(ClaimError::Evicted(_)) => {
-                panic!("lease_for_test on a non-resident unit")
-            }
-            Err(ClaimError::Busy) => panic!("test lease on an over-subscribed pool"),
+    /// Panics when the key is not resident (before touching any state).
+    #[cfg(test)]
+    fn lease_for_test(&self, layer: u32, expert: u32) -> Lease {
+        assert!(
+            self.residency.is_resident(layer, expert),
+            "lease_for_test on a non-resident unit"
+        );
+        let snapshot = PolicySnapshot::empty();
+        let Ok(Claim::Resident { slot }) = self.residency.claim(layer, expert, &snapshot) else {
+            panic!("lease_for_test: resident unit was not claimed as Resident");
         };
         Lease {
             map: self.residency.clone(),
@@ -419,11 +486,6 @@ impl ExpertPool {
             expert,
             slot,
         }
-    }
-
-    /// Slot bytes covered by `lease` (lease guarantees no refill).
-    pub fn slot_bytes_under(&self, lease: &Lease) -> &[u8] {
-        self.arena.slot(lease.slot(), lease)
     }
 }
 
@@ -518,7 +580,7 @@ mod tests {
         ExpertPool::new(
             arena,
             source,
-            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
             Arc::new(P3Stats::new()),
             unit_geometry(stride),
             vec![0; 1],
@@ -538,7 +600,7 @@ mod tests {
         ExpertPool::new(
             arena,
             source,
-            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
             Arc::new(P3Stats::new()),
             unit_geometry(stride),
             vec![0; 1],
@@ -604,6 +666,86 @@ mod tests {
             .unwrap();
     }
 
+    /// Source that panics in `read_expert` the first time it is called.
+    struct PanicOnce(std::sync::atomic::AtomicBool);
+
+    impl ExpertSource for PanicOnce {
+        fn read_expert(
+            &self,
+            _: u32,
+            kind: ExpertKind,
+            expert: u32,
+            into: &mut [u8],
+            head: usize,
+        ) -> io::Result<()> {
+            if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("source panicked mid-fill");
+            }
+            into[head..].fill(0x10 * (kind.ordinal() as u8 + 1) + expert as u8);
+            Ok(())
+        }
+
+        fn plane(&self, _: u32, _: ExpertKind, _: u32) -> Option<(u64, u64)> {
+            None
+        }
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn panicking_source_leaves_no_filling_key_and_no_inflight_demand() {
+        let stride = 64u64;
+        let arena = Arena::new(&[SlotClass {
+            slot_size: 3 * stride as usize,
+            slots: 1,
+        }])
+        .unwrap();
+        let source: Arc<dyn ExpertSource> = arc_dyn(std::sync::Arc::new(PanicOnce(
+            std::sync::atomic::AtomicBool::new(true),
+        )));
+        let pool = ExpertPool::new(
+            arena,
+            source,
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            unit_geometry(stride),
+            vec![0; 1],
+        );
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.ensure_range(true, 0, ExpertKind::Gate, 3, 3, &mut |_| {});
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(pool.demand_inflight(), 0, "guard released on unwind");
+        assert!(!pool.is_resident(0, 3), "no ghost residency");
+        // Would park forever on the fill gate if the key stayed `filling`.
+        pool.ensure_range(true, 0, ExpertKind::Gate, 3, 3, &mut |p| {
+            assert_eq!(p, [0x13; 64])
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn inconsistent_construction_is_an_error() {
+        let arena = Arena::new(&[SlotClass {
+            slot_size: 192,
+            slots: 1,
+        }])
+        .unwrap();
+        let source: Arc<dyn ExpertSource> = arc_dyn(std::sync::Arc::new(FakeSource::new(64)));
+        let snaps = Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty())));
+        // Two layer classes for a one-layer geometry.
+        let err = ExpertPool::try_new(
+            arena,
+            source,
+            snaps,
+            Arc::new(P3Stats::new()),
+            unit_geometry(64),
+            vec![0, 0],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("geometry layers"), "{err}");
+    }
+
     // Sequential unit test over loom-primitive pool types: needs no exploration
     // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
@@ -640,7 +782,7 @@ mod tests {
         assert!(pool.residency.is_resident(0, 1));
         // The survivor's slot carries ITS bytes (provenance under lease):
         let lease = pool.lease_for_test(0, 1);
-        assert_eq!(pool.slot_bytes_under(&lease)[0], 0x11);
+        assert_eq!(lease.bytes()[0], 0x11);
     }
 
     // Sequential unit test over loom-primitive pool types: needs no exploration
@@ -661,7 +803,7 @@ mod tests {
         // The errored unit's slot was recycled, not leaked:
         assert_eq!(pool.arena.slot_count(), 2);
         let lease = pool.lease_for_test(0, 3);
-        assert_eq!(pool.slot_bytes_under(&lease)[0], 0x13);
+        assert_eq!(lease.bytes()[0], 0x13);
     }
 
     // Sequential unit test over loom-primitive pool types: needs no exploration
@@ -695,7 +837,7 @@ mod tests {
         let pool = test_pool(2);
         pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut |_| {})
             .unwrap();
-        let mut snap = PolicySnapshot::test_empty();
+        let mut snap = PolicySnapshot::empty();
         snap.lease(0, 0);
         pool.snapshots.update(Arc::new(snap));
         pool.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut |_| {})

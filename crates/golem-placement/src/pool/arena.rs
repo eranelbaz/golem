@@ -2,7 +2,7 @@
 
 //! mlock'd RAM expert slot arena (§5.4): `mmap(MAP_ANONYMOUS|MAP_NORESERVE)`
 //! locked into physical memory, carved into per-class slot regions — one run
-//! of equal slots per distinct slot size (§5 pool amendment). Slots are handed out
+//! of equal slots per distinct slot size (§5.4). Slots are handed out
 //! exclusively by [`super::residency::ResidencyMap`] claims + leases; the
 //! arena itself never coordinates access.
 //!
@@ -68,21 +68,44 @@ impl fmt::Display for ArenaError {
 
 impl std::error::Error for ArenaError {}
 
-/// Drops `[off, off + len)` of `file` from the page cache once its bytes
-/// sit in a pool slot: expert bytes must never stay double-cached (§5.4;
-/// 172.8 GiB of experts vs 93 GiB RAM). Advisory — a failure leaves only a
-/// cache-pressure cost, never wrong bytes, so it is not an error.
+/// Page-aligned superset of `[off, off + len)`: the kernel only drops whole
+/// pages inside the advised range, so the partial boundary pages must be
+/// covered explicitly.
+pub(crate) fn page_span(off: u64, len: usize) -> (u64, u64) {
+    let page = PAGE as u64;
+    let start = off - off % page;
+    let end = (off + len as u64).next_multiple_of(page);
+    (start, end - start)
+}
+
+/// Drops the pages covering `[off, off + len)` of `file` from the page cache
+/// once its bytes sit in a pool slot: expert bytes must never stay
+/// double-cached (§5.4; 172.8 GiB of experts vs 93 GiB RAM). Advisory — a
+/// failure leaves only a cache-pressure cost, never wrong bytes, so it is not
+/// an error.
 pub(crate) fn drop_page_cache(file: &std::fs::File, off: u64, len: usize) {
     use std::os::fd::AsRawFd;
+    let (start, span) = page_span(off, len);
     // SAFETY: posix_fadvise takes a live fd (borrowed from `file` for the
     // call) and plain integers; it touches no Rust-visible memory.
     unsafe {
         libc::posix_fadvise(
             file.as_raw_fd(),
-            off as libc::off_t,
-            len as libc::off_t,
+            start as libc::off_t,
+            span as libc::off_t,
             libc::POSIX_FADV_DONTNEED,
         );
+    }
+}
+
+/// Marks `file` random-access so buffered expert reads do no readahead (it
+/// would only populate the cache with neighbouring expert bytes). The flag
+/// lives on the open file description, so one call at open covers every read.
+pub(crate) fn advise_random(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: as in `drop_page_cache`; offset 0 / len 0 means the whole file.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
     }
 }
 
@@ -94,7 +117,7 @@ fn last_errno() -> i32 {
 }
 
 /// A locked slot arena: `len` bytes carved into per-class slot regions — one
-/// run of equal slots per distinct slot size (§5 pool amendment).
+/// run of equal slots per distinct slot size (§5.4).
 ///
 /// # Safety contract (shared access)
 /// `&Arena` hands out `&[u8]`/`&mut [u8]` views of slots, but exclusivity is
@@ -227,44 +250,52 @@ impl Arena {
         self.base.get() as *mut u8
     }
 
-    /// Read slot bytes, under a live [`Lease`](super::pager::Lease) on the
-    /// key mapped to `i` (the lease is the capability; only the
-    /// pager constructs leases, so a shared read is unreachable without one).
+    /// Read the slot a live [`Lease`](super::pager::Lease) covers. The view
+    /// borrows the lease, so it cannot outlive it: the lease is the
+    /// capability that excludes writers and keeps the slot from being
+    /// refilled.
     ///
     /// # Panics
-    /// Panics when `i >= slot_count` or the lease names another slot.
-    pub fn slot(&self, i: u32, lease: &crate::pool::pager::Lease) -> &[u8] {
+    /// Panics when the lease belongs to another arena.
+    pub(crate) fn slot<'l>(&self, lease: &'l crate::pool::pager::Lease) -> &'l [u8] {
+        assert!(
+            lease.is_for(self),
+            "slot read under a lease of another arena"
+        );
+        let i = lease.slot();
         assert!(i < self.slots);
-        assert_eq!(lease.slot(), i, "slot read under a lease for another slot");
         let n = self.slot_size_of(i);
-        // SAFETY: i < slots ⇒ in-bounds; the lease excludes writers (§6.6).
+        // SAFETY: i < slots ⇒ in-bounds; the lease excludes writers (§6.6),
+        // keeps the mapping alive (it owns an `Arc<Arena>`), and the result
+        // borrows the lease, so the view ends before the lease can drop.
         unsafe { std::slice::from_raw_parts(self.ptr().add(self.offset_of(i)), n) }
     }
 
-    /// Mutable slot view for the page-in path. Caller must hold the `Filled`
-    /// claim for `i` (exclusive): a single writer per slot between claim and
-    /// fill completion — the residency map's claim granted this caller the
-    /// only lease, and the fill-completion gate keeps every other claimer
-    /// parked until the fill is reported done, after which this `&mut` has
-    /// ended and only shared `&` reads remain.
-    // &self → &mut [u8] is the point: the aliasing rule it relies on is the
-    // Filled-claim exclusivity contract documented above, which the residency
-    // map's claim + fill gate enforce.
+    /// Mutable slot view for the page-in path. The residency map's claim
+    /// granted the claimer the only lease on the slot and parks every other
+    /// claimer of the key until the fill is reported done; the view borrows
+    /// the claim mutably, so it cannot outlive it nor coexist with a second
+    /// view from the same claim.
     ///
     /// # Panics
-    /// Panics when `i >= slot_count` or the claim names another slot.
-    #[allow(clippy::mut_from_ref)] // the point: FillClaim proves exclusivity
-    pub(crate) fn slot_mut(&self, i: u32, claim: &crate::pool::residency::FillClaim) -> &mut [u8] {
+    /// Panics when the claim names a slot outside the arena.
+    #[allow(clippy::mut_from_ref)] // exclusivity is carried by `&mut FillClaim`
+    pub(crate) fn slot_mut<'c>(
+        &self,
+        claim: &'c mut crate::pool::residency::FillClaim<'_>,
+    ) -> &'c mut [u8] {
+        let i = claim.slot();
         assert!(i < self.slots);
-        assert_eq!(
-            claim.slot, i,
-            "slot fill under a FillClaim for another slot"
-        );
-        // SAFETY: same bounds as `slot`; exclusivity comes from the Filled
-        // claim — the residency map guarantees no other writer or reader for
-        // this slot until the claim is released.
         let n = self.slot_size_of(i);
+        // SAFETY: same bounds as `slot`; the claim is the sole writer and no
+        // reader exists until it is finished or cancelled (consumed), which
+        // ends this borrow first.
         unsafe { std::slice::from_raw_parts_mut(self.ptr().add(self.offset_of(i)), n) }
+    }
+
+    /// Number of slot classes.
+    pub fn class_count(&self) -> usize {
+        self.classes.len()
     }
 
     /// Number of slots.
@@ -334,6 +365,14 @@ mod tests {
             },
         ])
         .expect("mlock may fail on low RLIMIT_MEMLOCK")
+    }
+
+    #[test]
+    fn page_span_covers_partial_boundary_pages() {
+        assert_eq!(page_span(0, 4096), (0, 4096));
+        assert_eq!(page_span(100, 4096), (0, 8192), "straddles two pages");
+        assert_eq!(page_span(4096 + 8, 10), (4096, 4096));
+        assert_eq!(page_span(8191, 2), (4096, 8192));
     }
 
     #[test]

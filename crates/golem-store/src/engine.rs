@@ -73,10 +73,10 @@ pub struct PageRead<'a> {
     pub expected_crcs: &'a [u32],
 }
 
-/// Default worker count for [`IoEngine::new`]. M0 measured t8 legs
-/// regressing to ~2 GiB/s per drive (vs 5.8/2.2 at t1); 1–2 in-flight reads
-/// per drive is the measured optimum — the per-replica derivation arrives
-/// with the M3.3 store wiring.
+/// Default worker count for [`IoEngine::new`], a total across all drives, not
+/// per drive: a stopgap until the per-replica count is derived from the drive
+/// set. Measured t8 legs regress to ~2 GiB/s per drive (vs 5.8/2.2 at t1);
+/// 1–2 in-flight reads per drive is the measured optimum.
 pub const DEFAULT_IO_THREADS: usize = 2;
 
 /// One queued chunk read; `index` is the chunk's position in the striped plan

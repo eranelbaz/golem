@@ -50,12 +50,12 @@ fn arena_locks_and_slots_are_disjoint() {
     let plane = (16 * 32 * 4) as u64; // n_ff_exp * n_embd * F32 (tiny-moe plane)
     let pool = ExpertPool::new(
         Arena::new(&[SlotClass {
-            slot_size: 3 * plane as usize, // one slot = one gate/up/down unit (§3.4 v3)
+            slot_size: 3 * plane as usize, // one slot = one gate/up/down unit (§3.4)
             slots: 4,
         }])
         .expect("mlock may fail on low RLIMIT_MEMLOCK"),
         arc_dyn(std::sync::Arc::new(ByteSource)),
-        Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
+        Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
         Arc::new(P3Stats::new()),
         PoolGeometry {
             layers: vec![UnitLayout::new([plane; 3], [None; 3]).unwrap()],

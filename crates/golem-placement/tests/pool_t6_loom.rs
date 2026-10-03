@@ -8,7 +8,7 @@
 use golem_placement::pool::primitives::arc_dyn;
 use golem_placement::pool::primitives::{self, Arc};
 use golem_placement::pool::{
-    Arena, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, PoolGeometry, SlotClass,
+    Arena, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, PoolError, PoolGeometry, SlotClass,
     SnapshotHandle, UnitLayout,
 };
 
@@ -57,43 +57,63 @@ fn loom_pool() -> Arc<ExpertPool> {
     ExpertPool::new(
         arena,
         arc_dyn(std::sync::Arc::new(ProvenanceSource)),
-        Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
+        Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
         Arc::new(P3Stats::new()),
         geometry,
         vec![0; 1],
     )
 }
 
+/// Runs one `ensure_range` and counts the copy if it ran. `Busy` is the only
+/// legal failure: the 1-slot pool can be fully leased by the other thread. A
+/// source error or a swallowed result would make the model vacuous.
+fn ensure_counted(pool: &ExpertPool, expert: u32, copies: &Counter, expect: ExpertKind) {
+    let mut copy = |bytes: &[u8]| {
+        assert!(
+            bytes.iter().all(|&b| b == plane_byte(expect, expert)),
+            "torn slot under lease"
+        );
+        copies.fetch_add(1, Ordering::Relaxed);
+    };
+    match pool.ensure_range(true, 0, ExpertKind::Gate, expert, expert, &mut copy) {
+        Ok(()) | Err(PoolError::Busy) => {}
+        Err(e) => panic!("unexpected pool error: {e}"),
+    }
+}
+
+type Counter = Arc<primitives::AtomicUsize>;
+
+fn counter() -> Counter {
+    Arc::new(primitives::AtomicUsize::new(0))
+}
+
 #[test]
 fn t6_access_pagein_evict_copy_no_torn_reads() {
     primitives::model(|| {
         let pool = loom_pool();
-        let p2 = pool.clone();
-        let pagein = primitives::spawn(move || {
-            let mut copy = |bytes: &[u8]| {
-                assert!(
-                    bytes.iter().all(|&b| b == plane_byte(ExpertKind::Gate, 1)),
-                    "torn slot under lease"
-                )
-            };
-            let _ = p2.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut copy);
-        });
-        let mut copy = |bytes: &[u8]| {
-            assert!(
-                bytes.iter().all(|&b| b == plane_byte(ExpertKind::Gate, 0)),
-                "torn slot under lease"
-            )
-        };
-        let _ = pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut copy);
+        let copies = counter();
+        let (p2, c2) = (pool.clone(), copies.clone());
+        let pagein = primitives::spawn(move || ensure_counted(&p2, 1, &c2, ExpertKind::Gate));
+        ensure_counted(&pool, 0, &copies, ExpertKind::Gate);
         pagein.join().unwrap();
+        assert!(
+            copies.load(Ordering::Relaxed) >= 1,
+            "no copy ran: the model checked nothing"
+        );
         // Post-join: residency ⊆ slot provenance (final-state sanity only).
         for e in 0..2u32 {
-            if pool.residency.is_resident(0, e) {
-                let lease = pool.lease_for_test(0, e);
-                assert_eq!(
-                    pool.slot_bytes_under(&lease)[0],
-                    plane_byte(ExpertKind::Gate, e)
-                );
+            if pool.is_resident(0, e) {
+                let mut leases = Vec::new();
+                pool.ensure_range_leased(
+                    0,
+                    ExpertKind::Gate,
+                    e,
+                    e,
+                    &mut [std::ptr::null()],
+                    &mut leases,
+                )
+                .unwrap();
+                assert_eq!(leases[0].bytes()[0], plane_byte(ExpertKind::Gate, e));
             }
         }
     });
@@ -101,29 +121,21 @@ fn t6_access_pagein_evict_copy_no_torn_reads() {
 
 /// Same-unit concurrent claims: exactly one thread fills; the other must park
 /// on the fill-completion gate and then read FULLY written bytes — no torn
-/// mid-fill reads under lease.
+/// mid-fill reads under lease. One unit, one slot: neither claim can be Busy.
 #[test]
 fn t6_same_key_concurrent_claim_no_torn_fill() {
     primitives::model(|| {
         let pool = loom_pool();
-        let p2 = pool.clone();
-        let second = primitives::spawn(move || {
-            let mut copy = |bytes: &[u8]| {
-                assert!(
-                    bytes.iter().all(|&b| b == plane_byte(ExpertKind::Gate, 1)),
-                    "torn mid-fill read"
-                )
-            };
-            let _ = p2.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut copy);
-        });
-        let mut copy = |bytes: &[u8]| {
-            assert!(
-                bytes.iter().all(|&b| b == plane_byte(ExpertKind::Gate, 1)),
-                "torn mid-fill read"
-            )
-        };
-        let _ = pool.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut copy);
+        let copies = counter();
+        let (p2, c2) = (pool.clone(), copies.clone());
+        let second = primitives::spawn(move || ensure_counted(&p2, 1, &c2, ExpertKind::Gate));
+        ensure_counted(&pool, 1, &copies, ExpertKind::Gate);
         second.join().unwrap();
+        assert_eq!(
+            copies.load(Ordering::Relaxed),
+            2,
+            "both claimers of one key must copy"
+        );
     });
 }
 
@@ -131,20 +143,15 @@ fn t6_same_key_concurrent_claim_no_torn_fill() {
 fn t6_leased_expert_never_evicted() {
     primitives::model(|| {
         let pool = loom_pool();
-        let p2 = pool.clone();
-        let evictor = primitives::spawn(move || {
-            let mut copy =
-                |bytes: &[u8]| assert!(bytes.iter().all(|&b| b == plane_byte(ExpertKind::Gate, 1)));
-            let _ = p2.ensure_range(true, 0, ExpertKind::Gate, 1, 1, &mut copy);
-        });
-        let mut copy = |bytes: &[u8]| {
-            assert!(
-                bytes.iter().all(|&b| b == plane_byte(ExpertKind::Gate, 0)),
-                "lease violated: slot refilled during copy"
-            )
-        };
-        let _ = pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut copy);
+        let copies = counter();
+        let (p2, c2) = (pool.clone(), copies.clone());
+        let evictor = primitives::spawn(move || ensure_counted(&p2, 1, &c2, ExpertKind::Gate));
+        ensure_counted(&pool, 0, &copies, ExpertKind::Gate);
         evictor.join().unwrap();
+        assert!(
+            copies.load(Ordering::Relaxed) >= 1,
+            "no copy ran: the model checked nothing"
+        );
     });
 }
 
@@ -184,7 +191,7 @@ fn t6_two_planes_of_one_unit_one_fill() {
         // One slot serves the unit; both planes carry their own fill bytes.
         let slots: Vec<u32> = mine.iter().chain(theirs.iter()).map(|l| l.slot()).collect();
         assert!(slots.windows(2).all(|w| w[0] == w[1]), "one slot per unit");
-        let bytes = pool.arena.slot(slots[0], &mine[0]);
+        let bytes = mine[0].bytes();
         assert!(
             bytes[..8]
                 .iter()

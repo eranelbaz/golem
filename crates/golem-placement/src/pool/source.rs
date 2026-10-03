@@ -8,7 +8,7 @@
 // `cfg(loom)` is set via RUSTFLAGS by the loom leg; declare it known here.
 #![allow(unexpected_cfgs)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use golem_gguf::{data_section_offset, ggml_row_bytes, tensor_entries};
 
+use super::arena::{advise_random, drop_page_cache};
 use super::residency::ExpertKind;
 
 /// One expert layer's unit (§6.1): gate, up, down planes at fixed offsets
@@ -44,9 +45,16 @@ impl UnitLayout {
     /// Lays out planes of `stride` bytes. `direct[k] = Some(h)`: plane `k`
     /// can be read with `O_DIRECT` and sits `h` bytes past a block boundary
     /// in the file, so its region is `h + stride` rounded up to
-    /// [`DIRECT_ALIGN`]; `None`: densely packed (`head = 0`, region = stride).
-    /// `None` on overflow.
+    /// [`DIRECT_ALIGN`]; `None`: `head = 0`, region = stride. When ANY plane
+    /// is direct, every region is rounded up to [`DIRECT_ALIGN`] so each
+    /// region (and with it the slot) starts page-aligned, as `O_DIRECT`
+    /// requires of the buffer address. `None` on overflow.
     pub fn new(stride: [u64; 3], direct: [Option<u64>; 3]) -> Option<Self> {
+        let align = if direct.iter().any(Option::is_some) {
+            DIRECT_ALIGN
+        } else {
+            1
+        };
         let mut offset = [0; 3];
         let mut head = [0; 3];
         let mut region = [0; 3];
@@ -54,7 +62,6 @@ impl UnitLayout {
         for k in 0..3 {
             head[k] = direct[k].unwrap_or(0);
             offset[k] = at.checked_add(head[k])?;
-            let align = if direct[k].is_some() { DIRECT_ALIGN } else { 1 };
             region[k] = head[k]
                 .checked_add(stride[k])?
                 .checked_next_multiple_of(align)?;
@@ -87,7 +94,7 @@ impl UnitLayout {
 /// Pool geometry derived from the expert plane table (§5.4): per-layer unit
 /// layouts (dense-lead-adjusted, MTP excluded), the dense-lead-adjusted
 /// layer/expert counts, and total expert bytes. RAM slot sizing is per unit
-/// class (§5 pool amendment), so no single slot size here — each class's
+/// class (§5.4), so no single slot size here — each class's
 /// slot size is its own unit bytes (see [`Self::classes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolGeometry {
@@ -115,7 +122,7 @@ impl PoolGeometry {
     }
 
     /// Distinct slot sizes ascending, with the layers of each — the per-class
-    /// slab partition (§5 pool amendment).
+    /// slab partition (§5.4).
     pub fn classes(&self) -> Vec<(u64, Vec<u32>)> {
         let mut by_size: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         for (layer, l) in self.layers.iter().enumerate() {
@@ -174,6 +181,18 @@ pub enum SourceError {
         /// Unmapped ggml type tag.
         ggml_type: u32,
     },
+    /// An expert tensor's block index is implausibly large (corrupt name).
+    BlockOutOfRange {
+        /// Offending tensor name.
+        name: String,
+    },
+    /// Shard metadata disagrees with its position in the split set.
+    BadSplit {
+        /// Shard path.
+        path: PathBuf,
+        /// What disagrees.
+        why: String,
+    },
     /// Plane byte size overflowed `u64`.
     StrideOverflow {
         /// Offending tensor name.
@@ -198,6 +217,8 @@ impl fmt::Display for SourceError {
             Self::UnknownGgmlType { name, ggml_type } => {
                 write!(f, "tensor {name}: unknown ggml type {ggml_type}")
             }
+            Self::BlockOutOfRange { name } => write!(f, "tensor {name}: block index out of range"),
+            Self::BadSplit { path, why } => write!(f, "shard {}: {why}", path.display()),
             Self::StrideOverflow { name } => write!(f, "tensor {name}: plane stride overflow"),
             Self::IncompleteLayer { layer } => {
                 write!(f, "expert layer {layer} is missing one of gate/up/down")
@@ -254,10 +275,16 @@ pub struct GgufPreadSource {
     direct: Vec<Option<File>>,
     /// Cleared on the first direct-read failure of a shard (btrfs has
     /// returned EIO under concurrent `O_DIRECT`); that shard then stays
-    /// buffered + `POSIX_FADV_DONTNEED`.
+    /// buffered + `POSIX_FADV_DONTNEED`. A short read alone does not clear it.
     direct_ok: Vec<AtomicBool>,
     direct_reads: AtomicU64,
-    planes: HashMap<(u32, ExpertKind), Plane>,
+    /// Indexed by [`plane_index`]; `None` where a layer lacks that plane.
+    planes: Vec<Option<Plane>>,
+}
+
+/// Flat index of one `(layer, kind)` plane: no hashing on the page-in path.
+fn plane_index(layer: u32, kind: ExpertKind) -> usize {
+    layer as usize * ExpertKind::ALL.len() + kind.ordinal()
 }
 
 /// `blk.<N>.` prefix parse.
@@ -268,17 +295,22 @@ fn blk_of(name: &str) -> Option<u32> {
 /// Pure geometry over a walked plane table: one `UnitLayout` per layer in
 /// `ExpertKind::ALL` order, every live layer complete (§6.1). Empty table →
 /// an empty geometry, which `GgufPreadSource::geometry` surfaces as `None`.
-fn geometry_of(planes: &HashMap<(u32, ExpertKind), Plane>) -> Result<PoolGeometry, SourceError> {
-    let n_layers = planes.keys().map(|&(l, _)| l + 1).max().unwrap_or(0);
-    let n_experts = planes.values().map(|p| p.n_experts).max().unwrap_or(0);
+fn geometry_of(planes: &[Option<Plane>]) -> Result<PoolGeometry, SourceError> {
+    let n_layers = (planes.len() / ExpertKind::ALL.len()) as u32;
+    let n_experts = planes
+        .iter()
+        .flatten()
+        .map(|p| p.n_experts)
+        .max()
+        .unwrap_or(0);
     let mut expert_bytes = 0u64;
     let mut layers = Vec::with_capacity(n_layers as usize);
     for layer in 0..n_layers {
         let mut stride = [0u64; 3];
         for (i, s) in stride.iter_mut().enumerate() {
             let kind = ExpertKind::ALL[i];
-            let p = planes
-                .get(&(layer, kind))
+            let p = planes[plane_index(layer, kind)]
+                .as_ref()
                 .ok_or(SourceError::IncompleteLayer { layer })?;
             *s = p.stride;
             expert_bytes = expert_bytes
@@ -291,7 +323,7 @@ fn geometry_of(planes: &HashMap<(u32, ExpertKind), Plane>) -> Result<PoolGeometr
                     name: tensor_name(layer, kind),
                 })?;
         }
-        let head = ExpertKind::ALL.map(|k| planes[&(layer, k)].head());
+        let head = ExpertKind::ALL.map(|k| planes[plane_index(layer, k)].and_then(|p| p.head()));
         layers.push(
             UnitLayout::new(stride, head).ok_or(SourceError::StrideOverflow {
                 name: tensor_name(layer, ExpertKind::Down),
@@ -307,8 +339,7 @@ fn geometry_of(planes: &HashMap<(u32, ExpertKind), Plane>) -> Result<PoolGeometr
 
 /// Tensor name of one expert plane, for error reports.
 fn tensor_name(layer: u32, kind: ExpertKind) -> String {
-    let stem = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"][kind.ordinal()];
-    format!("blk.{layer}.{stem}.weight")
+    format!("blk.{layer}.{}.weight", kind.stem())
 }
 
 impl GgufPreadSource {
@@ -316,7 +347,7 @@ impl GgufPreadSource {
     /// the model carries no expert tensors, an error when a live layer cannot
     /// form a unit.
     pub fn geometry(&self) -> Result<Option<PoolGeometry>, SourceError> {
-        if self.planes.is_empty() {
+        if self.planes.iter().all(Option::is_none) {
             return Ok(None);
         }
         geometry_of(&self.planes).map(Some)
@@ -335,7 +366,16 @@ impl GgufPreadSource {
     /// expert tensor whose stride math fails.
     pub fn open(path: &Path, n_dense_lead: u32) -> Result<Self, SourceError> {
         let kvs = golem_gguf::read_kvs(&mut File::open(path)?)?;
-        let split_count = golem_gguf::kv_int(&kvs, "split.count").unwrap_or(1);
+        let split_count = match golem_gguf::kv_int(&kvs, "split.count") {
+            None => 1,
+            Some(0) => {
+                return Err(SourceError::BadSplit {
+                    path: path.to_path_buf(),
+                    why: "split.count = 0".into(),
+                });
+            }
+            Some(n) => n,
+        };
         let nextn = golem_gguf::arch_kv_int(&kvs, "nextn_predict_layers").unwrap_or(0);
         let block_count = golem_gguf::arch_kv_int(&kvs, "block_count");
         let mtp_from = block_count
@@ -343,7 +383,7 @@ impl GgufPreadSource {
                 // A nextn value larger than block_count is a corrupt KV, not
                 // "skip everything": name it (library rule: Result, not panic).
                 if nextn > bc {
-                    return Err(SourceError::Gguf(golem_gguf::Error(format!(
+                    return Err(SourceError::Gguf(golem_gguf::Error::Invalid(format!(
                         "nextn_predict_layers {nextn} > block_count {bc}"
                     ))));
                 }
@@ -355,13 +395,16 @@ impl GgufPreadSource {
         // count fails on the first missing shard instead.
         let mut files = Vec::with_capacity((split_count as usize).min(64));
         let mut direct = Vec::with_capacity(files.capacity());
-        let mut planes = HashMap::new();
+        let mut found: BTreeMap<usize, Plane> = BTreeMap::new();
         for shard in 0..split_count {
             let shard_path = shard_path(path, shard, split_count)?;
             let mut file = File::open(&shard_path)?;
+            if split_count > 1 {
+                check_split(&shard_path, &mut file, shard, split_count)?;
+            }
             let data_start = data_section_offset(&mut file)?;
             for e in tensor_entries(&mut file)? {
-                let Some(kind) = ExpertKind::from_tensor_name(&e.name) else {
+                let Some(kind) = e.expert_kind() else {
                     continue;
                 };
                 let Some(blk) = blk_of(&e.name) else {
@@ -375,33 +418,50 @@ impl GgufPreadSource {
                         continue; // MTP/NextN block: skipped at load
                     }
                 }
+                if blk > MAX_BLOCKS {
+                    return Err(SourceError::BlockOutOfRange { name: e.name });
+                }
+                let overflow = || SourceError::StrideOverflow {
+                    name: e.name.clone(),
+                };
                 let stride = ggml_row_bytes(e.ggml_type, e.dims[0])
                     .ok_or(SourceError::UnknownGgmlType {
                         name: e.name.clone(),
                         ggml_type: e.ggml_type,
                     })?
                     .checked_mul(e.dims[1])
-                    .ok_or(SourceError::StrideOverflow {
-                        name: e.name.clone(),
-                    })?;
-                planes.insert(
-                    (blk - n_dense_lead, kind),
+                    .ok_or_else(overflow)?;
+                found.insert(
+                    plane_index(blk - n_dense_lead, kind),
                     Plane {
                         shard: shard as usize,
-                        base: data_start + e.offset,
+                        base: data_start.checked_add(e.offset).ok_or_else(overflow)?,
                         stride,
-                        n_experts: e.dims[2] as u32,
+                        n_experts: u32::try_from(e.dims[2]).map_err(|_| overflow())?,
                     },
                 );
             }
             files.push(file);
-            direct.push(
-                OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_DIRECT)
-                    .open(&shard_path)
-                    .ok(),
-            );
+            direct.push(match open_direct(&shard_path) {
+                Ok(f) => Some(f),
+                Err(err) => {
+                    tracing::warn!(
+                        shard = %shard_path.display(),
+                        error = %err,
+                        "O_DIRECT open failed; shard reads buffered + POSIX_FADV_DONTNEED"
+                    );
+                    None
+                }
+            });
+        }
+        let n_planes = found.keys().next_back().map_or(0, |&i| i + 1);
+        let n_planes = n_planes.next_multiple_of(ExpertKind::ALL.len());
+        let mut planes = vec![None; n_planes];
+        for (i, p) in found {
+            planes[i] = Some(p);
+        }
+        for f in &files {
+            advise_random(f);
         }
         let direct_ok = direct.iter().map(|_| AtomicBool::new(true)).collect();
         Ok(Self {
@@ -416,6 +476,35 @@ impl GgufPreadSource {
     /// Plane reads that bypassed the page cache via `O_DIRECT`.
     pub fn direct_reads(&self) -> u64 {
         self.direct_reads.load(Ordering::Relaxed)
+    }
+}
+
+/// Upper bound on a plausible `blk.N` index; a larger one is a corrupt name,
+/// not a model (and would size the plane table).
+const MAX_BLOCKS: u32 = 1 << 16;
+
+fn open_direct(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+}
+
+/// A shard must say it is shard `no` of `count`: a renamed, reordered or
+/// foreign-set sibling would otherwise map planes to the wrong files.
+fn check_split(path: &Path, file: &mut File, no: u64, count: u64) -> Result<(), SourceError> {
+    let kvs = golem_gguf::read_kvs(file)?;
+    let bad = |why: String| SourceError::BadSplit {
+        path: path.to_path_buf(),
+        why,
+    };
+    match golem_gguf::kv_int(&kvs, "split.no") {
+        Some(n) if n == no => {}
+        other => return Err(bad(format!("split.no = {other:?}, expected {no}"))),
+    }
+    match golem_gguf::kv_int(&kvs, "split.count") {
+        Some(c) if c == count => Ok(()),
+        other => Err(bad(format!("split.count = {other:?}, expected {count}"))),
     }
 }
 
@@ -470,9 +559,10 @@ const READ_RETRIES: usize = 64;
 impl GgufPreadSource {
     /// Direct (`O_DIRECT`) read of the block-aligned file range covering one
     /// plane into `into`, which starts `head` bytes before the plane. `None`
-    /// when the shard/plane/buffer can't go direct; `Some(Err)` on an I/O
-    /// failure (the caller disables direct reads for the shard and retries
-    /// buffered).
+    /// when the shard/plane/buffer can't go direct, or a short read left the
+    /// cursor unaligned (this read alone then goes buffered); `Some(Err)` on
+    /// an I/O failure (the caller disables direct reads for the shard and
+    /// retries buffered).
     fn read_direct(
         &self,
         p: &Plane,
@@ -492,19 +582,47 @@ impl GgufPreadSource {
             return None;
         }
         let want = head + p.stride as usize; // bytes that must arrive
-        Some(read_full(file, buf, file_start, want))
+        match read_full(
+            |b, o| file.read_at(b, o),
+            buf,
+            file_start,
+            want,
+            DIRECT_ALIGN,
+        ) {
+            Ok(Fill::Done) => Some(Ok(())),
+            Ok(Fill::Unaligned) => None,
+            Err(e) => Some(Err(e)),
+        }
     }
+}
+
+/// How a [`read_full`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Fill {
+    /// At least `want` bytes arrived.
+    Done,
+    /// A short read left the cursor off `align`; the remainder cannot be
+    /// read with the same `O_DIRECT` buffer/offset contract.
+    Unaligned,
 }
 
 /// Positioned read of `buf` at `off` until at least `want` bytes arrived
 /// (a direct read may stop at EOF inside the aligned tail). Bounded retries
-/// on EINTR / short reads; 0 bytes before `want` is `UnexpectedEof`.
-fn read_full(file: &File, buf: &mut [u8], mut off: u64, want: usize) -> io::Result<()> {
+/// on EINTR / short reads; 0 bytes before `want` is `UnexpectedEof`. With
+/// `align > 1`, a short read that ends off `align` stops with
+/// [`Fill::Unaligned`] instead of retrying a misaligned `O_DIRECT` read.
+fn read_full(
+    mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+    buf: &mut [u8],
+    mut off: u64,
+    want: usize,
+    align: u64,
+) -> io::Result<Fill> {
     let mut done = 0usize;
     for _ in 0..READ_RETRIES {
-        // Safe pread wrapper (FileExt::read_at): does not move the cursor,
-        // so concurrent readers cannot disturb each other.
-        let n = match file.read_at(&mut buf[done..], off) {
+        // `read_at` is a positioned read (`FileExt::read_at`): it does not
+        // move the cursor, so concurrent readers cannot disturb each other.
+        let n = match read_at(&mut buf[done..], off) {
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
@@ -518,7 +636,10 @@ fn read_full(file: &File, buf: &mut [u8], mut off: u64, want: usize) -> io::Resu
         done += n;
         off += n as u64;
         if done >= want {
-            return Ok(());
+            return Ok(Fill::Done);
+        }
+        if off % align != 0 {
+            return Ok(Fill::Unaligned);
         }
     }
     Err(io::Error::new(
@@ -536,7 +657,11 @@ impl ExpertSource for GgufPreadSource {
         into: &mut [u8],
         head: usize,
     ) -> io::Result<()> {
-        let Some(p) = self.planes.get(&(layer, kind)) else {
+        let Some(p) = self
+            .planes
+            .get(plane_index(layer, kind))
+            .and_then(Option::as_ref)
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no expert plane layer {layer} kind {kind:?}"),
@@ -576,13 +701,19 @@ impl ExpertSource for GgufPreadSource {
             Some(Err(_)) | None => {}
         }
         let file = &self.files[p.shard];
-        read_full(file, &mut into[head..head + stride], start, stride)?;
-        super::arena::drop_page_cache(file, start, stride);
+        read_full(
+            |b, o| file.read_at(b, o),
+            &mut into[head..head + stride],
+            start,
+            stride,
+            1,
+        )?;
+        drop_page_cache(file, start, stride);
         Ok(())
     }
 
     fn plane(&self, layer: u32, kind: ExpertKind, expert: u32) -> Option<(u64, u64)> {
-        let p = self.planes.get(&(layer, kind))?;
+        let p = self.planes.get(plane_index(layer, kind))?.as_ref()?;
         Some((p.base + u64::from(expert) * p.stride, p.stride))
     }
 }
@@ -590,6 +721,8 @@ impl ExpertSource for GgufPreadSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(loom))]
+    use std::sync::Arc;
 
     fn fixture() -> std::path::PathBuf {
         xtask::tiny_moe::cached_fixture()
@@ -734,20 +867,18 @@ mod tests {
         ));
     }
 
-    fn planes_fixture(spec: &[(u32, ExpertKind)]) -> HashMap<(u32, ExpertKind), Plane> {
-        spec.iter()
-            .map(|&(layer, kind)| {
-                (
-                    (layer, kind),
-                    Plane {
-                        shard: 0,
-                        base: 0,
-                        stride: 128,
-                        n_experts: 8,
-                    },
-                )
-            })
-            .collect()
+    fn planes_fixture(spec: &[(u32, ExpertKind)]) -> Vec<Option<Plane>> {
+        let n = spec.iter().map(|&(l, _)| l as usize + 1).max().unwrap_or(0);
+        let mut planes = vec![None; n * ExpertKind::ALL.len()];
+        for &(layer, kind) in spec {
+            planes[plane_index(layer, kind)] = Some(Plane {
+                shard: 0,
+                base: 0,
+                stride: 128,
+                n_experts: 8,
+            });
+        }
+        planes
     }
 
     #[test]
@@ -786,37 +917,34 @@ mod tests {
         src.read_expert(0, ExpertKind::Gate, 63, &mut buf, 0)
             .unwrap();
         assert!(
-            buf.iter().all(|&b| b == xtask::shape_moe::fill_byte(1, 0)),
-            "read from the data shard, gate provenance byte"
+            buf.iter()
+                .enumerate()
+                .all(|(i, &b)| b == xtask::shape_moe::fill_byte(1, 0, 63, i)),
+            "read from the data shard: blk 1 gate plane, expert 63 pattern"
         );
     }
 
-    /// Page-multiple F16 planes (2048·1 elems × 2 B = 4096 B) at an
-    /// unaligned file offset: the direct path must land each plane at
-    /// `head` inside its page-rounded region, byte-exact, and leave the
-    /// buffered fallback byte-identical. `.test-cache` is on the repo
-    /// filesystem; where it refuses O_DIRECT the test fails loudly rather
-    /// than passing on the buffered path (evidence rule).
-    #[test]
+    /// Writes a one-layer GGUF (`blk.0`, F16, 4 experts) under `.test-cache`
+    /// with per-plane `ne0` and returns its path. Plane `k` of expert `e` is
+    /// filled with `byte(k, e)`.
     #[cfg(not(loom))]
-    fn direct_read_lands_plane_at_head_byte_exact() {
+    fn write_one_layer(name: &str, ne0: [u64; 3]) -> std::path::PathBuf {
         use xtask::gguf::{GgufKv, GgufTensorMeta, GgufValue, write_gguf};
-        const NE0: u64 = 2048;
         const N_EXP: u64 = 4;
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.test-cache/direct-align.gguf");
-        let byte = |k: usize, e: u64| (0x10 * (k as u64 + 1) + e) as u8;
-        let tensors: Vec<_> = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let tensors: Vec<_> = ExpertKind::ALL
             .iter()
-            .enumerate()
-            .map(|(k, stem)| {
+            .map(|kind| {
+                let k = kind.ordinal();
                 let data = (0..N_EXP)
-                    .flat_map(|e| std::iter::repeat_n(byte(k, e), (NE0 * 2) as usize))
+                    .flat_map(|e| std::iter::repeat_n(byte(k, e), (ne0[k] * 2) as usize))
                     .collect();
                 (
                     GgufTensorMeta {
-                        name: format!("blk.0.{stem}.weight"),
-                        dims: vec![NE0, 1, N_EXP],
+                        name: format!("blk.0.{}.weight", kind.stem()),
+                        dims: vec![ne0[k], 1, N_EXP],
                         ggml_type: golem_gguf::GGML_TYPE_F16,
                     },
                     data,
@@ -828,17 +956,21 @@ mod tests {
             value: GgufValue::Str("glm4moe".into()),
         }];
         write_gguf(&mut File::create(&path).unwrap(), &kvs, &tensors).unwrap();
+        path
+    }
 
-        let src = GgufPreadSource::open(&path, 0).unwrap();
-        assert!(src.direct[0].is_some(), "repo filesystem refused O_DIRECT");
+    #[cfg(not(loom))]
+    fn byte(k: usize, e: u64) -> u8 {
+        (0x10 * (k as u64 + 1) + e) as u8
+    }
+
+    /// Pages experts 0 and 3 through the production stack (page-aligned
+    /// mlocked arena + pager page-in), checking every plane byte-exact.
+    #[cfg(not(loom))]
+    fn page_in_and_check(src: GgufPreadSource) -> (Arc<GgufPreadSource>, UnitLayout) {
+        use crate::pool::{Arena, ExpertPool, P3Stats, PolicySnapshot, SlotClass, SnapshotHandle};
         let g = src.geometry().unwrap().unwrap();
         let unit = g.layers[0];
-        assert_ne!(unit.head[0], 0, "fixture must exercise an unaligned plane");
-        assert!(unit.region.iter().all(|r| r % DIRECT_ALIGN == 0));
-
-        // Production stack: page-aligned mlocked arena + pager page-in.
-        use crate::pool::{Arena, ExpertPool, P3Stats, PolicySnapshot, SlotClass, SnapshotHandle};
-        use std::sync::Arc;
         let src = Arc::new(src);
         let arena = Arena::new(&[SlotClass {
             slot_size: unit.slot_bytes() as usize,
@@ -848,9 +980,9 @@ mod tests {
         let pool = ExpertPool::new(
             arena,
             src.clone(),
-            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
             Arc::new(P3Stats::new()),
-            g.clone(),
+            g,
             vec![0],
         );
         for e in [0u32, 3] {
@@ -864,6 +996,26 @@ mod tests {
                 .unwrap();
             }
         }
+        (src, unit)
+    }
+
+    /// Page-multiple F16 planes (2048·1 elems × 2 B = 4096 B) at an
+    /// unaligned file offset: the direct path must land each plane at
+    /// `head` inside its page-rounded region, byte-exact, and leave the
+    /// buffered fallback byte-identical. `.test-cache` is on the repo
+    /// filesystem; where it refuses O_DIRECT the test fails loudly rather
+    /// than passing on the buffered path (evidence rule).
+    #[test]
+    #[cfg(not(loom))]
+    fn direct_read_lands_plane_at_head_byte_exact() {
+        let path = write_one_layer("direct-align.gguf", [2048; 3]);
+        let src = GgufPreadSource::open(&path, 0).unwrap();
+        assert!(src.direct[0].is_some(), "repo filesystem refused O_DIRECT");
+        let unit = src.geometry().unwrap().unwrap().layers[0];
+        assert_ne!(unit.head[0], 0, "fixture must exercise an unaligned plane");
+        assert!(unit.region.iter().all(|r| r % DIRECT_ALIGN == 0));
+
+        let (src, unit) = page_in_and_check(src);
         assert_eq!(src.direct_reads(), 6, "every plane went direct");
 
         // Buffered path (head 0, plain buffer): byte-identical plane.
@@ -876,6 +1028,151 @@ mod tests {
             6,
             "head mismatch takes the buffered path"
         );
+    }
+
+    /// A non-block-multiple plane between two direct planes (the real
+    /// GLM q-mix shape): the down plane's region must still start
+    /// page-aligned, so it keeps going direct.
+    #[test]
+    #[cfg(not(loom))]
+    fn mixed_stride_unit_keeps_later_planes_direct() {
+        let path = write_one_layer("direct-mixed.gguf", [2048, 64, 2048]);
+        let src = GgufPreadSource::open(&path, 0).unwrap();
+        assert!(src.direct[0].is_some(), "repo filesystem refused O_DIRECT");
+        let unit = src.geometry().unwrap().unwrap().layers[0];
+        assert_eq!(unit.stride, [4096, 128, 4096]);
+        assert!(unit.region.iter().all(|r| r % DIRECT_ALIGN == 0));
+
+        let (src, _) = page_in_and_check(src);
+        assert_eq!(src.direct_reads(), 4, "gate and down direct, up buffered");
+    }
+
+    #[test]
+    fn unit_layout_page_aligns_every_region_when_any_plane_is_direct() {
+        let u = UnitLayout::new([4096, 100, 8192], [Some(8), None, Some(0)]).unwrap();
+        assert!(u.region.iter().all(|r| r % DIRECT_ALIGN == 0), "{u:?}");
+        assert_eq!(u.slot_bytes() % DIRECT_ALIGN, 0);
+        let start = |k: usize| u.offset[k] - u.head[k];
+        assert!(
+            (0..3).all(|k| start(k) % DIRECT_ALIGN == 0),
+            "every region starts page-aligned: {u:?}"
+        );
+        // No direct plane: dense packing, no padding.
+        let dense = UnitLayout::new([100, 100, 100], [None; 3]).unwrap();
+        assert_eq!(dense.slot_bytes(), 300);
+    }
+
+    #[test]
+    fn short_direct_read_off_alignment_stops_instead_of_retrying() {
+        // The kernel returned 5000 of 8192 requested bytes: the next
+        // O_DIRECT read would start at an unaligned offset (EINVAL), so the
+        // caller must fall back for this read, not retry.
+        let mut calls = 0;
+        let mut buf = vec![0u8; 8192];
+        let fill = read_full(
+            |b, _| {
+                calls += 1;
+                let n = b.len().min(5000);
+                b[..n].fill(7);
+                Ok(n)
+            },
+            &mut buf,
+            0,
+            8192,
+            DIRECT_ALIGN,
+        )
+        .unwrap();
+        assert_eq!((fill, calls), (Fill::Unaligned, 1));
+        // A short read that stays aligned keeps going.
+        let mut calls = 0;
+        let fill = read_full(
+            |b, _| {
+                calls += 1;
+                let n = b.len().min(4096);
+                Ok(n)
+            },
+            &mut buf,
+            0,
+            8192,
+            DIRECT_ALIGN,
+        )
+        .unwrap();
+        assert_eq!((fill, calls), (Fill::Done, 2));
+    }
+
+    /// Writes a tiny split set; shard `i` claims `(no[i], count[i])`.
+    #[cfg(not(loom))]
+    fn write_split(dir: &str, no: [u16; 2], count: [u16; 2]) -> std::path::PathBuf {
+        use xtask::gguf::{GgufKv, GgufTensorMeta, GgufValue, write_gguf};
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.test-cache")
+            .join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        for i in 0..2 {
+            let kvs = [
+                GgufKv {
+                    key: "general.architecture".into(),
+                    value: GgufValue::Str("glm4moe".into()),
+                },
+                GgufKv {
+                    key: "split.no".into(),
+                    value: GgufValue::U16(no[i]),
+                },
+                GgufKv {
+                    key: "split.count".into(),
+                    value: GgufValue::U16(count[i]),
+                },
+            ];
+            let tensors: Vec<(GgufTensorMeta, Vec<u8>)> = if i == 1 {
+                ExpertKind::ALL
+                    .iter()
+                    .map(|kind| {
+                        (
+                            GgufTensorMeta {
+                                name: format!("blk.0.{}.weight", kind.stem()),
+                                dims: vec![64, 1, 2],
+                                ggml_type: golem_gguf::GGML_TYPE_F16,
+                            },
+                            vec![1u8; 64 * 2 * 2],
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let f = d.join(format!("m-{:05}-of-00002.gguf", i + 1));
+            write_gguf(&mut File::create(f).unwrap(), &kvs, &tensors).unwrap();
+        }
+        d.join("m-00001-of-00002.gguf")
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn split_set_is_cross_checked_per_shard() {
+        let ok = write_split("split-ok", [0, 1], [2, 2]);
+        assert!(
+            GgufPreadSource::open(&ok, 0)
+                .unwrap()
+                .geometry()
+                .unwrap()
+                .is_some()
+        );
+
+        let swapped = write_split("split-swapped", [0, 0], [2, 2]);
+        assert!(matches!(
+            GgufPreadSource::open(&swapped, 0),
+            Err(SourceError::BadSplit { .. })
+        ));
+        let mismatched = write_split("split-count", [0, 1], [2, 3]);
+        assert!(matches!(
+            GgufPreadSource::open(&mismatched, 0),
+            Err(SourceError::BadSplit { .. })
+        ));
+        let zero = write_split("split-zero", [0, 1], [0, 2]);
+        assert!(matches!(
+            GgufPreadSource::open(&zero, 0),
+            Err(SourceError::BadSplit { .. })
+        ));
     }
 
     #[test]
