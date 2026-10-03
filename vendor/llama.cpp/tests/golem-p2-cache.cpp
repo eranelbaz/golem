@@ -1,4 +1,4 @@
-// Golem P2 v3 fuzz (design §3.4 v3): exercises the shared SLOT-INDIRECTED
+// Golem P2 fuzz (design §3.4): exercises the shared SLOT-INDIRECTED
 // device cache state machine (ggml/src/golem-device-cache.hpp — the exact
 // template the split scheduler runs) for the invariants that matter now:
 //   1. bit ⇒ current: after a step, every routed expert's remapped slot holds
@@ -7,7 +7,7 @@
 //      routed set never appear (they cannot — routed covers the ids bitset).
 //   3. victim choice (order permutation / routed set) never changes routed
 //      coverage; budget overflow with routed > K aborts loudly.
-//   4. per-layer sharing (§3.4 v3): the three planes (gate/up/down) of one layer
+//   4. per-layer sharing (§3.4): the three planes (gate/up/down) of one layer
 //      share one slot table — an eviction happens once per layer, not once per
 //      plane, and each plane keeps its own validity bits.
 //
@@ -99,6 +99,38 @@ int main() {
             auto c = step(k, 2, {0, 1});
             GGML_ASSERT(c.copied == 2 && c.skipped == 0);
         }
+    }
+
+    {   // leg: ids tensor = ggml_argsort_top_k view (nb[1] = n_expert*4, n_tokens > 1).
+        // The dense gather must yield exactly ne0*ne1 selected ids; walking the raw
+        // buffer densely would read non-selected argsort entries and overrun ids_dev.
+        const int64_t ne0 = 2, ne1 = 3, n_expert = 6;
+        const size_t nb0 = sizeof(int32_t), nb1 = n_expert * sizeof(int32_t);
+        // ggml_nbytes of the view: (ne1-1)*nb1 + ne0*nb0
+        std::vector<int32_t> raw((ne1 - 1) * n_expert + ne0, -1);
+        const int32_t sel[3][2] = {{5, 1}, {1, 4}, {0, 5}};
+        for (int64_t i1 = 0; i1 < ne1; ++i1)
+            for (int64_t i0 = 0; i0 < ne0; ++i0) raw[i1 * n_expert + i0] = sel[i1][i0];
+
+        std::vector<int32_t> dense;
+        golem::golem_gather_ids_dense(raw.data(), ne0, ne1, nb0, nb1, dense);
+        REQUIRE((int64_t) dense.size() == ne0 * ne1, "dense ids size %zu != %lld", dense.size(),
+                (long long) (ne0 * ne1));
+        for (int64_t i1 = 0; i1 < ne1; ++i1)
+            for (int64_t i0 = 0; i0 < ne0; ++i0)
+                REQUIRE(dense[i1 * ne0 + i0] == sel[i1][i0], "dense gather mismatch at (%lld,%lld)",
+                        (long long) i0, (long long) i1);
+
+        golem::GolemLayerSlots L3;
+        std::vector<int32_t> remap3, order3 = {0, 1, 2, 3, 4, 5};
+        const std::vector<int32_t> routed3 = {0, 1, 4, 5};
+        golem::golem_slab_step_nop(L3, 0, routed3, dense.data(), (int64_t) dense.size(),
+                                   order3.data(), 4, (int32_t) n_expert, remap3);
+        REQUIRE((int64_t) remap3.size() == ne0 * ne1, "remap size %zu != ids_dev nelements %lld",
+                remap3.size(), (long long) (ne0 * ne1));
+
+        // Pre-fix behavior: the raw buffer walked densely is longer than ids_dev.
+        REQUIRE((int64_t) raw.size() != ne0 * ne1, "fixture must be strided");
     }
 
     const int32_t n = 8;

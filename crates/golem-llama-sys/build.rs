@@ -11,8 +11,12 @@ use std::path::{Path, PathBuf};
 const BACKEND_ENV: &str = "GOLEM_LLAMA_SYS_BACKEND";
 const SKIP_GATE_ENV: &str = "GOLEM_LLAMA_SYS_SKIP_PIN_GATE";
 const AMDGPU_TARGET_ENV: &str = "GOLEM_LLAMA_SYS_AMDGPU_TARGET";
+const ROCM_PATH_ENV: &str = "ROCM_PATH";
 const DEFAULT_AMDGPU_TARGET: &str = "gfx1100";
-const ROCM_HIP_COMPILER: &str = "/opt/rocm/llvm/bin/clang++";
+
+fn rocm_root() -> PathBuf {
+    PathBuf::from(env::var(ROCM_PATH_ENV).unwrap_or_else(|_| "/opt/rocm".into()))
+}
 
 fn detect_backend() -> (&'static str, &'static str) {
     match env::var(BACKEND_ENV).as_deref() {
@@ -65,6 +69,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={BACKEND_ENV}");
     println!("cargo:rerun-if-env-changed={SKIP_GATE_ENV}");
     println!("cargo:rerun-if-env-changed={AMDGPU_TARGET_ENV}");
+    println!("cargo:rerun-if-env-changed={ROCM_PATH_ENV}");
     println!("cargo:rustc-check-cfg=cfg(golem_backend_hip)");
 
     let (raw, resolved) = detect_backend();
@@ -154,11 +159,13 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
     let vendor = repo_root.join("vendor/llama.cpp");
     let build_root = out_dir.join(format!("build-{backend}"));
 
+    let hip_compiler = rocm_root().join("llvm/bin/clang++");
     if backend == "hip" {
-        if !Path::new(ROCM_HIP_COMPILER).exists() {
+        if !hip_compiler.exists() {
             panic!(
-                "backend hip requires the ROCm HIP compiler at {ROCM_HIP_COMPILER} (absent) — \
-                 install ROCm or set GOLEM_LLAMA_SYS_BACKEND=cpu"
+                "backend hip requires the ROCm HIP compiler at {} (absent) — \
+                 install ROCm or set GOLEM_LLAMA_SYS_BACKEND=cpu",
+                hip_compiler.display()
             );
         }
         rocm_advisory_check(repo_root);
@@ -192,16 +199,16 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
                 .unwrap_or_else(|| DEFAULT_AMDGPU_TARGET.to_string());
             // CMake's HIP-language setup needs the ROCm root to emit `-x
             // hip`; without it clang compiles .cu as CUDA and rejects gfx1100.
-            let rocm_root = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+            let rocm_root = rocm_root();
             cfg.define("GGML_HIP", "ON")
-                .env("ROCM_PATH", &rocm_root)
+                .env(ROCM_PATH_ENV, &rocm_root)
                 .define("CMAKE_HIP_COMPILER_ROCM_ROOT", &rocm_root)
                 .define("AMDGPU_TARGETS", &amdgpu_target)
                 // CMake ≥ 4 HIP-language builds read this, not the legacy
                 // AMDGPU_TARGETS; without it clang falls back to CUDA arch
                 // probing and rejects gfx1100.
                 .define("CMAKE_HIP_ARCHITECTURES", &amdgpu_target)
-                .define("CMAKE_HIP_COMPILER", ROCM_HIP_COMPILER);
+                .define("CMAKE_HIP_COMPILER", &hip_compiler);
         }
         other => unreachable!("detect_backend only yields cpu|hip, got {other:?}"),
     }
@@ -220,7 +227,7 @@ fn rocm_advisory_check(repo_root: &Path) {
     let pinned = pin_gate::read_kv_value(&text, "rocm")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| panic!("rocm key missing in {}", lock.display()));
-    let Some(installed) = fs::read_to_string("/opt/rocm/.info/version")
+    let Some(installed) = fs::read_to_string(rocm_root().join(".info/version"))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -314,6 +321,7 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .allowlist_type("llama_.*")
         .allowlist_type("golem_.*")
         .allowlist_var("LLAMA_.*")
+        .allowlist_var("GOLEM_.*")
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: true,
         })
@@ -392,7 +400,7 @@ fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) 
         }
     }
     if backend == "hip" {
-        searched.push(PathBuf::from("/opt/rocm/lib"));
+        searched.push(rocm_root().join("lib"));
     }
     for path in &searched {
         println!("cargo:rustc-link-search=native={}", path.display());

@@ -102,6 +102,7 @@ fn bench_size(size: usize, iters: usize) {
 }
 
 #[test]
+#[ignore = "benchmark"]
 fn pinned_h2d_bandwidth_report() {
     bench_size(4_700_000, 20); // gate/up plane ≈ 4.7 MB
     bench_size(5_800_000, 20); // down plane ≈ 5.8 MB

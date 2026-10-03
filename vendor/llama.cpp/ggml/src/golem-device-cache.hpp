@@ -1,11 +1,11 @@
-// Golem patch P2 v3 (design §3.4 v3): SLOT-INDIRECTED device expert cache,
-// one slot table per expert layer shared by its gate/up/down tensors (§3.4 v3).
+// Golem patch P2 (design §3.4): SLOT-INDIRECTED device expert cache, one slot
+// table per expert layer shared by its gate/up/down tensors.
 // Included by BOTH ggml-backend.cpp (split-scheduler copy path) and
 // tests/golem-p2-cache.cpp (fuzz harness): a single shared definition —
 // hand-copied declarations would be an ODR drift (silent wrong-layout crash).
 //
-// The device cache is a slab of K+1 expert-plane slots per tensor (the shrank
-// scheduler input cpy; +1 non-NaN padding slot), and MUL_MAT_ID reads it
+// The device cache is a slab of K+1 expert-plane slots per tensor (+1 non-NaN
+// padding slot), and MUL_MAT_ID reads it
 // through a REMAPPED ids tensor (values in [0, K)): routing is untouched —
 // only the addressing moves. The three expert tensors of a layer consume the
 // same routed ids (llama-graph build_moe_ffn), so slot assignment and
@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 struct ggml_context;
@@ -33,24 +34,24 @@ struct GolemLayerSlots {
     int32_t K = 0, n_experts = 0;
     std::vector<int32_t> slot_of;   // expert → slot, -1 = unassigned
     std::vector<int32_t> owner_of;  // slot → expert, -1 = free
+    // Slots [0, next_free) have all been assigned: an evicted slot is handed
+    // straight to the evictor, so free slots only exist at/after the cursor.
+    int32_t next_free = 0;
     std::vector<ggml_bitset_t> valid[3];
     // Per-step scratch (n_experts bits each), reused so a decode step does
     // no heap allocation after the first.
     std::vector<ggml_bitset_t> seen, is_routed;
 };
 
-// One (layer, kind) slab. Keyed by the host tensor fingerprint; any sched
-// slab pointer change resets the state, so
-// validity bits never describe stale device bytes. Slot assignment lives in
+// One (layer, kind) slab, keyed by the host tensor data pointer. A change of
+// K or plane stride reallocates the slab and invalidates its validity bits, so
+// they never describe stale device bytes. Slot assignment lives in
 // GolemLayerSlots (per layer, shared across kinds).
 struct GolemSlabEntry {
-    // fingerprint
-    const void *owner = nullptr;   // host tensor data ptr
     int32_t K = 0;                 // addressable slots (padding slot excluded)
-    int32_t n_experts = 0;
     size_t expert_size = 0;
-    // persistent device slab (K+1 planes; owns its buffer, independent of
-    // galloc plans — cached slot bytes survive graph rebuilds)
+    // persistent device slab (K+1 planes) in its own buffer, independent of
+    // galloc plans — cached slot bytes survive graph rebuilds
     struct ggml_tensor *slab = nullptr;
     struct ggml_backend_buffer *buf = nullptr;
     struct ggml_context *ctx = nullptr;
@@ -69,6 +70,21 @@ struct GolemSlabCounters {
     uint64_t skipped = 0;  // routed experts whose slot bytes were current
     uint64_t evicted = 0;  // slots stolen from non-routed experts
 };
+
+// Gathers a strided int32 ids tensor (ggml_argsort_top_k is a view: nb[1] =
+// n_expert*4) into `out` as ne0*ne1 densely packed values, row-major — the
+// layout of the remapped-ids device tensor. `out` keeps its capacity across
+// calls, so steady-state decode does no heap allocation.
+inline void golem_gather_ids_dense(const void *raw, int64_t ne0, int64_t ne1,
+                                   size_t nb0, size_t nb1, std::vector<int32_t> &out) {
+    out.resize((size_t) (ne0 * ne1));
+    const char *base = (const char *) raw;
+    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            memcpy(&out[(size_t) (i1 * ne0 + i0)], base + i1 * nb1 + i0 * nb0, sizeof(int32_t));
+        }
+    }
+}
 
 // A slab (re)allocation: slab k's device bytes are gone — clear its whole
 // validity word so every routed expert is re-copied on the next step.
@@ -89,7 +105,7 @@ inline void golem_layer_invalidate(GolemLayerSlots &L, int kind) {
 //   assignment dropped and its bit cleared in ALL THREE valid[k] words, so
 //   the later planes re-copy instead of reading freed slots. Routed set
 //   larger than K cannot be staged → GGML_ABORT (fail-loud; prefill slab
-//   sizing is design §2.4, deferred to M3.5).
+//   sizing is design §2.4).
 // - Validity is per kind: copy iff !valid[kind][slot].
 // - on_copy(slot, id): physical host→device write of expert `id`'s plane into
 //   `slot`. Called once per non-current routed expert.
@@ -122,6 +138,7 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
     if ((int32_t) L.slot_of.size() != n_experts || L.K != K) {
         L.slot_of.assign(n_experts, -1);
         L.owner_of.assign(K, -1);
+        L.next_free = 0;
         for (int k = 0; k < 3; ++k) {
             L.valid[k].assign(ggml_bitset_size(K + 1), 0);
         }
@@ -143,13 +160,7 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
         if (L.slot_of[id] != -1) {
             continue;
         }
-        int32_t s = -1;
-        for (int32_t t = 0; t < K; ++t) {
-            if (L.owner_of[t] == -1) {
-                s = t;
-                break;
-            }
-        }
+        int32_t s = L.next_free < K ? L.next_free++ : -1;
         if (s == -1) {
             for (int32_t i = 0; i < n_experts && s == -1; ++i) {
                 const int32_t cand = order[i];
@@ -194,8 +205,8 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
         }
     }
 
-    // Build the remapped ids (values in [0, K]; ids_dev adds the padding slot
-    // as index K — never referenced by valid remaps).
+    // Build the remapped ids (values in [0, K); ids_dev's padding slot K is
+    // never referenced by remaps).
     remap.resize(ids_count);
     for (int64_t i = 0; i < ids_count; ++i) {
         const int32_t v = ids[i];

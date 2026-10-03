@@ -15,9 +15,15 @@ extern "C" {
 /* Opaque policy-state handle computed and owned by Rust. */
 typedef struct golem_policy_state golem_policy_state;
 
+/* Hook ABI revision: bump on any change to the hook signatures or to the
+ * golem_* queries; the Rust bindings assert their header constant equals the
+ * compiled library's golem_hooks_abi_version(). */
+#define GOLEM_HOOKS_ABI_VERSION 3
+int golem_hooks_abi_version(void);
+
 /* Hook: ensure [first_id, last_id] of `tensor` are resident in the host expert
  * pool before the substrate reads them (blocks; called on the decode thread).
- * ABI v2 (design §3.4): fills out_ptrs[e - first_id] with the pool-side host
+ * Fills out_ptrs[e - first_id] with the pool-side host
  * pointer of expert e's plane — the RAM pool is the source of the host→device
  * copy, because the loader's expert bytes may live in a read-only file mmap.
  * The pool holds a lease on each returned slot until the matching
@@ -27,9 +33,9 @@ typedef void (*golem_ensure_host_resident_fn)(void *ctx, const void *tensor,
                                               const void **out_ptrs);
 
 /* Hook: releases the host-pool leases taken by ensure_host_resident since
- * the previous copy_done. Called at the start of each scheduler compute —
- * the engine synchronizes after every llama_decode (session.rs), so the
- * previous decode's DMAs are complete and the slots are safe to recycle. */
+ * the previous copy_done. Called at the start of each scheduler compute,
+ * after the scheduler has synchronized its backends, so the previous
+ * compute's DMAs are complete and the slots are safe to recycle. */
 typedef void (*golem_copy_done_fn)(void *ctx);
 
 /* Hook: supply eviction/keep ordering for the device expert-copy cache.
@@ -42,7 +48,9 @@ typedef const int32_t *(*golem_policy_query_fn)(void *ctx, const void *tensor,
 /* Hook: per-step routing notification for score decay/accumulation. */
 typedef void (*golem_notify_access_fn)(void *ctx, int64_t expert_id);
 
-/* Register hooks. Passing NULL for any hook restores upstream behavior for
+/* Register hooks. Not synchronized: call before any scheduler compute starts
+ * and not concurrently with one (the engine registers at pool enable, before
+ * the first decode). Passing NULL for any hook restores upstream behavior for
  * that hook (design invariant: unset hooks == byte-identical to upstream). */
 void golem_register_hooks(golem_ensure_host_resident_fn ensure_host_resident,
                           golem_policy_query_fn policy_query,
@@ -63,15 +71,17 @@ int32_t golem_tensor_expert_stride_bytes(const void *tensor);
  * CUDA/HIP device init consults it. */
 void golem_set_expert_offload_min_batch(int n);
 
-/* --- P2/P4: slot-indirected device expert cache (design sec 3.4 v2). --- */
+/* --- P2/P4: slot-indirected device expert cache (design §3.4). --- */
 
 /* Expert-slot budget for the device cache, in EXPERTS: a count per
  * layer (one slot table shared by the layer's three expert tensors),
- * never a byte cap derived from one tensor's stride. 0 = unlimited (a
- * full-size slab). Mutated over FFI by tests and set once by the
- * engine at pool enable. */
+ * never a byte cap derived from one tensor's stride. Values above a
+ * tensor's expert count clamp to it; <= 0 is "unset" and aborts when the
+ * pooled path first needs a slab (device allocations are budget-bounded,
+ * never proportional to the expert count). Set once by the engine at
+ * pool enable. */
 void golem_set_device_cache_experts(int32_t k);
-/* Current budget (0 = unlimited). */
+/* Current budget (<= 0 = unset). */
 int32_t golem_device_cache_experts(void);
 
 /* Clear the device cache map - the invalidation/multi-model seam (also the cold-start lever). */

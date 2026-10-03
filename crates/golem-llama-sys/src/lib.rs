@@ -34,6 +34,13 @@ pub fn pin_gate_skipped() -> bool {
     option_env!("GOLEM_LLAMA_PIN_GATE_SKIPPED") == Some("1")
 }
 
+/// ABI revision of the compiled substrate's hook surface; must equal
+/// [`raw::GOLEM_HOOKS_ABI_VERSION`] (the header the bindings were generated from).
+pub fn hooks_abi_version() -> i32 {
+    // SAFETY: pure function, no invariants.
+    unsafe { raw::golem_hooks_abi_version() }
+}
+
 pub mod raw {
     // bindgen bitfield accessors trip `unnecessary_transmutes`
     #![allow(
@@ -90,7 +97,8 @@ pub mod pinned {
         if r == 0 { Ok(()) } else { Err(r) }
     }
 
-    /// `(free, total)` device bytes (`hipMemGetInfo`). `None` when the HIP
+    /// `(free, total)` bytes of the current HIP device (`hipMemGetInfo`);
+    /// the substrate's device must be the process's current one. `None` when the HIP
     /// runtime reports an error — callers must then refuse to derive a device
     /// budget rather than guess.
     pub fn free_device_mem() -> Option<(usize, usize)> {
