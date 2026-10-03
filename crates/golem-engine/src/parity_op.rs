@@ -1,4 +1,4 @@
-//! T1 op-parity leg (M1.4): `ggml_mul_mat_id` over synthetic expert tensors,
+//! T1 op-parity leg: `ggml_mul_mat_id` over synthetic expert tensors,
 //! recorded as a checksum-per-expert-id JSONL dump. Raw ggml FFI lives here
 //! (design §13 unsafe policy): the CLI drives this through the safe
 //! [`run_op_leg`] only.

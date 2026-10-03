@@ -1,4 +1,4 @@
-//! Acceptance (M1.4 Task 1): the parity dump mode records contiguous,
+//! Acceptance: the parity dump mode records contiguous,
 //! in-vocab, top1>=top2 steps on tiny-moe and decodes identically to
 //! `chat_turn`. CPU substrate.
 mod common;

@@ -6,7 +6,7 @@
 //! - T1: `golem-parity-op` v1 (header + per-expert-id checksum rows) written
 //!   by the `parity-op` leg.
 //!
-//! Verdict semantics (M1.4 plan Global Constraints): per position, tokens are
+//! Verdict semantics: per position, tokens are
 //! compared first. On divergence, the divergence is *tolerated* iff
 //! `min(gap_a, gap_b) < epsilon` where `gap = top1 - top2` at that position
 //! in each leg (strict `<`: `gap == epsilon` diverges). The verdict for a
@@ -283,7 +283,7 @@ pub struct T2Report {
     pub backends: Vec<String>,
     /// Max `|top1_a - top1_b|` over compared positions (pre-first-divergence
     /// per pair; cascade positions excluded). The GPU-kernel numerics bound
-    /// evidence for the M1 escalation (plan §OPEN Step B).
+    /// evidence for GPU-leg acceptance.
     pub max_logit_dev: f64,
     /// Optional GPU-kernel deviation bound (CLI `--gpu-dev-bound`).
     pub gpu_dev_bound: Option<f64>,

@@ -1,4 +1,4 @@
-//! Acceptance (M1.4 Task 3): GPU-offload plumbing in `EngineConfig`. Defaults
+//! Acceptance: GPU-offload plumbing in `EngineConfig`. Defaults
 //! must leave the tiny-moe CPU decode byte-identical, and the `offloaded()`
 //! dump-header hook must report the config's offload intent. CPU substrate.
 mod common;

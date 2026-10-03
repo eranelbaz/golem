@@ -17,8 +17,8 @@ fn golem_p2_device_cache_stats_roundtrip() {
     // Opaque to bindgen (zero-sized marker struct), not a laid-out record.
     assert_eq!(std::mem::size_of::<raw::golem_device_cache_stats>(), 0);
 
-    // SAFETY: FFI call, no invariants (0 = full capacity).
-    unsafe { raw::golem_set_device_cache_budget(0) };
+    // SAFETY: FFI call, no invariants (<= 0 = unset budget).
+    unsafe { raw::golem_set_device_cache_experts(0) };
     let p = unsafe { raw::golem_get_device_cache_stats() };
     assert!(!p.is_null());
 
@@ -30,4 +30,12 @@ fn golem_p2_device_cache_stats_roundtrip() {
     assert_eq!(stats[0].load(Ordering::Relaxed), 0); // bytes_copied
     assert_eq!(stats[1].load(Ordering::Relaxed), 0); // bytes_skipped
     assert_eq!(stats[2].load(Ordering::Relaxed), 0); // evictions
+}
+
+#[test]
+fn golem_hooks_abi_version_matches_header() {
+    assert_eq!(
+        golem_llama_sys::hooks_abi_version(),
+        raw::GOLEM_HOOKS_ABI_VERSION as i32
+    );
 }

@@ -13,7 +13,9 @@ pub struct EngineConfig {
     pub batch_tokens: u32,
     /// Maximum tokens to generate per completion.
     pub n_predict: u32,
-    /// Decode threads (tech design §7.2: default 1).
+    /// Decode threads (§7.2 as amended: logical CPUs / 2, min 1 — CPU-side
+    /// ops still run on these: sampling, the non-offloaded tail, tokenizer,
+    /// ids readback).
     pub threads: u32,
     /// Model layers to offload to the GPU (`llama_model_params::n_gpu_layers`,
     /// llama.h): 0 keeps the whole model on CPU — the CI-leg default.
@@ -31,11 +33,11 @@ pub struct EngineConfig {
     /// (T4 invariant). The CLI computes a suggestion but always passes an
     /// explicit whole-GiB value.
     pub ram_experts_gib: u64,
-    /// Soft cap for the P2 device expert-copy cache, in experts (§3.4). The
-    /// byte budget is `n × expert_stride`, set when the first expert tensor is
-    /// registered (the stride is only knowable from a live tensor). **0 =
-    /// unlimited** (the default): the device cache keeps every copied expert
-    /// and never evicts.
+    /// Per-(layer, kind) device expert-slab size, in experts (§3.4 as amended
+    /// for the slot-indirected cache). **0 (the default) = derive from free
+    /// VRAM at pool enable** (half of free, bounded; never unlimited —
+    /// unbounded slabs OOM the 24 GiB card on the real model). A routed set
+    /// larger than K aborts loudly, so a K below the model's top-k is rejected at enable.
     pub device_cache_experts: u32,
 }
 
@@ -46,7 +48,9 @@ impl Default for EngineConfig {
             n_ctx: 256,
             batch_tokens: 512,
             n_predict: 64,
-            threads: 1,
+            threads: std::thread::available_parallelism()
+                .map(|n| (n.get() / 2).max(1) as u32)
+                .unwrap_or(1),
             n_gpu_layers: 0,
             flash_attn_on: false,
             cpu_moe_layers: None,
@@ -66,7 +70,7 @@ mod tests {
         assert_eq!(c.n_ctx, 256);
         assert_eq!(c.batch_tokens, 512);
         assert_eq!(c.n_predict, 64);
-        assert_eq!(c.threads, 1);
+        assert!(c.threads >= 1, "threadpool never empty");
         assert_eq!(c.model_path, PathBuf::new());
         assert_eq!(
             c.n_gpu_layers, 0,
@@ -77,7 +81,7 @@ mod tests {
         assert_eq!(c.ram_experts_gib, 0, "RAM expert pool defaults off (T4)");
         assert_eq!(
             c.device_cache_experts, 0,
-            "device cache defaults to unlimited (never evicts)"
+            "0 = unset: the engine derives a bounded K from free VRAM at enable"
         );
     }
 }

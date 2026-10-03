@@ -1,6 +1,6 @@
 //! `xtask parity` — T2 harness scaffold: validates the model parses as GGUF v3
-//! with a `general.architecture` KV and emits the scaffold report line (full
-//! parity execution is M1.4).
+//! with a `general.architecture` KV and emits the scaffold report line; it
+//! does not run parity.
 
 use std::path::PathBuf;
 
@@ -33,7 +33,7 @@ fn scaffold_json(model: &str, arch: &str) -> String {
     // serde_json escapes the interpolated values; the fixed key order keeps
     // the pinned report line stable.
     format!(
-        "{{\"harness\":\"t2-parity\",\"status\":\"scaffold\",\"model\":{},\"arch\":{},\"note\":\"native leg arrives with M1.4 (token-ID comparison with logit-gap epsilon, M0.5 session 10)\"}}",
+        "{{\"harness\":\"t2-parity\",\"status\":\"scaffold\",\"model\":{},\"arch\":{},\"note\":\"native leg not implemented (token-ID comparison with logit-gap epsilon)\"}}",
         serde_json::to_string(model).unwrap(),
         serde_json::to_string(arch).unwrap(),
     )
@@ -58,7 +58,7 @@ mod tests {
         assert_eq!(v["arch"], "glm4moe");
         assert_eq!(
             v["note"],
-            "native leg arrives with M1.4 (token-ID comparison with logit-gap epsilon, M0.5 session 10)"
+            "native leg not implemented (token-ID comparison with logit-gap epsilon)"
         );
     }
 

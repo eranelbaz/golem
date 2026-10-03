@@ -11,8 +11,12 @@ use std::path::{Path, PathBuf};
 const BACKEND_ENV: &str = "GOLEM_LLAMA_SYS_BACKEND";
 const SKIP_GATE_ENV: &str = "GOLEM_LLAMA_SYS_SKIP_PIN_GATE";
 const AMDGPU_TARGET_ENV: &str = "GOLEM_LLAMA_SYS_AMDGPU_TARGET";
+const ROCM_PATH_ENV: &str = "ROCM_PATH";
 const DEFAULT_AMDGPU_TARGET: &str = "gfx1100";
-const ROCM_HIP_COMPILER: &str = "/opt/rocm/llvm/bin/clang++";
+
+fn rocm_root() -> PathBuf {
+    PathBuf::from(env::var(ROCM_PATH_ENV).unwrap_or_else(|_| "/opt/rocm".into()))
+}
 
 fn detect_backend() -> (&'static str, &'static str) {
     match env::var(BACKEND_ENV).as_deref() {
@@ -65,6 +69,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed={BACKEND_ENV}");
     println!("cargo:rerun-if-env-changed={SKIP_GATE_ENV}");
     println!("cargo:rerun-if-env-changed={AMDGPU_TARGET_ENV}");
+    println!("cargo:rerun-if-env-changed={ROCM_PATH_ENV}");
+    println!("cargo:rustc-check-cfg=cfg(golem_backend_hip)");
 
     let (raw, resolved) = detect_backend();
     // links = "llama-cpp" surfaces this downstream as DEP_LLAMA_CPP_BACKEND.
@@ -153,11 +159,13 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
     let vendor = repo_root.join("vendor/llama.cpp");
     let build_root = out_dir.join(format!("build-{backend}"));
 
+    let hip_compiler = rocm_root().join("llvm/bin/clang++");
     if backend == "hip" {
-        if !Path::new(ROCM_HIP_COMPILER).exists() {
+        if !hip_compiler.exists() {
             panic!(
-                "backend hip requires the ROCm HIP compiler at {ROCM_HIP_COMPILER} (absent) — \
-                 install ROCm or set GOLEM_LLAMA_SYS_BACKEND=cpu"
+                "backend hip requires the ROCm HIP compiler at {} (absent) — \
+                 install ROCm or set GOLEM_LLAMA_SYS_BACKEND=cpu",
+                hip_compiler.display()
             );
         }
         rocm_advisory_check(repo_root);
@@ -189,9 +197,18 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
                 .ok()
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| DEFAULT_AMDGPU_TARGET.to_string());
+            // CMake's HIP-language setup needs the ROCm root to emit `-x
+            // hip`; without it clang compiles .cu as CUDA and rejects gfx1100.
+            let rocm_root = rocm_root();
             cfg.define("GGML_HIP", "ON")
-                .define("AMDGPU_TARGETS", amdgpu_target)
-                .define("CMAKE_HIP_COMPILER", ROCM_HIP_COMPILER);
+                .env(ROCM_PATH_ENV, &rocm_root)
+                .define("CMAKE_HIP_COMPILER_ROCM_ROOT", &rocm_root)
+                .define("AMDGPU_TARGETS", &amdgpu_target)
+                // CMake ≥ 4 HIP-language builds read this, not the legacy
+                // AMDGPU_TARGETS; without it clang falls back to CUDA arch
+                // probing and rejects gfx1100.
+                .define("CMAKE_HIP_ARCHITECTURES", &amdgpu_target)
+                .define("CMAKE_HIP_COMPILER", &hip_compiler);
         }
         other => unreachable!("detect_backend only yields cpu|hip, got {other:?}"),
     }
@@ -210,7 +227,7 @@ fn rocm_advisory_check(repo_root: &Path) {
     let pinned = pin_gate::read_kv_value(&text, "rocm")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| panic!("rocm key missing in {}", lock.display()));
-    let Some(installed) = fs::read_to_string("/opt/rocm/.info/version")
+    let Some(installed) = fs::read_to_string(rocm_root().join(".info/version"))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -242,11 +259,11 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
         .allowlist_function("llama_.*")
         .allowlist_function("golem_.*")
-        // GPU-offload plumbing (M1.4 Task 3): the `-ncmoe`-equivalent buft
+        // GPU-offload plumbing: the `-ncmoe`-equivalent buft
         // overrides pin expert tensors to the CPU buffer type by handle; the
         // loader compares overrides against exactly this pointer.
         .allowlist_function("ggml_backend_cpu_buffer_type")
-        // T1 op-parity leg (M1.4 Task 4): the minimal ggml FFI surface for
+        // T1 op-parity leg: the minimal ggml FFI surface for
         // golem-engine/src/parity_op.rs (design §13: raw ggml FFI is confined
         // to that module, so the bindings stay as narrow as possible).
         // Context lifecycle:
@@ -264,11 +281,11 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .allowlist_function("ggml_type_size")
         .allowlist_function("ggml_blck_size")
         // The op itself plus graph build; compute goes through the backend
-        // registry below (Task 4a), so no CPU-only compute entry is bound.
+        // registry below, so no CPU-only compute entry is bound.
         .allowlist_function("ggml_mul_mat_id")
         .allowlist_function("ggml_new_graph")
         .allowlist_function("ggml_build_forward_expand")
-        // Backend-registry compute (M1.4 Task 4a): the op must run on the
+        // Backend-registry compute: the op must run on the
         // HIP device when the binary is HIP-linked, so compute goes through
         // the device registry instead of the CPU-only path above.
         .allowlist_function("ggml_backend_dev_by_type")
@@ -295,7 +312,7 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .allowlist_type("ggml_cgraph")
         .allowlist_type("ggml_init_params")
         .allowlist_type("ggml_status")
-        // Opaque backend-registry handles + device-type enum (Task 4a):
+        // Opaque backend-registry handles + device-type enum:
         .allowlist_type("ggml_backend")
         .allowlist_type("ggml_backend_dev")
         .allowlist_type("ggml_backend_buffer")
@@ -304,6 +321,7 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .allowlist_type("llama_.*")
         .allowlist_type("golem_.*")
         .allowlist_var("LLAMA_.*")
+        .allowlist_var("GOLEM_.*")
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: true,
         })
@@ -382,7 +400,7 @@ fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) 
         }
     }
     if backend == "hip" {
-        searched.push(PathBuf::from("/opt/rocm/lib"));
+        searched.push(rocm_root().join("lib"));
     }
     for path in &searched {
         println!("cargo:rustc-link-search=native={}", path.display());
@@ -408,6 +426,7 @@ fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) 
         println!("cargo:rustc-link-lib=dylib=hipblas");
         println!("cargo:rustc-link-lib=dylib=rocblas");
         println!("cargo:rustc-link-lib=dylib=amdhip64");
+        println!("cargo:rustc-cfg=golem_backend_hip");
     }
     println!("cargo:rustc-link-lib=dylib=pthread");
     println!("cargo:rustc-link-lib=dylib=dl");

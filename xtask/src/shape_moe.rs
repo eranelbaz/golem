@@ -1,0 +1,299 @@
+//! Shape-realistic split-GGUF fixture: 2 shards with a metadata-only shard 1,
+//! `.weight` expert names, mixed Q4_K/Q5_K/Q6_K expert planes of differing
+//! strides, and an MTP/NextN expert layer that pool geometry must exclude from
+//! its layer list. `split.no`/`split.count` are u16 and `split.tensors.count`
+//! is i32, as `gguf-split` writes them. Not loadable by the substrate — this
+//! fixture exercises byte-source/preflight paths only.
+//!
+//! Intentionally NOT matched to GLM-5.3-Flash UD-Q4_K_XL (288 experts, 6
+//! shards, 42 live layers, ~4.7/5.8 MB planes): 64 experts, 2 shards, 3 live
+//! layers, and 295–430 KB planes keep generation fast. Each plane holds a
+//! per-expert byte pattern ([`fill_byte`]) so a wrong-expert or wrong-plane
+//! offset reads visibly different bytes.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+use crate::gguf::{self, GgufKv, GgufTensorMeta, GgufValue};
+use golem_gguf::{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K};
+
+pub mod dims {
+    pub const N_BLOCK: u32 = 5;
+    pub const DENSE_LEAD: u32 = 1;
+    pub const N_EXPERT: u32 = 64;
+    pub const NEXTN: u32 = 1;
+    /// Live expert layers: blk.1..=3, one per unit size class; blk.4 is MTP.
+    pub const LIVE: [u32; 3] = [1, 2, 3];
+    pub const NE0: u32 = 256;
+    pub const NE1: u32 = 32;
+}
+
+/// Device budget for tests using this fixture: below the smallest expert
+/// tensor (Q4_K: 144 B × 32 rows × 64 experts = 294 912 B), so no tensor can
+/// be device-resident whole.
+pub const DEVICE_BUDGET_BYTES: u64 = 256 * 1024;
+
+const N_SHARDS: u64 = 2;
+const N_TENSORS: i32 = 12;
+
+/// Single source of truth for the fixture: generates the split GGUF under
+/// `.test-cache/shape-moe-v3/` and returns the shard paths. Safe to call
+/// concurrently from several processes.
+pub fn cached_fixture() -> Vec<PathBuf> {
+    let dir = repo_root().join(".test-cache/shape-moe-v3");
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths: Vec<PathBuf> = (1..=N_SHARDS)
+        .map(|i| dir.join(format!("shape-moe-{:0>5}-of-{:0>5}.gguf", i, N_SHARDS)))
+        .collect();
+    if paths.iter().all(|p| p.exists()) {
+        return paths;
+    }
+    let tensors = expert_tensors();
+    for (shard_no, path) in paths.iter().enumerate() {
+        let shard_tensors: &[(GgufTensorMeta, Vec<u8>)] = if shard_no == 0 {
+            &[] // metadata-only first shard, like the real 6-shard model
+        } else {
+            &tensors
+        };
+        let tmp = path.with_extension(format!("gguf.{}.tmp", std::process::id()));
+        let f = std::fs::File::create(&tmp).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        write_shard(&mut w, u64::try_from(shard_no).unwrap(), shard_tensors).unwrap();
+        w.flush().unwrap();
+        // A concurrent generator may have won the rename; its bytes are identical.
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            assert!(path.exists(), "rename {}: {e}", path.display());
+        }
+    }
+    paths
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()
+        .unwrap()
+}
+
+fn kv(key: &str, value: GgufValue) -> GgufKv {
+    GgufKv {
+        key: key.to_owned(),
+        value,
+    }
+}
+
+fn kvs(shard_no: u64) -> Vec<GgufKv> {
+    let u = |v: u64| GgufValue::U32(u32::try_from(v).unwrap());
+    vec![
+        kv("general.architecture", GgufValue::Str("glm5next".into())),
+        kv("general.file_type", u(0)),
+        kv("glm5next.block_count", u(u64::from(dims::N_BLOCK))),
+        kv("glm5next.expert_count", u(u64::from(dims::N_EXPERT))),
+        kv("glm5next.expert_used_count", u(8)),
+        kv(
+            "glm5next.leading_dense_block_count",
+            u(u64::from(dims::DENSE_LEAD)),
+        ),
+        kv(
+            "glm5next.expert_feed_forward_length",
+            u(u64::from(dims::NE1)),
+        ),
+        kv("glm5next.nextn_predict_layers", u(u64::from(dims::NEXTN))),
+        kv("split.no", GgufValue::U16(shard_no.try_into().unwrap())),
+        kv("split.count", GgufValue::U16(N_SHARDS.try_into().unwrap())),
+        kv("split.tensors.count", GgufValue::I32(N_TENSORS)),
+    ]
+}
+
+/// Per-block plane types: blk 1..=3 each land in a distinct expert-unit size
+/// class; blk 4 is the MTP block (Q4/Q4/Q5 like blk 1).
+fn expert_tensors() -> Vec<(GgufTensorMeta, Vec<u8>)> {
+    let mut out = Vec::new();
+    let types = [
+        [GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K],
+        [GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K],
+        [GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K],
+        [GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K],
+    ];
+    for (i, blk) in (dims::DENSE_LEAD..dims::N_BLOCK).enumerate() {
+        for (kind, (name, ggml_type)) in [
+            ("ffn_gate_exps", types[i][0]),
+            ("ffn_up_exps", types[i][1]),
+            ("ffn_down_exps", types[i][2]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (ne0, ne1) = (dims::NE0, dims::NE1);
+            let row = golem_gguf::ggml_row_bytes(ggml_type, u64::from(ne0)).unwrap();
+            let stride = usize::try_from(row * u64::from(ne1)).unwrap();
+            let data = (0..dims::N_EXPERT)
+                .flat_map(|e| (0..stride).map(move |i| fill_byte(blk, kind, e, i)))
+                .collect();
+            out.push((
+                GgufTensorMeta {
+                    name: format!("blk.{blk}.{name}.weight"),
+                    dims: vec![u64::from(ne0), u64::from(ne1), u64::from(dims::N_EXPERT)],
+                    ggml_type,
+                },
+                data,
+            ));
+        }
+    }
+    out
+}
+
+/// Byte `i` of expert `expert`'s slice of plane (`blk`, `kind`): the cycle
+/// `[blk, kind, expert, i]`, so the triple is recoverable from any 3 bytes and
+/// the position byte catches intra-plane shifts.
+pub fn fill_byte(blk: u32, kind: usize, expert: u32, i: usize) -> u8 {
+    [blk as u8, kind as u8, expert as u8, i as u8][i % 4]
+}
+
+fn write_shard(
+    w: &mut impl Write,
+    shard_no: u64,
+    tensors: &[(GgufTensorMeta, Vec<u8>)],
+) -> std::io::Result<()> {
+    gguf::write_gguf(w, &kvs(shard_no), tensors).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shards_are_split_and_first_is_metadata_only() {
+        let paths = cached_fixture();
+        assert_eq!(paths.len(), 2);
+        for (no, p) in paths.iter().enumerate() {
+            let mut f = std::fs::File::open(p).unwrap();
+            let (_, n_tensors, n_kv) = golem_gguf::read_header(&mut f).unwrap();
+            let kvs = golem_gguf::read_kvs(&mut f).unwrap();
+            assert_eq!(
+                golem_gguf::kv_int(&kvs, "split.no"),
+                Some(no as u64),
+                "{}",
+                p.display()
+            );
+            assert_eq!(golem_gguf::kv_int(&kvs, "split.count"), Some(2));
+            if no == 0 {
+                assert_eq!(n_tensors, 0, "shard 1 must be metadata-only");
+            } else {
+                assert_eq!(n_tensors, N_TENSORS as u64, "4 expert blocks × 3 planes");
+            }
+            assert_eq!(n_kv, kvs.len() as u64);
+        }
+    }
+
+    #[test]
+    fn split_keys_use_gguf_split_types() {
+        let tags: Vec<_> = kvs(1)
+            .into_iter()
+            .filter(|k| k.key.starts_with("split."))
+            .map(|k| (k.key, std::mem::discriminant(&k.value)))
+            .collect();
+        let want = [
+            ("split.no", GgufValue::U16(0)),
+            ("split.count", GgufValue::U16(0)),
+            ("split.tensors.count", GgufValue::I32(0)),
+        ];
+        for (key, v) in want {
+            let got = tags.iter().find(|(k, _)| k == key).unwrap();
+            assert_eq!(got.1, std::mem::discriminant(&v), "{key}");
+        }
+    }
+
+    #[test]
+    fn device_budget_is_below_every_expert_tensor() {
+        let mut f = std::fs::File::open(&cached_fixture()[1]).unwrap();
+        for e in golem_gguf::tensor_entries(&mut f).unwrap() {
+            let bytes =
+                golem_gguf::ggml_row_bytes(e.ggml_type, e.dims[0]).unwrap() * e.dims[1] * e.dims[2];
+            assert!(DEVICE_BUDGET_BYTES < bytes, "{}", e.name);
+        }
+    }
+
+    #[test]
+    fn experts_carry_distinct_patterns_at_stride_offsets() {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&cached_fixture()[1]).unwrap();
+        let base = golem_gguf::data_section_offset(&mut f).unwrap();
+        let e = golem_gguf::tensor_entries(&mut f)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "blk.2.ffn_up_exps.weight")
+            .unwrap();
+        let stride = golem_gguf::ggml_row_bytes(e.ggml_type, e.dims[0]).unwrap() * e.dims[1];
+        let mut read = |expert: u64| {
+            let mut buf = vec![0u8; stride as usize];
+            f.seek(SeekFrom::Start(base + e.offset + expert * stride))
+                .unwrap();
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+        let (a, b) = (read(0), read(1));
+        assert_ne!(a, b);
+        for (expert, buf) in [(0u32, a), (1, b), (63, read(63))] {
+            assert!(
+                buf.iter()
+                    .enumerate()
+                    .all(|(i, &x)| x == fill_byte(2, 1, expert, i)),
+                "expert {expert}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_layers_span_three_unit_classes() {
+        let paths = cached_fixture();
+        let mut f = std::fs::File::open(&paths[1]).unwrap();
+        let entries = golem_gguf::tensor_entries(&mut f).unwrap();
+        let unit = |blk: u32| -> u64 {
+            ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                .iter()
+                .map(|k| {
+                    let e = entries
+                        .iter()
+                        .find(|e| e.name == format!("blk.{blk}.{k}.weight"))
+                        .unwrap();
+                    golem_gguf::ggml_row_bytes(e.ggml_type, e.dims[0]).unwrap() * e.dims[1]
+                })
+                .sum()
+        };
+        // Q4/Q4/Q5, Q4/Q4/Q6, Q5/Q5/Q6 rows at ne0 = 256 (144/176/210 B) × ne1 = 32.
+        assert_eq!(dims::LIVE.map(unit), [14_848, 15_936, 17_984]);
+        // MTP block 4 exists in the file and is excluded by the source walk.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "blk.4.ffn_down_exps.weight")
+        );
+    }
+
+    #[test]
+    fn expert_planes_have_mixed_quant_strides() {
+        let mut f = std::fs::File::open(&cached_fixture()[1]).unwrap();
+        let entries = golem_gguf::tensor_entries(&mut f).unwrap();
+        let strides: Vec<Vec<u64>> = dims::LIVE
+            .iter()
+            .map(|&blk| {
+                entries
+                    .iter()
+                    .filter(|e| e.name.contains(&format!("blk.{blk}.")))
+                    .map(|e| golem_gguf::ggml_row_bytes(e.ggml_type, e.dims[0]).unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            strides,
+            vec![
+                vec![144, 144, 176],
+                vec![144, 144, 210],
+                vec![176, 176, 210],
+            ],
+            "Q4/Q4/Q5, Q4/Q4/Q6, Q5/Q5/Q6 rows at ne0=256"
+        );
+    }
+}

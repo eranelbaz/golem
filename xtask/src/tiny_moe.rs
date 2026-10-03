@@ -6,7 +6,8 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::gguf::{self, GGML_TYPE_F32, GgufKv, GgufTensorMeta, GgufValue};
+use crate::gguf::{self, GgufKv, GgufTensorMeta, GgufValue};
+use golem_gguf::GGML_TYPE_F32;
 
 pub mod dims {
     pub const N_VOCAB: u32 = 320;

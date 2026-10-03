@@ -18,7 +18,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 /// Arguments of the `run` subcommand (tech design §9 minimal surface; flags
-/// only — §9.4 precedence rules are an M4.x concern).
+/// only — §9.4 precedence rules are not implemented).
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
     /// Path to the GGUF model file.
@@ -32,11 +32,12 @@ pub struct RunArgs {
     /// Context size in KV cache slots (engine §7.2 default: 256).
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(2..))]
     pub ctx: u32,
-    /// Decode threads (engine §7.2 default: 1). The M1.4 calibration matrix
-    /// runs reference-vs-reference legs at differing thread counts
-    /// (cpu-t16 vs cpu-t4), so the suite driver injects this flag per leg.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    pub threads: u32,
+    /// Decode threads (engine §7.2 default: logical CPUs / 2, min 1). The
+    /// calibration matrix runs reference-vs-reference legs at differing
+    /// thread counts (cpu-t16 vs cpu-t4), so the suite driver injects this
+    /// flag per leg.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub threads: Option<u32>,
     /// Model layers to offload to the GPU (`EngineConfig::n_gpu_layers`):
     /// 0 keeps the whole model on CPU (the CI-leg default); the hardware HIP
     /// parity leg uses 99. Without this knob a "hip"-labeled binary would
@@ -57,10 +58,16 @@ pub struct RunArgs {
     /// RAM expert pool size in GiB (P3, §5.4); 0/omitted keeps the pool off.
     /// Fractional GiB are floored to whole GiB (the engine config is whole-GiB).
     /// The pool is `mlock`ed: before loading anything, the preflight checks
-    /// `RLIMIT_MEMLOCK` and available RAM, and exits with an actionable
+    /// `RLIMIT_MEMLOCK` and available RAM, and fails with an actionable
     /// suggestion instead of failing mid-load.
     #[arg(long, value_name = "GIB")]
     pub ram_experts_gib: Option<f64>,
+    /// Per-layer device expert-slab size in experts
+    /// (`EngineConfig::device_cache_experts`); omitted/0 derives it from free
+    /// VRAM, which needs a GPU backend — CPU pooled runs must set it. Must be
+    /// at least the model's top-k.
+    #[arg(long, value_name = "EXPERTS")]
+    pub device_cache_experts: Option<u32>,
     /// Write a T2 parity dump (JSONL: line-1 header, then one record per
     /// generation step) to this file instead of streaming the completion;
     /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
@@ -73,20 +80,23 @@ impl RunArgs {
     /// Maps the CLI surface onto `EngineConfig` (flag name ↔ config field):
     /// `--ctx` → `n_ctx`, `--threads` → `threads`, `--n-gpu-layers` →
     /// `n_gpu_layers`, `--flash-attn` → `flash_attn_on`, `--cpu-moe-layers`
-    /// → `cpu_moe_layers`. Everything else stays at the engine default.
+    /// → `cpu_moe_layers`, `--device-cache-experts` → `device_cache_experts`.
+    /// Everything else stays at the engine default.
     pub fn to_config(&self) -> EngineConfig {
+        let default = EngineConfig::default();
         EngineConfig {
             model_path: self.model.clone(),
             n_ctx: self.ctx,
             n_predict: self.n_predict,
-            threads: self.threads,
+            threads: self.threads.unwrap_or(default.threads),
             n_gpu_layers: self.n_gpu_layers,
             flash_attn_on: self.flash_attn,
             cpu_moe_layers: self.cpu_moe_layers,
             // Fractional GiB floor to the engine's whole-GiB unit; a value in
             // (0, 1) therefore disables the pool — the help text says so.
             ram_experts_gib: self.ram_experts_gib.unwrap_or(0.0).max(0.0) as u64,
-            ..EngineConfig::default()
+            device_cache_experts: self.device_cache_experts.unwrap_or(0),
+            ..default
         }
     }
 }
@@ -143,35 +153,36 @@ fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
         0
     });
 
-    // Free-RAM suggestion: min(75% of free, what the experts actually need).
+    // Available-RAM suggestion: min(75% of available, what the experts actually need).
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    let free = sys.free_memory();
+    let free = sys.available_memory();
     let suggest = (free * 3 / 4).min(if expert_bytes > 0 {
         expert_bytes
     } else {
         u64::MAX
     });
+    // .max(1): a sub-GiB suggestion would print `--ram-experts-gib 0`, which
+    // disables the pool entirely — suggest the smallest workable pool instead.
+    let suggest_gib = (suggest / (1 << 30)).max(1);
 
     if let Some(limit) = memlock_limit() {
         if want_bytes > limit {
-            eprintln!(
-                "error: --ram-experts-gib {gib} needs {want_bytes} B locked but RLIMIT_MEMLOCK \
+            return Err(format!(
+                "--ram-experts-gib {gib} needs {want_bytes} B locked but RLIMIT_MEMLOCK \
                  is {limit} B.\nRaise it: `ulimit -l unlimited` (or systemd `LimitMEMLOCK=\
-                 infinity`), or size the pool down, e.g. --ram-experts-gib {}",
-                suggest / (1 << 30)
-            );
-            std::process::exit(1);
+                 infinity`), or size the pool down, e.g. --ram-experts-gib {suggest_gib}"
+            )
+            .into());
         }
     }
     if want_bytes > free * 3 / 4 {
-        eprintln!(
-            "error: --ram-experts-gib {gib} wants {want_bytes} B but only {free} B is free \
-             (cap: 75% of free RAM).\nSuggested size: --ram-experts-gib {} (expert bytes: \
-             {expert_bytes} B)",
-            suggest / (1 << 30)
-        );
-        std::process::exit(1);
+        return Err(format!(
+            "--ram-experts-gib {gib} wants {want_bytes} B but only {free} B is available \
+             (cap: 75% of available RAM).\nSuggested size: --ram-experts-gib {suggest_gib} \
+             (expert bytes: {expert_bytes} B)"
+        )
+        .into());
     }
     Ok(())
 }
@@ -184,11 +195,13 @@ fn expert_plane_bytes(model: &Path) -> Result<u64, Box<dyn Error>> {
         .kv_str("general.architecture")
         .unwrap_or_default()
         .to_owned();
-    let dense_lead = metadata
-        .kv_u64(&format!("{arch}.leading_dense_block_count"))
-        .unwrap_or(0) as u32;
+    let dense_lead = u32::try_from(
+        metadata
+            .kv_u64(&format!("{arch}.leading_dense_block_count"))
+            .unwrap_or(0),
+    )?;
     let src = GgufPreadSource::open(model, dense_lead)?;
-    Ok(src.geometry().map(|g| g.expert_bytes).unwrap_or(0))
+    Ok(src.geometry()?.map(|g| g.expert_bytes).unwrap_or(0))
 }
 
 fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
@@ -542,7 +555,13 @@ mod tests {
         assert_eq!(config.model_path, PathBuf::from("model.gguf"));
         assert_eq!(config.n_ctx, 256);
         assert_eq!(config.n_predict, 64);
-        assert_eq!(config.threads, 1, "engine §7.2 default");
+        // No --threads flag → the engine default (logical CPUs / 2, min 1),
+        // never the old hardcoded 1 that overrode it.
+        assert_eq!(
+            config.threads,
+            EngineConfig::default().threads,
+            "no flag → engine default threads"
+        );
         assert_eq!(config.n_gpu_layers, 0, "default offloads nothing");
         assert!(
             !config.flash_attn_on,
@@ -565,8 +584,24 @@ mod tests {
     }
 
     #[test]
+    fn run_args_map_device_cache_experts_flag_into_config() {
+        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        assert_eq!(config.device_cache_experts, 0, "unset = derive from VRAM");
+        let config = parse_run_args(&["run", "m.gguf", "--device-cache-experts", "9"]).to_config();
+        assert_eq!(config.device_cache_experts, 9);
+    }
+
+    #[test]
+    fn preflight_refuses_an_impossible_pool_with_err_not_exit() {
+        // 2^60 GiB-bytes exceeds both RLIMIT_MEMLOCK and available RAM; the
+        // preflight must return Err (a process::exit would kill this test).
+        let err = preflight_ram_pool(Path::new("/nonexistent.gguf"), 1 << 30).unwrap_err();
+        assert!(err.to_string().contains("--ram-experts-gib"), "{err}");
+    }
+
+    #[test]
     fn run_args_map_offload_and_threads_flags_into_config() {
-        // The Task 7 hardware HIP leg: n_gpu_layers=99, fa=ON, -ncmoe 45, t16.
+        // The hardware HIP leg config: n_gpu_layers=99, fa=ON, -ncmoe 45, t16.
         let args = parse_run_args(&[
             "run",
             "model.gguf",
@@ -597,7 +632,7 @@ mod tests {
         assert_eq!(config.cpu_moe_layers, None);
 
         let config = parse_run_args(&["run", "m.gguf", "--n-gpu-layers", "7"]).to_config();
-        assert_eq!(config.threads, 1);
+        assert_eq!(config.threads, EngineConfig::default().threads);
         assert_eq!(config.n_gpu_layers, 7);
         assert!(!config.flash_attn_on);
         assert_eq!(config.cpu_moe_layers, None);

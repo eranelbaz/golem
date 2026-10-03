@@ -1,116 +1,75 @@
-//! Residency map + P3 counters (§6.6): (layer, kind, expert) → slot with
-//! in-flight leases and atomic claim-time eviction.
+//! Residency map + P3 counters (§6.6): (layer, expert) unit → slot with
+//! in-flight leases and atomic claim-time eviction. One unit is an expert's
+//! gate, up and down planes co-allocated in one slot (§3.4): one key is
+//! claimed, filled, leased and evicted as a whole.
 
 // `cfg(loom)` is swapped via RUSTFLAGS by the T6 loom leg (declared in
 // primitives.rs); register it as known for this module's cfg uses too.
 #![allow(unexpected_cfgs)]
+// Tests build one-class slot tables as `vec![0..slots]`; the lint's
+// alternatives are no clearer.
+#![allow(clippy::single_range_in_vec_init)]
 
 use std::collections::HashSet;
+use std::fmt;
 
 use super::primitives::{AtomicU64, Condvar, Mutex};
 
-/// Which of an expert layer's three planes (§3.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ExpertKind {
-    /// `ffn_gate_exps`.
-    Gate,
-    /// `ffn_up_exps`.
-    Up,
-    /// `ffn_down_exps`.
-    Down,
-}
-
-impl ExpertKind {
-    /// All kinds, in ordinal order.
-    pub const ALL: [ExpertKind; 3] = [Self::Gate, Self::Up, Self::Down];
-
-    /// Parses from a ggml tensor name: runtime ggml names
-    /// (`...ffn_gate_exps`) and GGUF-side names (`...ffn_gate_exps.weight`)
-    /// both match; every other name is not an expert plane.
-    pub fn from_tensor_name(name: &str) -> Option<Self> {
-        if name.contains("ffn_gate_exps") {
-            Some(Self::Gate)
-        } else if name.contains("ffn_up_exps") {
-            Some(Self::Up)
-        } else if name.contains("ffn_down_exps") {
-            Some(Self::Down)
-        } else {
-            None
-        }
-    }
-
-    fn ordinal(self) -> usize {
-        self as usize
-    }
-}
-
-/// Flat pool key for `(layer, kind, expert)`.
-pub fn key_index(layer: u32, kind: ExpertKind, expert: u32, n_experts: u32) -> usize {
-    (layer as usize * ExpertKind::ALL.len() + kind.ordinal()) * n_experts as usize + expert as usize
-}
+// One expert-name matcher shared by C and Rust semantics (design §6.6; the C
+// side mirrors the rule in golem_expert_stem_kind).
+pub use golem_gguf::ExpertKind;
 
 /// Immutable, pre-materialized policy state consumed by eviction victim picks
-/// (§6.6): keys the policy pins (tier floors) and keys protected like
-/// outstanding leases. The pool never locks policy state — `claim` receives a
-/// snapshot built before the shard lock is taken; the shard lock stays
-/// leaf-most.
+/// (§6.6): keys protected like outstanding leases. The pool never locks
+/// policy state — `claim` receives a snapshot built before the shard lock is
+/// taken; the shard lock stays leaf-most.
 ///
-/// Pool-local for M2.3 (`test_empty`/`pin`/`lease` helpers); the M2.2-backed
-/// builder lands with the engine wiring.
+/// Built today only by `empty`/`lease`; a placement-backed builder feeds it
+/// once the policy scorer drives the pool.
 #[derive(Debug, Clone, Default)]
 pub struct PolicySnapshot {
-    pinned: HashSet<Key>,
     protected: HashSet<Key>,
 }
 
-/// Layer/kind/expert identity, layer-independent (unlike [`key_index`], whose
-/// width depends on `n_experts`). Snapshot keys must match real keys at every
-/// layer/kind.
-type Key = (u32, u8, u32);
-
-fn key_of(layer: u32, kind: ExpertKind, expert: u32) -> Key {
-    (layer, kind.ordinal() as u8, expert)
-}
+/// Layer/expert unit identity (layer-independent).
+type Key = (u32, u32);
 
 impl PolicySnapshot {
     /// Empty snapshot: nothing pinned, nothing protected.
-    pub fn test_empty() -> Self {
+    pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Floor-pin a key: never picked as an eviction victim.
-    pub fn pin(&mut self, layer: u32, kind: ExpertKind, expert: u32) {
-        self.pinned.insert(key_of(layer, kind, expert));
+    /// Protect a unit exactly like an outstanding map lease would.
+    pub fn lease(&mut self, layer: u32, expert: u32) {
+        self.protected.insert((layer, expert));
     }
 
-    /// Protect a key exactly like an outstanding map lease would.
-    pub fn lease(&mut self, layer: u32, kind: ExpertKind, expert: u32) {
-        self.protected.insert(key_of(layer, kind, expert));
-    }
-
-    fn excludes(&self, layer: u32, kind: ExpertKind, expert: u32) -> bool {
-        let key = key_of(layer, kind, expert);
-        self.pinned.contains(&key) || self.protected.contains(&key)
+    fn excludes(&self, layer: u32, expert: u32) -> bool {
+        // The set is empty in production today; skip the SipHash per CLOCK step.
+        !self.protected.is_empty() && self.protected.contains(&(layer, expert))
     }
 }
 
-/// One expert layer's residency state (§6.6): resident bits, lease counts,
-/// slot assignment, and the layer's slice of the pool slots.
-///
-/// Slots are partitioned across layer shards at construction (shard `l` owns
-/// a contiguous range), so a shard's critical section
-/// `{bit flip, victim pick, slot assignment, lease grant/release}` never
-/// touches another shard's state and no global free list exists.
+/// One expert layer's residency state (§6.6): resident bits, lease counts and
+/// slot assignment for this layer's keys. The slot free lists and CLOCK
+/// hands are per class, shared by every layer of the class (§6.6: no
+/// per-layer quota), so a shard's critical
+/// section covers only `{bit flip, slot_of, lease grant/release}`.
 #[derive(Debug)]
 struct Shard {
     bits: Vec<u64>,
+    /// CLOCK second-chance bits, one per key: set on every lease grant,
+    /// cleared (once) by the CLOCK scan before a keyed victim is taken.
+    ref_bits: Vec<u64>,
     leases: Vec<u16>,
     slot_of: Vec<i32>,
-    free_slots: Vec<u32>,
     /// Keys claimed (`Filled`/evict-refill) whose slot bytes the caller is
     /// still writing — the fill-completion gate: `Resident` claimers of these
-    /// keys park until the filler reports completion.
-    filling: HashSet<usize>,
+    /// keys park until the filler reports completion. Bitset over layer-local
+    /// keys (same `bit_*` helpers as `bits`): no hash lookup on the
+    /// `Resident` fast path.
+    filling: Vec<u64>,
 }
 
 /// A shard's lock paired with the condvar its fill gate waits on. The lock is
@@ -121,23 +80,58 @@ struct ShardLock {
     fill_cv: Condvar,
 }
 
-/// Residency map over all expert layers: `(layer, kind, expert) → slot` with
-/// in-flight leases and atomic claim-time eviction (§6.6). Per-layer shard
-/// locks; the shard lock is the leaf-most lock in the process.
+/// Residency map over all expert layers: `(layer, expert) → slot` with
+/// in-flight leases and atomic claim-time eviction (§6.6). Slots are carved
+/// into size classes (§5.4); a layer's keys claim, fill and evict only inside
+/// `class_of_layer[layer]`'s slot range — no class borrows another's slot.
+///
+/// Lock order (acyclic): `sweep` → shard; the per-class free stacks share one
+/// leaf lock — a shard guard is always dropped before the free list is
+/// touched, and the CLOCK scan never runs under the free list. The `sweep`
+/// mutex serialises evictions so two concurrent claimers can never take the
+/// same victim.
 #[derive(Debug)]
 pub struct ResidencyMap {
     n_experts: u32,
+    /// Layer → slot class; a claim for layer `l` pops / sweeps only class
+    /// `class_of_layer[l]`.
+    class_of_layer: Vec<u8>,
+    /// Built once: the layers served by each class (class → layers).
+    class_layers: Vec<Vec<u32>>,
+    /// Key count per class (`class_layers[c].len() × keys_per_layer`); the
+    /// starvation bound is computed against this, not the global key count.
+    class_keys: Vec<usize>,
     shards: Vec<ShardLock>,
+    /// One free-slot stack per class (§6.6: no per-layer quota; per-class
+    /// because slot sizes differ). Shared leaf lock.
+    free_slots: Mutex<Vec<Vec<u32>>>,
+    /// Serialises CLOCK sweeps; one hand per class over that class's keys.
+    sweep: Mutex<Vec<ClockHand>>,
+}
+
+/// Maximum keys examined per sweep call. A victimless sweep advances the hand
+/// past the examined window and returns `None`; the claimer yields and
+/// retries, continuing the scan. Second chances persist across sweeps, so a
+/// key passed over with its reference bit set can be taken by a later sweep.
+const SWEEP_BUDGET: usize = 1024;
+
+#[derive(Debug)]
+struct ClockHand {
+    hand: usize,
 }
 
 /// Claim outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Claim {
+#[derive(Debug)]
+pub enum Claim<'m> {
     /// Newly assigned slot (bit flipped under the lock); caller fills it
     /// (I/O outside all locks) and copies under the granted lease.
     Filled {
         /// The slot the caller must fill.
         slot: u32,
+        /// Exclusive-fill capability for that slot: the only way to take
+        /// `&mut` on an arena slot; constructed here and in the eviction
+        /// path, both inside the shard lock.
+        claim: FillClaim<'m>,
     },
     /// Already resident; a lease was granted; `slot` names the filled slot.
     Resident {
@@ -146,23 +140,91 @@ pub enum Claim {
     },
 }
 
+/// Why a claim did not return a slot. `Evicted`: the victim's slot is the
+/// claimer's and its I/O replaces the victim's bytes. `Busy`: every slot is
+/// leased or snapshot-protected after bounded CLOCK walks, or the key's lease
+/// count is saturated — transient by contract (leases release); the pool must
+/// not be over-subscribed.
+#[derive(Debug)]
+pub enum ClaimError<'m> {
+    /// An expert evicted by this claim; its slot is reassigned to the
+    /// claimer, whose I/O replaces the victim's bytes.
+    Evicted(Evicted<'m>),
+    /// No evictable slot after bounded full CLOCK walks, or `u16::MAX`
+    /// outstanding leases on the key.
+    Busy,
+}
+
 /// An expert evicted by this claim; its slot is reassigned to the claimer,
 /// whose I/O replaces the victim's bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Evicted {
+#[derive(Debug)]
+pub struct Evicted<'m> {
     /// The evicted victim.
     pub victim: Victim,
     /// The slot the caller must refill (== `victim.slot`).
     pub slot: u32,
+    /// Exclusive-fill capability for that slot.
+    pub claim: FillClaim<'m>,
 }
 
-/// The key + slot an eviction displaced.
+/// Exclusive-fill capability for one arena slot: a safe `&mut` on a slot
+/// requires `&mut FillClaim`, and only the residency map constructs them,
+/// under the shard lock, exactly when it has reassigned the slot to the
+/// claimer. Not `Copy`/`Clone`: [`Self::finish`] and [`Self::cancel`] consume
+/// it, and dropping it unfinished (a panic mid-fill) cancels the claim so the
+/// key never stays mid-fill with parked claimers.
+pub struct FillClaim<'m> {
+    map: &'m ResidencyMap,
+    layer: u32,
+    expert: u32,
+    slot: u32,
+    settled: bool,
+}
+
+impl FillClaim<'_> {
+    /// The slot this claim exclusively fills.
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    /// Marks the slot's bytes complete: clears the fill gate and wakes parked
+    /// `Resident` claimers, which then grant their leases. The claim's own
+    /// lease stays held.
+    pub(crate) fn finish(mut self) {
+        self.settled = true;
+        self.map.finish_fill(self.layer, self.expert);
+    }
+
+    /// Abandons a failed page-in; see [`ResidencyMap::cancel_claim`].
+    pub(crate) fn cancel(mut self) {
+        self.settled = true;
+        self.map.cancel_claim(self.layer, self.expert);
+    }
+}
+
+impl Drop for FillClaim<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.map.cancel_claim(self.layer, self.expert);
+        }
+    }
+}
+
+impl fmt::Debug for FillClaim<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FillClaim")
+            .field("layer", &self.layer)
+            .field("expert", &self.expert)
+            .field("slot", &self.slot)
+            .finish()
+    }
+}
+
+/// The unit + slot an eviction displaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Victim {
     /// Victim layer.
     pub layer: u32,
-    /// Victim plane kind.
-    pub kind: ExpertKind,
     /// Victim expert index.
     pub expert: u32,
     /// The slot whose bytes the victim owned.
@@ -170,47 +232,87 @@ pub struct Victim {
 }
 
 impl ResidencyMap {
-    /// Builds a map over `n_layers` expert layers of `n_experts` experts,
-    /// with `pool_slots` arena slots partitioned contiguously across shards.
+    /// Builds a map over `n_experts`-expert layers mapped to slot classes by
+    /// `class_of_layer`; class `c` serves exactly the slots in
+    /// `class_slots[c]` (contiguous arena ranges).
     ///
-    /// # Panics
-    /// Panics (debug) when `pool_slots < n_layers` — a shard with no slots
-    /// could never satisfy a claim.
-    pub fn new(n_layers: u32, n_experts: u32, pool_slots: u32) -> Self {
-        debug_assert!(n_layers > 0 && n_experts > 0);
-        debug_assert!(pool_slots >= n_layers, "every shard needs ≥1 slot");
-        let per = pool_slots / n_layers;
-        let shards = (0..n_layers)
-            .map(|l| {
-                let start = l * per;
-                let end = if l + 1 == n_layers {
-                    pool_slots
-                } else {
-                    (l + 1) * per
-                };
-                let words = Self::keys_per_layer(n_experts).div_ceil(64);
-                ShardLock {
-                    shard: Mutex::new(Shard {
-                        bits: vec![0; words],
-                        leases: vec![0; Self::keys_per_layer(n_experts)],
-                        slot_of: vec![-1; Self::keys_per_layer(n_experts)],
-                        // pop() allocates `start` first.
-                        free_slots: (start..end).rev().collect(),
-                        filling: HashSet::new(),
-                    }),
-                    fill_cv: Condvar::new(),
+    /// # Errors
+    /// No layers/experts/classes, a layer naming a missing class, a class
+    /// serving no layers (`clock_evict` would divide by zero), or overlapping
+    /// class slot ranges.
+    pub fn new(
+        class_of_layer: Vec<u8>,
+        n_experts: u32,
+        class_slots: Vec<std::ops::Range<u32>>,
+    ) -> Result<Self, PoolConfigError> {
+        let bad = |msg: String| Err(PoolConfigError(msg));
+        let n_layers = class_of_layer.len() as u32;
+        if n_layers == 0 || n_experts == 0 {
+            return bad("a pool without layers or experts cannot serve".into());
+        }
+        if class_slots.is_empty() {
+            return bad("a pool without slots cannot serve".into());
+        }
+        let n_classes = class_slots.len();
+        let mut class_layers = vec![Vec::new(); n_classes];
+        for (l, &c) in class_of_layer.iter().enumerate() {
+            if c as usize >= n_classes {
+                return bad(format!(
+                    "layer {l} names class {c}, but only {n_classes} classes exist"
+                ));
+            }
+            class_layers[c as usize].push(l as u32);
+        }
+        if let Some(c) = class_layers.iter().position(Vec::is_empty) {
+            return bad(format!("class {c} has slots but serves no layers"));
+        }
+        for (a, ra) in class_slots.iter().enumerate() {
+            for rb in &class_slots[a + 1..] {
+                if ra.end > rb.start && rb.end > ra.start {
+                    return bad(format!("class slot ranges {ra:?} and {rb:?} overlap"));
                 }
+            }
+        }
+        let class_keys: Vec<usize> = class_layers
+            .iter()
+            .map(|ls| ls.len() * Self::keys_per_layer(n_experts))
+            .collect();
+        let keys_per_layer = Self::keys_per_layer(n_experts);
+        let filling_words = keys_per_layer.div_ceil(64);
+        let shards = (0..n_layers)
+            .map(|_| ShardLock {
+                shard: Mutex::new(Shard {
+                    bits: vec![0; keys_per_layer.div_ceil(64)],
+                    ref_bits: vec![0; keys_per_layer.div_ceil(64)],
+                    leases: vec![0; keys_per_layer],
+                    slot_of: vec![-1; keys_per_layer],
+                    filling: vec![0; filling_words],
+                }),
+                fill_cv: Condvar::new(),
             })
             .collect();
-        Self { n_experts, shards }
+        // pop() allocates each class's lowest slot first.
+        let free_slots: Vec<Vec<u32>> = class_slots
+            .iter()
+            .map(|r| r.clone().rev().collect())
+            .collect();
+        Ok(Self {
+            n_experts,
+            class_of_layer,
+            class_layers,
+            class_keys,
+            shards,
+            free_slots: Mutex::new(free_slots),
+            sweep: Mutex::new((0..n_classes).map(|_| ClockHand { hand: 0 }).collect()),
+        })
     }
 
     fn keys_per_layer(n_experts: u32) -> usize {
-        ExpertKind::ALL.len() * n_experts as usize
+        n_experts as usize
     }
 
-    fn local(&self, kind: ExpertKind, expert: u32) -> usize {
-        kind.ordinal() * self.n_experts as usize + expert as usize
+    fn local(&self, expert: u32) -> usize {
+        expert as usize
     }
 
     fn bit_test(bits: &[u64], i: usize) -> bool {
@@ -225,17 +327,17 @@ impl ResidencyMap {
         bits[i / 64] &= !(1 << (i % 64));
     }
 
-    /// Residency of one key (shard lock, flip-length hold).
-    pub fn is_resident(&self, layer: u32, kind: ExpertKind, expert: u32) -> bool {
+    /// Residency of one unit (shard lock, flip-length hold).
+    pub fn is_resident(&self, layer: u32, expert: u32) -> bool {
         let sh = self.shards[layer as usize].shard.lock().unwrap();
-        Self::bit_test(&sh.bits, self.local(kind, expert))
+        Self::bit_test(&sh.bits, self.local(expert))
     }
 
     /// Claims a key under ONE shard-lock critical section (§6.6):
     ///
     /// - resident → lease++, `Ok(Resident)`
     /// - free slot → assign + flip + lease, `Ok(Filled)`
-    /// - full → pick victim from the lock-free [`PolicySnapshot`] (candidates
+    /// - full → pick victim from the [`PolicySnapshot`] (candidates
     ///   exclude leased and snapshot-excluded keys), clear the victim bit,
     ///   reassign its slot, flip the claimer's bit, grant the claimer's lease,
     ///   `Err(Evicted)` — the caller's I/O replaces the victim's bytes in that
@@ -243,37 +345,57 @@ impl ResidencyMap {
     ///
     /// No policy locks are taken while the shard lock is held; victim pick
     /// only reads the snapshot. When every candidate is protected (all slots
-    /// leased/pinned) the claim releases the lock, yields, and retries until a
-    /// lease holder makes progress — a lease is always dropped by its owner in
-    /// finite time, so the loop terminates.
+    /// leased/pinned) the claim yields and retries through a bounded number
+    /// of full CLOCK walks; if no victim appears it returns
+    /// [`ClaimError::Busy`] — leases are transient, so over-subscription is
+    /// a loud error, not an unbounded spin.
     ///
-    /// Every successful path (and `Err(Evicted)`) grants exactly one lease;
+    /// Every successful path (and `Err(ClaimError::Evicted)`) grants exactly one lease;
     /// the caller drops it via [`Self::release_lease`] after its copy, or
-    /// [`Self::cancel_claim`] if its page-in fails.
+    /// [`FillClaim::cancel`] if its page-in fails.
     ///
     /// Fill-completion gating: `Filled`/evict-refill grants also mark the key
     /// mid-fill; a `Resident` claim on a mid-fill key parks on the shard
-    /// condvar (lock released) until the filler's [`Self::finish_fill`] (or a
-    /// `cancel_claim`) wakes it, so leased readers never observe slot bytes a
+    /// condvar (lock released) until the filler's [`FillClaim::finish`] (or a
+    /// cancel) wakes it, so leased readers never observe slot bytes a
     /// concurrent filler is still writing. A claimer parked through a
     /// cancelled fill re-enters the loop and claims fresh.
-    pub fn claim(
+    pub(crate) fn claim(
         &self,
         layer: u32,
-        kind: ExpertKind,
         expert: u32,
         snapshot: &PolicySnapshot,
-    ) -> Result<Claim, Evicted> {
+    ) -> Result<Claim<'_>, ClaimError<'_>> {
         let li = layer as usize;
-        let i = self.local(kind, expert);
+        let class = self.class_of_layer[li] as usize;
+        let i = self.local(expert);
+        // Bounded starvation guard: CLOCK finds a victim within two full laps
+        // (the first may only clear second-chance bits), each lap
+        // ⌈class_keys / SWEEP_BUDGET⌉ sweeps over the claimer's own class.
+        // Beyond that every slot in the class is leased or snapshot-protected
+        // — leases are transient, so the class is over-subscribed and the
+        // caller gets a loud busy error instead of an unbounded spin. The
+        // bound assumes ref bits stay cleared; concurrent `Resident` hits
+        // re-set them, so a re-touch storm can surface `Busy` early — the P3
+        // caller aborts on it, which the class floor (layers × K slots)
+        // keeps out of reach for one decode thread.
+        let starve_bound = 2 * self.class_keys[class].div_ceil(SWEEP_BUDGET) + 1;
+        let mut starved = 0usize;
         loop {
             let mut sh = self.shards[li].shard.lock().unwrap();
             if Self::bit_test(&sh.bits, i) {
-                while sh.filling.contains(&i) {
+                while Self::bit_test(&sh.filling, i) {
                     sh = self.shards[li].fill_cv.wait(sh).unwrap();
                 }
                 if Self::bit_test(&sh.bits, i) {
+                    // Saturated lease count: a wrap to 0 would make a leased
+                    // key evictable under in-flight readers. Transient like
+                    // every other Busy — leases release.
+                    if sh.leases[i] == u16::MAX {
+                        return Err(ClaimError::Busy);
+                    }
                     sh.leases[i] += 1;
+                    Self::ref_set(&mut sh.ref_bits, i);
                     return Ok(Claim::Resident {
                         slot: sh.slot_of[i] as u32,
                     });
@@ -281,92 +403,201 @@ impl ResidencyMap {
                 // Fill was cancelled while parked: fall through and claim
                 // fresh (the slot is back on the free list).
             }
-            if let Some(slot) = sh.free_slots.pop() {
-                sh.filling.insert(i);
-                sh.slot_of[i] = slot as i32;
-                Self::bit_set(&mut sh.bits, i);
-                sh.leases[i] += 1;
-                return Ok(Claim::Filled { slot });
-            }
-            // Pool (shard partition) full: atomic victim pick + clear + reassign.
-            let victim = (0..Self::keys_per_layer(self.n_experts)).find(|&c| {
-                Self::bit_test(&sh.bits, c)
-                    && sh.leases[c] == 0
-                    && !snapshot.excludes(
-                        layer,
-                        ExpertKind::ALL[c / self.n_experts as usize],
-                        c as u32 % self.n_experts,
-                    )
-            });
-            let Some(v) = victim else {
-                drop(sh);
-                super::primitives::yield_now();
-                continue;
+            // Falling through holds no state that needs the shard lock.
+            // Take a free slot of the layer's class if any; else run that
+            // class's CLOCK. The shard guard stays dropped across the free list and
+            // the scan — the free list is a leaf, and the sweep takes shard
+            // locks one at a time under its own mutex.
+            drop(sh);
+            // Bind the pop outside the match: a match-scrutinee temporary
+            // lives to the end of the match, which would hold the free-list
+            // guard across the CLOCK sweep below.
+            let popped = self.free_slots.lock().unwrap()[class].pop();
+            let acquired = match popped {
+                Some(slot) => Some((slot, None)),
+                None => {
+                    starved += 1;
+                    if starved > starve_bound {
+                        return Err(ClaimError::Busy);
+                    }
+                    self.clock_evict(class, snapshot).map(|(v, s)| (s, Some(v)))
+                }
             };
-            Self::bit_clear(&mut sh.bits, v);
-            let slot = sh.slot_of[v] as u32;
-            sh.slot_of[v] = -1;
-            let vkind = ExpertKind::ALL[v / self.n_experts as usize];
-            let vexpert = v as u32 % self.n_experts;
-            sh.filling.insert(i);
+            let (slot, victim) = match acquired {
+                Some(x) => x,
+                None => {
+                    super::primitives::yield_now();
+                    continue;
+                }
+            };
+            starved = 0;
+            sh = self.shards[li].shard.lock().unwrap();
+            if Self::bit_test(&sh.bits, i) {
+                // A concurrent claimer filled this key while we hunted for a
+                // slot: return the slot (its residency, if the CLOCK cleared
+                // one, is already cleared) and re-read the state. The shard
+                // guard is dropped before the free list (leaf) is touched.
+                drop(sh);
+                self.free_slots.lock().unwrap()[class].push(slot);
+                continue;
+            }
+            Self::bit_set(&mut sh.filling, i);
             sh.slot_of[i] = slot as i32;
             Self::bit_set(&mut sh.bits, i);
+            // Reference bit stays clear on first fill: a key evicts on its
+            // first sweep unless it was re-touched (Resident) in between.
+            // A non-resident key holds no leases (eviction and cancel clear
+            // the bit only at zero), so this cannot overflow.
+            debug_assert_eq!(sh.leases[i], 0, "non-resident key with leases");
             sh.leases[i] += 1;
-            return Err(Evicted {
-                victim: Victim {
-                    layer,
-                    kind: vkind,
-                    expert: vexpert,
-                    slot,
-                },
+            let claim = FillClaim {
+                map: self,
+                layer,
+                expert,
                 slot,
-            });
+                settled: false,
+            };
+            if let Some(victim) = victim {
+                return Err(ClaimError::Evicted(Evicted {
+                    victim,
+                    slot,
+                    claim,
+                }));
+            }
+            return Ok(Claim::Filled { slot, claim });
         }
     }
 
-    /// Marks a mid-fill key's slot bytes complete: clears the fill gate and
-    /// wakes parked `Resident` claimers, which then grant their leases. Pager
-    /// contract: called (only) after the `Filled` claim's copy into the slot
-    /// finished — the gate is what makes the slot's `&mut` phase exclusive.
-    pub(crate) fn finish_fill(&self, layer: u32, kind: ExpertKind, expert: u32) {
+    /// Per-class CLOCK sweep: walks the class's keys round-robin from its hand, giving each
+    /// resident, unleased, unprotected key a second chance (clear its
+    /// reference bit) before taking it as the victim. Reference bits are set
+    /// only on Resident reuse — a key filled once and never re-touched is
+    /// immediately evictable, while a reused key survives until a full pass
+    /// finds nothing else. Returns the victim and its slot, with the victim's
+    /// residency already cleared under its shard lock.
+    fn clock_evict(&self, class: usize, snapshot: &PolicySnapshot) -> Option<(Victim, u32)> {
+        let kpl = Self::keys_per_layer(self.n_experts);
+        let class_key_count = self.class_keys[class];
+        let mut hands = self.sweep.lock().unwrap();
+        let hand = &mut hands[class];
+        let start = hand.hand;
+        for step in 0..SWEEP_BUDGET.min(class_key_count) {
+            let idx = (start + step) % class_key_count;
+            // Class keys are (layer-in-class, expert): decode the flat index
+            // back to the real layer and its shard-local key.
+            let li = self.class_layers[class][idx / kpl] as usize;
+            let c = idx % kpl;
+            let mut sh = self.shards[li].shard.lock().unwrap();
+            if !Self::bit_test(&sh.bits, c) || sh.leases[c] != 0 {
+                drop(sh);
+                hand.hand = idx + 1;
+                continue;
+            }
+            // Snapshot-excluded keys are never victims: test them before
+            // the CLOCK ref-bit flip, or an excluded key loses its
+            // second chance and stays demoted forever (it can't be picked
+            // to earn the bit back).
+            let expert = c as u32;
+            if snapshot.excludes(li as u32, expert) {
+                drop(sh);
+                continue;
+            }
+            if Self::ref_test(&sh.ref_bits, c) {
+                Self::ref_clear(&mut sh.ref_bits, c);
+                drop(sh);
+                hand.hand = idx + 1;
+                continue;
+            }
+            let slot = sh.slot_of[c] as u32;
+            Self::bit_clear(&mut sh.bits, c);
+            sh.slot_of[c] = -1;
+            drop(sh);
+            hand.hand = idx + 1;
+            return Some((
+                Victim {
+                    layer: li as u32,
+                    expert,
+                    slot,
+                },
+                slot,
+            ));
+        }
+        // Budget exhausted without a victim: park the hand past the examined
+        // window so a retry sweep continues the scan instead of re-walking it.
+        hand.hand = (start + SWEEP_BUDGET.min(class_key_count)) % class_key_count;
+        None
+    }
+
+    fn ref_test(bits: &[u64], i: usize) -> bool {
+        bits[i / 64] >> (i % 64) & 1 == 1
+    }
+
+    fn ref_set(bits: &mut [u64], i: usize) {
+        bits[i / 64] |= 1 << (i % 64);
+    }
+
+    fn ref_clear(bits: &mut [u64], i: usize) {
+        bits[i / 64] &= !(1 << (i % 64));
+    }
+
+    /// Clears the fill gate and wakes parked `Resident` claimers; reached
+    /// only through [`FillClaim::finish`], after the slot's bytes are written.
+    fn finish_fill(&self, layer: u32, expert: u32) {
         let mut sh = self.shards[layer as usize].shard.lock().unwrap();
-        sh.filling.remove(&self.local(kind, expert));
+        let i = self.local(expert);
+        Self::bit_clear(&mut sh.filling, i);
         self.shards[layer as usize].fill_cv.notify_all();
     }
 
     /// Drops one lease. The slot stays resident until evicted via `claim`.
-    pub fn release_lease(&self, layer: u32, kind: ExpertKind, expert: u32) {
+    pub(crate) fn release_lease(&self, layer: u32, expert: u32) {
         let mut sh = self.shards[layer as usize].shard.lock().unwrap();
-        let i = self.local(kind, expert);
+        let i = self.local(expert);
         debug_assert!(sh.leases[i] > 0, "release without a lease");
         sh.leases[i] = sh.leases[i].saturating_sub(1);
     }
 
-    /// Abandon a failed page-in: drops the claim's lease and, when no other
-    /// lease remains, clears the key's residency and returns the slot to the
-    /// shard's free list — no ghost residency, no leaked slot. Also clears the
-    /// fill gate and wakes claimers parked on it (they re-claim fresh).
-    pub fn cancel_claim(&self, layer: u32, kind: ExpertKind, expert: u32) {
+    /// Abandons a page-in (reached only through [`FillClaim`]): drops the claim's lease — by contract the
+    /// only one on the key (concurrent claimers park on the fill gate until
+    /// this cancel or the fill completes) — clears the key's residency and
+    /// returns the slot to its class's free list: no ghost residency, no
+    /// leaked slot. Also clears the fill gate and wakes claimers parked on
+    /// it (they re-claim fresh).
+    fn cancel_claim(&self, layer: u32, expert: u32) {
         let li = layer as usize;
-        let mut sh = self.shards[li].shard.lock().unwrap();
-        let i = self.local(kind, expert);
-        debug_assert!(sh.leases[i] > 0, "cancel without a lease");
-        sh.filling.remove(&i);
-        sh.leases[i] = sh.leases[i].saturating_sub(1);
-        if sh.leases[i] == 0 {
+        let freed = {
+            let mut sh = self.shards[li].shard.lock().unwrap();
+            let i = self.local(expert);
+            debug_assert!(sh.leases[i] > 0, "cancel without a lease");
+            Self::bit_clear(&mut sh.filling, i);
+            sh.leases[i] = sh.leases[i].saturating_sub(1);
+            debug_assert_eq!(sh.leases[i], 0, "cancel_claim holds the only lease");
             Self::bit_clear(&mut sh.bits, i);
             let s = sh.slot_of[i];
             sh.slot_of[i] = -1;
-            if s >= 0 {
-                sh.free_slots.push(s as u32);
-            }
+            (s >= 0).then_some(s as u32)
+            // Shard guard dropped before the leaf free list.
+        };
+        if let Some(s) = freed {
+            self.free_slots.lock().unwrap()[self.class_of_layer[li] as usize].push(s);
         }
         self.shards[li].fill_cv.notify_all();
     }
 }
 
-/// P3 slow-path counters (Global Constraints: demand and prefetch counted
-/// separately; P4/M2.4 absorbs this block without renames).
+/// Inconsistent pool construction input (layers, classes, slot ranges).
+#[derive(Debug, thiserror::Error)]
+#[error("invalid pool configuration: {0}")]
+pub struct PoolConfigError(String);
+
+impl PoolConfigError {
+    pub(crate) fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
+}
+
+/// P3 slow-path counters (design §6.6: demand and prefetch counted
+/// separately).
 #[derive(Debug, Default)]
 pub struct P3Stats {
     /// Page-ins on the demand (decode) path.
@@ -416,135 +647,321 @@ mod tests {
         assert_eq!(ExpertKind::from_tensor_name("blk.0.ffn_gate.weight"), None);
     }
 
-    #[test]
-    fn key_index_is_flat_and_injective() {
-        assert_eq!(key_index(0, ExpertKind::Gate, 3, 8), 3);
-        assert_eq!(key_index(0, ExpertKind::Up, 0, 8), 8);
-        assert_eq!(key_index(1, ExpertKind::Down, 7, 8), 3 * 8 + 2 * 8 + 7);
+    /// What a claim granted, with the fill (if any) already completed.
+    #[derive(Debug, PartialEq)]
+    enum Got {
+        Filled(u32),
+        Resident(u32),
+        Evicted(Victim, u32),
+        Busy,
+    }
+
+    /// Claims a key and finishes its fill at once; the claim's lease stays held.
+    fn take(m: &ResidencyMap, snap: &PolicySnapshot, layer: u32, expert: u32) -> Got {
+        match m.claim(layer, expert, snap) {
+            Ok(Claim::Filled { slot, claim }) => {
+                claim.finish();
+                Got::Filled(slot)
+            }
+            Ok(Claim::Resident { slot }) => Got::Resident(slot),
+            Err(ClaimError::Evicted(e)) => {
+                let (victim, slot) = (e.victim, e.slot);
+                e.claim.finish();
+                Got::Evicted(victim, slot)
+            }
+            Err(ClaimError::Busy) => Got::Busy,
+        }
+    }
+
+    /// `take` + release: leaves the key resident and unleased.
+    fn warm(m: &ResidencyMap, snap: &PolicySnapshot, layer: u32, expert: u32) -> Got {
+        let got = take(m, snap, layer, expert);
+        m.release_lease(layer, expert);
+        got
+    }
+
+    fn map(layers: usize, n_experts: u32, classes: Vec<std::ops::Range<u32>>) -> ResidencyMap {
+        ResidencyMap::new(vec![0; layers], n_experts, classes).unwrap()
     }
 
     #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
     fn claim_flip_then_resident() {
-        let m = ResidencyMap::new(2, 8, 4);
-        assert!(!m.is_resident(0, ExpertKind::Gate, 3));
-        let snap = PolicySnapshot::test_empty();
-        match m.claim(0, ExpertKind::Gate, 3, &snap).unwrap() {
-            Claim::Filled { slot } => assert_eq!(slot, 0),
-            Claim::Resident { .. } => panic!("first claim must fill"),
-        }
-        assert!(m.is_resident(0, ExpertKind::Gate, 3));
-        m.release_lease(0, ExpertKind::Gate, 3);
+        let m = map(2, 8, vec![0..4]);
+        assert!(!m.is_resident(0, 3));
+        let snap = PolicySnapshot::empty();
+        assert_eq!(take(&m, &snap, 0, 3), Got::Filled(0));
+        assert!(m.is_resident(0, 3));
+        m.release_lease(0, 3);
     }
 
     #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
     fn second_claim_while_leased_is_a_hit_with_new_lease() {
-        let m = ResidencyMap::new(2, 8, 4);
-        let snap = PolicySnapshot::test_empty();
-        m.claim(0, ExpertKind::Gate, 3, &snap).unwrap();
-        m.finish_fill(0, ExpertKind::Gate, 3); // model the pager's page-in
-        assert!(matches!(
-            m.claim(0, ExpertKind::Gate, 3, &snap).unwrap(),
-            Claim::Resident { .. }
-        ));
+        let m = map(2, 8, vec![0..4]);
+        let snap = PolicySnapshot::empty();
+        take(&m, &snap, 0, 3);
+        assert!(matches!(take(&m, &snap, 0, 3), Got::Resident(_)));
     }
 
     #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
     fn full_pool_returns_victim_excluding_leased_and_pinned() {
-        let m = ResidencyMap::new(1, 8, 2);
-        let mut snap = PolicySnapshot::test_empty();
-        snap.pin(0, ExpertKind::Gate, 0); // floor-pinned
-        m.claim(0, ExpertKind::Gate, 0, &snap).unwrap();
-        m.finish_fill(0, ExpertKind::Gate, 0);
-        m.claim(0, ExpertKind::Gate, 1, &snap).unwrap();
-        m.finish_fill(0, ExpertKind::Gate, 1);
-        m.release_lease(0, ExpertKind::Gate, 0);
-        m.release_lease(0, ExpertKind::Gate, 1);
-        snap.lease(0, ExpertKind::Gate, 0); // simulate an outstanding lease on expert 0
-        let e = m.claim(0, ExpertKind::Gate, 2, &snap).unwrap_err();
-        assert_eq!(e.victim.expert, 1, "leased expert 0 must never be picked");
-        assert!(!m.is_resident(0, ExpertKind::Gate, 1), "victim bit cleared");
-        assert!(m.is_resident(0, ExpertKind::Gate, 2), "claimer flipped");
+        let m = map(1, 8, vec![0..2]);
+        let mut snap = PolicySnapshot::empty();
+        snap.lease(0, 0); // protected like an outstanding lease
+        warm(&m, &snap, 0, 0);
+        warm(&m, &snap, 0, 1);
+        let Got::Evicted(victim, _) = take(&m, &snap, 0, 2) else {
+            panic!("expected eviction")
+        };
+        assert_eq!(victim.expert, 1, "protected expert 0 must never be picked");
+        assert!(!m.is_resident(0, 1), "victim bit cleared");
+        assert!(m.is_resident(0, 2), "claimer flipped");
     }
 
     #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
     fn cancel_returns_slot_and_clears_residency() {
-        let m = ResidencyMap::new(1, 8, 1);
-        let snap = PolicySnapshot::test_empty();
-        m.claim(0, ExpertKind::Gate, 0, &snap).unwrap();
-        m.cancel_claim(0, ExpertKind::Gate, 0);
-        assert!(!m.is_resident(0, ExpertKind::Gate, 0));
+        let m = map(1, 8, vec![0..1]);
+        let snap = PolicySnapshot::empty();
+        let Ok(Claim::Filled { claim, .. }) = m.claim(0, 0, &snap) else {
+            panic!("first claim must fill")
+        };
+        claim.cancel();
+        assert!(!m.is_resident(0, 0));
         // The freed slot serves the next miss.
-        match m.claim(0, ExpertKind::Gate, 1, &snap).unwrap() {
-            Claim::Filled { slot } => assert_eq!(slot, 0),
-            Claim::Resident { .. } => panic!("slot must have been recycled"),
-        }
+        assert_eq!(take(&m, &snap, 0, 1), Got::Filled(0), "slot recycled");
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn dropping_an_unfinished_claim_cancels_it() {
+        // A panic mid-fill unwinds through `FillClaim::drop`: the key must not
+        // stay `filling` (parking every later claimer forever) or resident.
+        let m = map(1, 8, vec![0..1]);
+        let snap = PolicySnapshot::empty();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(Claim::Filled { claim, .. }) = m.claim(0, 0, &snap) else {
+                panic!("first claim must fill")
+            };
+            let _claim = claim;
+            panic!("source panicked mid-fill");
+        }));
+        assert!(unwound.is_err());
+        assert!(!m.is_resident(0, 0), "no ghost residency");
+        // Would hang on the fill gate if the key were still `filling`.
+        assert_eq!(take(&m, &snap, 0, 0), Got::Filled(0), "slot recycled");
     }
 
     #[test]
     fn concurrent_claim_two_threads_one_pagein() {
         primitives::model(|| {
-            let m = Arc::new(ResidencyMap::new(1, 8, 2));
+            let m = Arc::new(map(1, 8, vec![0..2]));
             let m2 = m.clone();
-            let snap = Arc::new(PolicySnapshot::test_empty());
+            let snap = Arc::new(PolicySnapshot::empty());
             let snap2 = snap.clone();
             // Models the pager per-thread: the `Filled` winner completes its
             // fill through the gate so the parked `Resident` claimer wakes.
-            let run = |m: Arc<ResidencyMap>, snap: Arc<PolicySnapshot>| match m
-                .claim(0, ExpertKind::Gate, 5, &snap)
-                .unwrap()
-            {
-                Claim::Filled { slot } => {
-                    assert_eq!(slot, 0);
-                    m.finish_fill(0, ExpertKind::Gate, 5);
-                }
-                Claim::Resident { slot } => assert_eq!(slot, 0),
-            };
-            let t = primitives::spawn(move || run(m2, snap2));
-            run(m, snap);
+            // Invariant: both claimers observe the SAME slot. Which thread
+            // wins the fill — and which slot it took — is
+            // scheduling-dependent (the free list is shared).
+            let seen = Arc::new(Mutex::new(None));
+            let seen2 = seen.clone();
+            let run =
+                |m: Arc<ResidencyMap>, snap: Arc<PolicySnapshot>, seen: Arc<Mutex<Option<u32>>>| {
+                    let (Got::Filled(slot) | Got::Resident(slot)) = take(&m, &snap, 0, 5) else {
+                        panic!("two claims on an empty 2-slot pool cannot evict or starve")
+                    };
+                    let mut first = seen.lock().unwrap();
+                    match *first {
+                        Some(prev) => assert_eq!(slot, prev, "both claimers see one slot"),
+                        None => *first = Some(slot),
+                    }
+                };
+            let t = primitives::spawn(move || run(m2, snap2, seen2));
+            run(m, snap, seen);
             t.join().unwrap();
         });
     }
 
     #[test]
-    fn pin_and_lease_exclude_real_keys_at_every_layer_and_kind() {
-        // Regression: snapshot keys were built with key_index(.., u32::MAX),
-        // which matched real keys only at (layer 0, Gate) — a pin/lease on any
-        // other layer or kind was silently ignored by victim picks.
-        // Pin, layer 1, Gate:
-        let m = ResidencyMap::new(2, 4, 4); // 2 slots per layer shard
-        let mut snap = PolicySnapshot::test_empty();
-        snap.pin(1, ExpertKind::Gate, 0);
-        m.claim(1, ExpertKind::Gate, 0, &snap).unwrap();
-        m.finish_fill(1, ExpertKind::Gate, 0);
-        m.claim(1, ExpertKind::Down, 0, &snap).unwrap();
-        m.finish_fill(1, ExpertKind::Down, 0);
-        m.release_lease(1, ExpertKind::Gate, 0);
-        m.release_lease(1, ExpertKind::Down, 0);
-        let e = m.claim(1, ExpertKind::Gate, 1, &snap).unwrap_err();
-        assert_eq!(
-            (e.victim.kind, e.victim.expert),
-            (ExpertKind::Down, 0),
-            "pinned (1, Gate, 0) must never be picked"
-        );
-        assert!(m.is_resident(1, ExpertKind::Gate, 0), "pin held");
+    fn concurrent_claim_and_cancel_on_full_pool() {
+        // One thread claims (forcing a CLOCK eviction on the full pool) while
+        // the other cancels a claim, returning its slot to the free list.
+        // Either path must hand the claimer exactly one slot, and the pool
+        // must end with no leaked slot: after both cancel, one more claim
+        // must find a free slot without evicting anyone.
+        primitives::model(|| {
+            let m = Arc::new(map(1, 4, vec![0..2]));
+            let snap = Arc::new(PolicySnapshot::empty());
+            for e in [0u32, 1] {
+                warm(&m, &snap, 0, e);
+            }
+            let m2 = m.clone();
+            let snap2 = snap.clone();
+            let t = primitives::spawn(move || {
+                // Claim key 2 on the full pool: it evicts (or reuses a slot
+                // the main thread's cancel just freed).
+                match m2.claim(0, 2, &snap2) {
+                    Ok(Claim::Filled { claim, .. }) => claim.cancel(),
+                    Err(ClaimError::Evicted(e)) => e.claim.cancel(),
+                    Ok(Claim::Resident { .. }) => panic!("key 2 starts non-resident"),
+                    Err(ClaimError::Busy) => panic!("two unleased keys are evictable"),
+                }
+            });
+            // Re-claim key 1 so both threads contend for the same slots; any
+            // claim outcome is legal (Resident, Filled, or Evicted with key 0
+            // or 1 as the victim). The cancel drops the lease and the
+            // residency, returning the slot.
+            match m.claim(0, 1, &snap) {
+                Ok(Claim::Resident { .. }) => m.cancel_claim(0, 1),
+                Ok(Claim::Filled { claim, .. }) => claim.cancel(),
+                Err(ClaimError::Evicted(e)) => e.claim.cancel(),
+                Err(ClaimError::Busy) => panic!("two unleased keys are evictable"),
+            }
+            t.join().unwrap();
+            // No slot leaked: a fresh claim must not evict.
+            assert!(matches!(take(&m, &snap, 0, 3), Got::Filled(_)));
+        });
+    }
 
-        // Snapshot lease, layer 1, non-Gate kind (victim scan hits it first):
-        let m = ResidencyMap::new(2, 4, 4);
-        let mut snap = PolicySnapshot::test_empty();
-        snap.lease(1, ExpertKind::Gate, 1);
-        m.claim(1, ExpertKind::Gate, 1, &snap).unwrap();
-        m.finish_fill(1, ExpertKind::Gate, 1);
-        m.claim(1, ExpertKind::Up, 0, &snap).unwrap();
-        m.finish_fill(1, ExpertKind::Up, 0);
-        m.release_lease(1, ExpertKind::Gate, 1);
-        m.release_lease(1, ExpertKind::Up, 0);
-        let e = m.claim(1, ExpertKind::Gate, 2, &snap).unwrap_err();
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn clock_churn_does_not_single_out_one_hot_expert() {
+        // Property: the victim is the CLOCK hand's coldest key, never a
+        // fixed index. Trace (3 slots, hot = key 2, colds = keys 0/1/3, one
+        // rotating cold claim per round after re-touching hot): the hand
+        // always finds a cold key whose second chance a previous sweep
+        // consumed before it wraps to the hot expert, so the hot expert is
+        // never evicted — the first-index policy evicted the same
+        // lowest-index key every time.
+        let m = map(1, 4, vec![0..3]);
+        let snap = PolicySnapshot::empty();
+        // Warm: hot, cA, cB resident (slots 0-2).
+        for e in [2u32, 0, 1] {
+            warm(&m, &snap, 0, e);
+        }
+        let colds: [u32; 3] = [3, 0, 1]; // cC, then cA, then cB rotate
+        for round in 0..30u32 {
+            warm(&m, &snap, 0, 2); // hot
+            let c = colds[(round % 3) as usize];
+            if let Got::Evicted(victim, _) = take(&m, &snap, 0, c) {
+                assert_ne!(
+                    victim.expert, 2,
+                    "round {round}: the hot expert was evicted"
+                );
+                m.release_lease(0, c);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn pin_and_lease_exclude_real_keys_at_every_layer() {
+        // Regression: snapshot keys must match real keys at every layer — a
+        // pin/lease on any protected unit must be invisible to victim picks.
+        // Snapshot-lease, layer 1, expert 0:
+        let m = map(2, 4, vec![0..2]);
+        let mut snap = PolicySnapshot::empty();
+        snap.lease(1, 0);
+        warm(&m, &snap, 1, 0);
+        warm(&m, &snap, 1, 1);
+        let Got::Evicted(victim, _) = take(&m, &snap, 1, 2) else {
+            panic!("expected eviction")
+        };
         assert_eq!(
-            (e.victim.kind, e.victim.expert),
-            (ExpertKind::Up, 0),
-            "snapshot-leased (1, Gate, 1) must never be picked"
+            victim.expert, 1,
+            "snapshot-leased (1, 0) must never be picked"
         );
-        assert!(m.is_resident(1, ExpertKind::Gate, 1), "lease held");
+        assert!(m.is_resident(1, 0), "lease held");
+
+        // Snapshot lease on (1, 1): the victim scan reaches it from layer 1's
+        // claim too — the class spans layers.
+        let m = map(2, 4, vec![0..2]);
+        let mut snap = PolicySnapshot::empty();
+        snap.lease(1, 1);
+        warm(&m, &snap, 1, 1);
+        warm(&m, &snap, 1, 0);
+        let Got::Evicted(victim, _) = take(&m, &snap, 1, 2) else {
+            panic!("expected eviction")
+        };
+        assert_eq!(
+            victim.expert, 0,
+            "snapshot-leased (1, 1) must never be picked"
+        );
+        assert!(m.is_resident(1, 1), "lease held");
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn claim_on_fully_protected_pool_returns_busy_not_infinite_spin() {
+        let m = map(1, 2, vec![0..2]);
+        let mut snap = PolicySnapshot::empty();
+        // Fill both slots and protect every resident.
+        for e in [0u32, 1] {
+            warm(&m, &snap, 0, e);
+            snap.lease(0, e);
+        }
+        // No free slot, no evictable victim: bounded walks, then a typed
+        // busy error instead of spinning forever.
+        assert_eq!(take(&m, &snap, 0, 2), Got::Busy);
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn overlapping_class_slot_ranges_are_rejected() {
+        let err = ResidencyMap::new(vec![0, 1], 8, vec![0..4, 3..6]).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn inconsistent_construction_is_an_error_not_a_panic() {
+        assert!(
+            ResidencyMap::new(vec![], 8, vec![0..1]).is_err(),
+            "no layers"
+        );
+        assert!(ResidencyMap::new(vec![0], 8, vec![]).is_err(), "no classes");
+        assert!(
+            ResidencyMap::new(vec![1], 8, vec![0..1]).is_err(),
+            "bad class"
+        );
+        assert!(
+            ResidencyMap::new(vec![0], 8, vec![0..1, 1..2]).is_err(),
+            "class 1 serves no layer"
+        );
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn victim_needing_two_clock_laps_is_found_not_busy() {
+        // 4 × 1032 = 4128 keys; the only resident is the last key, with
+        // its second-chance bit set. Lap 1 clears it, lap 2 takes it:
+        // 8256 keys = 9 sweeps of SWEEP_BUDGET, which a one-lap bound
+        // (4128 / 1024 + 2 = 6) reported as Busy.
+        let m = map(4, 1032, vec![0..1]);
+        let snap = PolicySnapshot::empty();
+        let last = (3, 1031);
+        take(&m, &snap, last.0, last.1);
+        assert!(matches!(take(&m, &snap, last.0, last.1), Got::Resident(_)));
+        m.release_lease(last.0, last.1);
+        m.release_lease(last.0, last.1);
+        let Got::Evicted(victim, _) = take(&m, &snap, 0, 0) else {
+            panic!("expected eviction")
+        };
+        assert_eq!((victim.layer, victim.expert), last);
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn saturated_lease_count_is_busy_not_a_wrap() {
+        let m = map(1, 2, vec![0..2]);
+        let snap = PolicySnapshot::empty();
+        take(&m, &snap, 0, 0);
+        m.shards[0].shard.lock().unwrap().leases[0] = u16::MAX;
+        assert_eq!(take(&m, &snap, 0, 0), Got::Busy);
+        assert_eq!(m.shards[0].shard.lock().unwrap().leases[0], u16::MAX);
     }
 
     #[test]
@@ -553,19 +970,15 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let m = Arc::new(ResidencyMap::new(1, 8, 2));
-        let snap = PolicySnapshot::test_empty();
-        assert!(matches!(
-            m.claim(0, ExpertKind::Gate, 5, &snap).unwrap(),
-            Claim::Filled { .. }
-        ));
+        let m = Arc::new(map(1, 8, vec![0..2]));
+        let snap = PolicySnapshot::empty();
+        let Ok(Claim::Filled { claim, .. }) = m.claim(0, 5, &snap) else {
+            panic!("first claim must fill")
+        };
         let (tx, rx) = mpsc::channel();
         let m2 = m.clone();
         let t = std::thread::spawn(move || {
-            let resident = matches!(
-                m2.claim(0, ExpertKind::Gate, 5, &snap),
-                Ok(Claim::Resident { slot: 0 })
-            );
+            let resident = matches!(m2.claim(0, 5, &snap), Ok(Claim::Resident { slot: 0 }));
             tx.send(()).unwrap();
             resident
         });
@@ -573,27 +986,73 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "claim must park while the fill is in flight"
         );
-        m.finish_fill(0, ExpertKind::Gate, 5);
+        claim.finish();
         assert!(t.join().unwrap(), "post-fill claim must be Resident");
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn eviction_stays_inside_the_claimers_class() {
+        // Layer 0 → class 0 (1 slot), layer 1 → class 1 (1 slot).
+        let m = ResidencyMap::new(vec![0, 1], 4, vec![0..1, 1..2]).unwrap();
+        let snap = PolicySnapshot::empty();
+        assert_eq!(warm(&m, &snap, 0, 0), Got::Filled(0));
+        assert_eq!(warm(&m, &snap, 1, 0), Got::Filled(1));
+        // Class 0 is full: the victim must be layer 0's key, never layer 1's.
+        let Got::Evicted(victim, slot) = warm(&m, &snap, 0, 1) else {
+            panic!("expected eviction")
+        };
+        assert_eq!((victim.layer, slot), (0, 0));
+        assert!(m.is_resident(1, 0));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn a_free_slot_in_another_class_is_not_taken() {
+        let m = ResidencyMap::new(vec![0, 1], 4, vec![0..1, 1..3]).unwrap();
+        let snap = PolicySnapshot::empty();
+        warm(&m, &snap, 0, 0);
+        // Class 1 has two free slots; class 0 must still evict, not borrow.
+        assert!(matches!(take(&m, &snap, 0, 1), Got::Evicted(..)));
+    }
+
+    #[test]
+    fn concurrent_claims_in_different_classes_never_share_a_slot() {
+        primitives::model(|| {
+            let m = Arc::new(ResidencyMap::new(vec![0, 1], 2, vec![0..1, 1..2]).unwrap());
+            let snap = Arc::new(PolicySnapshot::empty());
+            let (m2, s2) = (m.clone(), snap.clone());
+            let t = primitives::spawn(move || match take(&m2, &s2, 1, 0) {
+                Got::Filled(slot) => slot,
+                other => unreachable!("{other:?}"),
+            });
+            let mine = match take(&m, &snap, 0, 0) {
+                Got::Filled(slot) => slot,
+                other => unreachable!("{other:?}"),
+            };
+            assert_eq!((mine, t.join().unwrap()), (0, 1));
+        });
     }
 
     #[test]
     fn cancel_wakes_parked_claimers_with_recycled_slot() {
         primitives::model(|| {
-            let m = Arc::new(ResidencyMap::new(1, 8, 2));
+            let m = Arc::new(map(1, 8, vec![0..2]));
             let m2 = m.clone();
-            let snap = Arc::new(PolicySnapshot::test_empty());
+            let snap = Arc::new(PolicySnapshot::empty());
             let snap2 = snap.clone();
+            // Main holds key 5 mid-fill; the spawned claimer either parks on
+            // the gate (the cancel wakes it and it claims the recycled slot
+            // fresh) or runs entirely after the cancel — both end Filled on
+            // the one slot.
+            let Ok(Claim::Filled { claim, .. }) = m.claim(0, 5, &snap) else {
+                panic!("first claim must fill")
+            };
             let t = primitives::spawn(move || {
-                // Parks on the mid-fill gate; the cancel below wakes it and
-                // it claims the recycled slot fresh.
-                matches!(
-                    m2.claim(0, ExpertKind::Gate, 5, &snap2),
-                    Ok(Claim::Filled { slot: 0 })
-                )
+                // Filled on whichever slot was free when it re-claimed.
+                matches!(take(&m2, &snap2, 0, 5), Got::Filled(_))
             });
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            m.cancel_claim(0, ExpertKind::Gate, 5);
+            claim.cancel();
             assert!(t.join().unwrap());
         });
     }

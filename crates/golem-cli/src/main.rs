@@ -19,17 +19,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a local GGUF model (greedy sampling this milestone); `--parity-dump
+    /// Run a local GGUF model (greedy sampling); `--parity-dump
     /// <FILE>` emits a T2 parity dump (JSONL) instead of streaming text.
     Run {
-        /// The only sampler this milestone; the flag is kept so later samplers
-        /// slot in without a breaking change.
+        /// The only sampler for now; the flag is kept so later samplers slot in
+        /// without a breaking change.
         #[arg(long, required = true)]
         greedy: bool,
         #[command(flatten)]
         args: run::RunArgs,
     },
-    /// Compute the T1 op-parity leg (M1.4): run `ggml_mul_mat_id` over
+    /// Compute the T1 op-parity leg: run `ggml_mul_mat_id` over
     /// synthetic expert tensors and write a checksum-per-expert-id JSONL dump.
     /// Fully synthetic — no model file is read.
     ParityOp {

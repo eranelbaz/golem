@@ -1,4 +1,8 @@
 #include "ggml-cuda.h"
+
+// Golem expert-offload threshold override + graphs gate (defined in ggml-backend.cpp).
+extern "C" int golem_expert_offload_min_batch(int default_value);
+extern "C" int golem_graphs_disabled(void);
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2556,6 +2560,14 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+
+    // Golem (design §3.5): the golem hooks fire inside the
+    // split-scheduler expert-copy branch; a captured graph replays the
+    // recorded copies without re-entering the hooks, silently freezing
+    // routing-dependent copies. Disable capture whenever golem hooks are on.
+    if (golem_graphs_disabled()) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -5714,7 +5726,10 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
-            const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            // Golem: the engine forces expert MUL_MAT_ID onto the GPU by
+            // overriding the threshold (golem-hooks.h); env stays as fallback.
+            const int min_batch_size = golem_expert_offload_min_batch(
+                getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32);
 
             const ggml_cuda_device_info & info = ggml_cuda_info();
             const bool virtual_devices = info.device_count > info.physical_device_count;

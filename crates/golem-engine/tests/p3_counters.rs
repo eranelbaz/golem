@@ -1,9 +1,9 @@
-//! P3 acceptance (Task 5): counters move across cold→warm decode, and pool-on
-//! output is byte-for-byte deterministic across identical runs (§7.4 batch=1
-//! determinism — the real correctness gate: catches wrong plane addressing,
-//! kind mix-ups, and torn copies that counters-only tests cannot). The second
-//! session below is NOT "pool off": P3 hooks are process-global, so it shares
-//! the same pool — it is a determinism reference, not an off-pool baseline.
+//! P3 acceptance: counters move across a cold → warm decode (cold turn pages
+//! experts in; warm turn pages nothing and is served by the device cache), and
+//! a second session in the hook-owning process is refused with
+//! `EngineError::PoolInit`. Cross-session output determinism is NOT asserted
+//! here (not a GPU guarantee; the cross-process pool-on/off comparison lives
+//! in golem-cli's `pooled_parity`).
 //! Runs only where a GPU split exists (feature `hip-tests`, HIP CI job); CPU
 //! builds never enter the split-scheduler expert-copy path, so the pool would
 //! idle.
@@ -12,6 +12,7 @@ mod common;
 
 use std::sync::atomic::Ordering;
 
+use golem_engine::error::EngineError;
 use golem_engine::session::{ChatTurn, Session};
 
 fn turn(prompt: &str) -> [ChatTurn<'_>; 1] {
@@ -30,22 +31,14 @@ fn chat(session: &mut Session, prompt: &str) -> String {
 }
 
 #[test]
-fn p3_counters_move_and_output_is_deterministic() {
-    // Pool ON (1 GiB pool for tiny-moe's 3·8 planes of 2048 B):
+fn p3_counters_move_cold_to_warm_and_second_session_is_refused() {
     let mut cfg = common::offload::offload_config();
     cfg.ram_experts_gib = 1;
-    let mut on = match Session::new(&cfg) {
-        Ok(s) => s,
-        Err(e) if e.to_string().contains("mlock") => {
-            eprintln!(
-                "SKIPPED: RLIMIT_MEMLOCK below the 1 GiB pool (ram_experts_gib=1); \
-                 run on a machine with unlimited memlock (HIP CI job): {e}"
-            );
-            return;
-        }
-        Err(e) => panic!("session with pooled offload failed: {e}"),
-    };
-    let out_on = chat(&mut on, "Hello");
+    // Pool ON (1 GiB pool for tiny-moe's 3·8 planes of 2048 B). A failed
+    // precondition (RLIMIT_MEMLOCK below the pool) FAILS — an early return
+    // reads as a pass to the harness (AGENTS.md Evidence).
+    let mut on = Session::new(&cfg).expect("session with pooled offload");
+    let _ = chat(&mut on, "Hello");
 
     let stats = on.p3_stats().expect("pool enabled ⇒ stats present");
     assert!(
@@ -53,17 +46,39 @@ fn p3_counters_move_and_output_is_deterministic() {
         "cold decode pages experts in"
     );
 
-    // Warm decode: fast hits rise (same session, experts now resident).
-    let before = on.p3_stats().unwrap().fast_hits.load(Ordering::Relaxed);
+    // Warm decode: the P2 device cache serves the second turn (skips rise)
+    // and the P3 pool pages nothing in — hot experts are resident in both
+    // tiers, so neither the DMA nor the RAM pool is touched.
+    let slow_before = on
+        .p3_stats()
+        .unwrap()
+        .demand_slow_pageins
+        .load(Ordering::Relaxed);
+    let dc_before = on.device_cache_stats().expect("pooled split ⇒ P4 stats");
     let _ = chat(&mut on, "Hello");
-    let after = on.p3_stats().unwrap().fast_hits.load(Ordering::Relaxed);
-    assert!(after > before, "second turn must be all fast hits");
+    let slow_after = on
+        .p3_stats()
+        .unwrap()
+        .demand_slow_pageins
+        .load(Ordering::Relaxed);
+    let dc_after = on.device_cache_stats().unwrap();
+    assert_eq!(
+        slow_after, slow_before,
+        "warm turn must not page experts in from RAM-disk"
+    );
+    assert!(
+        dc_after.bytes_skipped > dc_before.bytes_skipped,
+        "warm turn must be served from the device cache: {dc_before:?} → {dc_after:?}"
+    );
 
-    // Determinism reference: two identical sessions share the process-global
-    // pool (hooks are process-wide), so equal output checks §7.4 batch=1
-    // determinism, not pool-on vs pool-off.
-    let off_cfg = common::offload::offload_config();
-    let mut off = Session::new(&off_cfg).unwrap();
-    let out_off = chat(&mut off, "Hello");
-    assert_eq!(out_on, out_off, "pool-on decode diverged across sessions");
+    // A second session in this process — pooled or not — must be refused:
+    // the hooks are process-global and would serve the old model's pool
+    // bytes to a new model's recycled tensor addresses.
+    match Session::new(&common::offload::offload_config()) {
+        Err(EngineError::PoolInit(msg)) => {
+            assert!(msg.contains("expert hooks"), "unexpected refusal: {msg}");
+        }
+        Err(e) => panic!("second session must be refused as PoolInit, got: {e}"),
+        Ok(_) => panic!("a second session in a hook-owning process must be refused"),
+    }
 }

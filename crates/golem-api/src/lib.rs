@@ -1,7 +1,7 @@
 //! HTTP API contract: OpenAI-compatible types, the Golem error envelope, and
 //! the request field policy (tech design §8).
 //!
-//! Scaffold (task B1): the error envelope is complete per design §8.4; the
+//! Scaffold: the error envelope is complete per design §8.4; the
 //! full request/response type set and the field-policy table land in M4.1.
 
 use serde::{Deserialize, Serialize};

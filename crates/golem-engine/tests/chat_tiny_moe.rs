@@ -1,4 +1,4 @@
-//! Acceptance (board M1.3): a chat completes on tiny-moe in CI (CPU substrate).
+//! Acceptance: a chat completes on tiny-moe in CI (CPU substrate).
 //! Uses the reserved ▁hello / ▁world vocab tokens as the smoke prompt.
 mod common;
 

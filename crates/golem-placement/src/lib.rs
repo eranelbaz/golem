@@ -32,32 +32,25 @@ impl fmt::Display for Tier {
     }
 }
 
-/// A floor set cannot fit its tier budget (§6.4) — maps to
+/// A cap cannot fit its tier budget (§6.4) — maps to
 /// `golem_plan_infeasible` at the boundary; carries the exact numbers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Infeasible {
-    /// Tier whose floor/budget pair failed.
+    /// Tier whose cap/budget pair failed.
     pub tier: Tier,
-    /// Bytes the floor set requires (`u64::MAX` on `checked_mul` overflow, 0 on a count rejection).
+    /// Bytes the cap requires (`u64::MAX` on `checked_mul` overflow).
     pub required_bytes: u64,
     /// The failing budget.
     pub budget_bytes: u64,
-    /// Per-expert bytes supplied to [`Policy::new`]; 0 when rejected on counts.
+    /// Per-expert bytes supplied to [`Policy::new`].
     pub max_bytes_per_expert: u64,
 }
 
 impl fmt::Display for Infeasible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.max_bytes_per_expert == 0 {
-            return write!(
-                f,
-                "golem_plan_infeasible: {} floor count exceeds capacity",
-                self.tier
-            );
-        }
         write!(
             f,
-            "golem_plan_infeasible: {} floor requires {} bytes ({} experts × {} B) but budget is {}",
+            "golem_plan_infeasible: {} cap requires {} bytes ({} experts × {} B) but budget is {}",
             self.tier,
             self.required_bytes,
             self.required_bytes / self.max_bytes_per_expert,
@@ -78,20 +71,12 @@ pub struct PlacementConfig {
     pub experts_per_layer: u32,
     /// Score half-life in steps, H (§6.2); decay = e^(−1/H).
     pub half_life_steps: f64,
-    /// Promotion threshold θ_hi (§6.3).
-    pub theta_hi: f64,
-    /// Demotion threshold θ_lo (§6.3).
-    pub theta_lo: f64,
     /// Minimum dwell in a tier before any transition, D_min (§6.3).
     pub min_dwell_steps: u64,
     /// VRAM expert budget, in experts (count cap).
     pub vram_experts_max: usize,
     /// Host pool capacity, in experts.
     pub ram_slots: usize,
-    /// VRAM floor: top-N vram residents pinned against eviction.
-    pub vram_experts_min: usize,
-    /// RAM floor: top-N ram residents pinned against eviction.
-    pub ram_experts_min: usize,
 }
 
 impl Default for PlacementConfig {
@@ -100,13 +85,9 @@ impl Default for PlacementConfig {
             layers: 0,
             experts_per_layer: 0,
             half_life_steps: 512.0,
-            theta_hi: 1.0,
-            theta_lo: 0.4,
             min_dwell_steps: 256,
             vram_experts_max: 0,
             ram_slots: 0,
-            vram_experts_min: 0,
-            ram_experts_min: 0,
         }
     }
 }
@@ -145,7 +126,7 @@ impl Default for ExpertState {
 }
 
 /// Placement policy over a flat expert table (§6.1): scores (§6.2), transitions
-/// with hysteresis + min-dwell + floors (§6.3), budgets (§6.4).
+/// with hysteresis + min-dwell (§6.3), budgets (§6.4).
 #[derive(Debug)]
 pub struct Policy {
     cfg: PlacementConfig,
@@ -160,22 +141,19 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Feasibility check at load time (§6.4): rejects floor sets that cannot
-    /// fit their byte budgets, and count-inconsistent floor/cap pairs.
-    /// Byte checks run first; count rejections use the
-    /// `max_bytes_per_expert = 0` sentinel (safe because a genuine byte
-    /// failure cannot occur when the caller passes 0).
+    /// Feasibility check at load time (§6.4, caps only): rejects caps that
+    /// cannot fit their byte budgets at `max_bytes_per_expert` bytes each.
     ///
     /// # Panics
     /// Panics if `half_life_steps <= 0` or non-finite (would produce NaN
-    /// scores), or if `theta_lo > theta_hi` (inverted hysteresis).
+    /// scores).
     pub fn new(
         cfg: PlacementConfig,
         max_bytes_per_expert: u64,
         vram_budget_bytes: u64,
         ram_budget_bytes: u64,
     ) -> Result<Self, Infeasible> {
-        let vram_req = (cfg.vram_experts_min as u64).saturating_mul(max_bytes_per_expert);
+        let vram_req = (cfg.vram_experts_max as u64).saturating_mul(max_bytes_per_expert);
         if vram_req > vram_budget_bytes {
             return Err(Infeasible {
                 tier: Tier::Vram,
@@ -184,7 +162,7 @@ impl Policy {
                 max_bytes_per_expert,
             });
         }
-        let ram_req = (cfg.ram_experts_min as u64).saturating_mul(max_bytes_per_expert);
+        let ram_req = (cfg.ram_slots as u64).saturating_mul(max_bytes_per_expert);
         if ram_req > ram_budget_bytes {
             return Err(Infeasible {
                 tier: Tier::Ram,
@@ -193,23 +171,10 @@ impl Policy {
                 max_bytes_per_expert,
             });
         }
-        if cfg.vram_experts_min > cfg.vram_experts_max || cfg.ram_experts_min > cfg.ram_slots {
-            return Err(Infeasible {
-                tier: if cfg.vram_experts_min > cfg.vram_experts_max {
-                    Tier::Vram
-                } else {
-                    Tier::Ram
-                },
-                required_bytes: 0,
-                budget_bytes: 0,
-                max_bytes_per_expert: 0,
-            });
-        }
         assert!(
             cfg.half_life_steps > 0.0 && cfg.half_life_steps.is_finite(),
             "half_life_steps must be finite and > 0"
         );
-        assert!(cfg.theta_lo <= cfg.theta_hi, "theta_lo must be <= theta_hi");
         let n = cfg.layers as usize * cfg.experts_per_layer as usize;
         Ok(Self {
             cfg,
@@ -409,83 +374,104 @@ impl Policy {
             step.saturating_sub(self.states[k].last_transition_step) > cfg.min_dwell_steps
         };
 
+        // Promotion is a two-phase relative-swap rule (§6.3 as amended):
+        // the order is seeded with current VRAM residents first (best-first,
+        // up to the cap), then a dwell-expired RAM candidate fills any
+        // remaining room and, at a full cap, displaces the weakest seeded
+        // resident only when its score beats that resident by ≥ 20% (and
+        // the resident's min-dwell has expired). Seeding residents before
+        // considering challengers is what makes the margin real hysteresis
+        // against incumbents — a single rank-sorted iteration can never
+        // reach the swap branch because every earlier entry scored at
+        // least as high. Absolute thresholds cannot separate hot from cold
+        // here: the steady-state score of an average expert is p·H ≈ 14 at
+        // H = 512, an order of magnitude above any fixed θ.
+        const SWAP_MARGIN: f64 = 1.2;
         let mut vram_order: Vec<PolicyEntry> = Vec::with_capacity(cfg.vram_experts_max);
-        for &(_, k) in &rank {
+        let mut in_order = vec![false; n];
+        // Phase 1: incumbents keep their seats.
+        for &(score, k) in &rank {
             if vram_order.len() == cfg.vram_experts_max {
                 break;
             }
-            let promoted = !resident(k, TIER_VRAM)
-                && resident(k, TIER_RAM)
-                && self.states[k].score >= cfg.theta_hi
-                && dwell_ok(k);
-            if resident(k, TIER_VRAM) || promoted {
-                vram_order.push(PolicyEntry {
-                    key: k,
-                    score: self.states[k].score,
-                    floor_pinned: false,
-                });
+            if resident(k, TIER_VRAM) {
+                in_order[k] = true;
+                vram_order.push(PolicyEntry { key: k, score });
             }
         }
-        let mut vram_floor = 0usize;
-        for e in &mut vram_order {
-            if vram_floor == cfg.vram_experts_min {
+        // Phase 2: challengers. The margin is relative (`score >= 1.2·incumbent`),
+        // so a 0.0-score incumbent is displaced only through the dwell
+        // tie-break (`dwell_ok(weakest.key)`): the margin is vacuous there
+        // (0 ≥ 1.2·0) and min-dwell is what bounds the churn. The swap
+        // transiently leaves a displaced resident in VRAM past the cap
+        // until its eviction lands — bounded by D_min, and the real P2
+        // slab (K slots) enforces the hard budget at promotion time.
+        for &(score, k) in &rank {
+            if cfg.vram_experts_max == 0 || in_order[k] || !resident(k, TIER_RAM) || !dwell_ok(k) {
+                continue;
+            }
+            if vram_order.len() < cfg.vram_experts_max {
+                in_order[k] = true;
+                vram_order.push(PolicyEntry { key: k, score });
+                continue;
+            }
+            // The weakest seat, not the last-pushed one: after a swap the
+            // challenger sits at the tail. Ties pick the higher key (rank order).
+            let (wi, weakest) = vram_order
+                .iter()
+                .copied()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.score.total_cmp(&b.score).then(b.key.cmp(&a.key)))
+                .expect("cap > 0 with a full order is non-empty");
+            // A never-accessed challenger (score 0) never swaps: 0 ≥ 1.2·0
+            // would otherwise churn zero-score seats. A 0.0-score incumbent
+            // yields to any positive challenger once its dwell expires.
+            if score > 0.0 && score >= SWAP_MARGIN * weakest.score && dwell_ok(weakest.key) {
+                in_order[weakest.key] = false;
+                in_order[k] = true;
+                vram_order[wi] = PolicyEntry { key: k, score };
+            } else {
+                // Challengers arrive best-first and the weakest seat only
+                // strengthens on a swap: once one is rejected, all later are.
                 break;
             }
-            // decision 3: floors pin residents — candidates don't consume quota
-            if resident(e.key, TIER_VRAM) {
-                e.floor_pinned = true;
-                vram_floor += 1;
-            }
         }
-
-        let mut in_order = vec![false; n];
+        vram_order.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.key.cmp(&b.key)));
         let mut promoted = vec![false; n];
-        let mut floor_pinned = vec![false; n];
         for e in &vram_order {
-            in_order[e.key] = true;
-            if e.floor_pinned {
-                floor_pinned[e.key] = true;
-            } else if !resident(e.key, TIER_VRAM) {
+            if !resident(e.key, TIER_VRAM) {
                 promoted[e.key] = true;
             }
         }
+        // Eviction candidates: VRAM residents that fell out of the order
+        // (displaced by a swap or pushed past the cap), dwell-gated,
+        // weakest first.
         let mut vram_evict_order: Vec<PolicyEntry> = rank
             .iter()
-            .filter(|&&(s, k)| {
-                resident(k, TIER_VRAM)
-                    && !floor_pinned[k]
-                    && (!in_order[k] || (s < cfg.theta_lo && dwell_ok(k)))
-            })
-            .map(|&(s, k)| PolicyEntry {
+            .filter(|&&(_, k)| resident(k, TIER_VRAM) && !in_order[k] && dwell_ok(k))
+            .map(|&(_, k)| PolicyEntry {
                 key: k,
-                score: s,
-                floor_pinned: false,
+                score: self.states[k].score,
             })
             .collect();
         vram_evict_order.reverse();
 
         let mut ram_evict_order: Vec<PolicyEntry> = Vec::new();
-        let mut ram_floor = 0usize;
         for &(_, k) in &rank {
             if !resident(k, TIER_RAM) || resident(k, TIER_VRAM) {
-                continue;
-            }
-            if ram_floor < cfg.ram_experts_min {
-                ram_floor += 1;
                 continue;
             }
             // promoted into VRAM this pass — P2 owns it, P3 must not evict it
             if promoted[k] {
                 continue;
             }
-            // decision 5: min-dwell gates RAM eviction too
+            // min-dwell gates RAM eviction too
             if !dwell_ok(k) {
                 continue;
             }
             ram_evict_order.push(PolicyEntry {
                 key: k,
                 score: self.states[k].score,
-                floor_pinned: false,
             });
         }
         ram_evict_order.reverse();
@@ -581,15 +567,14 @@ impl Policy {
     /// Warm-start plan (§6.3): after [`Policy::seed_from_journal`], the
     /// ordered flat keys to page-in and promote BEFORE the first request.
     /// Computes its own top-N ranking BY SCORE — deliberately bypassing the
-    /// `pass` promotion gates (residency, dwell, θ_hi): a freshly-seeded
+    /// `pass` promotion gates (residency, dwell, margin): a freshly-seeded
     /// policy is fully cold (every key [`Tier::Disk`]), and `pass()`
     /// promotion requires RAM residency, so `pass(step).vram_order` is
     /// empty by construction regardless of score and MUST NOT be the
     /// source. Ties break by ascending key index (matching `pass()`'s
     /// ordering). Returns `(vram, ram)`: `vram` = top `vram_experts_max`
-    /// by seeded score, best-first, the first `vram_experts_min` of which
-    /// are the VRAM floor; `ram` = next `ram_experts_min` best keys not
-    /// already in `vram`, the RAM floor. Does NOT touch residency — the
+    /// by seeded score, best-first; `ram` = the next best keys that fit
+    /// the rest of the pool (`ram_slots − vram`). Does NOT touch residency — the
     /// pool executes page-in + promote and reports back via
     /// [`Policy::apply_transition`] (existing P2/P3 contract).
     ///
@@ -607,7 +592,7 @@ impl Policy {
         let vram = rank[..vram_end].iter().map(|&(_, k)| k).collect();
         let ram = rank[vram_end..]
             .iter()
-            .take(cfg.ram_experts_min)
+            .take(cfg.ram_slots.saturating_sub(vram_end))
             .map(|&(_, k)| k)
             .collect();
         (vram, ram)
@@ -636,8 +621,6 @@ pub struct PolicyEntry {
     pub key: usize,
     /// Effective score at the pass.
     pub score: f64,
-    /// Pinned by the tier floor — the executor must not evict.
-    pub floor_pinned: bool,
 }
 
 /// Orderings a policy pass produces (§6.3). P2 consumes `vram_order`
@@ -662,9 +645,7 @@ mod tests {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 1,
             ram_slots: 8,
-            ram_experts_min: 1,
             ..Default::default()
         };
         Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap()
@@ -675,9 +656,7 @@ mod tests {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 4,
-            vram_experts_min: 1,
             ram_slots: 8,
-            ram_experts_min: 1,
             ..Default::default()
         };
         Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap()
@@ -693,19 +672,15 @@ mod tests {
     #[test]
     fn defaults_match_design_numbers() {
         let c = PlacementConfig::default();
-        assert_eq!(
-            (c.half_life_steps, c.theta_hi, c.theta_lo, c.min_dwell_steps),
-            (512.0, 1.0, 0.4, 256)
-        );
+        assert_eq!((c.half_life_steps, c.min_dwell_steps), (512.0, 256));
     }
 
     #[test]
-    fn new_rejects_vram_floor_that_exceeds_budget() {
+    fn new_rejects_vram_cap_that_exceeds_budget() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
-            vram_experts_max: 8,
-            vram_experts_min: 4,
+            vram_experts_max: 4,
             ..Default::default()
         };
         let err = Policy::new(cfg, 1000, 3000, u64::MAX).unwrap_err();
@@ -722,11 +697,11 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_ram_floor_that_exceeds_budget() {
+    fn new_rejects_ram_cap_that_exceeds_budget() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
-            ram_experts_min: 4,
+            ram_slots: 4,
             ..Default::default()
         };
         let err = Policy::new(cfg, 1000, u64::MAX, 3000).unwrap_err();
@@ -742,39 +717,15 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_bad_counts() {
-        let a = PlacementConfig {
-            layers: 1,
-            experts_per_layer: 8,
-            ram_experts_min: 3,
-            ram_slots: 2,
-            ..Default::default()
-        };
-        assert!(Policy::new(a, 1, u64::MAX, 1 << 40).is_err());
-        let b = PlacementConfig {
-            layers: 1,
-            experts_per_layer: 8,
-            vram_experts_min: 5,
-            vram_experts_max: 4,
-            ..Default::default()
-        };
-        let err = Policy::new(b, 1, 1 << 40, 1 << 40).unwrap_err();
-        assert_eq!(err.max_bytes_per_expert, 0);
-        assert!(err.to_string().contains("count"));
-    }
-
-    #[test]
     fn new_accepts_feasible_config() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 2,
             ram_slots: 6,
-            ram_experts_min: 2,
             ..Default::default()
         };
-        let p = Policy::new(cfg, 1000, 4000, 8000).unwrap();
+        let p = Policy::new(cfg, 1000, 8000, 8000).unwrap();
         assert_eq!(p.len(), 8);
     }
 
@@ -847,7 +798,176 @@ mod tests {
     }
 
     #[test]
-    fn promotion_requires_theta_hi_and_dwell() {
+    fn swap_margin_is_real_hysteresis_against_incumbents() {
+        // Cap 1 fully occupied by a VRAM resident: the swap branch must be
+        // reachable through the full-cap path — a 1.1× challenger is
+        // rejected, a 1.3× one swaps after the incumbent's min-dwell. A
+        // huge half-life makes decay ≈ 1, so scores are access counts.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 1,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        // Resident: score 100 at the pass step.
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        for s in 0..100 {
+            p.on_access(0, s);
+        }
+        // Challenger, RAM-resident, score 110 < 1.2 × 100: rejected. Access
+        // steps must stay above the first pass (pass sweeps all stamps).
+        p.apply_transition(1, Tier::Ram, true, 0);
+        for s in 1000..1110 {
+            p.on_access(1, s);
+        }
+        let out = p.pass(1000);
+        assert_eq!(out.vram_order[0].key, 0, "1.1× challenger must not swap");
+        assert!(out.vram_evict_order.iter().all(|e| e.key != 0));
+        // Challenger, score 130 ≥ 1.2 × 100, incumbent dwell expired: swaps.
+        p.apply_transition(2, Tier::Ram, true, 0);
+        for s in 2000..2130 {
+            p.on_access(2, s);
+        }
+        let out = p.pass(3000);
+        assert_eq!(out.vram_order[0].key, 2, "1.3× challenger must swap");
+        assert!(out.vram_evict_order.iter().any(|e| e.key == 0));
+    }
+
+    #[test]
+    fn each_challenger_faces_the_weakest_remaining_incumbent() {
+        // Cap 2, incumbents 100 and 200, challengers 300 and 250. 300 takes
+        // the 100 seat; 250 must then face the 200 incumbent (≥ 1.2×), not
+        // the just-seated 300 challenger.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 2,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        for (k, n) in [(0usize, 100u64), (1, 200)] {
+            p.apply_transition(k, Tier::Ram, true, 0);
+            p.apply_transition(k, Tier::Vram, true, 1);
+            for s in 0..n {
+                p.on_access(k, s);
+            }
+        }
+        for (k, n) in [(2usize, 300u64), (3, 250)] {
+            p.apply_transition(k, Tier::Ram, true, 0);
+            for s in 0..n {
+                p.on_access(k, 300 + s);
+            }
+        }
+        let out = p.pass(1000);
+        let order: Vec<_> = out.vram_order.iter().map(|e| e.key).collect();
+        assert_eq!(order, [2, 3], "both challengers swap, best-first");
+        let evict: Vec<_> = out.vram_evict_order.iter().map(|e| e.key).collect();
+        assert_eq!(evict, [0, 1], "both incumbents displaced, worst-first");
+    }
+
+    #[test]
+    fn all_zero_scores_never_swap() {
+        // Cap 1 held by a 0.0-score resident, challenger also 0.0: 0 ≥ 1.2·0
+        // must not displace it even with the dwell long expired.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 1,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        p.apply_transition(1, Tier::Ram, true, 0);
+        let out = p.pass(1000);
+        assert_eq!(out.vram_order.len(), 1);
+        assert_eq!(out.vram_order[0].key, 0, "zero challenger must not swap");
+    }
+
+    #[test]
+    fn zero_score_incumbent_leaves_via_dwell_tie_break() {
+        // Cap 1 held by a never-accessed (0.0-score) VRAM resident. Its
+        // margin comparison is vacuous (0 ≥ 1.2·0), so displacement goes
+        // through the min-dwell tie-break: no swap while its dwell runs,
+        // swap once expired.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 1,
+                min_dwell_steps: 10,
+                half_life_steps: 1.0e12,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        // Challenger: RAM-resident, score 1.
+        p.apply_transition(1, Tier::Ram, true, 0);
+        p.on_access(1, 1000);
+        let out = p.pass(5);
+        assert_eq!(out.vram_order[0].key, 0, "incumbent dwell has not expired");
+        let out = p.pass(1000);
+        assert_eq!(
+            out.vram_order[0].key, 1,
+            "0.0-score incumbent displaced after dwell"
+        );
+        assert!(out.vram_evict_order.iter().any(|e| e.key == 0));
+    }
+
+    #[test]
+    fn zero_vram_cap_yields_empty_order_no_panic() {
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 0,
+                ram_slots: 8,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        let out = p.pass(10_000);
+        assert!(out.vram_order.is_empty());
+        // A resident nobody keeps must be an eviction candidate, not a panic.
+        assert_eq!(out.vram_evict_order.first().map(|e| e.key), Some(0));
+    }
+
+    #[test]
+    fn promotion_requires_room_or_margin_and_dwell() {
+        // Under the cap: any dwell-expired RAM candidate promotes.
         let mut p = seeded();
         p.apply_transition(2, Tier::Ram, true, 0);
         for s in 0..300 {
@@ -857,13 +977,56 @@ mod tests {
         }
         let out = p.pass(300);
         assert!(out.vram_order.iter().any(|e| e.key == 2));
-        p.apply_transition(3, Tier::Ram, true, 0);
+        // Within min-dwell: no promotion.
+        p.apply_transition(3, Tier::Ram, true, 100);
         let out = p.pass(301);
         assert!(out.vram_order.iter().all(|e| e.key != 3));
     }
 
     #[test]
-    fn eviction_candidates_respect_hysteresis_floor_and_cap() {
+    fn borderline_candidate_does_not_displace_resident() {
+        // Cap 1, resident key 0; key 1 touches 9 of every 10 steps — its
+        // score tracks ~0.9× key 0's, under the 1.2× swap margin, so the
+        // pair cannot oscillate once min-dwell has expired.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 1,
+                min_dwell_steps: 10,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        p.apply_transition(0, Tier::Ram, true, 0);
+        p.apply_transition(0, Tier::Vram, true, 1);
+        p.apply_transition(1, Tier::Ram, true, 0);
+        for step in 100..400 {
+            p.on_access(0, step);
+            if step % 10 != 0 {
+                p.on_access(1, step);
+            }
+            let out = p.pass(step);
+            assert_eq!(out.vram_order[0].key, 0, "step {step}: no oscillation");
+            assert!(
+                out.vram_evict_order.iter().all(|e| e.key != 0),
+                "step {step}: resident not displaced"
+            );
+        }
+        // A decisive hot streak clears the margin and takes the slot.
+        for step in 400..1000 {
+            p.on_access(1, step);
+        }
+        let out = p.pass(1000);
+        assert_eq!(out.vram_order[0].key, 1, "margin swap fired");
+        assert!(out.vram_evict_order.iter().any(|e| e.key == 0));
+    }
+
+    #[test]
+    fn eviction_candidates_respect_hysteresis_and_cap() {
         let mut p = seeded();
         for k in 0..5 {
             p.apply_transition(k, Tier::Ram, true, 0);
@@ -877,13 +1040,13 @@ mod tests {
             out.vram_evict_order.iter().any(|e| e.key == 4),
             "coldest beyond-cut resident must be evictable: {out:?}"
         );
-        assert!(
-            out.vram_evict_order.iter().all(|e| e.key != 0),
-            "floor-pinned top resident is never evicted"
+        assert_eq!(
+            out.vram_evict_order.first().map(|e| e.key),
+            Some(4),
+            "coldest beyond-cut resident is evicted first"
         );
         assert!(out.vram_order.len() <= 4, "budget cap respected");
         assert_eq!(out.vram_order[0].key, 0, "best-first ordering");
-        assert!(out.vram_order[0].floor_pinned);
     }
 
     #[test]
@@ -910,12 +1073,13 @@ mod tests {
     }
 
     #[test]
-    fn demotion_requires_theta_lo_when_budget_has_slack() {
+    fn residents_within_cap_are_not_eviction_candidates() {
+        // Budget slack: every VRAM resident is in the order, so none is a
+        // demotion candidate — placement changes only via the swap margin.
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 0,
             ..Default::default()
         };
         let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
@@ -928,23 +1092,37 @@ mod tests {
         p.on_access(2, 9900);
         let out = p.pass(10_000);
         assert!(
-            out.vram_evict_order.iter().any(|e| e.key == 0)
-                && out.vram_evict_order.iter().any(|e| e.key == 1),
-            "sub-θ_lo residents evictable: {out:?}"
+            out.vram_evict_order.is_empty(),
+            "no resident is displaced when the cap has slack: {out:?}"
         );
-        assert!(
-            out.vram_evict_order.iter().all(|e| e.key != 2),
-            "θ_lo..θ_hi band is protected when budget has slack"
-        );
+        assert_eq!(out.vram_order.len(), 3);
     }
 
     #[test]
-    fn ram_eviction_order_excludes_vram_resident_and_floor() {
-        let mut p = seeded();
-        p.apply_transition(1, Tier::Ram, true, 0);
-        p.apply_transition(2, Tier::Ram, true, 0);
+    fn ram_eviction_order_excludes_vram_resident_and_promoted() {
+        // RAM residents beyond the VRAM cap (not in the order, so not
+        // promoted) are the P3 eviction supply, weakest first.
+        let mut p = Policy::new(
+            PlacementConfig {
+                layers: 1,
+                experts_per_layer: 8,
+                vram_experts_max: 2,
+                ram_slots: 8,
+                ..Default::default()
+            },
+            1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        for k in [1_usize, 2, 3, 4] {
+            p.apply_transition(k, Tier::Ram, true, 0);
+        }
         p.apply_transition(1, Tier::Vram, true, 1);
-        p.on_access(2, 9999); // top ram score → ram floor pin
+        // Scored: a 0.0-score VRAM incumbent would now be displacable via
+        // the dwell tie-break, and this test is about RAM eviction supply.
+        p.on_access(1, 9998);
+        p.on_access(2, 9999); // hottest RAM resident → promoted, not evictable
         let out = p.pass(10_000);
         assert!(
             out.ram_evict_order.iter().all(|e| e.key != 1),
@@ -952,14 +1130,14 @@ mod tests {
         );
         assert!(
             out.ram_evict_order.iter().all(|e| e.key != 2),
-            "ram floor-pinned excluded"
+            "promoted excluded"
         );
-        p.apply_transition(7, Tier::Ram, true, 0);
-        let out = p.pass(10_001);
         assert!(
-            out.ram_evict_order.iter().any(|e| e.key == 7),
-            "cold unpinned ram expert evictable"
+            out.ram_evict_order.iter().any(|e| e.key == 3)
+                && out.ram_evict_order.iter().any(|e| e.key == 4),
+            "cap-overflow ram residents are the eviction supply: {out:?}"
         );
+        assert_eq!(out.ram_evict_order[0].key, 4, "weakest first");
     }
 
     #[test]
@@ -981,37 +1159,21 @@ mod tests {
     }
 
     #[test]
-    fn floor_pin_survives_below_theta_lo_with_dwell() {
+    fn dwell_expired_ram_resident_is_promoted() {
         let cfg = PlacementConfig {
             layers: 1,
             experts_per_layer: 8,
             vram_experts_max: 8,
-            vram_experts_min: 1,
-            ..Default::default()
-        };
-        let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
-        p.apply_transition(0, Tier::Vram, true, 0);
-        p.on_access(0, 0); // score 1.0, decays below θ_lo after enough idle
-        let out = p.pass(5_000);
-        assert!(
-            out.vram_evict_order.iter().all(|e| e.key != 0),
-            "floor-pinned resident below θ_lo is still never evicted: {out:?}"
-        );
-    }
-
-    #[test]
-    fn zero_ram_floor_allows_any_ram_resident_evictable() {
-        let cfg = PlacementConfig {
-            layers: 1,
-            experts_per_layer: 8,
-            vram_experts_max: 8,
-            ram_experts_min: 0,
             ..Default::default()
         };
         let mut p = Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap();
         p.apply_transition(0, Tier::Ram, true, 0);
         let out = p.pass(10_000);
-        assert!(out.ram_evict_order.iter().any(|e| e.key == 0));
+        assert!(
+            out.vram_order.iter().any(|e| e.key == 0),
+            "promoted (in the VRAM order, so not P3-evictable): {out:?}"
+        );
+        assert!(out.ram_evict_order.iter().all(|e| e.key != 0));
     }
 
     #[test]
@@ -1136,9 +1298,7 @@ mod tests {
                 layers: 1,
                 experts_per_layer: 8,
                 vram_experts_max: 8,
-                vram_experts_min: 1,
                 ram_slots: 8,
-                ram_experts_min: 1,
                 half_life_steps: 512.0,
                 ..Default::default()
             },
@@ -1190,9 +1350,7 @@ mod tests {
                 layers: 1,
                 experts_per_layer: 8,
                 vram_experts_max: 8,
-                vram_experts_min: 1,
                 ram_slots: 8,
-                ram_experts_min: 1,
                 half_life_steps: 512.0,
                 ..Default::default()
             },

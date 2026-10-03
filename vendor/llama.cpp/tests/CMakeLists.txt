@@ -374,10 +374,18 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
 
     # Golem P2 fuzz: device expert-copy cache state machine. The shared header
-    # lives in ggml/src; golem_dc_step is defined in ggml-backend.cpp -> link ggml.
+    # lives in ggml/src; GGML_ABORT resolves to ggml_abort -> link ggml.
     llama_build_and_test(golem-p2-cache.cpp)
     target_link_libraries(golem-p2-cache PRIVATE ggml)
     target_include_directories(golem-p2-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    # Golem regression: pooled-run copy never reads past the last slot
+    # (padding tail = separate copy of the last expert's own bytes). The
+    # shared prototype lives in ggml/src (golem-p3-copy.h); golem_copy_
+    # pooled_expert_run is defined in ggml-backend.cpp -> link ggml.
+    llama_build_and_test(golem-p3-copy.cpp)
+    target_link_libraries(golem-p3-copy PRIVATE ggml)
+    target_include_directories(golem-p3-copy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

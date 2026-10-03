@@ -21,7 +21,25 @@ fn ensure_host_resident_fires_on_offload_decode() {
         _tensor: *const libc::c_void,
         first: i32,
         last: i32,
+        _ptrs: *mut *const libc::c_void,
     ) {
+        // ABI v2: the substrate copies from the returned pointers; these
+        // hook-level tests don't page from a pool, so serve one static buffer.
+        static SRC: [u8; 65536] = [0u8; 65536];
+        // SAFETY: `_tensor` is the substrate's expert tensor, valid for the call.
+        let stride =
+            unsafe { golem_llama_sys::raw::golem_tensor_expert_stride_bytes(_tensor) } as usize;
+        assert!(
+            stride <= SRC.len(),
+            "expert plane stride {stride} exceeds the static source ({} B)",
+            SRC.len()
+        );
+        let src = SRC.as_ptr() as *const libc::c_void;
+        for i in 0..((last - first + 1) as usize) {
+            // SAFETY: C passes `last - first + 1` writable out-pointer slots.
+            unsafe { *_ptrs.add(i) = src };
+        }
+
         CALLS.fetch_add(1, Ordering::SeqCst);
         LAST_RANGE.store(((first as usize) << 16) | last as usize, Ordering::SeqCst);
     }
@@ -31,6 +49,7 @@ fn ensure_host_resident_fires_on_offload_decode() {
     unsafe {
         golem_llama_sys::raw::golem_register_hooks(
             Some(on_ensure),
+            None,
             None,
             None,
             std::ptr::null_mut(),

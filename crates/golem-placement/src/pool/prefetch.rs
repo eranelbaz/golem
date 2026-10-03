@@ -1,50 +1,27 @@
 //! §6.5 prefetch: background page-ins fed by an injected access-set source,
-//! demand-priority gated (rounds skip while demand page-ins are in flight)
-//! and capacity gated ([`GATE_CAPACITY`] = `io_threads - 1` at the §5.4
-//! default). Substrate-inert in M2.3: the vendored C has no `notify_access`
-//! call-site (P4 owns it), so the production feed is empty and real inputs
-//! arrive with M2.4 — the mechanism here is proven against injected feeds.
+//! demand-priority gated (rounds skip while demand page-ins are in flight).
+//! One prefetch thread, so at most one prefetch page-in is ever in flight.
+//! The engine's feed is P4's `notify_access` recency (golem-engine
+//! `PolicyFeed`); tests prove the mechanism against injected feeds.
+
+// cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
+#![allow(unexpected_cfgs)]
 
 use std::time::Duration;
 
 use super::pager::ExpertPool;
-use super::primitives::{Arc, AtomicBool, AtomicUsize, JoinHandle, Ordering, spawn};
-use super::residency::ExpertKind;
-
-/// Max concurrent prefetch page-ins: `io_threads - 1` at the §5.4 default
-/// (io_threads = 5), so demand reads always keep I/O headroom.
-pub const GATE_CAPACITY: usize = 4;
+use super::primitives::{Arc, AtomicBool, JoinHandle, Ordering, spawn};
 
 /// Access-set union depth (§6.5: union of the last k steps).
 pub const PREFETCH_K: usize = 3;
 
-/// Recent-access source (the surface P4's `notify_access` call-site will
-/// feed). Injected implementations back the M2.3 tests; the engine wires an
-/// empty feed until that call-site exists (Global Constraints deviation 2).
+/// Recent-access source: the engine backs it with P4's `notify_access`
+/// recency; tests inject their own.
 pub trait AccessFeed: Send + Sync {
-    /// The union of the last `k` steps' accessed keys. The pool filters
-    /// already-resident keys itself; returned keys may repeat across calls.
-    fn take_union(&self, k: usize) -> Vec<(u32, ExpertKind, u32)>;
-}
-
-/// Capacity gate over prefetch page-ins: in-flight accounting with a
-/// [`GATE_CAPACITY`] ceiling (`io_threads - 1`). Single prefetch thread
-/// today, so the observed maximum stays at 1; the accounting carries over to
-/// a sharded prefetcher without redesign.
-struct PrefetchGate {
-    in_flight: Arc<AtomicUsize>,
-    max_concurrent: Arc<AtomicUsize>,
-}
-
-impl PrefetchGate {
-    fn acquire(&self) {
-        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        self.max_concurrent.fetch_max(now, Ordering::Relaxed);
-    }
-
-    fn release(&self) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
-    }
+    /// The union of the last `k` steps' accessed `(layer, expert)` units.
+    /// The pool filters already-resident units itself; returned units may
+    /// repeat across calls.
+    fn take_union(&self, k: usize) -> Vec<(u32, u32)>;
 }
 
 /// Handle to the spawned prefetch thread. `stop()` signals; `Drop` signals
@@ -53,17 +30,9 @@ impl PrefetchGate {
 pub struct PrefetchHandle {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    gate: PrefetchGate,
 }
 
 impl PrefetchHandle {
-    /// Highest number of concurrently in-flight prefetch page-ins ever
-    /// observed (never above [`GATE_CAPACITY`] — the demand-priority gate
-    /// assertion surface).
-    pub fn max_concurrent_prefetch(&self) -> usize {
-        self.gate.max_concurrent.load(Ordering::Relaxed)
-    }
-
     /// Signals the thread to stop (join happens on `Drop`).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -90,16 +59,8 @@ pub fn spawn_prefetch(
     k: usize,
 ) -> PrefetchHandle {
     let stop = Arc::new(AtomicBool::new(false));
-    let gate = PrefetchGate {
-        in_flight: Arc::new(AtomicUsize::new(0)),
-        max_concurrent: Arc::new(AtomicUsize::new(0)),
-    };
     let thread = {
         let stop = stop.clone();
-        let gate = PrefetchGate {
-            in_flight: gate.in_flight.clone(),
-            max_concurrent: gate.max_concurrent.clone(),
-        };
         spawn(move || {
             loop {
                 if stop.load(Ordering::Relaxed) {
@@ -114,25 +75,20 @@ pub fn spawn_prefetch(
                 let batch: Vec<_> = access
                     .take_union(k)
                     .into_iter()
-                    .filter(|&(layer, kind, expert)| {
-                        !pool.residency.is_resident(layer, kind, expert)
-                    })
+                    .filter(|&(layer, expert)| !pool.residency.is_resident(layer, expert))
                     .collect();
                 if batch.is_empty() {
                     park();
                     continue;
                 }
-                for (layer, kind, expert) in batch {
+                for (layer, expert) in batch {
                     if stop.load(Ordering::Relaxed) || pool.demand_inflight() > 0 {
                         break;
                     }
-                    gate.acquire();
-                    let result = pool.ensure_range(false, layer, kind, expert, expert, &mut |_| {});
-                    gate.release();
-                    if let Err(e) = result {
+                    if let Err(e) = pool.ensure_unit(false, layer, expert) {
                         // Transient source trouble must not kill prefetching;
                         // `source_errors` already counted the failure.
-                        tracing::warn!(layer, ?kind, expert, error = %e, "prefetch page-in failed; continuing");
+                        tracing::warn!(layer, expert, error = %e, "prefetch page-in failed; continuing");
                     }
                 }
             }
@@ -141,7 +97,6 @@ pub fn spawn_prefetch(
     PrefetchHandle {
         stop,
         thread: Some(thread),
-        gate,
     }
 }
 
@@ -159,47 +114,51 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::pool::pager::SnapshotHandle;
+    use crate::pool::ExpertKind;
     use crate::pool::primitives::arc_dyn;
     use crate::pool::residency::PolicySnapshot;
-    use crate::pool::{Arena, ExpertPool, ExpertSource, P3Stats};
+    use crate::pool::source::UnitLayout;
+    use crate::pool::{Arena, ExpertPool, ExpertSource, P3Stats, SlotClass};
+    use crate::pool::{PoolGeometry, pager::SnapshotHandle};
 
-    /// Feed backed by a queue; `take_union` drains up to `k` keys.
+    const N_EXPERTS: u32 = 8;
+
+    /// Feed backed by a queue; `take_union` drains up to `k` units.
     struct QueueFeed {
-        keys: Mutex<VecDeque<(u32, ExpertKind, u32)>>,
+        keys: Mutex<VecDeque<(u32, u32)>>,
     }
 
     impl QueueFeed {
-        fn new(keys: Vec<(u32, ExpertKind, u32)>) -> Self {
+        fn new(keys: Vec<(u32, u32)>) -> Self {
             Self {
                 keys: Mutex::new(keys.into()),
             }
         }
 
-        fn push(&self, key: (u32, ExpertKind, u32)) {
+        fn push(&self, key: (u32, u32)) {
             self.keys.lock().unwrap().push_back(key);
         }
     }
 
     impl AccessFeed for QueueFeed {
-        fn take_union(&self, k: usize) -> Vec<(u32, ExpertKind, u32)> {
+        fn take_union(&self, k: usize) -> Vec<(u32, u32)> {
             let mut keys = self.keys.lock().unwrap();
             let n = k.min(keys.len());
             keys.drain(..n).collect()
         }
     }
 
-    /// Source that identifies experts by their id byte and optionally blocks
-    /// one key on a condvar until released — the demand-priority harness.
+    /// Source that blocks one unit on a condvar until released — the
+    /// demand-priority harness. Counts read_expert calls per plane.
     struct GateSource {
-        attempts: Mutex<HashMap<(u32, ExpertKind, u32), usize>>,
-        blocked: (u32, ExpertKind, u32),
+        attempts: Mutex<HashMap<(u32, u32), usize>>,
+        blocked: (u32, u32),
         released: Mutex<bool>,
         cv: Condvar,
     }
 
     impl GateSource {
-        fn new(blocked: (u32, ExpertKind, u32)) -> Self {
+        fn new(blocked: (u32, u32)) -> Self {
             Self {
                 attempts: Mutex::new(HashMap::new()),
                 blocked,
@@ -208,7 +167,7 @@ mod tests {
             }
         }
 
-        fn attempts(&self, key: (u32, ExpertKind, u32)) -> usize {
+        fn attempts(&self, key: (u32, u32)) -> usize {
             *self.attempts.lock().unwrap().get(&key).unwrap_or(&0)
         }
 
@@ -222,11 +181,12 @@ mod tests {
         fn read_expert(
             &self,
             layer: u32,
-            kind: ExpertKind,
+            _kind: ExpertKind,
             expert: u32,
             into: &mut [u8],
+            head: usize,
         ) -> io::Result<()> {
-            let key = (layer, kind, expert);
+            let key = (layer, expert);
             *self.attempts.lock().unwrap().entry(key).or_insert(0) += 1;
             if key == self.blocked {
                 let mut released = self.released.lock().unwrap();
@@ -234,7 +194,7 @@ mod tests {
                     released = self.cv.wait(released).unwrap();
                 }
             }
-            into.fill(expert as u8);
+            into[head..].fill(expert as u8);
             Ok(())
         }
 
@@ -244,15 +204,24 @@ mod tests {
     }
 
     fn test_pool(slots: u32, source: Arc<dyn ExpertSource>) -> Arc<ExpertPool> {
-        let slot_size = 64;
-        let arena = Arena::new(slot_size * slots as usize, slot_size).unwrap();
+        let stride = 64;
+        let arena = Arena::new(&[SlotClass {
+            slot_size: 3 * stride as usize,
+            slots,
+        }])
+        .unwrap();
+        let geometry = PoolGeometry {
+            layers: vec![UnitLayout::new([stride; 3], [None; 3]).unwrap(); 1],
+            n_experts: N_EXPERTS,
+            expert_bytes: 0,
+        };
         ExpertPool::new(
             arena,
             source,
-            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
             Arc::new(P3Stats::new()),
-            1,
-            8,
+            geometry,
+            vec![0; 1],
         )
     }
 
@@ -266,62 +235,61 @@ mod tests {
         }
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn prefetch_pages_missing_experts_and_stops_on_drop() {
-        let source = StdArc::new(GateSource::new((u32::MAX, ExpertKind::Gate, u32::MAX)));
+        let source = StdArc::new(GateSource::new((u32::MAX, u32::MAX)));
         let pool = test_pool(8, arc_dyn(source.clone()));
-        let feed = StdArc::new(QueueFeed::new(vec![
-            (0, ExpertKind::Gate, 0),
-            (0, ExpertKind::Gate, 1),
-        ]));
+        let feed = StdArc::new(QueueFeed::new(vec![(0, 0), (0, 1)]));
         let handle = spawn_prefetch(pool.clone(), arc_dyn(feed), 3);
         until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 2);
-        assert!(pool.residency.is_resident(0, ExpertKind::Gate, 0));
-        assert!(pool.residency.is_resident(0, ExpertKind::Gate, 1));
+        assert!(pool.residency.is_resident(0, 0));
+        assert!(pool.residency.is_resident(0, 1));
         drop(handle); // stop + join — returns promptly (bounded park)
     }
 
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
+    #[cfg(not(loom))]
     fn prefetch_yields_to_demand() {
         // Demand page-in of expert 7 blocks inside the source, holding
-        // `demand_inflight` > 0; a queued prefetch key must NOT be read until
-        // demand completes, and prefetch concurrency never exceeds the gate.
-        let source = StdArc::new(GateSource::new((0, ExpertKind::Gate, 7)));
+        // `demand_inflight` > 0; a queued prefetch unit must NOT be read
+        // until demand completes, and prefetch concurrency never exceeds
+        // (one prefetch thread, so no concurrency to bound).
+        let source = StdArc::new(GateSource::new((0, 7)));
         let pool = test_pool(8, arc_dyn(source.clone()));
-        let feed = StdArc::new(QueueFeed::new(vec![(0, ExpertKind::Gate, 0)]));
+        let feed = StdArc::new(QueueFeed::new(vec![(0, 0)]));
         let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()), 3);
 
         // Round 1: prefetch pages expert 0.
         until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 1);
 
-        // Demand thread: blocks inside read_expert for expert 7.
+        // Demand thread: blocks inside read_expert for expert 7's gate plane.
         let p2 = pool.clone();
         let demand = std::thread::spawn(move || {
-            p2.ensure_range(true, 0, ExpertKind::Gate, 7, 7, &mut |_| {})
-                .unwrap();
+            p2.ensure_unit(true, 0, 7).unwrap();
         });
-        until(|| source.attempts((0, ExpertKind::Gate, 7)) == 1);
+        until(|| source.attempts((0, 7)) == 1);
 
-        // Offer another prefetch key while demand is in flight: the
+        // Offer another prefetch unit while demand is in flight: the
         // prefetcher must skip it (checked before every round).
-        feed.push((0, ExpertKind::Gate, 2));
+        feed.push((0, 2));
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(
-            source.attempts((0, ExpertKind::Gate, 2)),
+            source.attempts((0, 2)),
             0,
             "prefetch read while demand was in flight"
         );
 
-        // Demand completes; the queued key is then paged in.
+        // Demand completes; the queued unit is then paged in.
         source.release();
         demand.join().unwrap();
-        until(|| source.attempts((0, ExpertKind::Gate, 2)) == 1);
+        until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 2);
         assert_eq!(pool.stats.demand_slow_pageins.load(Ordering::Relaxed), 1);
         assert_eq!(pool.stats.prefetch_pageins.load(Ordering::Relaxed), 2);
-        assert!(
-            handle.max_concurrent_prefetch() <= GATE_CAPACITY,
-            "prefetch oversubscribed the gate"
-        );
         handle.stop();
     }
 }

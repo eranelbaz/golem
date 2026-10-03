@@ -435,10 +435,10 @@ def run_suite(cpu_bin: str, hip_bin: str | None, model: str, outdir: str, quant:
     """Full suite: provenance gate → T1 legs → T2 legs (8 prompts × legs) →
     per-pair compare → merged report. Returns 0 iff every leg succeeded,
     T1 passes, and T2 passes under the token rule or — when `gpu_dev_bound`
-    is set — under the bounded GPU-kernel deviation criterion (plan §OPEN
-    Step B: GPU-leg acceptance = deviation bound; token rate still recorded).
+    is set — under the bounded GPU-kernel deviation criterion (GPU-leg
+    acceptance = deviation bound; token rate still recorded).
 
-    `threads_a` / `threads_b` are the Task 7 calibration knobs: per-leg T2
+    `threads_a` / `threads_b` are the calibration knobs: per-leg T2
     decode-thread counts (leg A = cpu, leg B = hip). None (the default) runs
     the leg with no `--threads` flag at the engine default; together they
     express the reference-vs-reference matrix (e.g. cpu-t16 vs cpu-t4).

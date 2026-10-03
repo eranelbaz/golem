@@ -28,7 +28,7 @@ pub struct ReplicaRegistry {
 pub struct ShardReplicas {
     /// Position of this shard in the manifest's `shards` vector.
     pub shard_index: usize,
-    /// Arc'd so Task 4 can hand out `Arc<dyn ChunkSource>` clones from `&self`
+    /// Arc'd so readers can hand out `Arc<dyn ChunkSource>` clones from `&self`
     /// (`File` is not `Clone`).
     pub replicas: Vec<Arc<ReplicaSlot>>,
 }

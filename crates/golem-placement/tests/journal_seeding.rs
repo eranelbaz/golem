@@ -1,4 +1,4 @@
-//! Journal warm-start seeding (§6.3, M2.5 task 3): replay a recorded trace
+//! Journal warm-start seeding (§6.3): replay a recorded trace
 //! into a fresh policy with a step gap and check the seeded ranking against
 //! an independent replay of the same trace. The xorshift trace generator is
 //! duplicated from `tests/properties.rs` (its helpers are private to that
@@ -24,17 +24,14 @@ const HOT: usize = 32;
 const STEPS: u64 = 2048;
 const GAP: u64 = 512;
 
-/// Brief fixture (authoritative): vram floor+top (64) + ram floor (32) = 96
-/// pre-promoted slots ≥ HOT (32) — the whole hot set plus slack fits by
-/// construction.
+/// Brief fixture (authoritative): vram cap 64 + pool 128 pre-promoted slots
+/// ≥ HOT (32) — the whole hot set plus slack fits by construction.
 fn fixture() -> Policy {
     let cfg = PlacementConfig {
         layers: 2,
         experts_per_layer: 128,
         vram_experts_max: 64,
-        vram_experts_min: 8,
         ram_slots: 128,
-        ram_experts_min: 32,
         ..Default::default()
     };
     Policy::new(cfg, 1, u64::MAX, u64::MAX).unwrap()
@@ -255,17 +252,17 @@ fn independent_scores(trace: &[(u64, usize)]) -> [f64; NUM_KEYS] {
 }
 
 #[test]
-fn warm_plan_slices_seeded_ranking_into_floors() {
+fn warm_plan_slices_seeded_ranking_into_tiers() {
     let (journal, trace) = gen_trace(0x9E3779B97F4A7C15);
     let mut p = seeded_policy(&journal);
     let (vram, ram) = p.warm_plan();
     let cfg = p.config().clone();
 
-    // Exact shape: vram_experts_max VRAM keys, ram_experts_min RAM keys.
+    // Exact shape: vram_experts_max VRAM keys; RAM fills the rest of the pool.
     assert_eq!(vram.len(), cfg.vram_experts_max);
-    assert_eq!(ram.len(), cfg.ram_experts_min);
+    assert_eq!(ram.len(), cfg.ram_slots - cfg.vram_experts_max);
     for &k in &ram {
-        assert!(!vram.contains(&k), "key {k} appears in both floors");
+        assert!(!vram.contains(&k), "key {k} appears in both tiers");
     }
 
     // Both lists follow pass()'s total order: score desc, ties by
@@ -288,7 +285,7 @@ fn warm_plan_slices_seeded_ranking_into_floors() {
     let first_ram = rank_of(ram[0]);
     assert!(
         last_vram.0 > first_ram.0 || (last_vram.0 == first_ram.0 && last_vram.1 < first_ram.1),
-        "ram floor starts before the vram ranking ends"
+        "ram tier starts before the vram ranking ends"
     );
 
     // The plan's VRAM list tracks an independent §6.2 replay of the same

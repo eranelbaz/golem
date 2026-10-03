@@ -2,7 +2,7 @@
 //!
 //! Reads only the header, KV records, and tensor infos; never maps tensor
 //! data. Byte-size and alignment handling are deferred to their first
-//! consumers (VRAM budget, M2.2).
+//! consumers (VRAM budget).
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -15,7 +15,7 @@ use crate::error::EngineError;
 
 impl From<raw_gguf::Error> for EngineError {
     fn from(e: raw_gguf::Error) -> Self {
-        EngineError::InvalidModel(e.0)
+        EngineError::InvalidModel(e.to_string())
     }
 }
 

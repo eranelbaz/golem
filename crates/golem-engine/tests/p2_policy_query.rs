@@ -3,7 +3,7 @@
 //! persistent device cache skips re-routed experts on an identical second
 //! turn (P4 counters expose the traffic through `Session::device_cache_stats`).
 //! The permutation seam test registers its own recording hooks over the
-//! pool-off offload config (C engages P2 on hook presence alone — Task 1's
+//! pool-off offload config (C engages P2 on hook presence alone — the
 //! call-site); the counters test drives the engine-registered hooks (pool
 //! on). Runs only where a GPU split exists (feature `hip-tests`, HIP CI
 //! job); CPU builds never enter the split-scheduler expert-copy path.
@@ -52,10 +52,27 @@ fn policy_query_is_consulted_with_valid_permutations() {
     }
     extern "C" fn on_ensure(
         _ctx: *mut libc::c_void,
-        _tensor: *const libc::c_void,
-        _first: i32,
-        _last: i32,
+        tensor: *const libc::c_void,
+        first: i32,
+        last: i32,
+        ptrs: *mut *const libc::c_void,
     ) {
+        // ABI v2: the substrate copies from the returned pointers, so serve
+        // the tensor's REAL per-expert planes — the same bytes the unpooled
+        // upstream path reads (`input->data + id·nb[2]`). One shared static
+        // would hand every expert zero bytes, making misplaced planes
+        // undetectable by any output assertion.
+        // SAFETY: `tensor` is the substrate's expert tensor, valid for the
+        // call; only `data` is read, and the per-expert stride comes from
+        // the substrate's own metadata query (nb[2], see golem-hooks.h).
+        let base = unsafe { (*tensor.cast::<golem_llama_sys::raw::ggml_tensor>()).data };
+        let stride =
+            unsafe { golem_llama_sys::raw::golem_tensor_expert_stride_bytes(tensor) } as usize;
+        for e in first..=last {
+            unsafe {
+                *ptrs.add((e - first) as usize) = base.byte_add(e as usize * stride).cast();
+            }
+        }
     }
 
     // SAFETY: valid fn pointers; process-lifetime registration (no unregis-
@@ -66,13 +83,18 @@ fn policy_query_is_consulted_with_valid_permutations() {
             Some(on_ensure),
             Some(on_query),
             Some(on_notify),
+            None,
             std::ptr::null_mut(),
         );
     }
 
     // Pool OFF (engine registers nothing): these hooks stand in for the
     // engine's, isolating the C call-site seam. P2 engages because BOTH
-    // policy_query and ensure_host_resident are non-null (Task 1 contract).
+    // policy_query and ensure_host_resident are non-null (call-site contract).
+    // The pooled path aborts on an unset (K = 0) budget, and the session's
+    // load-time self-check already decodes through these hooks.
+    // SAFETY: FFI setter, no invariants; K = n_expert of tiny-moe.
+    unsafe { golem_llama_sys::raw::golem_set_device_cache_experts(8) };
     let cfg = common::offload::offload_config();
     let mut session = Session::new(&cfg).unwrap();
     let out = chat(&mut session, "Hello");
@@ -104,23 +126,13 @@ fn policy_query_is_consulted_with_valid_permutations() {
 
 /// Engine-registered hooks (pool on): the persistent device cache skips the
 /// identical re-route of a second turn, and P4 counters surface the traffic.
-/// Skips with a reason when the 1 GiB RAM pool cannot mlock (RLIMIT_MEMLOCK
-/// below 1 GiB — local dev boxes); the HIP CI job runs it for real.
+/// A failed precondition (RLIMIT_MEMLOCK below the 1 GiB pool) FAILS — an
+/// early return reads as a pass to the harness (AGENTS.md Evidence).
 #[test]
 fn device_cache_skips_on_second_identical_turn() {
     let mut cfg = common::offload::offload_config();
     cfg.ram_experts_gib = 1; // pool on ⇒ engine registers all three hooks
-    let mut session = match Session::new(&cfg) {
-        Ok(s) => s,
-        Err(e) if e.to_string().contains("mlock") => {
-            eprintln!(
-                "SKIPPED: RLIMIT_MEMLOCK below the 1 GiB pool (ram_experts_gib=1); \
-                 run on a machine with unlimited memlock (HIP CI job): {e}"
-            );
-            return;
-        }
-        Err(e) => panic!("session with pooled offload failed: {e}"),
-    };
+    let mut session = Session::new(&cfg).expect("session with pooled offload");
 
     let out1 = chat(&mut session, "Hello");
     assert!(!out1.is_empty());
