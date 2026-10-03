@@ -154,7 +154,7 @@ struct PolicyQueryState {
     /// Double-buffered order slices: the slice returned to C stays valid
     /// until the next policy_query call (frozen-buffer contract,
     /// golem-hooks.h; C consumes it within the same copy step).
-    bufs: [Mutex<Vec<i32>>; 2],
+    bufs: [Mutex<OrderBuf>; 2],
     /// Index of the buffer currently exposed to C (`bufs` element).
     exposed: AtomicUsize,
     /// Last layer passed to policy_query; notify attribution key.
@@ -175,7 +175,10 @@ impl PolicyQueryState {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             step: AtomicU64::new(0),
-            bufs: [Mutex::new(Vec::new()), Mutex::new(Vec::new())],
+            bufs: [
+                Mutex::new(OrderBuf::new(n_experts)),
+                Mutex::new(OrderBuf::new(n_experts)),
+            ],
             exposed: AtomicUsize::new(0),
             last_queried: AtomicU32::new(NO_LAYER),
             shuffle,
@@ -184,29 +187,34 @@ impl PolicyQueryState {
         }
     }
 
-    /// Publish `order` in the buffer NOT currently exposed to C and return
-    /// its pointer (valid until the next publish, per the frozen-buffer
-    /// contract; C consumes within the same copy step).
-    fn store_order(&self, order: Vec<i32>) -> *const i32 {
+    /// Builds the evict-first order for `layer` (shared by all three of its
+    /// tensors) in the buffer NOT currently exposed to C and returns its
+    /// pointer (valid until the next publish, per the frozen-buffer
+    /// contract; C consumes within the same copy step). `None` = identity
+    /// (non-expert tensor). One lock, no allocation: buffers are sized at
+    /// enable.
+    fn publish_order(&self, layer: Option<u32>) -> *const i32 {
         let next = 1 - self.exposed.load(Ordering::Relaxed);
-        *self.bufs[next].lock().unwrap() = order;
+        let mut buf = self.bufs[next].lock().unwrap();
+        let OrderBuf { keys, order } = &mut *buf;
+        match layer {
+            Some(layer) => {
+                debug_assert!(
+                    layer < self.n_layers,
+                    "order requested outside the registered geometry"
+                );
+                let lo = layer as usize * self.n_experts as usize;
+                for (k, a) in keys.iter_mut().zip(&self.last_access[lo..]) {
+                    *k = a.load(Ordering::Relaxed);
+                }
+                build_order(keys, self.shuffle, order);
+            }
+            None => order.iter_mut().zip(0..).for_each(|(o, i)| *o = i),
+        }
+        let ptr = order.as_ptr();
+        drop(buf);
         self.exposed.store(next, Ordering::Relaxed);
-        self.bufs[next].lock().unwrap().as_ptr()
-    }
-
-    /// Evict-first order for one layer (shared by all three of its
-    /// tensors): never-accessed experts first, then ascending last-access
-    /// step.
-    fn order_for(&self, layer: u32) -> Vec<i32> {
-        debug_assert!(
-            layer < self.n_layers && self.n_experts > 0,
-            "order requested outside the registered geometry"
-        );
-        let lo = layer as usize * self.n_experts as usize;
-        let hist: Vec<Option<u64>> = (lo..lo + self.n_experts as usize)
-            .map(|i| self.access_step(i))
-            .collect();
-        build_order(&hist, self.n_experts as usize, self.shuffle)
+        ptr
     }
 
     /// Last-access step of flat index `idx`; `None` = never accessed.
@@ -254,34 +262,41 @@ impl PolicyQueryState {
     }
 }
 
-/// Recency order builder (pure; unit-tested): never-accessed experts first
-/// (ascending index), then ascending last-access step. `shuffle` reverses
-/// the result — any permutation is legal to return (invariant 4); the knob
-/// exists to prove consumers don't depend on the ordering.
-///
-/// # Panics
-/// Malformed input (map length ≠ expert count) — belt-and-suspenders: the
-/// map is engine-built with exact length, so a mismatch is an internal
-/// contract break.
-fn build_order(last_access: &[Option<u64>], n_experts: usize, shuffle: bool) -> Vec<i32> {
-    assert_eq!(
-        last_access.len(),
-        n_experts,
-        "malformed access map: {} entries for {n_experts} experts",
-        last_access.len()
-    );
-    let mut idx: Vec<usize> = (0..n_experts).collect();
-    idx.sort_by_key(|&i| (last_access[i].is_some(), last_access[i].unwrap_or(0)));
-    let order: Vec<i32> = idx.into_iter().map(|i| i as i32).collect();
-    if shuffle {
-        order.into_iter().rev().collect()
-    } else {
-        order
+/// One order slot handed to C plus its sort-key scratch, both
+/// `n_experts` long for the process lifetime.
+struct OrderBuf {
+    keys: Vec<u64>,
+    order: Vec<i32>,
+}
+
+impl OrderBuf {
+    fn new(n_experts: u32) -> Self {
+        Self {
+            keys: vec![0; n_experts as usize],
+            order: vec![0; n_experts as usize],
+        }
     }
 }
 
-/// Rust-side permutation check (belt-and-suspenders; C validates the order
-/// authoritatively per the placement policy).
+/// Recency order builder (pure; unit-tested): `keys` are the raw
+/// `last_access` words (0 = never, else step + 1), so ascending key puts
+/// never-accessed experts first, then ascending last-access step; ties break
+/// by ascending index. `shuffle` reverses the result — any permutation is
+/// legal to return (invariant 4); the knob exists to prove consumers don't
+/// depend on the ordering. Writes a permutation of `0..keys.len()` into
+/// `order` by construction; no allocation (unstable sort, unique keys).
+fn build_order(keys: &[u64], shuffle: bool, order: &mut [i32]) {
+    debug_assert_eq!(keys.len(), order.len());
+    order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
+    order.sort_unstable_by_key(|&i| (keys[i as usize], i));
+    if shuffle {
+        order.reverse();
+    }
+}
+
+/// Permutation check for tests; C validates every published order
+/// authoritatively (golem_slab_step), so the hot path doesn't repeat it.
+#[cfg(test)]
 fn is_permutation(order: &[i32], n: usize) -> bool {
     order.len() == n && order.iter().all(|&i| i >= 0 && (i as usize) < n) && {
         let mut seen = vec![false; n];
@@ -703,29 +718,27 @@ pub(crate) extern "C" fn ensure_host_resident(
     if out_ptrs.is_null() {
         p3_fatal("P3: ensure_host_resident called with null out_ptrs".into());
     }
-    // SAFETY: C allocates `n` entries and passes the array here (copy_experts_to).
-    let out: &mut [*const c_void] = unsafe { std::slice::from_raw_parts_mut(out_ptrs, n) };
+    // SAFETY: C allocates `n` entries and passes the array here
+    // (copy_experts_to); `*const c_void` and `*const u8` share layout.
+    let out: &mut [*const u8] = unsafe { std::slice::from_raw_parts_mut(out_ptrs.cast(), n) };
 
     // The pool IS the H2D source. Claim + page-in each expert and
-    // hand the slot pointer to C; the lease stays held (in `in_flight_leases`)
-    // until `copy_done`, so eviction cannot recycle a slot mid-DMA.
-    let (ptrs, leases) =
-        match h
-            .pool
-            .ensure_range_leased(true, entry.layer, entry.kind, first, last)
-        {
-            Ok(r) => r,
-            Err(e) => p3_fatal(format!(
-                "P3 page-in failed (layer {}, {kind:?}, experts [{first}, {last}]): {e}; \
+    // hand the slot pointer to C; the lease stays held (in `in_flight_leases`,
+    // capacity reused across steps — no allocation once warm) until
+    // `copy_done`, so eviction cannot recycle a slot mid-DMA.
+    let mut leases = h.in_flight_leases.lock().unwrap();
+    if let Err(e) =
+        h.pool
+            .ensure_range_leased(entry.layer, entry.kind, first, last, out, &mut leases)
+    {
+        p3_fatal(format!(
+            "P3 page-in failed (layer {}, {kind:?}, experts [{first}, {last}]): {e}; \
              aborting rather than decoding on garbage",
-                entry.layer,
-                kind = entry.kind
-            )),
-        };
-    for (slot, dst) in ptrs.into_iter().zip(out.iter_mut()) {
-        *dst = slot as *const c_void;
+            entry.layer,
+            kind = entry.kind
+        ));
     }
-    h.in_flight_leases.lock().unwrap().extend(leases);
+    drop(leases);
 
     // Counters visibility: one info line per 1000 slow paths (real metrics
     // are P4's).
@@ -774,7 +787,7 @@ extern "C" fn policy_query(ctx: *mut c_void, tensor: *const c_void, n_experts: i
     let Some(entry) = h.entry_for(tensor) else {
         // Defensive: C queries only expert tensors; anything else gets a
         // legal identity permutation (invariant 4: any permutation is valid).
-        return h.policy.store_order((0..n_experts.max(0)).collect());
+        return h.policy.publish_order(None);
     };
     if n_experts != entry.n_experts as i32 {
         p3_fatal(format!(
@@ -783,18 +796,7 @@ extern "C" fn policy_query(ctx: *mut c_void, tensor: *const c_void, n_experts: i
         ));
     }
     h.policy.last_queried.store(entry.layer, Ordering::Relaxed);
-    let order = h.policy.order_for(entry.layer);
-    // Belt-and-suspenders: C validates the permutation authoritatively
-    // and aborts on corruption; failing here yields a
-    // Rust-side message instead.
-    if !is_permutation(&order, entry.n_experts as usize) {
-        p3_fatal(format!(
-            "P2: order builder produced a non-permutation for layer {}, {kind:?}: {order:?}",
-            entry.layer,
-            kind = entry.kind
-        ));
-    }
-    h.policy.store_order(order)
+    h.policy.publish_order(Some(entry.layer))
 }
 
 /// The P4 `notify_access` trampoline: one routed expert of the tensor most
@@ -928,6 +930,20 @@ fn blk_of(name: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn built(keys: &[u64], shuffle: bool) -> Vec<i32> {
+        let mut order = vec![0; keys.len()];
+        build_order(keys, shuffle, &mut order);
+        order
+    }
+
+    impl PolicyQueryState {
+        fn order_for_test(&self, layer: u32) -> Vec<i32> {
+            let p = self.publish_order(Some(layer));
+            // SAFETY: the published buffer holds n_experts entries until the next publish.
+            unsafe { std::slice::from_raw_parts(p, self.n_experts as usize) }.to_vec()
+        }
+    }
+
     #[test]
     fn device_cache_experts_explicit_wins_and_default_is_never_unbounded() {
         let c = EngineConfig {
@@ -1021,7 +1037,7 @@ mod tests {
         p.last_queried.store(1, Ordering::Relaxed); // last query: layer 1 (any kind)
         p.note_access(2);
         assert_eq!(
-            p.order_for(1),
+            p.order_for_test(1),
             vec![0, 1, 3, 2],
             "expert 2 accessed → evicted last"
         );
@@ -1038,9 +1054,10 @@ mod tests {
 
     #[test]
     fn order_builder_recency_sorts_never_accessed_first() {
-        let hist = vec![Some(5), None, Some(2), None, Some(2)];
+        // Raw last_access words: 0 = never, else step + 1.
+        let hist = [6, 0, 3, 0, 3];
         assert_eq!(
-            build_order(&hist, 5, false),
+            built(&hist, false),
             vec![1, 3, 2, 4, 0],
             "never-accessed first (ascending index), then ascending step"
         );
@@ -1048,17 +1065,27 @@ mod tests {
 
     #[test]
     fn order_builder_shuffle_changes_order_but_stays_a_permutation() {
-        let hist: Vec<Option<u64>> = (0..8u64).map(Some).collect();
-        assert_eq!(build_order(&hist, 8, false), (0..8).collect::<Vec<i32>>());
-        let shuffled = build_order(&hist, 8, true);
-        assert_ne!(shuffled, build_order(&hist, 8, false));
+        let hist: Vec<u64> = (1..=8).collect();
+        assert_eq!(built(&hist, false), (0..8).collect::<Vec<i32>>());
+        let shuffled = built(&hist, true);
+        assert_ne!(shuffled, built(&hist, false));
         assert!(is_permutation(&shuffled, 8));
     }
 
     #[test]
-    #[should_panic(expected = "malformed access map")]
-    fn order_builder_rejects_malformed_map() {
-        build_order(&[Some(1), None], 3, false);
+    fn published_order_is_identity_for_non_expert_and_a_permutation_otherwise() {
+        let pq = PolicyQueryState::new(2, 6, false);
+        let id = pq.publish_order(None);
+        // SAFETY: the published buffer holds n_experts entries until the next publish.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(id, 6) },
+            &[0, 1, 2, 3, 4, 5]
+        );
+        pq.last_queried.store(1, Ordering::Relaxed);
+        pq.note_access(4);
+        let o = pq.order_for_test(1);
+        assert!(is_permutation(&o, 6));
+        assert_eq!(*o.last().unwrap(), 4);
     }
 
     #[test]
@@ -1077,7 +1104,7 @@ mod tests {
         pq.note_access(0);
         assert!((0..8).all(|i| pq.access_step(i).is_none()));
 
-        assert_eq!(pq.order_for(0), vec![0, 1, 2, 3]);
+        assert_eq!(pq.order_for_test(0), vec![0, 1, 2, 3]);
         pq.last_queried.store(0, Ordering::Relaxed);
         pq.step.store(7, Ordering::Relaxed);
         for id in 0..4 {

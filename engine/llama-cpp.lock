@@ -4,7 +4,7 @@ branch = glm5next/upstream
 commit = 86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9
 pr = 27754
 base_upstream = 930e2fa5995789efbf249a8bf61325bb626e417b  # ggml-org/llama.cpp merge-base at pin
-content_sha256 = a5a339e36817b6d110cc5cb1d8374d8a1b701871ace3cbf2e5230f04059ca5a6                  # recomputable tree hash; CI re-derives it
+content_sha256 = 92d95e00fdc560dbb0aa11e40a83865890235eb80d450c72509fdc8c7687f3cc                  # recomputable tree hash; CI re-derives it
 archive_sha256 = dfe22d466b1ceb824651ada7c6f20347f4f18caa241dc3459fb5f10560d265e3                  # provenance only; unverifiable after tarball deletion
 rocm = 7.2.4              # advisory minimum (design §3.5 amended this PR); M0.2 WARNs on rocminfo mismatch and skips the check when rocminfo is absent (CI/no-GPU) — it does not hard-assert
 patches = P1+P2+P3+P3copy  # P3copy: golem_copy_pooled_expert_run — pooled-run H2D copy plan (padding tail = last expert's own bytes, never past the slot)

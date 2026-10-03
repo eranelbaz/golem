@@ -300,36 +300,38 @@ impl ExpertPool {
         &full[off as usize..(off + stride) as usize]
     }
 
-    /// Claims `[first, last]`, pages each expert in, and returns
-    /// the pool-side host pointer per expert together with the held leases.
+    /// Demand-claims `[first, last]`, pages each expert in, writes the pool-side
+    /// host pointer per expert into `ptrs` (`last - first + 1` entries) and
+    /// appends the held leases to `leases`. Caller-owned buffers: the decode
+    /// hot path reuses them, so no allocation per call. On error, leases for
+    /// the experts already claimed stay in `leases` (released when dropped).
     /// The caller MUST drop the leases only after the device has consumed the
     /// bytes (the glue releases them from the `copy_done` hook).
+    ///
+    /// # Panics
+    /// `ptrs.len() != last - first + 1`.
     pub fn ensure_range_leased(
         &self,
-        demand: bool,
         layer: u32,
         kind: ExpertKind,
         first: u32,
         last: u32,
-    ) -> Result<(Vec<*const u8>, Vec<Lease>), PoolError> {
+        ptrs: &mut [*const u8],
+        leases: &mut Vec<Lease>,
+    ) -> Result<(), PoolError> {
         debug_assert!(first <= last, "inverted range ({first}, {last})");
-        if demand {
-            self.demand_inflight.fetch_add(1, Ordering::Relaxed);
-        }
+        assert_eq!(ptrs.len(), (last - first + 1) as usize, "ptrs length");
+        self.demand_inflight.fetch_add(1, Ordering::Relaxed);
         let result = (|| {
             let snapshot = self.snapshots.current();
-            let mut ptrs = Vec::with_capacity((last - first + 1) as usize);
-            let mut leases = Vec::with_capacity((last - first + 1) as usize);
-            for expert in first..=last {
-                let (slot, lease) = self.claim_leased(demand, layer, expert, &snapshot)?;
-                ptrs.push(self.plane_bytes(layer, slot, &lease, kind).as_ptr());
+            for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
+                let (slot, lease) = self.claim_leased(true, layer, expert, &snapshot)?;
+                *dst = self.plane_bytes(layer, slot, &lease, kind).as_ptr();
                 leases.push(lease);
             }
-            Ok((ptrs, leases))
+            Ok(())
         })();
-        if demand {
-            self.demand_inflight.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.demand_inflight.fetch_sub(1, Ordering::Relaxed);
         result
     }
 

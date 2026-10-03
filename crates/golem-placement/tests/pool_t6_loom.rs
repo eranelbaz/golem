@@ -160,14 +160,28 @@ fn t6_two_planes_of_one_unit_one_fill() {
         let pool = loom_pool();
         let p2 = pool.clone();
         let t = primitives::spawn(move || {
-            let (_, leases) = p2
-                .ensure_range_leased(true, 0, ExpertKind::Down, 1, 1)
-                .unwrap();
+            let mut leases = Vec::new();
+            p2.ensure_range_leased(
+                0,
+                ExpertKind::Down,
+                1,
+                1,
+                &mut [std::ptr::null()],
+                &mut leases,
+            )
+            .unwrap();
             leases
         });
-        let (_, mine) = pool
-            .ensure_range_leased(true, 0, ExpertKind::Gate, 1, 1)
-            .unwrap();
+        let mut mine = Vec::new();
+        pool.ensure_range_leased(
+            0,
+            ExpertKind::Gate,
+            1,
+            1,
+            &mut [std::ptr::null()],
+            &mut mine,
+        )
+        .unwrap();
         let theirs = t.join().unwrap();
         // One slot serves the unit; both planes carry their own fill bytes.
         let slots: Vec<u32> = mine.iter().chain(theirs.iter()).map(|l| l.slot()).collect();

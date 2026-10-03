@@ -34,6 +34,9 @@ struct GolemLayerSlots {
     std::vector<int32_t> slot_of;   // expert → slot, -1 = unassigned
     std::vector<int32_t> owner_of;  // slot → expert, -1 = free
     std::vector<ggml_bitset_t> valid[3];
+    // Per-step scratch (n_experts bits each), reused so a decode step does
+    // no heap allocation after the first.
+    std::vector<ggml_bitset_t> seen, is_routed;
 };
 
 // One (layer, kind) slab. Keyed by the host tensor fingerprint; any sched
@@ -103,7 +106,8 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
 
     // Validate order FIRST: all ids distinct, all in [0, n_experts).
     {
-        std::vector<ggml_bitset_t> seen(ggml_bitset_size(n_experts), 0);
+        std::vector<ggml_bitset_t> &seen = L.seen;
+        seen.assign(ggml_bitset_size(n_experts), 0);
         GGML_ASSERT(order != NULL);
         for (int32_t i = 0; i < n_experts; ++i) {
             GGML_ASSERT(order[i] >= 0 && order[i] < n_experts);
@@ -125,7 +129,8 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
         L.n_experts = n_experts;
     }
 
-    std::vector<ggml_bitset_t> is_routed(ggml_bitset_size(n_experts), 0);
+    std::vector<ggml_bitset_t> &is_routed = L.is_routed;
+    is_routed.assign(ggml_bitset_size(n_experts), 0);
     for (int32_t id : routed) {
         GGML_ASSERT(id >= 0 && id < n_experts);
         ggml_bitset_set(is_routed.data(), id);
