@@ -32,6 +32,11 @@ jobs:
             test-models-
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # hip-tests-gated code is cfg'd out of the workspace lint above; lint it
+      # on the CPU substrate so it cannot rot before the HIP runner exists.
+      - run: >-
+          cargo clippy -p golem-engine -p golem-cli --all-targets
+          --features golem-engine/hip-tests,golem-cli/hip-tests -- -D warnings
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -40,20 +45,19 @@ jobs:
       # Raise it on this step's shell so nextest and its children inherit it.
       - run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          echo "memlock limit: $(ulimit -l)"
           cargo nextest run --workspace --success-output=immediate
-      # T6 loom leg (§12.2): unfiltered — every non-model test is
-      # #[cfg(not(loom))]-gated, so the whole crate must pass under loom.
-      # A filter here hid 8 broken tests once; don't reintroduce one.
-      - name: T6 loom (placement pool)
+      # Unfiltered: tests that cannot run under loom are #[cfg(not(loom))],
+      # so every test compiled in must pass; a name filter once hid 8 failures.
+      - name: Loom (placement pool)
         run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-placement --features loom
-      # M1.4 parity-suite leg (stdlib driver): pytest file runs the in-script
-      # selftest through the real xtask comparator. Must stay after the
-      # workspace build so target/debug/xtask exists (no cargo-run fallback).
+      # Parity-suite tests drive the real xtask comparator, so they must run
+      # after the workspace build (target/debug/xtask; no cargo-run fallback).
       - run: python3 -m pip install --quiet 'pytest==8.4.2'
-      - run: python3 -m pytest tests/test_parity_suite.py -q
+      - run: python3 -m pytest tests -q
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # M2.1 P1 gate: upstream vendored ctest + unset-hooks byte-identity.
+  # P1 gate: upstream vendored ctest + unset-hooks byte-identity.
   # No build-substrate.sh (HIP-only, no args): CPU substrate comes from
   # golem-llama-sys/build.rs via GOLEM_LLAMA_SYS_BACKEND=cpu; the gate's
   # cmake build is its own upstream-test tree (one substrate each).
@@ -74,9 +78,9 @@ jobs:
 
   # P3 functional acceptance: the split-scheduler
   # expert-copy path only executes where a GPU split exists, so this leg runs
-  # on the self-hosted HIP runner; CPU CI never reaches it. No HIP runner is
-  # registered yet, so the job is workflow_dispatch-only — PR CI stays green
-  # and the leg runs manually (`gh workflow run ci.yml`) once the runner is up.
+  # on a self-hosted HIP runner; CPU CI never reaches it. No HIP runner is
+  # budgeted, so the job is workflow_dispatch-only and P1–P4 PRs carry pasted
+  # `--features hip-tests` output with zero SKIPPED lines instead (AGENTS.md).
   p3-hip:
     if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, hip]

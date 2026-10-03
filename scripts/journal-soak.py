@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""24 h placement-journal soak (M2.5 Task 7, §6.3/§11 — hardware, not CI-gated).
+"""24 h placement-journal soak (§6.3/§11 — hardware, not CI-gated).
 
 Drives the placement journal cycle (start → seed-from-journal → run trace →
 graceful stop → next iteration seeds from the previous journal) against the
