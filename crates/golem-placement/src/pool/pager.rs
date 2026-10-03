@@ -353,20 +353,20 @@ impl ExpertPool {
         // residency map is the only constructor (§6.6).
         let fill_claim = claim.expect("page_in without a FillClaim (capability invariant)");
         let unit = &self.geometry.layers[layer as usize];
-        // One disk→pool copy per unit: three preads straight into the
-        // claimed slot's plane sub-slices (split from the single slot_mut
-        // borrow — no bounce buffer, §3.4 v3).
-        let slot_bytes = self.arena.slot_mut(slot, &fill_claim);
+        // One disk→pool copy per unit: three reads straight into the
+        // claimed slot's plane regions (split from the single slot_mut
+        // borrow — no bounce buffer, §3.4 v3; each region is sized for an
+        // aligned direct read of its plane, §5.4).
+        let mut rest = self.arena.slot_mut(slot, &fill_claim);
         let result: std::io::Result<()> = 'fill: {
-            let (gate, rest) = slot_bytes.split_at_mut(unit.offset[1] as usize);
-            let (up, down) = rest.split_at_mut((unit.offset[2] - unit.offset[1]) as usize);
-            let planes = [
-                (ExpertKind::Gate, &mut gate[..unit.stride[0] as usize]),
-                (ExpertKind::Up, &mut up[..unit.stride[1] as usize]),
-                (ExpertKind::Down, &mut down[..unit.stride[2] as usize]),
-            ];
-            for (kind, buf) in planes {
-                if let Err(e) = self.source.read_expert(layer, kind, expert, buf) {
+            for kind in ExpertKind::ALL {
+                let k = kind.ordinal();
+                let (region, tail) = rest.split_at_mut(unit.region[k] as usize);
+                rest = tail;
+                if let Err(e) =
+                    self.source
+                        .read_expert(layer, kind, expert, region, unit.head[k] as usize)
+                {
                     break 'fill Err(e);
                 }
             }
@@ -476,6 +476,7 @@ mod tests {
             kind: ExpertKind,
             expert: u32,
             into: &mut [u8],
+            head: usize,
         ) -> io::Result<()> {
             let k = key(4, N_EXPERTS, layer, expert).unwrap();
             let mut errors = self.errors.lock().unwrap();
@@ -486,8 +487,8 @@ mod tests {
                 }
             }
             drop(errors);
-            assert_eq!(into.len(), self.stride);
-            into.fill(self.plane_byte(kind, expert));
+            assert_eq!(into.len() - head, self.stride);
+            into[head..].fill(self.plane_byte(kind, expert));
             Ok(())
         }
 
@@ -499,13 +500,7 @@ mod tests {
     /// One layer, three uniform planes of `stride` B — the unit is 3×stride.
     fn unit_geometry(stride: u64) -> PoolGeometry {
         PoolGeometry {
-            layers: vec![
-                UnitLayout {
-                    stride: [stride; 3],
-                    offset: [0, stride, 2 * stride],
-                };
-                1
-            ],
+            layers: vec![UnitLayout::new([stride; 3], [None; 3]).unwrap(); 1],
             n_experts: N_EXPERTS,
             expert_bytes: 0,
         }

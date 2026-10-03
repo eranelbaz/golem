@@ -228,6 +228,7 @@ mod tests {
             _kind: ExpertKind,
             expert: u32,
             into: &mut [u8],
+            head: usize,
         ) -> io::Result<()> {
             let key = (layer, expert);
             *self.attempts.lock().unwrap().entry(key).or_insert(0) += 1;
@@ -237,7 +238,7 @@ mod tests {
                     released = self.cv.wait(released).unwrap();
                 }
             }
-            into.fill(expert as u8);
+            into[head..].fill(expert as u8);
             Ok(())
         }
 
@@ -254,13 +255,7 @@ mod tests {
         }])
         .unwrap();
         let geometry = PoolGeometry {
-            layers: vec![
-                UnitLayout {
-                    stride: [stride; 3],
-                    offset: [0, stride, 2 * stride],
-                };
-                1
-            ],
+            layers: vec![UnitLayout::new([stride; 3], [None; 3]).unwrap(); 1],
             n_experts: N_EXPERTS,
             expert_bytes: 0,
         };

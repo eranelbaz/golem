@@ -28,11 +28,12 @@ impl golem_placement::pool::ExpertSource for ByteSource {
         _kind: ExpertKind,
         expert: u32,
         into: &mut [u8],
+        head: usize,
     ) -> std::io::Result<()> {
         if layer != 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "layer"));
         }
-        into.fill(0xAA + expert as u8);
+        into[head..].fill(0xAA + expert as u8);
         Ok(())
     }
 
@@ -57,10 +58,7 @@ fn arena_locks_and_slots_are_disjoint() {
         Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::test_empty()))),
         Arc::new(P3Stats::new()),
         PoolGeometry {
-            layers: vec![UnitLayout {
-                stride: [plane; 3],
-                offset: [0, plane, 2 * plane],
-            }],
+            layers: vec![UnitLayout::new([plane; 3], [None; 3]).unwrap()],
             n_experts: 2,
             expert_bytes: 0,
         },

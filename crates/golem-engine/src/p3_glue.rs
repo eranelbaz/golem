@@ -895,7 +895,7 @@ impl PoolHandle {
         // tensor yet). This is the load-time proof that plane addressing is
         // right; wrong it can never ship.
         let mut disk = vec![0u8; stride];
-        if let Err(e) = self.source.read_expert(layer, kind, 0, &mut disk) {
+        if let Err(e) = self.source.read_expert(layer, kind, 0, &mut disk, 0) {
             p3_fatal(format!("P3: verification pread failed for {name}: {e}"));
         }
         // SAFETY: the weights buffer holds n_experts·stride fully populated

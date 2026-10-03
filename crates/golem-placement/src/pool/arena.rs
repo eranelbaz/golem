@@ -86,6 +86,9 @@ pub(crate) fn drop_page_cache(file: &std::fs::File, off: u64, len: usize) {
     }
 }
 
+/// Class-region alignment (one page).
+const PAGE: usize = 4096;
+
 fn last_errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
@@ -167,7 +170,15 @@ impl Arena {
                 offset,
             });
             first += c.slots;
-            offset = bytes;
+            // Page-aligned class regions: with page-multiple slot sizes every
+            // slot (and every direct-read plane region) stays page-aligned,
+            // as O_DIRECT requires (§5.4).
+            offset = bytes
+                .checked_next_multiple_of(PAGE)
+                .ok_or(ArenaError::InvalidLayout {
+                    pool_bytes: usize::MAX,
+                    slot_size: c.slot_size,
+                })?;
         }
         let pool_bytes = offset;
         // SAFETY: no pointer inputs; anonymous private mapping with no file

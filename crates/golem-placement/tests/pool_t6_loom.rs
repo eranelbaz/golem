@@ -30,8 +30,9 @@ impl golem_placement::pool::ExpertSource for ProvenanceSource {
         kind: ExpertKind,
         expert: u32,
         into: &mut [u8],
+        head: usize,
     ) -> io::Result<()> {
-        into.fill(plane_byte(kind, expert));
+        into[head..].fill(plane_byte(kind, expert));
         Ok(())
     }
 
@@ -49,10 +50,7 @@ fn loom_pool() -> Arc<ExpertPool> {
     }])
     .unwrap();
     let geometry = PoolGeometry {
-        layers: vec![UnitLayout {
-            stride: [plane; 3],
-            offset: [0, plane, 2 * plane],
-        }],
+        layers: vec![UnitLayout::new([plane; 3], [None; 3]).unwrap()],
         n_experts: 2,
         expert_bytes: 0,
     };
