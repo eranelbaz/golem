@@ -19,7 +19,13 @@ pub fn model<F>(f: F)
 where
     F: Fn() + Send + Sync + 'static,
 {
-    loom::model(f);
+    // Preemption bound keeps the 2-thread pool models tractable (unbounded
+    // explores ~8 min of interleavings on this machine; bound 2 still
+    // exercises every single-lock race these tests target).
+    // LOOM_MAX_PREEMPTIONS overrides via Builder::new.
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound.get_or_insert(2);
+    builder.check(f);
 }
 /// Spawns a modeled thread (loom) or a real thread (std).
 #[cfg(loom)]
