@@ -6,8 +6,9 @@
 //! Concurrency discipline (§6.6, T6): every concurrent type comes from
 //! [`primitives`] (std/loom cfg-swap) — no direct `std::sync` in pool code.
 //! The residency shard lock is leaf-most: policy state reaches `claim` only
-//! through a [`PolicySnapshot`] read (one short mutex hold per `ensure_*`
-//! call) made before any shard lock is taken.
+//! through a [`PolicySnapshot`] read (one short mutex hold per decode-path
+//! compute, per prefetch/`ensure_range` call) made before any shard lock is
+//! taken.
 
 /// mlock'd slot arena — the only `unsafe` in the pool module.
 #[allow(unsafe_code)]
@@ -20,7 +21,7 @@ mod residency;
 mod source;
 
 pub use arena::{Arena, SlotClass};
-pub use pager::{ExpertPool, Lease, PoolError, SnapshotHandle};
+pub use pager::{ExpertPool, Lease, PoolError, SnapshotHandle, StepClaims};
 pub use prefetch::{AccessFeed, PREFETCH_K, PrefetchHandle, spawn_prefetch};
 pub use residency::{ExpertKind, P3Stats, PolicySnapshot, PoolConfigError};
 pub use source::{ExpertSource, GgufPreadSource, PoolGeometry, SourceError, UnitLayout};

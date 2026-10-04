@@ -9,7 +9,7 @@ use golem_placement::pool::primitives::arc_dyn;
 use golem_placement::pool::primitives::{self, Arc};
 use golem_placement::pool::{
     Arena, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, PoolError, PoolGeometry, SlotClass,
-    SnapshotHandle, UnitLayout,
+    SnapshotHandle, StepClaims, UnitLayout,
 };
 
 use golem_placement::pool::primitives::Ordering;
@@ -103,17 +103,10 @@ fn t6_access_pagein_evict_copy_no_torn_reads() {
         // Post-join: residency ⊆ slot provenance (final-state sanity only).
         for e in 0..2u32 {
             if pool.is_resident(0, e) {
-                let mut leases = Vec::new();
-                pool.ensure_range_leased(
-                    0,
-                    ExpertKind::Gate,
-                    e,
-                    e,
-                    &mut [std::ptr::null()],
-                    &mut leases,
-                )
-                .unwrap();
-                assert_eq!(leases[0].bytes()[0], plane_byte(ExpertKind::Gate, e));
+                let mut step = StepClaims::new(pool.clone());
+                step.ensure_range_leased(0, ExpertKind::Gate, e, e, &mut [std::ptr::null()])
+                    .unwrap();
+                assert_eq!(step.leases()[0].bytes()[0], plane_byte(ExpertKind::Gate, e));
             }
         }
     });
@@ -156,8 +149,8 @@ fn t6_leased_expert_never_evicted() {
 }
 
 /// Gate and Down of one expert claimed concurrently: one fill, both planes
-/// read their own bytes; nobody observes a half-filled unit. Both leases are
-/// held across the join, so the second claimer must ride the first fill (an
+/// read their own bytes; nobody observes a half-filled unit. Both steps'
+/// leases are held across the join, so the second claimer must ride the first fill (an
 /// evict-and-refill between the two would be legal only after a release).
 #[test]
 fn t6_two_planes_of_one_unit_one_fill() {
@@ -165,33 +158,24 @@ fn t6_two_planes_of_one_unit_one_fill() {
         let pool = loom_pool();
         let p2 = pool.clone();
         let t = primitives::spawn(move || {
-            let mut leases = Vec::new();
-            p2.ensure_range_leased(
-                0,
-                ExpertKind::Down,
-                1,
-                1,
-                &mut [std::ptr::null()],
-                &mut leases,
-            )
-            .unwrap();
-            leases
+            let mut step = StepClaims::new(p2);
+            step.ensure_range_leased(0, ExpertKind::Down, 1, 1, &mut [std::ptr::null()])
+                .unwrap();
+            step
         });
-        let mut mine = Vec::new();
-        pool.ensure_range_leased(
-            0,
-            ExpertKind::Gate,
-            1,
-            1,
-            &mut [std::ptr::null()],
-            &mut mine,
-        )
-        .unwrap();
+        let mut mine = StepClaims::new(pool.clone());
+        mine.ensure_range_leased(0, ExpertKind::Gate, 1, 1, &mut [std::ptr::null()])
+            .unwrap();
         let theirs = t.join().unwrap();
         // One slot serves the unit; both planes carry their own fill bytes.
-        let slots: Vec<u32> = mine.iter().chain(theirs.iter()).map(|l| l.slot()).collect();
+        let slots: Vec<u32> = mine
+            .leases()
+            .iter()
+            .chain(theirs.leases())
+            .map(|l| l.slot())
+            .collect();
         assert!(slots.windows(2).all(|w| w[0] == w[1]), "one slot per unit");
-        let bytes = mine[0].bytes();
+        let bytes = mine.leases()[0].bytes();
         assert!(
             bytes[..8]
                 .iter()
@@ -209,5 +193,39 @@ fn t6_two_planes_of_one_unit_one_fill() {
         );
         drop(mine);
         drop(theirs);
+    });
+}
+
+/// A step claim pins the unit for all its planes: a concurrent evictor on
+/// the 1-slot pool can never take the slot between the Gate claim and the
+/// Down reuse, and the Down plane reads its own fill bytes.
+#[test]
+fn t6_step_claim_pins_the_unit_across_planes() {
+    primitives::model(|| {
+        let pool = loom_pool();
+        let copies = counter();
+        let (p2, c2) = (pool.clone(), copies.clone());
+        let evictor = primitives::spawn(move || ensure_counted(&p2, 1, &c2, ExpertKind::Gate));
+        let mut step = StepClaims::new(pool.clone());
+        let mut ptr = [std::ptr::null()];
+        match step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut ptr) {
+            Ok(()) => {
+                step.ensure_range_leased(0, ExpertKind::Down, 0, 0, &mut ptr)
+                    .unwrap();
+                let bytes = step.leases()[0].bytes();
+                assert!(
+                    bytes[16..]
+                        .iter()
+                        .all(|&b| b == plane_byte(ExpertKind::Down, 0))
+                );
+                assert_eq!(ptr[0], bytes[16..].as_ptr());
+                assert_eq!(pool.stats.demand_claims.load(Ordering::Relaxed), 1);
+            }
+            // The evictor leased the only slot first.
+            Err(PoolError::Busy) => assert!(step.leases().is_empty()),
+            Err(e) => panic!("unexpected pool error: {e}"),
+        }
+        step.next_step();
+        evictor.join().unwrap();
     });
 }

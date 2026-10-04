@@ -22,9 +22,10 @@
 //!   the host buffer is guaranteed untouched by the pool — mismatch is a loud
 //!   abort (the void FFI ABI has no error return).
 //! - *Pool pointers, not host bytes:* `ensure_host_resident` claims each
-//!   expert of `first..=last` (`ExpertPool::ensure_range_leased`), writes the
-//!   slot's plane pointer into `out_ptrs`, and C copies H2D from there. The
-//!   leases stay thread-local until the next compute's `copy_done`.
+//!   `(layer, expert)` unit of `first..=last` once per compute through the
+//!   thread-local `StepClaims` (the unit's other planes reuse that lease),
+//!   writes the slot's plane pointer into `out_ptrs`, and C copies H2D from
+//!   there. The leases are released by the next compute's `copy_done`.
 #![allow(unsafe_code)]
 
 use golem_placement::pool::SlotClass;
@@ -36,7 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use golem_llama_sys::raw;
 use golem_placement::pool::{
     AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PREFETCH_K,
-    PolicySnapshot, PrefetchHandle, SnapshotHandle, spawn_prefetch,
+    PolicySnapshot, PrefetchHandle, SnapshotHandle, StepClaims, spawn_prefetch,
 };
 
 use crate::config::EngineConfig;
@@ -64,14 +65,16 @@ thread_local! {
     static LAST_ENTRY: std::cell::Cell<Option<(usize, TensorEntry)>> =
         const { std::cell::Cell::new(None) };
 
-    /// Leases taken by `ensure_host_resident` on the decode thread, released
-    /// by `copy_done` at the start of the NEXT compute on that same thread
-    /// (both fire from `ggml_backend_sched_compute_splits`). Thread-local: no
-    /// lock per routed expert and none held across page-in I/O; capacity is
-    /// reused across steps. The engine synchronizes after every decode, so by
-    /// the next compute the prior step's DMAs are complete.
-    static IN_FLIGHT_LEASES: std::cell::RefCell<Vec<golem_placement::pool::Lease>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// The decode thread's claim table: `ensure_host_resident` claims each
+    /// unit once per compute here (other planes reuse the lease) and
+    /// `copy_done` ends the step at the start of the NEXT compute on this
+    /// same thread (both fire from `ggml_backend_sched_compute_splits`).
+    /// Thread-local: no lock per routed expert beyond one shard lock per
+    /// unit, none held across page-in I/O; allocated on first use, reused
+    /// across steps. The engine synchronizes after every decode and
+    /// `copy_done` drains the backends, so the prior step's DMAs are complete.
+    static STEP_CLAIMS: std::cell::RefCell<Option<StepClaims>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The leaked process-lifetime P3 state. See [`HANDLE`].
@@ -782,13 +785,12 @@ fn ensure_host_resident_inner(
     // (copy_experts_to); `*const c_void` and `*const u8` share layout.
     let out: &mut [*const u8] = unsafe { std::slice::from_raw_parts_mut(out_ptrs.cast(), n) };
 
-    // The pool IS the H2D source. Claim + page-in each expert and
-    // hand the slot pointer to C; the lease stays held (in `IN_FLIGHT_LEASES`,
-    // capacity reused across steps — no allocation once warm) until
+    // The pool IS the H2D source. Claim + page-in each unit once per compute
+    // and hand the slot's plane pointer to C; the lease stays held until
     // `copy_done`, so eviction cannot recycle a slot mid-DMA.
-    let paged = IN_FLIGHT_LEASES.with_borrow_mut(|leases| {
-        h.pool
-            .ensure_range_leased(entry.layer, entry.kind, first, last, out, leases)
+    let paged = STEP_CLAIMS.with_borrow_mut(|step| {
+        step.get_or_insert_with(|| StepClaims::new(h.pool.clone()))
+            .ensure_range_leased(entry.layer, entry.kind, first, last, out)
     });
     if let Err(e) = paged {
         p3_fatal(format!(
@@ -812,14 +814,16 @@ fn ensure_host_resident_inner(
     }
 }
 
-/// Releases the host-pool leases of the previous compute. Runs
-/// at the START of a scheduler compute; the engine synchronizes after
-/// every decode, so its DMAs are complete.
+/// Ends the previous compute's step: releases its host-pool leases and
+/// refreshes the policy snapshot. Runs at the START of a scheduler compute,
+/// after C drained the backends, so the previous compute's DMAs are complete.
 extern "C" fn copy_done(_ctx: *mut c_void) {
-    // Same thread as `ensure_host_resident` (both run inside
-    // `ggml_backend_sched_compute_splits`); Lease::drop releases each.
     guarded("copy_done", || {
-        IN_FLIGHT_LEASES.with_borrow_mut(|leases| leases.clear());
+        STEP_CLAIMS.with_borrow_mut(|step| {
+            if let Some(step) = step {
+                step.next_step();
+            }
+        });
     });
 }
 

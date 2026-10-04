@@ -22,9 +22,11 @@ use super::source::{ExpertSource, PoolGeometry};
 
 /// Read handle over the current [`PolicySnapshot`] (rebuilt by the placement
 /// thread each pass). Guarded by a primitives mutex held only for an `Arc`
-/// clone/swap, taken once per `ensure_*` call and always OUTSIDE the
-/// residency shard lock, preserving the shard lock's leaf-most position
-/// (§6.6). Modeled under loom, so T6 explores snapshot reads exactly.
+/// clone/swap, taken once per scheduler compute on the decode path
+/// ([`StepClaims::next_step`]) and once per `ensure_range`/`ensure_unit` call,
+/// and always OUTSIDE the residency shard lock, preserving the shard lock's
+/// leaf-most position (§6.6). Modeled under loom, so T6 explores snapshot reads
+/// exactly.
 #[derive(Debug, Default)]
 pub struct SnapshotHandle {
     current: super::primitives::Mutex<Arc<PolicySnapshot>>,
@@ -49,9 +51,10 @@ impl SnapshotHandle {
     }
 }
 
-/// Demand-path failure: source read failed after bounded retries. The key's
-/// claim is cancelled (no ghost residency, slot recycled); the FFI layer
-/// aborts loudly on this.
+/// Demand-path failure: a source read that failed after bounded retries
+/// (the key's claim is cancelled — no ghost residency, slot recycled; the
+/// FFI layer aborts loudly on this), an over-subscribed pool, or a caller
+/// contract violation.
 #[derive(Debug)]
 pub enum PoolError {
     /// Source read failed after bounded retries.
@@ -63,6 +66,13 @@ pub enum PoolError {
     /// — the pool is over-subscribed; leases are transient, so this is a
     /// loud contract violation, not a wait.
     Busy,
+    /// Caller passed a length-mismatched `ptrs` or an out-of-range
+    /// `(layer, expert)` range — a programming error, reported as a value
+    /// so no `pub fn` panics (library rule: errors are `Result`).
+    Contract {
+        /// What the caller violated.
+        reason: String,
+    },
 }
 
 impl fmt::Display for PoolError {
@@ -73,6 +83,7 @@ impl fmt::Display for PoolError {
                 f,
                 "expert pool busy: no evictable slot — pool over-subscribed"
             ),
+            PoolError::Contract { reason } => write!(f, "pool contract violated: {reason}"),
         }
     }
 }
@@ -86,7 +97,7 @@ impl std::error::Error for PoolError {}
 pub struct Lease {
     map: Arc<ResidencyMap>,
     /// Keeps the mapping alive while raw slot pointers handed out with this
-    /// lease (`ensure_range_leased`) may still be read by an in-flight H2D.
+    /// lease ([`StepClaims`]) may still be read by an in-flight H2D.
     _arena: Arc<Arena>,
     layer: u32,
     expert: u32,
@@ -130,12 +141,11 @@ impl Lease {
     /// #     geometry,
     /// #     vec![0],
     /// # ).unwrap();
-    /// let mut leases = Vec::new();
-    /// pool.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut [std::ptr::null()], &mut leases)
+    /// let mut step = StepClaims::new(pool);
+    /// step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut [std::ptr::null()])
     ///     .unwrap();
-    /// let lease = leases.pop().unwrap();
-    /// let bytes = lease.bytes();
-    /// drop(lease);
+    /// let bytes = step.leases()[0].bytes();
+    /// drop(step);
     /// assert_eq!(bytes[0], 1);
     /// ```
     pub fn bytes(&self) -> &[u8] {
@@ -146,6 +156,112 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         self.map.release_lease(self.layer, self.expert);
+    }
+}
+
+/// `lease_of` entry of a unit not claimed this step.
+const UNCLAIMED: u32 = u32::MAX;
+
+/// The decode thread's claim table for one scheduler compute (§6.6, §3.4
+/// P3): the first plane of a `(layer, expert)` unit claims and leases it
+/// (one shard lock); the unit's other planes reuse that lease. The policy
+/// snapshot is read once per step, so a call takes no snapshot mutex. Leases
+/// are held until [`Self::next_step`], which the caller runs only once the
+/// device has consumed the step's bytes (the glue's `copy_done`).
+pub struct StepClaims {
+    pool: Arc<ExpertPool>,
+    snapshot: Arc<PolicySnapshot>,
+    /// `layer × n_experts + expert` → index into `leases`, or `UNCLAIMED`.
+    lease_of: Vec<u32>,
+    /// This step's leases; also the touched-list `next_step` resets.
+    leases: Vec<Lease>,
+}
+
+impl StepClaims {
+    /// An empty table over every unit of `pool` (allocated once).
+    pub fn new(pool: Arc<ExpertPool>) -> Self {
+        let units = pool.geometry.layers.len() * pool.geometry.n_experts as usize;
+        Self {
+            snapshot: pool.snapshot(),
+            lease_of: vec![UNCLAIMED; units],
+            leases: Vec::new(),
+            pool,
+        }
+    }
+
+    /// The leases held this step, in claim order.
+    pub fn leases(&self) -> &[Lease] {
+        &self.leases
+    }
+
+    /// Ends the step: releases every lease, resets the entries it touched
+    /// and refreshes the snapshot. The caller guarantees the device has
+    /// consumed every pointer handed out this step.
+    pub fn next_step(&mut self) {
+        let n = self.pool.geometry.n_experts as usize;
+        for lease in self.leases.drain(..) {
+            self.lease_of[lease.layer as usize * n + lease.expert as usize] = UNCLAIMED;
+        }
+        self.snapshot = self.pool.snapshot();
+    }
+
+    /// Writes the `kind` plane's pool pointer for each expert of
+    /// `[first, last]` into `ptrs` (`last - first + 1` entries), claiming
+    /// and paging in each unit not yet leased this step. On error the units
+    /// already claimed stay leased until `next_step`; the failed one is not
+    /// recorded.
+    ///
+    /// # Errors
+    /// Source failure after bounded retries (claim cancelled first), an
+    /// over-subscribed pool, or an inverted range, length-mismatched `ptrs`,
+    /// or out-of-range unit (reported as [`PoolError::Contract`], not a
+    /// panic).
+    pub fn ensure_range_leased(
+        &mut self,
+        layer: u32,
+        kind: ExpertKind,
+        first: u32,
+        last: u32,
+        ptrs: &mut [*const u8],
+    ) -> Result<(), PoolError> {
+        let pool = &*self.pool;
+        let n = pool.geometry.n_experts;
+        if first > last {
+            return Err(PoolError::Contract {
+                reason: format!("inverted expert range [{first}, {last}]"),
+            });
+        }
+        if (layer as usize) >= pool.geometry.layers.len() || last >= n {
+            return Err(PoolError::Contract {
+                reason: format!("unit out of range: layer {layer}, experts [{first}, {last}]"),
+            });
+        }
+        if ptrs.len() != (last - first + 1) as usize {
+            return Err(PoolError::Contract {
+                reason: format!(
+                    "ptrs length {}: expected last - first + 1 = {}",
+                    ptrs.len(),
+                    last - first + 1
+                ),
+            });
+        }
+        let _inflight = pool.demand_guard(true);
+        let base = layer as usize * n as usize;
+        for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
+            let at = &mut self.lease_of[base + expert as usize];
+            if *at == UNCLAIMED {
+                let lease = pool.claim_leased(true, layer, expert, &self.snapshot)?;
+                // Count successes only: one increment per unit per scheduler
+                // compute, never for a failed attempt that will be retried.
+                pool.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
+                *at = self.leases.len() as u32;
+                self.leases.push(lease);
+            }
+            *dst = pool
+                .plane_bytes(layer, &self.leases[*at as usize], kind)
+                .as_ptr();
+        }
+        Ok(())
     }
 }
 
@@ -267,6 +383,12 @@ impl ExpertPool {
         self.demand_inflight.load(Ordering::Relaxed)
     }
 
+    /// The current policy snapshot, counted (one `SnapshotHandle` mutex hold).
+    fn snapshot(&self) -> Arc<PolicySnapshot> {
+        self.stats.snapshot_reads.fetch_add(1, Ordering::Relaxed);
+        self.snapshots.current()
+    }
+
     /// Page in every missing key in `[first, last]` for this (layer, kind),
     /// then run `copy` ONCE per key while its lease is held; `copy` receives
     /// the slot bytes. This is the P3 callback body.
@@ -308,7 +430,7 @@ impl ExpertPool {
         copy: &mut dyn FnMut(&[u8]),
     ) -> Result<(), PoolError> {
         debug_assert!(first <= last, "inverted range ({first}, {last})");
-        let snapshot = self.snapshots.current();
+        let snapshot = self.snapshot();
         for expert in first..=last {
             let lease = self.claim_leased(demand, layer, expert, &snapshot)?;
             copy(self.plane_bytes(layer, &lease, kind));
@@ -325,7 +447,7 @@ impl ExpertPool {
     /// over-subscribed pool.
     pub fn ensure_unit(&self, demand: bool, layer: u32, expert: u32) -> Result<(), PoolError> {
         let _inflight = self.demand_guard(demand);
-        let snapshot = self.snapshots.current();
+        let snapshot = self.snapshot();
         // Prefetch reads no bytes; the fill itself was the work.
         drop(self.claim_leased(demand, layer, expert, &snapshot)?);
         Ok(())
@@ -373,37 +495,6 @@ impl ExpertPool {
         let unit = &self.geometry.layers[layer as usize];
         let (off, stride) = unit.plane(kind);
         &lease.bytes()[off as usize..(off + stride) as usize]
-    }
-
-    /// Demand-claims `[first, last]`, pages each expert in, writes the pool-side
-    /// host pointer per expert into `ptrs` (`last - first + 1` entries) and
-    /// appends the held leases to `leases`. Caller-owned buffers: the decode
-    /// hot path reuses them, so no allocation per call. On error, leases for
-    /// the experts already claimed stay in `leases` (released when dropped).
-    /// The caller MUST drop the leases only after the device has consumed the
-    /// bytes (the glue releases them from the `copy_done` hook).
-    ///
-    /// # Panics
-    /// `ptrs.len() != last - first + 1`.
-    pub fn ensure_range_leased(
-        &self,
-        layer: u32,
-        kind: ExpertKind,
-        first: u32,
-        last: u32,
-        ptrs: &mut [*const u8],
-        leases: &mut Vec<Lease>,
-    ) -> Result<(), PoolError> {
-        debug_assert!(first <= last, "inverted range ({first}, {last})");
-        assert_eq!(ptrs.len(), (last - first + 1) as usize, "ptrs length");
-        let _inflight = self.demand_guard(true);
-        let snapshot = self.snapshots.current();
-        for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
-            let lease = self.claim_leased(true, layer, expert, &snapshot)?;
-            *dst = self.plane_bytes(layer, &lease, kind).as_ptr();
-            leases.push(lease);
-        }
-        Ok(())
     }
 
     /// Fills one slot from the source. The `Filled`/evict claim left this key
@@ -849,5 +940,139 @@ mod tests {
         assert!(!pool.residency.is_resident(0, 1));
         assert!(pool.residency.is_resident(0, 2));
         assert_eq!(pool.stats.evictions.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(not(loom))]
+    fn plane_byte(kind: ExpertKind, expert: u32) -> u8 {
+        0x10 * (kind.ordinal() as u8 + 1) + expert as u8
+    }
+
+    // Sequential unit test over loom-primitive pool types: needs no exploration
+    // (the t6 model covers the interleavings) and cannot run outside `model()`.
+    #[test]
+    #[cfg(not(loom))]
+    fn step_claims_each_unit_once_and_reads_the_snapshot_once_per_step() {
+        let pool = test_pool(3);
+        let mut step = StepClaims::new(pool.clone());
+        let reads = pool.stats.snapshot_reads.load(Ordering::Relaxed);
+        let mut ptrs = [std::ptr::null(); 3];
+        for kind in ExpertKind::ALL {
+            step.ensure_range_leased(0, kind, 0, 2, &mut ptrs).unwrap();
+            for (e, &p) in (0u32..).zip(&ptrs) {
+                let lease = &step.leases()[e as usize];
+                let bytes = pool.plane_bytes(0, lease, kind);
+                assert_eq!(
+                    p,
+                    bytes.as_ptr(),
+                    "{kind:?} e{e} points into its unit's lease"
+                );
+                assert!(
+                    bytes.iter().all(|&b| b == plane_byte(kind, e)),
+                    "{kind:?} e{e}"
+                );
+            }
+        }
+        let s = &pool.stats;
+        assert_eq!(
+            s.demand_claims.load(Ordering::Relaxed),
+            3,
+            "one claim per unit"
+        );
+        assert_eq!(s.demand_slow_pageins.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            s.fast_hits.load(Ordering::Relaxed),
+            0,
+            "up/down never re-claimed"
+        );
+        assert_eq!(step.leases().len(), 3);
+        assert_eq!(
+            s.snapshot_reads.load(Ordering::Relaxed),
+            reads,
+            "no snapshot read per call"
+        );
+        // All 3 slots leased across the planes: a fourth unit cannot evict.
+        assert!(matches!(
+            pool.ensure_range(true, 0, ExpertKind::Gate, 3, 3, &mut |_| {}),
+            Err(PoolError::Busy)
+        ));
+
+        // Re-read: the Busy `ensure_range` above took its own snapshot read.
+        let reads = s.snapshot_reads.load(Ordering::Relaxed);
+        step.next_step();
+        assert_eq!(
+            s.snapshot_reads.load(Ordering::Relaxed),
+            reads + 1,
+            "one read per step"
+        );
+        assert!(step.leases().is_empty());
+        // Leases released: the fourth unit now evicts one of them.
+        pool.ensure_range(true, 0, ExpertKind::Gate, 3, 3, &mut |_| {})
+            .unwrap();
+
+        for kind in ExpertKind::ALL {
+            step.ensure_range_leased(0, kind, 0, 1, &mut ptrs[..2])
+                .unwrap();
+        }
+        assert_eq!(
+            s.demand_claims.load(Ordering::Relaxed),
+            5,
+            "re-claimed once per unit"
+        );
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn a_failed_step_claim_leaves_no_stale_entry() {
+        let pool = test_pool_failing(2, (0, ExpertKind::Gate, 1));
+        let mut step = StepClaims::new(pool.clone());
+        let mut ptrs = [std::ptr::null(); 2];
+        assert!(
+            step.ensure_range_leased(0, ExpertKind::Gate, 0, 1, &mut ptrs)
+                .is_err()
+        );
+        assert_eq!(step.leases().len(), 1, "e0 stays leased, e1 does not");
+        // e1 was never recorded: the same step claims it afresh (fails once only).
+        step.ensure_range_leased(0, ExpertKind::Up, 1, 1, &mut ptrs[..1])
+            .unwrap();
+        let bytes = pool.plane_bytes(0, &step.leases()[1], ExpertKind::Up);
+        assert_eq!(ptrs[0], bytes.as_ptr());
+        assert!(bytes.iter().all(|&b| b == plane_byte(ExpertKind::Up, 1)));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn step_claim_reports_an_out_of_range_unit_as_contract_error() {
+        let pool = test_pool(2);
+        let mut step = StepClaims::new(pool);
+        let mut ptrs = [std::ptr::null()];
+        match step.ensure_range_leased(0, ExpertKind::Gate, N_EXPERTS, N_EXPERTS, &mut ptrs) {
+            Err(PoolError::Contract { reason }) => {
+                assert!(reason.contains("out of range"), "{reason}")
+            }
+            other => panic!("expected Contract error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn step_claim_reports_an_inverted_range_as_contract_error() {
+        let pool = test_pool(2);
+        let mut step = StepClaims::new(pool);
+        assert!(matches!(
+            step.ensure_range_leased(0, ExpertKind::Gate, 1, 0, &mut []),
+            Err(PoolError::Contract { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn step_claim_reports_a_length_mismatch_as_contract_error() {
+        let pool = test_pool(2);
+        let mut step = StepClaims::new(pool);
+        let mut ptrs = [std::ptr::null(); 2];
+        assert!(matches!(
+            step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut ptrs),
+            Err(PoolError::Contract { .. })
+        ));
     }
 }
