@@ -22,9 +22,11 @@ use super::source::{ExpertSource, PoolGeometry};
 
 /// Read handle over the current [`PolicySnapshot`] (rebuilt by the placement
 /// thread each pass). Guarded by a primitives mutex held only for an `Arc`
-/// clone/swap, taken once per `ensure_*` call and always OUTSIDE the
-/// residency shard lock, preserving the shard lock's leaf-most position
-/// (§6.6). Modeled under loom, so T6 explores snapshot reads exactly.
+/// clone/swap, taken once per scheduler compute on the decode path
+/// ([`StepClaims::next_step`]) and once per `ensure_range`/`ensure_unit` call,
+/// and always OUTSIDE the residency shard lock, preserving the shard lock's
+/// leaf-most position (§6.6). Modeled under loom, so T6 explores snapshot reads
+/// exactly.
 #[derive(Debug, Default)]
 pub struct SnapshotHandle {
     current: super::primitives::Mutex<Arc<PolicySnapshot>>,
@@ -86,7 +88,7 @@ impl std::error::Error for PoolError {}
 pub struct Lease {
     map: Arc<ResidencyMap>,
     /// Keeps the mapping alive while raw slot pointers handed out with this
-    /// lease (`ensure_range_leased`) may still be read by an in-flight H2D.
+    /// lease ([`StepClaims`]) may still be read by an in-flight H2D.
     _arena: Arc<Arena>,
     layer: u32,
     expert: u32,
@@ -130,12 +132,11 @@ impl Lease {
     /// #     geometry,
     /// #     vec![0],
     /// # ).unwrap();
-    /// let mut leases = Vec::new();
-    /// pool.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut [std::ptr::null()], &mut leases)
+    /// let mut step = StepClaims::new(pool);
+    /// step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut [std::ptr::null()])
     ///     .unwrap();
-    /// let lease = leases.pop().unwrap();
-    /// let bytes = lease.bytes();
-    /// drop(lease);
+    /// let bytes = step.leases()[0].bytes();
+    /// drop(step);
     /// assert_eq!(bytes[0], 1);
     /// ```
     pub fn bytes(&self) -> &[u8] {
@@ -471,37 +472,6 @@ impl ExpertPool {
         let unit = &self.geometry.layers[layer as usize];
         let (off, stride) = unit.plane(kind);
         &lease.bytes()[off as usize..(off + stride) as usize]
-    }
-
-    /// Demand-claims `[first, last]`, pages each expert in, writes the pool-side
-    /// host pointer per expert into `ptrs` (`last - first + 1` entries) and
-    /// appends the held leases to `leases`. Caller-owned buffers: the decode
-    /// hot path reuses them, so no allocation per call. On error, leases for
-    /// the experts already claimed stay in `leases` (released when dropped).
-    /// The caller MUST drop the leases only after the device has consumed the
-    /// bytes (the glue releases them from the `copy_done` hook).
-    ///
-    /// # Panics
-    /// `ptrs.len() != last - first + 1`.
-    pub fn ensure_range_leased(
-        &self,
-        layer: u32,
-        kind: ExpertKind,
-        first: u32,
-        last: u32,
-        ptrs: &mut [*const u8],
-        leases: &mut Vec<Lease>,
-    ) -> Result<(), PoolError> {
-        debug_assert!(first <= last, "inverted range ({first}, {last})");
-        assert_eq!(ptrs.len(), (last - first + 1) as usize, "ptrs length");
-        let _inflight = self.demand_guard(true);
-        let snapshot = self.snapshot();
-        for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
-            let lease = self.claim_leased(true, layer, expert, &snapshot)?;
-            *dst = self.plane_bytes(layer, &lease, kind).as_ptr();
-            leases.push(lease);
-        }
-        Ok(())
     }
 
     /// Fills one slot from the source. The `Filled`/evict claim left this key

@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 
 use golem_engine::error::EngineError;
 use golem_engine::session::{ChatTurn, Session};
+use xtask::tiny_moe::dims;
 
 fn turn(prompt: &str) -> [ChatTurn<'_>; 1] {
     [ChatTurn {
@@ -44,6 +45,18 @@ fn p3_counters_move_cold_to_warm_and_second_session_is_refused() {
     assert!(
         stats.demand_slow_pageins.load(Ordering::Relaxed) > 0,
         "cold decode pages experts in"
+    );
+
+    // §6.6 claim-once: the slab copies all three planes of a unit in the same
+    // compute (P2 validity bits move together), so ≤ 1 claim per unit per
+    // compute means claims ≤ plane copies / 3. Every tiny-moe plane is
+    // N_EMBD · N_FF_EXP f32 (gate/up [embd, ff], down [ff, embd]).
+    let plane_bytes = u64::from(dims::N_EMBD * dims::N_FF_EXP) * 4;
+    let plane_copies = on.device_cache_stats().unwrap().bytes_copied / plane_bytes;
+    let claims = stats.demand_claims.load(Ordering::Relaxed);
+    assert!(
+        claims > 0 && 3 * claims <= plane_copies,
+        "one shard-lock claim per unit per compute: {claims} claims for {plane_copies} plane copies"
     );
 
     // Warm decode: the P2 device cache serves the second turn (skips rise)
