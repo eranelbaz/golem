@@ -248,6 +248,48 @@ fn revision_from_hf_cache_metadata_and_rejects_non_hex() {
     }
 }
 
+#[test]
+fn revision_walks_all_ancestors_and_splits_absent_from_unknown() {
+    let root = tempdir("hf-nested");
+    let sha = "beefcafe1234567";
+    let snap = Path::new("hub/models--org--name/snapshots").join(sha);
+    let sub = root.join(&snap);
+    std::fs::create_dir_all(&sub).unwrap();
+    copy_fixture_to(&sub);
+    let n = xtask::shape_moe::cached_fixture()[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let meta = root
+        .join(".cache/huggingface/download")
+        .join(&snap)
+        .join(format!("{n}.metadata"));
+
+    // Metadata absent at every ancestor → no revision and no source line.
+    let m = import(&req(sub.clone(), vec![])).unwrap().manifest;
+    assert_eq!(
+        (m.revision.as_deref(), m.revision_source.as_deref()),
+        (None, None)
+    );
+
+    // The first *existing* metadata decides even when bad, so a bad one at
+    // the found ancestor yields `unknown`, never a walk past it.
+    std::fs::create_dir_all(meta.parent().unwrap()).unwrap();
+    std::fs::write(&meta, "garbage line\n").unwrap();
+    let m = import(&req(sub.clone(), vec![])).unwrap().manifest;
+    assert_eq!(
+        (m.revision.as_deref(), m.revision_source.as_deref()),
+        (None, Some("unknown"))
+    );
+
+    // Commit hash on line 1 of that same file, reached three ancestors up.
+    std::fs::write(&meta, format!("{sha}\netag\n1.0\n")).unwrap();
+    let m = import(&req(sub, vec![])).unwrap().manifest;
+    assert_eq!(m.revision.as_deref(), Some(sha));
+    assert_eq!(m.revision_source.as_deref(), Some("hf-cache"));
+}
+
 fn no_tmp(dir: &Path) -> bool {
     std::fs::read_dir(dir).unwrap().all(|e| {
         !e.unwrap()

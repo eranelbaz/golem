@@ -889,31 +889,38 @@ fn is_commit_hash(line: &str) -> bool {
 }
 
 /// HF download metadata revision for a source dir `dir` with first shard
-/// `shard`: `<dir-parent>/.cache/huggingface/download/<dir-name>/<shard>.metadata`,
-/// whose first line is the commit hash. Returns `(revision, source)`;
-/// `(None, None)` when the metadata file does not exist, `(None,
-/// Some("unknown"))` when it holds no plausible commit hash.
+/// `shard`: walk `dir`'s ancestors (nearest first); the first `a` for which
+/// `a/.cache/huggingface/download/<dir relative to a>/<shard>.metadata`
+/// exists decides — its first line is the revision when it is 7–64
+/// lowercase hex (no trimming), anything else is `unknown`. Returns
+/// `(revision, source)`: `(None, None)` when no ancestor has the file,
+/// `(None, Some("unknown"))` when the nearest existing one is unreadable,
+/// non-UTF-8, or holds no plausible commit hash.
 fn hf_cache_revision(dir: &Path, shard: &Path) -> (Option<String>, Option<&'static str>) {
-    let (Some(name), Some(parent), Some(file)) = (dir.file_name(), dir.parent(), shard.file_name())
-    else {
+    let Some(file) = shard.file_name() else {
         return (None, None);
     };
-    let meta = parent
-        .join(".cache/huggingface/download")
-        .join(name)
-        .join(format!("{}.metadata", file.to_string_lossy()));
-    let Ok(text) = std::fs::read_to_string(&meta) else {
-        return (None, None);
-    };
-    match text
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|l| is_commit_hash(l))
-    {
-        Some(line) => (Some(line.to_owned()), Some("hf-cache")),
-        None => (None, Some("unknown")),
+    for a in dir.ancestors().skip(1) {
+        let Ok(rel) = dir.strip_prefix(a) else {
+            continue;
+        };
+        let meta = a
+            .join(".cache/huggingface/download")
+            .join(rel)
+            .join(format!("{}.metadata", file.to_string_lossy()));
+        // The first *existing* metadata file decides, hex or not; a truly
+        // absent one (or dir) keeps the search going up the chain.
+        let text = match std::fs::read_to_string(&meta) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return (None, Some("unknown")),
+        };
+        return match text.lines().next().filter(|l| is_commit_hash(l)) {
+            Some(line) => (Some(line.to_owned()), Some("hf-cache")),
+            None => (None, Some("unknown")),
+        };
     }
+    (None, None)
 }
 
 /// Free-space need for one replica: bytes of every shard whose copy is

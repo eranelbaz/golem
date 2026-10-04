@@ -36,8 +36,13 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    // A failed rename must not orphan the temp file either; after a
-    // successful rename the parent-dir fsync makes the new name durable.
+    // A failed rename must not orphan the temp file either. If the rename
+    // succeeded but the parent-dir fsync failed, the error is still
+    // returned while the file is already published: `path` exists and its
+    // bytes are durable (the file itself was fsynced above) — only the
+    // directory entry's persistence is unconfirmed, so callers must treat
+    // this Err as "state unknown", not "target unchanged". The tmp removal
+    // below is then a harmless no-op.
     let publish = std::fs::rename(&tmp, path).and_then(|()| {
         let dir = std::fs::File::open(path.parent().unwrap_or(Path::new(".")));
         dir.and_then(|d| d.sync_all())
