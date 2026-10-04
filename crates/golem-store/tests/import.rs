@@ -1,6 +1,6 @@
 //! `golem_store::import::scan_source` against the shape-realistic fixture:
 //! shard-set discovery, arch gate, live-only planes, and pinned geometry.
-use golem_store::import::{ImportError, scan_source};
+use golem_store::import::{ImportError, hash_shards, scan_source, verify_replica};
 use std::path::{Path, PathBuf};
 
 fn fixture_dir() -> PathBuf {
@@ -125,4 +125,116 @@ fn scan_requires_chat_template_kv() {
     let msg = err.to_string();
     assert!(msg.contains("missing tokenizer.chat_template"), "{msg}");
     assert!(matches!(err, ImportError::Source { .. }));
+}
+
+fn no_tmp(dir: &Path) -> bool {
+    std::fs::read_dir(dir).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".golem-import")
+    })
+}
+
+// The fixture shards are ≈4 MB — smaller than the default 8 MiB chunk — so a
+// fixed chunk size could never exercise an expert spanning a chunk boundary;
+// the chunk-size parameter exists for exactly this test.
+#[test]
+fn digests_and_crcs_are_chunk_size_invariant() {
+    use sha2::{Digest, Sha256};
+    let scan = scan_source(&fixture_dir()).unwrap();
+    let mut prev: Option<Vec<Vec<u32>>> = None;
+    for chunk in [4096 + 7, 64 * 1024, 1 << 20, 8 << 20] {
+        let out = hash_shards(&scan, &[], chunk).unwrap();
+        for (i, p) in scan.shards.iter().enumerate() {
+            let bytes = std::fs::read(p).unwrap();
+            assert_eq!(out.sha256[i], format!("{:x}", Sha256::digest(&bytes)));
+            assert_eq!(out.bytes[i], bytes.len() as u64);
+        }
+        for (pi, plane) in scan.planes.iter().enumerate() {
+            let bytes = std::fs::read(&scan.shards[plane.shard]).unwrap();
+            for e in 0..plane.experts as usize {
+                let a = plane.base as usize + e * plane.stride as usize;
+                assert_eq!(
+                    out.crc[pi][e],
+                    crc32c::crc32c(&bytes[a..a + plane.stride as usize]),
+                    "chunk {chunk}"
+                );
+            }
+        }
+        if let Some(p) = &prev {
+            assert_eq!(p, &out.crc);
+        }
+        prev = Some(out.crc);
+    }
+}
+
+#[test]
+fn replica_clone_is_byte_identical_and_clean() {
+    let scan = scan_source(&fixture_dir()).unwrap();
+    let r = tempdir("replica");
+    hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).unwrap();
+    for p in &scan.shards {
+        assert_eq!(
+            std::fs::read(p).unwrap(),
+            std::fs::read(r.join(p.file_name().unwrap())).unwrap()
+        );
+    }
+    assert!(no_tmp(&r), "tmp and lock removed");
+}
+
+#[test]
+fn same_size_wrong_bytes_replica_is_recloned() {
+    let scan = scan_source(&fixture_dir()).unwrap();
+    let r = tempdir("stale");
+    copy_fixture_to(&r);
+    let victim = r.join(scan.shards[1].file_name().unwrap());
+    let mut b = std::fs::read(&victim).unwrap();
+    let mid = b.len() / 2;
+    b[mid] ^= 0xff;
+    std::fs::write(&victim, &b).unwrap();
+    hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).unwrap();
+    assert_eq!(
+        std::fs::read(&scan.shards[1]).unwrap(),
+        std::fs::read(&victim).unwrap()
+    );
+}
+
+#[test]
+fn verify_replica_reports_mismatch() {
+    let scan = scan_source(&fixture_dir()).unwrap();
+    let r = tempdir("verify");
+    let f = r.join("x.gguf");
+    std::fs::write(&f, b"not the shard").unwrap();
+    let want = hash_shards(&scan, &[], 1 << 20).unwrap().sha256[1].clone();
+    assert!(matches!(
+        verify_replica(&f, &want, 1 << 20),
+        Err(ImportError::ReplicaMismatch { .. })
+    ));
+}
+
+#[test]
+fn failed_replica_leaves_no_tmp_in_any_replica() {
+    let scan = scan_source(&fixture_dir()).unwrap();
+    let good = tempdir("good");
+    let bad = tempdir("bad").join("missing-subdir");
+    assert!(hash_shards(&scan, &[good.clone(), bad], 64 * 1024).is_err());
+    assert!(no_tmp(&good));
+}
+
+#[test]
+fn stale_tmp_is_swept_and_live_lock_refuses() {
+    let scan = scan_source(&fixture_dir()).unwrap();
+    let r = tempdir("sweep");
+    std::fs::write(r.join("old.gguf.golem-import.123.0.tmp"), b"x").unwrap();
+    hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).unwrap();
+    assert!(no_tmp(&r));
+    std::fs::write(r.join(".golem-import.lock"), b"not-a-pid").unwrap();
+    hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).unwrap();
+    assert!(no_tmp(&r), "stale lock taken over and released");
+    std::fs::write(r.join(".golem-import.lock"), std::process::id().to_string()).unwrap();
+    let e = hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains(".golem-import.lock"), "{e}");
 }
