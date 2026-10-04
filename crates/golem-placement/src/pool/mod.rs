@@ -7,7 +7,8 @@
 //! [`primitives`] (std/loom cfg-swap) — no direct `std::sync` in pool code.
 //! The residency shard lock is leaf-most: policy state reaches `claim` only
 //! through a [`PolicySnapshot`] read (one short mutex hold per decode-path
-//! compute, per prefetch/`ensure_range` call) made before any shard lock is taken.
+//! compute, per prefetch/`ensure_range` call) made before any shard lock is
+//! taken.
 
 /// mlock'd slot arena — the only `unsafe` in the pool module.
 #[allow(unsafe_code)]

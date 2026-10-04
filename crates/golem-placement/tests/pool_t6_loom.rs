@@ -218,6 +218,7 @@ fn t6_step_claim_pins_the_unit_across_planes() {
                         .iter()
                         .all(|&b| b == plane_byte(ExpertKind::Down, 0))
                 );
+                assert_eq!(ptr[0], bytes[16..].as_ptr());
                 assert_eq!(pool.stats.demand_claims.load(Ordering::Relaxed), 1);
             }
             // The evictor leased the only slot first.

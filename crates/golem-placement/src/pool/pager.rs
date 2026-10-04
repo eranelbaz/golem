@@ -51,9 +51,10 @@ impl SnapshotHandle {
     }
 }
 
-/// Demand-path failure: source read failed after bounded retries. The key's
-/// claim is cancelled (no ghost residency, slot recycled); the FFI layer
-/// aborts loudly on this.
+/// Demand-path failure: a source read that failed after bounded retries
+/// (the key's claim is cancelled — no ghost residency, slot recycled; the
+/// FFI layer aborts loudly on this), an over-subscribed pool, or a caller
+/// contract violation.
 #[derive(Debug)]
 pub enum PoolError {
     /// Source read failed after bounded retries.
@@ -212,8 +213,9 @@ impl StepClaims {
     ///
     /// # Errors
     /// Source failure after bounded retries (claim cancelled first), an
-    /// over-subscribed pool, or a length-mismatched `ptrs` / out-of-range
-    /// unit (reported as [`PoolError::Contract`], not a panic).
+    /// over-subscribed pool, or an inverted range, length-mismatched `ptrs`,
+    /// or out-of-range unit (reported as [`PoolError::Contract`], not a
+    /// panic).
     pub fn ensure_range_leased(
         &mut self,
         layer: u32,
@@ -222,9 +224,18 @@ impl StepClaims {
         last: u32,
         ptrs: &mut [*const u8],
     ) -> Result<(), PoolError> {
-        debug_assert!(first <= last, "inverted range ({first}, {last})");
         let pool = &*self.pool;
         let n = pool.geometry.n_experts;
+        if first > last {
+            return Err(PoolError::Contract {
+                reason: format!("inverted expert range [{first}, {last}]"),
+            });
+        }
+        if (layer as usize) >= pool.geometry.layers.len() || last >= n {
+            return Err(PoolError::Contract {
+                reason: format!("unit out of range: layer {layer}, experts [{first}, {last}]"),
+            });
+        }
         if ptrs.len() != (last - first + 1) as usize {
             return Err(PoolError::Contract {
                 reason: format!(
@@ -232,11 +243,6 @@ impl StepClaims {
                     ptrs.len(),
                     last - first + 1
                 ),
-            });
-        }
-        if (layer as usize) >= pool.geometry.layers.len() || last >= n {
-            return Err(PoolError::Contract {
-                reason: format!("unit out of range: layer {layer}, experts [{first}, {last}]"),
             });
         }
         let _inflight = pool.demand_guard(true);
@@ -1045,6 +1051,17 @@ mod tests {
             }
             other => panic!("expected Contract error, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn step_claim_reports_an_inverted_range_as_contract_error() {
+        let pool = test_pool(2);
+        let mut step = StepClaims::new(pool);
+        assert!(matches!(
+            step.ensure_range_leased(0, ExpertKind::Gate, 1, 0, &mut []),
+            Err(PoolError::Contract { .. })
+        ));
     }
 
     #[test]
