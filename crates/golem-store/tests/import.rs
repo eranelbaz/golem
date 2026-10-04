@@ -290,6 +290,52 @@ fn revision_walks_all_ancestors_and_splits_absent_from_unknown() {
     assert_eq!(m.revision_source.as_deref(), Some("hf-cache"));
 }
 
+// Independent full-plane CRC check against the real GLM-5.3-Flash import:
+// locates the tensor via `golem_gguf::tensor_entries` (not `PlaneSpan`) and
+// verifies every expert's bytes against the manifest CRC32C. Needs ~1.6 GB of
+// shard reads, so it is opt-in; without GOLEM_IMPORT_MANIFEST it fails (AGENTS
+// evidence rule), it never silently passes.
+#[test]
+#[ignore = "reads ~1.6 GB of real model shards; set GOLEM_IMPORT_MANIFEST and run with --run-ignored only"]
+fn real_plane_crc() {
+    use std::io::{Read, Seek};
+
+    let path = std::env::var("GOLEM_IMPORT_MANIFEST")
+        .expect("GOLEM_IMPORT_MANIFEST must point at the imported manifest");
+    let m = golem_store::load_manifest(Path::new(&path)).unwrap();
+    let entry = m
+        .expert_index
+        .as_ref()
+        .expect("manifest must carry an expert index")
+        .iter()
+        .find(|e| e.layer == 23 && e.tensor.contains("ffn_down_exps"))
+        .expect("middle-layer ffn_down_exps entry")
+        .clone();
+    let crcs = entry.crc32c.as_ref().expect("manifest CRC32C per expert");
+    assert_eq!(crcs.len(), entry.experts as usize);
+
+    // Locate the shard holding the tensor by walking each shard's tensor
+    // table (header-only reads); replicas[0] is the source copy.
+    let mut loc = None;
+    for s in &m.shards {
+        let mut f = std::fs::File::open(s.replicas[0].join(&s.file)).unwrap();
+        let entries = golem_gguf::tensor_entries(&mut f).unwrap();
+        if let Some(t) = entries.iter().find(|t| t.name == entry.tensor) {
+            let dso = golem_gguf::data_section_offset(&mut f).unwrap();
+            loc = Some((f, dso + t.offset));
+            break;
+        }
+    }
+    let (mut f, base) = loc.expect("tensor found in some shard");
+
+    let row = &mut vec![0u8; entry.bytes_per_expert as usize];
+    for (i, off) in entry.offsets_bytes.iter().enumerate() {
+        f.seek(std::io::SeekFrom::Start(base + off)).unwrap();
+        f.read_exact(row).unwrap();
+        assert_eq!(crc32c::crc32c(row), crcs[i], "{} expert {i}", entry.tensor);
+    }
+}
+
 fn no_tmp(dir: &Path) -> bool {
     std::fs::read_dir(dir).unwrap().all(|e| {
         !e.unwrap()
