@@ -65,6 +65,13 @@ pub enum PoolError {
     /// — the pool is over-subscribed; leases are transient, so this is a
     /// loud contract violation, not a wait.
     Busy,
+    /// Caller passed a length-mismatched `ptrs` or an out-of-range
+    /// `(layer, expert)` range — a programming error, reported as a value
+    /// so no `pub fn` panics (library rule: errors are `Result`).
+    Contract {
+        /// What the caller violated.
+        reason: String,
+    },
 }
 
 impl fmt::Display for PoolError {
@@ -75,6 +82,7 @@ impl fmt::Display for PoolError {
                 f,
                 "expert pool busy: no evictable slot — pool over-subscribed"
             ),
+            PoolError::Contract { reason } => write!(f, "pool contract violated: {reason}"),
         }
     }
 }
@@ -203,11 +211,9 @@ impl StepClaims {
     /// recorded.
     ///
     /// # Errors
-    /// Source failure after bounded retries (claim cancelled first) or an
-    /// over-subscribed pool.
-    ///
-    /// # Panics
-    /// `ptrs.len() != last - first + 1`, or a unit outside the pool.
+    /// Source failure after bounded retries (claim cancelled first), an
+    /// over-subscribed pool, or a length-mismatched `ptrs` / out-of-range
+    /// unit (reported as [`PoolError::Contract`], not a panic).
     pub fn ensure_range_leased(
         &mut self,
         layer: u32,
@@ -217,13 +223,22 @@ impl StepClaims {
         ptrs: &mut [*const u8],
     ) -> Result<(), PoolError> {
         debug_assert!(first <= last, "inverted range ({first}, {last})");
-        assert_eq!(ptrs.len(), (last - first + 1) as usize, "ptrs length");
         let pool = &*self.pool;
         let n = pool.geometry.n_experts;
-        assert!(
-            (layer as usize) < pool.geometry.layers.len() && last < n,
-            "unit out of range: layer {layer}, experts [{first}, {last}]"
-        );
+        if ptrs.len() != (last - first + 1) as usize {
+            return Err(PoolError::Contract {
+                reason: format!(
+                    "ptrs length {}: expected last - first + 1 = {}",
+                    ptrs.len(),
+                    last - first + 1
+                ),
+            });
+        }
+        if (layer as usize) >= pool.geometry.layers.len() || last >= n {
+            return Err(PoolError::Contract {
+                reason: format!("unit out of range: layer {layer}, experts [{first}, {last}]"),
+            });
+        }
         let _inflight = pool.demand_guard(true);
         let base = layer as usize * n as usize;
         for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
@@ -1020,11 +1035,27 @@ mod tests {
 
     #[test]
     #[cfg(not(loom))]
-    #[should_panic(expected = "unit out of range")]
-    fn step_claim_rejects_an_out_of_range_unit() {
+    fn step_claim_reports_an_out_of_range_unit_as_contract_error() {
         let pool = test_pool(2);
         let mut step = StepClaims::new(pool);
         let mut ptrs = [std::ptr::null()];
-        let _ = step.ensure_range_leased(0, ExpertKind::Gate, N_EXPERTS, N_EXPERTS, &mut ptrs);
+        match step.ensure_range_leased(0, ExpertKind::Gate, N_EXPERTS, N_EXPERTS, &mut ptrs) {
+            Err(PoolError::Contract { reason }) => {
+                assert!(reason.contains("out of range"), "{reason}")
+            }
+            other => panic!("expected Contract error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn step_claim_reports_a_length_mismatch_as_contract_error() {
+        let pool = test_pool(2);
+        let mut step = StepClaims::new(pool);
+        let mut ptrs = [std::ptr::null(); 2];
+        assert!(matches!(
+            step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut ptrs),
+            Err(PoolError::Contract { .. })
+        ));
     }
 }
