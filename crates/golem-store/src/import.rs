@@ -168,6 +168,18 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
                     ),
                 ));
             }
+            // Untrusted header value: a split shard is one listed file, so a
+            // count beyond the listed files can never complete; fail before
+            // materializing an attacker-sized path list.
+            if count > names.len() as u64 {
+                return Err(source(
+                    &first_path,
+                    format!(
+                        "split.count {count} exceeds {} listed .gguf files",
+                        names.len()
+                    ),
+                ));
+            }
             let expected: Vec<PathBuf> = (0..count)
                 .map(|i| shard_path(&first_path, i, count))
                 .collect::<std::io::Result<_>>()

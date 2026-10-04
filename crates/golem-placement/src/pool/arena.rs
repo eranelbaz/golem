@@ -73,7 +73,8 @@ impl std::error::Error for ArenaError {}
 /// lives on the open file description, so one call at open covers every read.
 pub(crate) fn advise_random(file: &std::fs::File) {
     use std::os::fd::AsRawFd;
-    // SAFETY: as in `drop_page_cache`; offset 0 / len 0 means the whole file.
+    // SAFETY: as in `golem_store::sys::drop_page_cache`; offset 0 / len 0
+    // means the whole file.
     unsafe {
         libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
     }

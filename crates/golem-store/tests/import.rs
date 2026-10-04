@@ -218,7 +218,13 @@ fn import_rejects_bad_name_and_empty_label() {
 
 #[test]
 fn revision_from_hf_cache_metadata_and_rejects_non_hex() {
-    for (line1, want) in [("abc1234def", Some("abc1234def")), ("not a sha", None)] {
+    for (line1, want) in [
+        ("abc1234def", Some("abc1234def")),
+        ("not a sha", None),
+        // Hash lines are matched without trimming: surrounding whitespace
+        // disqualifies the line, so the revision is `unknown`.
+        ("  abc1234def  ", None),
+    ] {
         let root = tempdir(&format!("hf-{}", want.is_some()));
         let sub = root.join("Q");
         let meta = root.join(".cache/huggingface/download/Q");

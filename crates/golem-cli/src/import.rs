@@ -30,8 +30,9 @@ pub struct ImportArgs {
 
 /// Runs one import to completion: fail fast on an existing manifest, hash +
 /// mirror, print same-disk warnings, then publish the manifest atomically.
-/// The overwrite guard is re-checked after the (possibly long) hash so two
-/// concurrent imports of one name cannot silently clobber each other.
+/// The overwrite guard is re-checked after the (possibly long) hash, but
+/// concurrent imports may still race on the final manifest write — last
+/// writer wins, and both outputs are valid manifests.
 ///
 /// # Errors
 /// Any failure from argument resolution, the import itself, manifest
