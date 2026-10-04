@@ -360,6 +360,7 @@ name = "golem-placement"
 version = "0.1.0"
 dependencies = [
  "golem-gguf",
+ "golem-store",
  "libc",
  "loom",
  "thiserror",

@@ -68,36 +68,6 @@ impl fmt::Display for ArenaError {
 
 impl std::error::Error for ArenaError {}
 
-/// Page-aligned superset of `[off, off + len)`: the kernel only drops whole
-/// pages inside the advised range, so the partial boundary pages must be
-/// covered explicitly.
-pub(crate) fn page_span(off: u64, len: usize) -> (u64, u64) {
-    let page = PAGE as u64;
-    let start = off - off % page;
-    let end = (off + len as u64).next_multiple_of(page);
-    (start, end - start)
-}
-
-/// Drops the pages covering `[off, off + len)` of `file` from the page cache
-/// once its bytes sit in a pool slot: expert bytes must never stay
-/// double-cached (§5.4; 172.8 GiB of experts vs 93 GiB RAM). Advisory — a
-/// failure leaves only a cache-pressure cost, never wrong bytes, so it is not
-/// an error.
-pub(crate) fn drop_page_cache(file: &std::fs::File, off: u64, len: usize) {
-    use std::os::fd::AsRawFd;
-    let (start, span) = page_span(off, len);
-    // SAFETY: posix_fadvise takes a live fd (borrowed from `file` for the
-    // call) and plain integers; it touches no Rust-visible memory.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            start as libc::off_t,
-            span as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        );
-    }
-}
-
 /// Marks `file` random-access so buffered expert reads do no readahead (it
 /// would only populate the cache with neighbouring expert bytes). The flag
 /// lives on the open file description, so one call at open covers every read.
@@ -365,14 +335,6 @@ mod tests {
             },
         ])
         .expect("mlock may fail on low RLIMIT_MEMLOCK")
-    }
-
-    #[test]
-    fn page_span_covers_partial_boundary_pages() {
-        assert_eq!(page_span(0, 4096), (0, 4096));
-        assert_eq!(page_span(100, 4096), (0, 8192), "straddles two pages");
-        assert_eq!(page_span(4096 + 8, 10), (4096, 4096));
-        assert_eq!(page_span(8191, 2), (4096, 8192));
     }
 
     #[test]

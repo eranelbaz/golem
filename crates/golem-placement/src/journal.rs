@@ -233,12 +233,13 @@ pub fn journal_dir_from(data_dir: Option<&str>, instance: Option<&str>) -> Optio
     )
 }
 
-/// [`journal_dir_from`] over the process environment (`GOLEM_DATA_DIR`,
-/// `GOLEM_INSTANCE`). Thin wrapper only — no env mutation anywhere
-/// (workspace denies `unsafe`; `set_var` is unsafe in edition 2024).
+/// [`journal_dir_from`] over the process environment (`GOLEM_DATA_DIR` read
+/// once, in [`golem_store::data_dir`]; `GOLEM_INSTANCE`). Thin wrapper only —
+/// no env mutation anywhere (workspace denies `unsafe`; `set_var` is unsafe
+/// in edition 2024).
 pub fn journal_dir() -> Option<PathBuf> {
     journal_dir_from(
-        std::env::var("GOLEM_DATA_DIR").ok().as_deref(),
+        golem_store::data_dir().as_deref().and_then(Path::to_str),
         std::env::var("GOLEM_INSTANCE").ok().as_deref(),
     )
 }

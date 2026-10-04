@@ -3,7 +3,8 @@
 //! Higher-level metadata parsing lives with each consumer.
 
 use std::collections::HashSet;
-use std::io::{Read, Seek};
+use std::io::{self, Read, Seek};
+use std::path::{Path, PathBuf};
 
 /// GGUF v3 value-type tags (ggml/include/gguf.h): 9 = array, 12 = f64.
 pub const TYPE_U8: u32 = 0;
@@ -452,6 +453,77 @@ pub fn arch_kv_int(kvs: &[(String, KvVal)], suffix: &str) -> Option<u64> {
     kv_int(kvs, &format!("{arch}.{suffix}"))
 }
 
+/// Live expert blocks (§2.2, R-2): `[leading_dense, block_count − nextn)`.
+/// MTP/NextN blocks excluded; an empty or inverted range is a corrupt header.
+pub fn live_layers(kvs: &[(String, KvVal)]) -> Result<std::ops::Range<u32>, Error> {
+    let get = |k: &str| arch_kv_int(kvs, k);
+    let bc = get("block_count").ok_or_else(|| Error::Invalid("missing block_count".into()))?;
+    let nextn = get("nextn_predict_layers").unwrap_or(0);
+    let lead = get("leading_dense_block_count").unwrap_or(0);
+    let end = bc.checked_sub(nextn).ok_or_else(|| {
+        Error::Invalid(format!("nextn_predict_layers {nextn} > block_count {bc}"))
+    })?;
+    if lead >= end {
+        return Err(Error::Invalid(format!(
+            "no live layers: lead {lead}, block_count {bc}, nextn {nextn}"
+        )));
+    }
+    let to32 = |v: u64| {
+        u32::try_from(v).map_err(|_| Error::Invalid(format!("block index {v} out of range")))
+    };
+    Ok(to32(lead)?..to32(end)?)
+}
+
+/// `blk.<N>.` prefix parse.
+#[must_use]
+pub fn blk_of(name: &str) -> Option<u32> {
+    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
+/// Sibling-shard path for shard `no` of `count`, rewriting the standard
+/// `-NNNNN-of-MMMMM.gguf` suffix of `first`. Single-file models (`count ==
+/// 1`) return `first` unchanged.
+pub fn shard_path(first: &Path, no: u64, count: u64) -> std::io::Result<PathBuf> {
+    if count == 1 {
+        return Ok(first.to_path_buf());
+    }
+    let name = first.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("non-UTF-8 model path {first:?}"),
+        )
+    })?;
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    let Some((prefix, counts)) = stem.rsplit_once("-of-") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "split.count = {count} but {name} does not end in -NNNNN-of-MMMMM.{ext:?}; \
+                 cannot discover sibling shards"
+            ),
+        ));
+    };
+    let Some((base, idx)) = prefix.rsplit_once('-') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot split shard index from {name}"),
+        ));
+    };
+    if !idx.bytes().all(|b| b.is_ascii_digit()) || idx.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shard index {idx:?} in {name} is not numeric"),
+        ));
+    }
+    let width = idx.len();
+    let ext_dot = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    Ok(first.with_file_name(format!("{base}-{:0width$}-of-{counts}{ext_dot}", no + 1)))
+}
+
 /// Absolute file offset of the tensor-data section: end of the tensor table
 /// (which follows the KV block) aligned up to `general.alignment` — the layout
 /// gguf.h and the fixture writer produce. Rewinds to the start first.
@@ -725,5 +797,63 @@ mod tests {
         let b = sample_gguf(0);
         let mut cur = std::io::Cursor::new(&b);
         assert!(data_section_offset(&mut cur).is_err());
+    }
+
+    fn glm_kvs(bc: u64, lead: u64, nextn: u64) -> Vec<(String, KvVal)> {
+        vec![
+            ("general.architecture".into(), KvVal::Str("glm5next".into())),
+            ("glm5next.block_count".into(), KvVal::Int(bc)),
+            (
+                "glm5next.leading_dense_block_count".into(),
+                KvVal::Int(lead),
+            ),
+            ("glm5next.nextn_predict_layers".into(), KvVal::Int(nextn)),
+        ]
+    }
+
+    #[test]
+    fn live_layers_excludes_dense_lead_and_mtp() {
+        assert_eq!(
+            live_layers(&glm_kvs(46, 3, 1)).unwrap(),
+            3..45,
+            "42 live, blk.45 MTP out"
+        );
+    }
+
+    #[test]
+    fn live_layers_rejects_corrupt_ranges() {
+        for (bc, lead, nextn) in [(2, 0, 3), (46, 50, 1), (4, 0, 4)] {
+            assert!(
+                matches!(
+                    live_layers(&glm_kvs(bc, lead, nextn)),
+                    Err(Error::Invalid(_))
+                ),
+                "{bc} {lead} {nextn}"
+            );
+        }
+    }
+
+    #[test]
+    fn blk_of_parses_prefix_only() {
+        assert_eq!(blk_of("blk.45.ffn_up_exps.weight"), Some(45));
+        assert_eq!(blk_of("output.weight"), None);
+        assert_eq!(blk_of("blk.x.ffn"), None);
+    }
+
+    #[test]
+    fn shard_path_rewrites_index_keeping_width() {
+        use std::path::Path;
+        let p = |s: &str, no, n| shard_path(Path::new(s), no, n).unwrap();
+        assert_eq!(
+            p("/d/M-00001-of-00006.gguf", 5, 6),
+            Path::new("/d/M-00006-of-00006.gguf")
+        );
+        assert_eq!(
+            p("/d/a-b-001-of-002.gguf", 1, 2),
+            Path::new("/d/a-b-002-of-002.gguf")
+        );
+        assert_eq!(p("/d/one.gguf", 0, 1), Path::new("/d/one.gguf"));
+        assert!(shard_path(Path::new("/d/a.gguf"), 1, 2).is_err());
+        assert!(shard_path(Path::new("/d/a-x-of-2.gguf"), 1, 2).is_err());
     }
 }
