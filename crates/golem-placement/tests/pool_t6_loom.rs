@@ -9,7 +9,7 @@ use golem_placement::pool::primitives::arc_dyn;
 use golem_placement::pool::primitives::{self, Arc};
 use golem_placement::pool::{
     Arena, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, PoolError, PoolGeometry, SlotClass,
-    SnapshotHandle, UnitLayout,
+    SnapshotHandle, StepClaims, UnitLayout,
 };
 
 use golem_placement::pool::primitives::Ordering;
@@ -209,5 +209,38 @@ fn t6_two_planes_of_one_unit_one_fill() {
         );
         drop(mine);
         drop(theirs);
+    });
+}
+
+/// A step claim pins the unit for all its planes: a concurrent evictor on
+/// the 1-slot pool can never take the slot between the Gate claim and the
+/// Down reuse, and the Down plane reads its own fill bytes.
+#[test]
+fn t6_step_claim_pins_the_unit_across_planes() {
+    primitives::model(|| {
+        let pool = loom_pool();
+        let copies = counter();
+        let (p2, c2) = (pool.clone(), copies.clone());
+        let evictor = primitives::spawn(move || ensure_counted(&p2, 1, &c2, ExpertKind::Gate));
+        let mut step = StepClaims::new(pool.clone());
+        let mut ptr = [std::ptr::null()];
+        match step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut ptr) {
+            Ok(()) => {
+                step.ensure_range_leased(0, ExpertKind::Down, 0, 0, &mut ptr)
+                    .unwrap();
+                let bytes = step.leases()[0].bytes();
+                assert!(
+                    bytes[16..]
+                        .iter()
+                        .all(|&b| b == plane_byte(ExpertKind::Down, 0))
+                );
+                assert_eq!(pool.stats.demand_claims.load(Ordering::Relaxed), 1);
+            }
+            // The evictor leased the only slot first.
+            Err(PoolError::Busy) => assert!(step.leases().is_empty()),
+            Err(e) => panic!("unexpected pool error: {e}"),
+        }
+        step.next_step();
+        evictor.join().unwrap();
     });
 }

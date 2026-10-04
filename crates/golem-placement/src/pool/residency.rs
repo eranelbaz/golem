@@ -612,6 +612,12 @@ pub struct P3Stats {
     pub evictions: AtomicU64,
     /// Source read failures after bounded retries.
     pub source_errors: AtomicU64,
+    /// Shard-lock claims on the decode path: at most one per unit per
+    /// scheduler compute (the other planes reuse the lease, §6.6).
+    pub demand_claims: AtomicU64,
+    /// Policy-snapshot mutex reads: once per compute on the decode path,
+    /// once per call on `ensure_range`/`ensure_unit`.
+    pub snapshot_reads: AtomicU64,
 }
 
 impl P3Stats {
