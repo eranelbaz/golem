@@ -16,6 +16,8 @@
 //! replica I/O, striping, and the pread engine ([`engine`]).
 
 mod engine;
+/// `golem import` (§5.5): local source discovery + expert-plane geometry.
+pub mod import;
 mod manifest;
 mod replica;
 mod stripe;

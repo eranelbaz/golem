@@ -37,10 +37,10 @@ const N_SHARDS: u64 = 2;
 const N_TENSORS: i32 = 12;
 
 /// Single source of truth for the fixture: generates the split GGUF under
-/// `.test-cache/shape-moe-v3/` and returns the shard paths. Safe to call
+/// `.test-cache/shape-moe-v4/` and returns the shard paths. Safe to call
 /// concurrently from several processes.
 pub fn cached_fixture() -> Vec<PathBuf> {
-    let dir = repo_root().join(".test-cache/shape-moe-v3");
+    let dir = repo_root().join(".test-cache/shape-moe-v4");
     std::fs::create_dir_all(&dir).unwrap();
     let paths: Vec<PathBuf> = (1..=N_SHARDS)
         .map(|i| dir.join(format!("shape-moe-{:0>5}-of-{:0>5}.gguf", i, N_SHARDS)))
@@ -88,6 +88,10 @@ fn kvs(shard_no: u64) -> Vec<GgufKv> {
     vec![
         kv("general.architecture", GgufValue::Str("glm5next".into())),
         kv("general.file_type", u(0)),
+        kv(
+            "tokenizer.chat_template",
+            GgufValue::Str("{{ messages }}".into()),
+        ),
         kv("glm5next.block_count", u(u64::from(dims::N_BLOCK))),
         kv("glm5next.expert_count", u(u64::from(dims::N_EXPERT))),
         kv("glm5next.expert_used_count", u(8)),
