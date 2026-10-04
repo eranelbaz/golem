@@ -229,8 +229,10 @@ impl StepClaims {
         for (expert, dst) in (first..=last).zip(ptrs.iter_mut()) {
             let at = &mut self.lease_of[base + expert as usize];
             if *at == UNCLAIMED {
-                pool.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
                 let lease = pool.claim_leased(true, layer, expert, &self.snapshot)?;
+                // Count successes only: one increment per unit per scheduler
+                // compute, never for a failed attempt that will be retried.
+                pool.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
                 *at = self.leases.len() as u32;
                 self.leases.push(lease);
             }
