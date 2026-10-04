@@ -105,3 +105,24 @@ fn scan_rejects_truncated_shard() {
     let e = scan_source(&tmp).unwrap_err().to_string();
     assert!(e.contains("past end"), "{e}");
 }
+
+#[test]
+fn scan_requires_chat_template_kv() {
+    // Fixture shard 1 carries `tokenizer.chat_template` in its KV metadata;
+    // patching one key byte in place (same length, so no data offsets move)
+    // leaves a shard that is otherwise valid but lacks the KV.
+    let tmp = tempdir("tmpl");
+    copy_fixture_to(&tmp);
+    let s1 = tmp.join(xtask::shape_moe::cached_fixture()[0].file_name().unwrap());
+    let mut bytes = std::fs::read(&s1).unwrap();
+    let pos = bytes
+        .windows(23)
+        .position(|w| w == b"tokenizer.chat_template")
+        .expect("fixture shard 1 must contain the chat_template KV key");
+    bytes[pos] = b'x';
+    std::fs::write(&s1, bytes).unwrap();
+    let err = scan_source(&tmp).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("missing tokenizer.chat_template"), "{msg}");
+    assert!(matches!(err, ImportError::Source { .. }));
+}

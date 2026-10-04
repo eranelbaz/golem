@@ -85,7 +85,8 @@ pub struct SourceScan {
     pub stamps: Vec<(u64, SystemTime)>,
     /// `general.architecture` of shard 1.
     pub arch: String,
-    /// sha256 hex of `tokenizer.chat_template` on shard 1, empty when absent.
+    /// sha256 hex of `tokenizer.chat_template` on shard 1; required (scan
+    /// errors with `ImportError::Source` when the KV is absent).
     pub chat_template_sha: String,
     /// Live expert planes, sorted by `(layer, tensor)`.
     pub planes: Vec<PlaneSpan>,
@@ -201,7 +202,9 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
     };
     let chat_template_sha = match kv_str(&first_kvs, "tokenizer.chat_template") {
         Some(t) => sha256_hex(t.as_bytes()),
-        None => String::new(),
+        None => {
+            return Err(source(&first_path, "missing tokenizer.chat_template"));
+        }
     };
     let live = live_layers(&first_kvs).map_err(|e| ImportError::Gguf {
         path: first_path.clone(),
