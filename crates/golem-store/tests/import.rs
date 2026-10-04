@@ -1,6 +1,8 @@
 //! `golem_store::import::scan_source` against the shape-realistic fixture:
 //! shard-set discovery, arch gate, live-only planes, and pinned geometry.
-use golem_store::import::{ImportError, hash_shards, scan_source, verify_replica};
+use golem_store::import::{
+    ImportError, ImportRequest, hash_shards, import, scan_source, verify_replica,
+};
 use std::path::{Path, PathBuf};
 
 fn fixture_dir() -> PathBuf {
@@ -125,6 +127,125 @@ fn scan_requires_chat_template_kv() {
     let msg = err.to_string();
     assert!(msg.contains("missing tokenizer.chat_template"), "{msg}");
     assert!(matches!(err, ImportError::Source { .. }));
+}
+
+fn req(source: PathBuf, replicas: Vec<PathBuf>) -> ImportRequest {
+    ImportRequest {
+        source,
+        replicas,
+        name: None,
+        quant: None,
+        revision_label: None,
+    }
+}
+
+#[test]
+fn import_builds_valid_manifest_with_crc_and_mirror() {
+    let src = fixture_dir();
+    let r = tempdir("mirror");
+    let out = import(&ImportRequest {
+        name: Some("shape".into()),
+        quant: Some("Q4_K".into()),
+        revision_label: Some("v1".into()),
+        ..req(src.clone(), vec![r.clone()])
+    })
+    .unwrap();
+    let m = out.manifest;
+    assert_eq!(
+        (
+            m.name.as_str(),
+            m.revision.as_deref(),
+            m.revision_source.as_deref()
+        ),
+        ("shape", Some("v1"), Some("user"))
+    );
+    assert_eq!(m.arch.as_deref(), Some("glm5next"));
+    let idx = m.expert_index.as_ref().unwrap();
+    assert_eq!(idx.len(), 3 * xtask::shape_moe::dims::LIVE.len());
+    assert!(
+        idx.iter()
+            .all(|e| e.crc32c.as_ref().unwrap().len() == e.experts as usize && e.layer != 4)
+    );
+    let want = vec![
+        std::fs::canonicalize(&src).unwrap(),
+        std::fs::canonicalize(&r).unwrap(),
+    ];
+    assert!(m.shards.iter().all(|s| s.replicas == want));
+}
+
+#[test]
+fn import_rejects_aliased_replicas() {
+    let src = fixture_dir();
+    assert!(
+        import(&req(src.clone(), vec![src.join(".")])).is_err(),
+        "replica == source"
+    );
+    let r = tempdir("dup");
+    assert!(
+        import(&req(
+            src.clone(),
+            vec![r.clone(), r.join("..").join(r.file_name().unwrap())]
+        ))
+        .is_err(),
+        "dup replica"
+    );
+    let link = tempdir("link").join("l");
+    std::os::unix::fs::symlink(&src, &link).unwrap();
+    assert!(import(&req(src, vec![link])).is_err(), "symlink to source");
+}
+
+#[test]
+fn import_rejects_bad_name_and_empty_label() {
+    let src = fixture_dir();
+    for bad in ["", "..", "a/b"] {
+        assert!(
+            import(&ImportRequest {
+                name: Some(bad.into()),
+                ..req(src.clone(), vec![])
+            })
+            .is_err(),
+            "{bad:?}"
+        );
+    }
+    assert!(
+        import(&ImportRequest {
+            revision_label: Some(String::new()),
+            ..req(src, vec![])
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn revision_from_hf_cache_metadata_and_rejects_non_hex() {
+    for (line1, want) in [("abc1234def", Some("abc1234def")), ("not a sha", None)] {
+        let root = tempdir(&format!("hf-{}", want.is_some()));
+        let sub = root.join("Q");
+        let meta = root.join(".cache/huggingface/download/Q");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&meta).unwrap();
+        copy_fixture_to(&sub);
+        let n = xtask::shape_moe::cached_fixture()[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            meta.join(format!("{n}.metadata")),
+            format!("{line1}\nffff\n1.0\n"),
+        )
+        .unwrap();
+        let m = import(&req(sub, vec![])).unwrap().manifest;
+        assert_eq!(m.revision.as_deref(), want);
+        assert_eq!(
+            m.revision_source.as_deref(),
+            Some(if want.is_some() {
+                "hf-cache"
+            } else {
+                "unknown"
+            })
+        );
+    }
 }
 
 fn no_tmp(dir: &Path) -> bool {

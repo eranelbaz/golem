@@ -152,29 +152,40 @@ impl ReplicaRegistry {
     /// §5.1 warn-only diagnostics: one line per physical device hosting two or
     /// more replicas of the same shard (no bandwidth aggregation).
     pub fn shared_device_warnings(&self) -> Vec<String> {
-        let mut warns = Vec::new();
-        for shard in &self.shards {
-            // Insertion-ordered grouping: device → replica paths.
-            let mut by_device: Vec<(String, Vec<PathBuf>)> = Vec::new();
-            for replica in &shard.replicas {
-                let Some(device) = physical_device_name(&replica.path) else {
-                    continue; // undeterminable → never a warning
-                };
-                match by_device.iter_mut().find(|(d, _)| *d == device) {
-                    Some((_, paths)) => paths.push(replica.path.clone()),
-                    None => by_device.push((device, vec![replica.path.clone()])),
-                }
-            }
-            for (device, paths) in by_device {
-                if paths.len() >= 2 {
-                    warns.push(format!(
-                        "replicas share a physical device; no bandwidth aggregation ({device}): {paths:?}"
-                    ));
-                }
-            }
-        }
-        warns
+        self.shards
+            .iter()
+            .flat_map(|shard| {
+                let paths: Vec<PathBuf> = shard.replicas.iter().map(|r| r.path.clone()).collect();
+                shared_device_pairs(&paths)
+            })
+            .collect()
     }
+}
+
+/// One warning per physical device hosting two or more of `roots`
+/// (insertion-ordered grouping; undeterminable devices never warn). Shared
+/// by [`ReplicaRegistry::shared_device_warnings`] and the §5.5 import
+/// same-disk warnings — one implementation of the device-pair rule.
+pub(crate) fn shared_device_pairs(roots: &[PathBuf]) -> Vec<String> {
+    let mut by_device: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for root in roots {
+        let Some(device) = physical_device_name(root) else {
+            continue; // undeterminable → never a warning
+        };
+        match by_device.iter_mut().find(|(d, _)| *d == device) {
+            Some((_, paths)) => paths.push(root.clone()),
+            None => by_device.push((device, vec![root.clone()])),
+        }
+    }
+    by_device
+        .into_iter()
+        .filter(|(_, paths)| paths.len() >= 2)
+        .map(|(device, paths)| {
+            format!(
+                "replicas share a physical device; no bandwidth aggregation ({device}): {paths:?}"
+            )
+        })
+        .collect()
 }
 
 /// Best-effort physical device identity for `path`.

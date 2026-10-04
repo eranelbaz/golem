@@ -1,4 +1,7 @@
-//! Atomic file write shared by every harness leg that emits a dump.
+//! Atomic file write shared by every harness leg that emits a dump, and by
+//! `golem import`'s manifest publication. Durability: fsync the temp file
+//! before rename, fsync the parent directory after — a crash leaves the old
+//! or the new file, never a truncated one or an unlinked rename.
 
 use std::io::Write;
 use std::path::Path;
@@ -24,12 +27,22 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    if let Err(e) = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(contents.as_bytes())) {
+    if let Err(e) = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(contents.as_bytes())?;
+        // Contents must reach the platter before the rename that publishes
+        // them, else a crash can publish empty/partial bytes.
+        f.sync_all()
+    }) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    // A failed rename must not orphan the temp file either.
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    // A failed rename must not orphan the temp file either; after a
+    // successful rename the parent-dir fsync makes the new name durable.
+    let publish = std::fs::rename(&tmp, path).and_then(|()| {
+        let dir = std::fs::File::open(path.parent().unwrap_or(Path::new(".")));
+        dir.and_then(|d| d.sync_all())
+    });
+    if let Err(e) = publish {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }

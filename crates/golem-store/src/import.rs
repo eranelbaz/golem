@@ -8,6 +8,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use crate::manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, validate};
 use golem_gguf::{
     blk_of, data_section_offset, ggml_row_bytes, kv_int, kv_str, live_layers, read_kvs, shard_path,
     tensor_entries,
@@ -405,8 +406,9 @@ fn read_span(f: &mut std::fs::File, path: &Path, buf: &mut [u8]) -> Result<usize
     Ok(done)
 }
 
-/// Rejects replicas that resolve to the source directory itself, so a
-/// replica commit can never rename over a source shard.
+/// Rejects replicas that resolve to the source directory itself, or to an
+/// earlier replica, so a replica commit can never rename over a source
+/// shard (or clobber its twin).
 fn reject_aliases(dir: &Path, replicas: &[PathBuf]) -> Result<(), ImportError> {
     use std::os::unix::fs::MetadataExt;
     let dev_ino = |p: &Path| -> Result<(u64, u64), ImportError> {
@@ -421,14 +423,20 @@ fn reject_aliases(dir: &Path, replicas: &[PathBuf]) -> Result<(), ImportError> {
         source: e,
     })?;
     let src_di = dev_ino(&src)?;
+    let mut seen: Vec<(u64, u64)> = Vec::with_capacity(replicas.len());
     for r in replicas {
         let rp = r.canonicalize().map_err(|e| ImportError::Io {
             path: r.clone(),
             source: e,
         })?;
-        if rp == src || dev_ino(&rp)? == src_di {
+        let di = dev_ino(&rp)?;
+        if rp == src || di == src_di {
             return Err(source(r, "replica aliases the source directory"));
         }
+        if seen.contains(&di) {
+            return Err(source(r, "replica aliases an earlier replica"));
+        }
+        seen.push(di);
     }
     Ok(())
 }
@@ -826,6 +834,222 @@ pub fn verify_replica(path: &Path, want_sha: &str, chunk: usize) -> Result<(), I
     }
 }
 
+/// `golem import` inputs (§5.5).
+#[derive(Debug, Clone, Default)]
+pub struct ImportRequest {
+    /// Directory holding the model's shard files (source of truth).
+    pub source: PathBuf,
+    /// Full-mirror target directories, one per disk.
+    pub replicas: Vec<PathBuf>,
+    /// Manifest name; default: the source directory's name.
+    pub name: Option<String>,
+    /// Quantization label recorded in the manifest.
+    pub quant: Option<String>,
+    /// Revision label; overrides hf-cache detection.
+    pub revision_label: Option<String>,
+}
+
+/// Import output: the manifest plus same-disk warnings for the caller to
+/// print.
+#[derive(Debug, Clone)]
+pub struct ImportOutcome {
+    /// Validated manifest, ready to write as `manifest.json`.
+    pub manifest: ModelManifest,
+    /// One line per pair of roots (source included) sharing a physical
+    /// device.
+    pub warnings: Vec<String>,
+}
+
+/// Manifest name: `--name`, else the source dir basename; must be exactly
+/// one normal path component (non-empty, no separator, not `.`/`..`).
+///
+/// # Errors
+/// [`ImportError::Source`] when the resolved name is not one component.
+pub fn resolve_name(source: &Path, name: Option<&str>) -> Result<String, ImportError> {
+    let candidate = match name {
+        Some(n) => n.to_owned(),
+        None => source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    };
+    if Path::new(&candidate).file_name().and_then(|f| f.to_str()) != Some(candidate.as_str()) {
+        return Err(ImportError::Source {
+            path: source.to_path_buf(),
+            msg: format!("model name {candidate:?} must be one path component"),
+        });
+    }
+    Ok(candidate)
+}
+
+/// Plausible HF commit hash: 7–64 lowercase hex chars.
+fn is_commit_hash(line: &str) -> bool {
+    (7..=64).contains(&line.len()) && line.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// HF download metadata revision for a source dir `dir` with first shard
+/// `shard`: `<dir-parent>/.cache/huggingface/download/<dir-name>/<shard>.metadata`,
+/// whose first line is the commit hash. Returns `(revision, source)`;
+/// `(None, None)` when the metadata file does not exist, `(None,
+/// Some("unknown"))` when it holds no plausible commit hash.
+fn hf_cache_revision(dir: &Path, shard: &Path) -> (Option<String>, Option<&'static str>) {
+    let (Some(name), Some(parent), Some(file)) = (dir.file_name(), dir.parent(), shard.file_name())
+    else {
+        return (None, None);
+    };
+    let meta = parent
+        .join(".cache/huggingface/download")
+        .join(name)
+        .join(format!("{}.metadata", file.to_string_lossy()));
+    let Ok(text) = std::fs::read_to_string(&meta) else {
+        return (None, None);
+    };
+    match text
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|l| is_commit_hash(l))
+    {
+        Some(line) => (Some(line.to_owned()), Some("hf-cache")),
+        None => (None, Some("unknown")),
+    }
+}
+
+/// Free-space need for one replica: bytes of every shard whose copy is
+/// absent or the wrong size (`present[s] == false`), plus one largest-shard
+/// of headroom so a clone cannot fill the disk mid-shard.
+fn preflight_need(sizes: &[u64], present: &[bool]) -> u64 {
+    let missing: u64 = sizes
+        .iter()
+        .zip(present)
+        .filter(|&(_, &p)| !p)
+        .map(|(&s, _)| s)
+        .sum();
+    missing + sizes.iter().max().copied().unwrap_or(0)
+}
+
+/// Preflights one replica: free-space against the incremental need (alias
+/// rejection happens before any preflight, in [`import`]).
+fn preflight(
+    shards: &[PathBuf],
+    stamps: &[(u64, SystemTime)],
+    replica: &Path,
+) -> Result<(), ImportError> {
+    let mut sizes = Vec::with_capacity(shards.len());
+    let mut present = Vec::with_capacity(shards.len());
+    for (s, p) in shards.iter().enumerate() {
+        sizes.push(stamps[s].0);
+        present.push(
+            std::fs::metadata(replica.join(p.file_name().unwrap_or_default()))
+                .map(|md| md.is_file() && md.len() == stamps[s].0)
+                .unwrap_or(false),
+        );
+    }
+    let need = preflight_need(&sizes, &present);
+    let avail = crate::sys::available_bytes(replica).map_err(|e| ImportError::Io {
+        path: replica.to_path_buf(),
+        source: e,
+    })?;
+    if avail < need {
+        return Err(source(
+            replica,
+            format!("not enough free space: need {need} B, have {avail} B"),
+        ));
+    }
+    Ok(())
+}
+
+/// Runs one full import (§5.5): validate inputs, scan the source, preflight
+/// every replica, hash + CRC + clone in one pass, detect the revision, and
+/// build the §4.2 manifest (validated before returning, so we never emit
+/// what [`crate::manifest::load_manifest`] would reject).
+///
+/// # Errors
+/// [`ImportError`] variants for bad names/labels, aliasing replicas, free
+/// space, source layout changes, and I/O failures.
+pub fn import(req: &ImportRequest) -> Result<ImportOutcome, ImportError> {
+    if req.revision_label.as_deref() == Some("") {
+        return Err(source(&req.source, "revision label must not be empty"));
+    }
+    let name = resolve_name(&req.source, req.name.as_deref())?;
+    let src = req.source.canonicalize().map_err(|e| ImportError::Io {
+        path: req.source.clone(),
+        source: e,
+    })?;
+    let mut replicas = Vec::with_capacity(req.replicas.len());
+    for r in &req.replicas {
+        std::fs::create_dir_all(r).map_err(|e| ImportError::Io {
+            path: r.clone(),
+            source: e,
+        })?;
+        replicas.push(r.canonicalize().map_err(|e| ImportError::Io {
+            path: r.clone(),
+            source: e,
+        })?);
+    }
+    let scan = scan_source(&src)?;
+    // Alias + duplicate rejection before any statvfs; `hash_shards`
+    // re-checks through the same helper.
+    reject_aliases(&src, &replicas)?;
+    for r in &replicas {
+        preflight(&scan.shards, &scan.stamps, r)?;
+    }
+    let digests = hash_shards(&scan, &replicas, CHUNK_BYTES)?;
+    let (revision, revision_source) = match req.revision_label.as_deref() {
+        Some(label) => (Some(label.to_owned()), Some("user".to_owned())),
+        None => {
+            let (r, s) = hf_cache_revision(&src, &scan.shards[0]);
+            (r, s.map(str::to_owned))
+        }
+    };
+    let mut roots = Vec::with_capacity(replicas.len() + 1);
+    roots.push(src.clone());
+    roots.extend(replicas.iter().cloned());
+    let warnings = crate::replica::shared_device_pairs(&roots);
+    let shards = scan
+        .shards
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ShardEntry {
+            file: s
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            bytes: digests.bytes[i],
+            sha256: digests.sha256[i].clone(),
+            replicas: roots.clone(),
+        })
+        .collect();
+    let expert_index = scan
+        .planes
+        .iter()
+        .zip(&digests.crc)
+        .map(|(p, crc)| ExpertIndexEntry {
+            tensor: p.tensor.clone(),
+            layer: p.layer,
+            experts: p.experts,
+            bytes_per_expert: p.stride,
+            offsets_bytes: (0..u64::from(p.experts)).map(|e| e * p.stride).collect(),
+            crc32c: Some(crc.clone()),
+        })
+        .collect();
+    let manifest = ModelManifest {
+        name,
+        shards,
+        repo: None,
+        revision,
+        revision_source,
+        quant: req.quant.clone(),
+        arch: Some(scan.arch.clone()),
+        expert_index: Some(expert_index),
+        chat_template_sha: Some(scan.chat_template_sha.clone()),
+    };
+    validate(&manifest, &src).map_err(|e| source(&src, e.to_string()))?;
+    Ok(ImportOutcome { manifest, warnings })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,5 +1074,18 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), b"abc");
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "tmp gone");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn preflight_need_sums_missing_shards_plus_largest_headroom() {
+        // Shard 0 present (keep); shards 1 and 2 missing: 30 + 20 copied,
+        // plus one largest-shard (30) of headroom so a clone cannot fill
+        // the disk mid-shard.
+        assert_eq!(
+            preflight_need(&[10, 30, 20], &[true, false, false]),
+            30 + 20 + 30
+        );
+        assert_eq!(preflight_need(&[10, 30, 20], &[true, true, true]), 30);
+        assert_eq!(preflight_need(&[], &[]), 0);
     }
 }

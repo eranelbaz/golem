@@ -315,6 +315,7 @@ dependencies = [
  "golem-engine",
  "golem-llama-sys",
  "golem-placement",
+ "golem-store",
  "libc",
  "serde",
  "serde_json",
