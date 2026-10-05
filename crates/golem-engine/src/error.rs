@@ -42,6 +42,10 @@ pub enum EngineError {
     /// expert-tensor geometry, or a second pool-enabled session in one process.
     #[error("RAM expert pool: {0}")]
     PoolInit(String),
+    /// Expert math would run off the GPU (design §2.3 I2, §8.4
+    /// `golem_backend_unavailable`): refused rather than a silent CPU fallback.
+    #[error("GPU backend unavailable for expert math: {0}")]
+    BackendUnavailable(String),
 }
 
 #[cfg(test)]
