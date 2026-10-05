@@ -1,1 +1,0 @@
-/home/eranelbaz/Projects/golem/docs/product-spec.md
