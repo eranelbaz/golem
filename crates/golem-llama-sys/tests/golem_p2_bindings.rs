@@ -52,8 +52,8 @@ fn golem_p1_expert_placement_stats_roundtrip() {
     // SAFETY: FFI getter, no invariants; returns a process-lifetime static, never null.
     let p = unsafe { raw::golem_get_expert_placement_stats() };
     assert!(!p.is_null());
-    // Layout contract from the C++ definition: on_gpu, on_cpu as lock-free u64.
-    // SAFETY: layout contract from the C++ definition (opaque to bindgen): 2 contiguous lock-free u64 counters, on_gpu then on_cpu; process-lifetime static.
+    // SAFETY: layout contract from the C++ definition (opaque to bindgen): 2
+    // contiguous lock-free u64 counters, on_gpu then on_cpu; process-lifetime static.
     let stats = unsafe { &*(p.cast::<[AtomicU64; 2]>()) };
     assert_eq!(stats[0].load(Ordering::Relaxed), 0);
     assert_eq!(stats[1].load(Ordering::Relaxed), 0);

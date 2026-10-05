@@ -462,7 +462,9 @@ pub struct Session {
     /// this is only the stats/geometry view, so no drop-order coupling with
     /// the substrate.
     p3: Option<p3_glue::PoolEnable>,
-    /// Set once a pooled offloaded turn's prefill passed [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first decode step passed [`check_experts_on_gpu`].
+    /// Set once a pooled offloaded turn's prefill passed
+    /// [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first
+    /// decode step passed [`check_experts_on_gpu`].
     pool_verified: bool,
 }
 
