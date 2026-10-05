@@ -31,7 +31,7 @@
 use golem_placement::pool::SlotClass;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use golem_gguf::blk_of;
@@ -174,12 +174,27 @@ struct PolicyQueryState {
     /// [`advance_decode_step`] from `Session`'s generation decode. Rust drives
     /// decode, so Rust owns the step.
     step: AtomicU64,
-    /// Double-buffered order slices: the slice returned to C stays valid
-    /// until the next policy_query call (frozen-buffer contract,
-    /// golem-hooks.h; C consumes it within the same copy step).
-    bufs: [Mutex<OrderBuf>; 2],
-    /// Index of the buffer currently exposed to C (`bufs` element).
-    exposed: AtomicUsize,
+    /// Per-layer order slots (index `n_layers` holds the identity order for
+    /// non-expert tensors, in its own slot so it can never poison a layer
+    /// entry). Pointer lifetime: a published pointer is stable until the
+    /// SAME layer's order is rebuilt at the next step — interleaved
+    /// publishes of other layers (or the identity) never clobber it. C
+    /// consumes the order within one copy step: the callback calls
+    /// policy_query and feeds the pointer to golem_slab_step before any
+    /// further publish (ggml-backend.cpp compute_splits, single decode
+    /// thread, n_copies == 1 enforced at callback entry), so the next-step
+    /// rebuild never races a live consumer.
+    order_bufs: Vec<Mutex<OrderBuf>>,
+    /// Pointer table into `order_bufs`, read without a lock on cache hits;
+    /// written under the slot mutex at build.
+    order_ptrs: Vec<AtomicPtr<i32>>,
+    /// Per-layer decode step of the last build: a rebuild happens only when
+    /// the step advanced since that layer's last publish. Plain atomics,
+    /// single decode thread; per-layer so interleaved publishes of other
+    /// layers within one step stay cache hits.
+    cached_step: Vec<AtomicU64>,
+    /// Rebuild counter (test observability: one build per (layer, step)).
+    order_builds: AtomicUsize,
     /// Last layer passed to policy_query; notify attribution key.
     /// [`NO_LAYER`] until the first query.
     last_queried: AtomicU32,
@@ -199,11 +214,14 @@ impl PolicyQueryState {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             step: AtomicU64::new(0),
-            bufs: [
-                Mutex::new(OrderBuf::new(n_experts)),
-                Mutex::new(OrderBuf::new(n_experts)),
-            ],
-            exposed: AtomicUsize::new(0),
+            order_bufs: (0..=n_layers)
+                .map(|_| Mutex::new(OrderBuf::new(n_experts)))
+                .collect(),
+            order_ptrs: (0..=n_layers)
+                .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+                .collect(),
+            cached_step: (0..=n_layers).map(|_| AtomicU64::new(u64::MAX)).collect(),
+            order_builds: AtomicUsize::new(0),
             last_queried: AtomicU32::new(NO_LAYER),
             scoring: AtomicBool::new(true),
             n_layers,
@@ -211,34 +229,55 @@ impl PolicyQueryState {
         }
     }
 
-    /// Builds the evict-first order for `layer` (shared by all three of its
-    /// tensors) in the buffer NOT currently exposed to C and returns its
-    /// pointer (valid until the next publish, per the frozen-buffer
-    /// contract; C consumes within the same copy step). `None` = identity
-    /// (non-expert tensor). One lock, no allocation: buffers are sized at
-    /// enable.
+    /// Returns the evict-first order for `layer` (shared by all three of its
+    /// tensors), rebuilt at most once per (layer, decode step) and cached in
+    /// the layer's slot; `None` = identity order for non-expert tensors,
+    /// built into its own slot and never cached under the layer key. Hot
+    /// path: cache hits are two relaxed atomic loads + a pointer load — no
+    /// lock, no allocation (slots sized at enable). Accepted staleness:
+    /// accesses recorded by `note_access` between a step's plane queries are
+    /// not reflected until the next step's rebuild (LRU heuristic quality,
+    /// not correctness).
     fn publish_order(&self, layer: Option<u32>) -> *const i32 {
-        let next = 1 - self.exposed.load(Ordering::Relaxed);
-        let mut buf = self.bufs[next].lock().unwrap();
-        let OrderBuf { keys, order } = &mut *buf;
-        match layer {
+        let slot = match layer {
             Some(layer) => {
                 debug_assert!(
                     layer < self.n_layers,
                     "order requested outside the registered geometry"
                 );
+                let step = self.step.load(Ordering::Relaxed);
+                let last = self.cached_step[layer as usize].load(Ordering::Relaxed);
+                if last == step {
+                    return self.order_ptrs[layer as usize]
+                        .load(Ordering::Relaxed)
+                        .cast_const();
+                }
+                let mut buf = self.order_bufs[layer as usize].lock().unwrap();
+                let OrderBuf { keys, order } = &mut *buf;
                 let lo = layer as usize * self.n_experts as usize;
                 for (k, a) in keys.iter_mut().zip(&self.last_access[lo..]) {
                     *k = a.load(Ordering::Relaxed);
                 }
                 build_order(keys, order);
+                self.order_builds.fetch_add(1, Ordering::Relaxed);
+                self.order_ptrs[layer as usize]
+                    .store(order.as_ptr() as *mut i32, Ordering::Relaxed);
+                self.cached_step[layer as usize].store(step, Ordering::Relaxed);
+                return order.as_ptr();
             }
-            None => order.iter_mut().zip(0..).for_each(|(o, i)| *o = i),
-        }
-        let ptr = order.as_ptr();
-        drop(buf);
-        self.exposed.store(next, Ordering::Relaxed);
-        ptr
+            None => self.n_layers as usize,
+        };
+        let mut buf = self.order_bufs[slot].lock().unwrap();
+        let order = &mut buf.order;
+        order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
+        self.order_ptrs[slot].store(order.as_ptr() as *mut i32, Ordering::Relaxed);
+        order.as_ptr()
+    }
+
+    /// Test observability: total order rebuilds so far.
+    #[cfg(test)]
+    fn order_builds(&self) -> usize {
+        self.order_builds.load(Ordering::Relaxed)
     }
 
     /// Last-access step of flat index `idx`; `None` = never accessed.
@@ -1211,6 +1250,35 @@ mod tests {
         assert_eq!(blk_of("blk.12.ffn_up_exps.weight"), Some(12));
         assert_eq!(blk_of("output.weight"), None);
         assert_eq!(blk_of("blk.x.ffn_gate_exps"), None);
+    }
+
+    #[test]
+    fn order_built_once_per_layer_per_step_and_content_is_correct() {
+        let pq = PolicyQueryState::new(2, 6);
+        // distinct access patterns per layer so the orders differ
+        pq.last_queried.store(0, Ordering::Relaxed);
+        pq.note_access(3);
+        let o0_a = pq.order_for_test(0);
+        pq.last_queried.store(1, Ordering::Relaxed);
+        pq.note_access(5);
+        let o1 = pq.order_for_test(1); // interleaved layer, same step
+        let o0_b = pq.order_for_test(0); // cache hit for layer 0, same step
+        assert_eq!(
+            o0_a, o0_b,
+            "cache hit must return layer 0's order, not the last-built buffer"
+        );
+        assert_ne!(o0_a, o1);
+        assert_eq!(pq.order_builds(), 2, "one build per (layer, step)");
+        // None (identity) must invalidate/never poison the layer cache
+        let _ = pq.publish_order(None);
+        let o0_c = pq.order_for_test(0);
+        assert_eq!(
+            o0_a, o0_c,
+            "identity publish must not corrupt the layer-0 cache"
+        );
+        pq.step.fetch_add(1, Ordering::Relaxed);
+        let _ = pq.order_for_test(0);
+        assert_eq!(pq.order_builds(), 3, "new step must rebuild");
     }
 
     #[test]
