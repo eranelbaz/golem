@@ -1137,8 +1137,8 @@ pub fn expert_placement() -> ExpertPlacement {
 
 /// Runtime proof of design I2 over the graphs built between `before` and
 /// `after`: every expert `MUL_MAT_ID` on the GPU, and at least one seen (a
-/// zero count would prove nothing). The one place an opt-in CPU expert-math
-/// mode (§1 O1) reports the CPU count instead of refusing; the counters are
+/// zero count would prove nothing). A future opt-in CPU expert-math mode
+/// (§1 O1) would report the CPU count here instead of refusing; the counters are
 /// process-global, so that mode also needs per-session counts if strict and
 /// opted-in sessions can share a process. The window covers graph builds:
 /// a reused graph keeps the placement of the build that produced it. HIP
