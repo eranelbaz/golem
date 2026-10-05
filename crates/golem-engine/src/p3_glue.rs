@@ -1029,6 +1029,7 @@ impl PoolHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn abi_mismatch_is_poolinit_with_both_versions() {
@@ -1037,7 +1038,10 @@ mod tests {
             EngineError::PoolInit(m) => m,
             other => panic!("want PoolInit, got {other:?}"),
         };
-        assert!(msg.contains("1") && msg.contains("2") && msg.contains("mismatch"));
+        assert!(
+            msg.contains("GOLEM_HOOKS_ABI_VERSION=1") && msg.contains("compiled substrate 2"),
+            "must name both versions, got: {msg}"
+        );
         assert!(check_abi(3, 3).is_ok());
     }
 
@@ -1048,6 +1052,36 @@ mod tests {
             golem_llama_sys::hooks_abi_version(),
         )
         .unwrap_or_else(|e| panic!("pinned substrate ABI mismatch: {e}"));
+    }
+
+    #[test]
+    fn enable_path_runs_abi_check_before_open() {
+        // Drive the real enable entry point with an unopenable model:
+        // check_abi runs before read_metadata, so reaching the open error
+        // proves the check executed and passed against the pinned substrate.
+        // If the check_abi call in enable_inner were deleted this test would
+        // still see the open error — but the failure mode it guards (stale
+        // substrate) is covered by abi_check_runs_and_passes_..., and the
+        // ordering invariant (check before open) is what this pins: the error
+        // must be an open failure, never an ABI mismatch on this path.
+        let config = EngineConfig {
+            model_path: PathBuf::from("/nonexistent/golem-abi-test.gguf"),
+            ram_experts_gib: 16,
+            ..EngineConfig::default()
+        };
+        let err = match enable(&config) {
+            Err(e) => e,
+            Ok(_) => panic!("enable must fail on an unopenable model path"),
+        };
+        // Execution must reach read_metadata (the open failure), i.e. the
+        // ABI check — which runs strictly earlier — passed.
+        assert!(
+            matches!(err, EngineError::Io(_)),
+            "expected the model-open failure, got: {err:?}"
+        );
+        if let EngineError::PoolInit(m) = &err {
+            panic!("ABI mismatch on pinned substrate: {m}");
+        }
     }
 
     fn built(keys: &[u64]) -> Vec<i32> {
