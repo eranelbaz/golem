@@ -87,6 +87,23 @@ const golem_expert_placement_stats *golem_get_expert_placement_stats(void) { ret
 
 #include "golem-device-cache.hpp" // golem::GolemSlabEntry + slab step: shared with the ctest fuzz TU (ODR)
 
+// Allocate the pinned staging under the SAME condition as the ids_dev realloc
+// (fingerprint change) — never a size-only reuse check, which could keep a
+// buffer registered against a different device after a backend switch.
+static void golem_ids_pin_alloc(golem::GolemSlabEntry &st, ggml_backend_t split_backend, int64_t ne0, int64_t ne1) {
+    if (st.ids_pin && st.ids_pin_bytes >= (size_t) ne0 * (size_t) ne1 * sizeof(int32_t)) return;
+    if (st.ids_pin_buf) ggml_backend_buffer_free(st.ids_pin_buf);
+    ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+    if (buft == nullptr) {
+        GGML_ABORT("golem P2: device exposes no host buffer type; cannot pin remapped-ids staging");
+    }
+    st.ids_pin_buf = ggml_backend_buft_alloc_buffer(buft, (size_t) ne0 * (size_t) ne1 * sizeof(int32_t));
+    GGML_ASSERT(st.ids_pin_buf != nullptr);
+    st.ids_pin = ggml_backend_buffer_get_base(st.ids_pin_buf);
+    st.ids_pin_bytes = (size_t) ne0 * (size_t) ne1 * sizeof(int32_t);
+}
+
 namespace golem { // same namespace as the shared header's inline types
 static std::mutex                                         golem_dc_mutex;
 static std::unordered_map<const void *, GolemSlabEntry> golem_dc; // key: HOST weights tensor data ptr (the stable identity; device cpy addresses alias across splits - each split's copy tensor can reuse the same device address, which reset every entry and defeated all reuse)
@@ -108,6 +125,9 @@ void golem_reset_device_cache(void) {
         }
         if (kv.second.ids_buf != nullptr) {
             ggml_backend_buffer_free(kv.second.ids_buf);
+        }
+        if (kv.second.ids_pin_buf != nullptr) {
+            ggml_backend_buffer_free(kv.second.ids_pin_buf);
         }
         if (kv.second.ids_ctx != nullptr) {
             ggml_free(kv.second.ids_ctx);
@@ -2075,6 +2095,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 st.ids_ne0 = ids_tensor->ne[0];
                                 st.ids_ne1 = ids_tensor->ne[1];
                             }
+                            // Pinned staging for the H2D below, same (re)alloc
+                            // condition as ids_dev. Pinnedness is load-bearing:
+                            // assert it so a regression to pageable memory cannot
+                            // pass silently.
+                            golem_ids_pin_alloc(st, split_backend, ids_tensor->ne[0], ids_tensor->ne[1]);
+                            GGML_ASSERT(ggml_backend_buffer_is_host(st.ids_pin_buf));
 
                             // Slab step: decide skips/copies/evictions + remap.
                             dc = golem::golem_slab_step(L, golem_kind - 1, routed, ids_dense.data(),
@@ -2083,13 +2109,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             GGML_ASSERT((int64_t) st.remap.size() == ggml_nelements(st.ids_dev));
 
                             slab = st.slab;
-                            // Remapped ids → device, then redirect every slab
-                            // consumer: src[0] → slab, src[2] → remapped ids.
-                            // Both are restored after the split's compute (the
-                            // recorded originals are the scheduler's cpy tensors;
-                            // kernels capture pointers at launch and graphs are
-                            // off while hooks are set).
-                            ggml_backend_tensor_set_async(split_backend, st.ids_dev, st.remap.data(),
+                            // Remapped ids → device from PINNED host memory,
+                            // then redirect every slab consumer: src[0] → slab,
+                            // src[2] → remapped ids. Both are restored after the
+                            // split's compute (the recorded originals are the
+                            // scheduler's cpy tensors; kernels capture pointers at
+                            // launch and graphs are off while hooks are set).
+                            //
+                            // SAFETY (ordering invariant): the step-(N+1) memcpy
+                            // below into ids_pin must never overlap the step-N DMA
+                            // reading it. This holds because compute_splits drains
+                            // every backend at entry when golem_h_copy_done is set
+                            // (engine registers it alongside policy_query — see
+                            // p3_glue.rs), so step N's H2D is complete before this
+                            // code runs again; a sync-granularity change must not
+                            // silently tear the remap. Defensive drain for any
+                            // registration path that sets policy_query without
+                            // copy_done (no-op in the engine configuration).
+                            if (golem_h_copy_done == NULL) {
+                                ggml_backend_synchronize(split_backend);
+                            }
+                            memcpy(st.ids_pin, st.remap.data(), st.remap.size() * sizeof(int32_t));
+                            ggml_backend_tensor_set_async(split_backend, st.ids_dev, st.ids_pin,
                                 0, st.remap.size() * sizeof(int32_t));
                             for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
                                 struct ggml_tensor * n2 = split->graph.nodes[ni];

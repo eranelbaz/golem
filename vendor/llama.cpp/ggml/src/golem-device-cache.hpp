@@ -61,6 +61,12 @@ struct GolemSlabEntry {
     struct ggml_tensor *ids_dev = nullptr;
     struct ggml_backend_buffer *ids_buf = nullptr;
     struct ggml_context *ids_ctx = nullptr;
+    // Pinned host staging for the remapped-ids H2D (AGENTS.md: pageable H2D
+    // is a bug; size is not gated). Bounded by ids_ne0 × ids_ne1 × 4 B,
+    // allocated once per ids-shape (re)allocation alongside ids_dev/ids_buf.
+    void *ids_pin = nullptr;                           // host-pinned base (int32 remaps)
+    size_t ids_pin_bytes = 0;
+    struct ggml_backend_buffer *ids_pin_buf = nullptr; // owns ids_pin, freed via buffer
     std::vector<int32_t> remap;    // host staging for the remapped ids
 };
 
