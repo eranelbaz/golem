@@ -462,7 +462,7 @@ pub struct Session {
     /// this is only the stats/geometry view, so no drop-order coupling with
     /// the substrate.
     p3: Option<p3_glue::PoolEnable>,
-    /// Set once a pooled offloaded turn's prefill and first decode step passed [`check_experts_on_gpu`] and [`check_pool_engaged`].
+    /// Set once a pooled offloaded turn's prefill passed [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first decode step passed [`check_experts_on_gpu`].
     pool_verified: bool,
 }
 
@@ -1156,7 +1156,8 @@ fn check_experts_on_gpu(
              expert op must run on the GPU \
              (design I2). Inspect split causes with GGML_SCHED_DEBUG=2 (1.off/1.wgt); a \
              flagless session loaded first in this process pins the op-offload threshold \
-             at upstream's 32"
+             at upstream's 32. The counts are process-global: another session decoding in \
+             this process during the turn is included in them"
         )));
     }
     Ok(())
