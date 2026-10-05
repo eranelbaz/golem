@@ -22,7 +22,7 @@ fn run_greedy_args(ram_experts_gib: &str, extra: &[&str]) -> std::process::Outpu
             "run",
             "--greedy",
             "--n-predict",
-            "16",
+            "32",
             "--n-gpu-layers",
             "99",
             "--cpu-moe-layers",
@@ -32,7 +32,18 @@ fn run_greedy_args(ram_experts_gib: &str, extra: &[&str]) -> std::process::Outpu
         ])
         .args(extra)
         .arg(&model)
-        .args(["--prompt", "Hello"])
+        .args([
+            "--prompt",
+            // Routing breadth: long and lexically varied so greedy decode
+            // plausibly routes more than K = 4 distinct experts per touched
+            // layer (tiny-moe top-k = 2) — a short prompt could leave the
+            // K = 4 budget unexercised and the comparison vacuous. The
+            // eviction/counter behavior itself is asserted in golem-engine's
+            // `budget_tiny_moe`, where the counters are readable.
+            "MoE routing probe: the quick brown fox jumps over the lazy dog \
+while numbers 1 2 3 4 5 6 7 8 9 march past a completely different \
+subject line",
+        ])
         .output()
         .unwrap()
 }
@@ -83,7 +94,6 @@ fn device_cache_budget_k4_matches_k8() {
         golem_llama_sys::Backend::Hip,
         "hip-tests requires a HIP-built substrate (GOLEM_LLAMA_SYS_BACKEND=hip)"
     );
-    let k4 = run_greedy_args("1", &["--device-cache-experts", "4"]);
     let k8 = run_greedy_args("1", &["--device-cache-experts", "8"]);
     assert!(
         k4.status.success(),
