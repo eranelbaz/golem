@@ -94,6 +94,7 @@ fn device_cache_budget_k4_matches_k8() {
         golem_llama_sys::Backend::Hip,
         "hip-tests requires a HIP-built substrate (GOLEM_LLAMA_SYS_BACKEND=hip)"
     );
+    let k4 = run_greedy_args("1", &["--device-cache-experts", "4"]);
     let k8 = run_greedy_args("1", &["--device-cache-experts", "8"]);
     assert!(
         k4.status.success(),
