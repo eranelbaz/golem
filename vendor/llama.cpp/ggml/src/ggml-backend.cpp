@@ -88,18 +88,25 @@ const golem_expert_placement_stats *golem_get_expert_placement_stats(void) { ret
 #include "golem-device-cache.hpp" // golem::GolemSlabEntry + slab step: shared with the ctest fuzz TU (ODR)
 
 // Allocate the pinned staging under the SAME condition as the ids_dev realloc
-// (fingerprint change) — never a size-only reuse check, which could keep a
-// buffer registered against a different device after a backend switch.
+// (ids shape change): the caller invokes this only from inside that realloc
+// block, so the pinned registration tracks the same device as ids_dev — never
+// a size-only reuse check, which could keep a buffer registered against a
+// different device after a backend switch.
 static void golem_ids_pin_alloc(golem::GolemSlabEntry &st, ggml_backend_t split_backend, int64_t ne0, int64_t ne1) {
-    if (st.ids_pin && st.ids_pin_bytes >= (size_t) ne0 * (size_t) ne1 * sizeof(int32_t)) return;
-    if (st.ids_pin_buf) ggml_backend_buffer_free(st.ids_pin_buf);
     ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
     ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
     if (buft == nullptr) {
         GGML_ABORT("golem P2: device exposes no host buffer type; cannot pin remapped-ids staging");
     }
+    st.ids_pin = nullptr;
+    st.ids_pin_bytes = 0;
+    if (st.ids_pin_buf) {
+        ggml_backend_buffer_free(st.ids_pin_buf);
+        st.ids_pin_buf = nullptr;
+    }
     st.ids_pin_buf = ggml_backend_buft_alloc_buffer(buft, (size_t) ne0 * (size_t) ne1 * sizeof(int32_t));
     GGML_ASSERT(st.ids_pin_buf != nullptr);
+    st.ids_pin_buft = buft;
     st.ids_pin = ggml_backend_buffer_get_base(st.ids_pin_buf);
     st.ids_pin_bytes = (size_t) ne0 * (size_t) ne1 * sizeof(int32_t);
 }
@@ -128,6 +135,9 @@ void golem_reset_device_cache(void) {
         }
         if (kv.second.ids_pin_buf != nullptr) {
             ggml_backend_buffer_free(kv.second.ids_pin_buf);
+            kv.second.ids_pin_buf = nullptr;
+            kv.second.ids_pin = nullptr;
+            kv.second.ids_pin_buft = nullptr;
         }
         if (kv.second.ids_ctx != nullptr) {
             ggml_free(kv.second.ids_ctx);
@@ -1812,6 +1822,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // Monotonic per-call sequence for golem_split_seq-stamped state
+    // (GolemSlabEntry::ids_pin_step same-step reuse detection).
+    static std::atomic<uint64_t> golem_h_split_seq{0};
+    const uint64_t golem_split_seq = golem_h_split_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -2094,19 +2109,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 GGML_ASSERT(st.ids_buf != nullptr);
                                 st.ids_ne0 = ids_tensor->ne[0];
                                 st.ids_ne1 = ids_tensor->ne[1];
+                                // Pinned staging for the H2D below: (re)allocated
+                                // under this SAME ids-shape-change condition as
+                                // ids_dev, so its registration never outlives the
+                                // device it was pinned against. Pinnedness is
+                                // load-bearing: assert it so a regression to
+                                // pageable memory cannot pass silently.
+                                golem_ids_pin_alloc(st, split_backend, ids_tensor->ne[0], ids_tensor->ne[1]);
                             }
-                            // Pinned staging for the H2D below, same (re)alloc
-                            // condition as ids_dev. Pinnedness is load-bearing:
-                            // assert it so a regression to pageable memory cannot
-                            // pass silently.
-                            golem_ids_pin_alloc(st, split_backend, ids_tensor->ne[0], ids_tensor->ne[1]);
-                            GGML_ASSERT(ggml_backend_buffer_is_host(st.ids_pin_buf));
-
                             // Slab step: decide skips/copies/evictions + remap.
                             dc = golem::golem_slab_step(L, golem_kind - 1, routed, ids_dense.data(),
                                 (int64_t) ids_dense.size(), order, K, (int32_t) n_expert, st.remap,
                                 [&](int32_t slot, int32_t id) { pending.emplace_back(slot, id); });
                             GGML_ASSERT((int64_t) st.remap.size() == ggml_nelements(st.ids_dev));
+                            GGML_ASSERT(ggml_backend_buffer_is_host(st.ids_pin_buf));
+                            GGML_ASSERT(ggml_backend_buffer_get_type(st.ids_pin_buf) == st.ids_pin_buft);
+                            // Same-step reuse: if this entry already fed a split in
+                            // THIS compute_splits call, its ids_pin may still have an
+                            // H2D DMA in flight; the entry-time drain (copy_done) only
+                            // covers cross-call reuse. Not reachable with llama.cpp MoE
+                            // graphs (each expert weights tensor feeds exactly one
+                            // MUL_MAT_ID, and only that split's nodes[0] takes this
+                            // branch), but the guard costs nothing off that path.
+                            if (st.ids_pin_step == golem_split_seq) {
+                                ggml_backend_synchronize(split_backend);
+                            }
+                            st.ids_pin_step = golem_split_seq;
 
                             slab = st.slab;
                             // Remapped ids → device from PINNED host memory,

@@ -67,6 +67,8 @@ struct GolemSlabEntry {
     void *ids_pin = nullptr;                           // host-pinned base (int32 remaps)
     size_t ids_pin_bytes = 0;
     struct ggml_backend_buffer *ids_pin_buf = nullptr; // owns ids_pin, freed via buffer
+    struct ggml_backend_buffer_type *ids_pin_buft = nullptr; // buffer type captured at alloc (pinnedness assert)
+    uint64_t ids_pin_step = 0;                         // compute_splits sequence of the last ids_pin write (same-step reuse detection)
     std::vector<int32_t> remap;    // host staging for the remapped ids
 };
 
