@@ -16,9 +16,11 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use golem_gguf::{data_section_offset, ggml_row_bytes, tensor_entries};
+use golem_gguf::{blk_of, data_section_offset, ggml_row_bytes, tensor_entries};
 
-use super::arena::{advise_random, drop_page_cache};
+use golem_store::sys::drop_page_cache;
+
+use super::arena::advise_random;
 use super::residency::ExpertKind;
 
 /// One expert layer's unit (§6.1): gate, up, down planes at fixed offsets
@@ -287,11 +289,6 @@ fn plane_index(layer: u32, kind: ExpertKind) -> usize {
     layer as usize * ExpertKind::ALL.len() + kind.ordinal()
 }
 
-/// `blk.<N>.` prefix parse.
-fn blk_of(name: &str) -> Option<u32> {
-    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
-}
-
 /// Pure geometry over a walked plane table: one `UnitLayout` per layer in
 /// `ExpertKind::ALL` order, every live layer complete (§6.1). Empty table →
 /// an empty geometry, which `GgufPreadSource::geometry` surfaces as `None`.
@@ -376,20 +373,23 @@ impl GgufPreadSource {
             }
             Some(n) => n,
         };
-        let nextn = golem_gguf::arch_kv_int(&kvs, "nextn_predict_layers").unwrap_or(0);
-        let block_count = golem_gguf::arch_kv_int(&kvs, "block_count");
-        let mtp_from = block_count
-            .map(|bc| {
-                // A nextn value larger than block_count is a corrupt KV, not
-                // "skip everything": name it (library rule: Result, not panic).
-                if nextn > bc {
-                    return Err(SourceError::Gguf(golem_gguf::Error::Invalid(format!(
-                        "nextn_predict_layers {nextn} > block_count {bc}"
-                    ))));
-                }
-                Ok(bc - nextn)
-            })
-            .transpose()?;
+        // Header layer rules live in golem-gguf (§2.2): the live range is
+        // [dense lead, block_count − nextn). Only computed when block_count
+        // is present; a missing one is rejected by the geometry walk. The
+        // engine argument and the header must not diverge: a lead mismatch
+        // would silently misnumber every pool layer.
+        let mtp_from = if golem_gguf::arch_kv_int(&kvs, "block_count").is_some() {
+            let live = golem_gguf::live_layers(&kvs)?;
+            if live.start != n_dense_lead {
+                return Err(SourceError::Gguf(golem_gguf::Error::Invalid(format!(
+                    "n_dense_lead {n_dense_lead} != header lead {}",
+                    live.start
+                ))));
+            }
+            Some(u64::from(live.end))
+        } else {
+            None
+        };
 
         // Untrusted header value: bound the up-front reservation; a bogus
         // count fails on the first missing shard instead.
@@ -397,7 +397,7 @@ impl GgufPreadSource {
         let mut direct = Vec::with_capacity(files.capacity());
         let mut found: BTreeMap<usize, Plane> = BTreeMap::new();
         for shard in 0..split_count {
-            let shard_path = shard_path(path, shard, split_count)?;
+            let shard_path = golem_gguf::shard_path(path, shard, split_count)?;
             let mut file = File::open(&shard_path)?;
             if split_count > 1 {
                 check_split(&shard_path, &mut file, shard, split_count)?;
@@ -506,50 +506,6 @@ fn check_split(path: &Path, file: &mut File, no: u64, count: u64) -> Result<(), 
         Some(c) if c == count => Ok(()),
         other => Err(bad(format!("split.count = {other:?}, expected {count}"))),
     }
-}
-
-/// Sibling-shard path for shard `no` of `count`, rewriting the standard
-/// `-NNNNN-of-MMMMM.gguf` suffix of `first`. Single-file models (`count ==
-/// 1`) return `first` unchanged.
-fn shard_path(first: &Path, no: u64, count: u64) -> Result<PathBuf, SourceError> {
-    if count == 1 {
-        return Ok(first.to_path_buf());
-    }
-    let name = first.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        SourceError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("non-UTF-8 model path {first:?}"),
-        ))
-    })?;
-    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
-    let Some((prefix, counts)) = stem.rsplit_once("-of-") else {
-        return Err(SourceError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "split.count = {count} but {name} does not end in -NNNNN-of-MMMMM.{ext:?}; \
-                 cannot discover sibling shards"
-            ),
-        )));
-    };
-    let Some((base, idx)) = prefix.rsplit_once('-') else {
-        return Err(SourceError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot split shard index from {name}"),
-        )));
-    };
-    if !idx.bytes().all(|b| b.is_ascii_digit()) || idx.is_empty() {
-        return Err(SourceError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("shard index {idx:?} in {name} is not numeric"),
-        )));
-    }
-    let width = idx.len();
-    let ext_dot = if ext.is_empty() {
-        String::new()
-    } else {
-        format!(".{ext}")
-    };
-    Ok(first.with_file_name(format!("{base}-{:0width$}-of-{counts}{ext_dot}", no + 1)))
 }
 
 /// Retry bound for EINTR / short reads (bounded, then

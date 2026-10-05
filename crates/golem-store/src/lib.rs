@@ -16,9 +16,15 @@
 //! replica I/O, striping, and the pread engine ([`engine`]).
 
 mod engine;
+/// `golem import` (§5.5): local source discovery + expert-plane geometry.
+pub mod import;
 mod manifest;
 mod replica;
 mod stripe;
+
+/// Raw syscall wrappers — the only `unsafe` in this crate.
+#[allow(unsafe_code)]
+pub mod sys;
 
 pub use engine::{ChunkSource, DEFAULT_IO_THREADS, IoEngine, PageRead, ShardSources};
 pub use manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, load_manifest};
@@ -29,6 +35,13 @@ pub use replica::{
 pub use stripe::{Chunk, plan_single, plan_striped};
 
 use std::path::PathBuf;
+
+/// The one reader of `GOLEM_DATA_DIR` (§4.2): root for manifests, models,
+/// and placement journals. `None` when unset or non-UTF-8.
+#[must_use]
+pub fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("GOLEM_DATA_DIR").map(PathBuf::from)
+}
 
 /// Errors surfaced by the store.
 #[derive(Debug, thiserror::Error)]

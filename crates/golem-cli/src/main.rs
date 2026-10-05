@@ -1,17 +1,14 @@
-//! `golem` CLI entry point (tech design §9): run, serve, list, stop, plan, pull.
+//! `golem` CLI entry point (tech design §9): run, parity-op, import.
 //! Bare `golem` (no subcommand) prints the version.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod import;
 mod run;
 
 #[derive(Parser)]
-#[command(
-    name = "golem",
-    version,
-    about = "golem CLI: run, serve, list, stop, plan, pull"
-)]
+#[command(name = "golem", version, about = "golem CLI: run, parity-op, import")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -41,6 +38,12 @@ enum Command {
         #[arg(long, value_parser = ["fp32", "q8_0"], default_value = "fp32")]
         quant: String,
     },
+    /// Import a local GGUF shard set into `$GOLEM_DATA_DIR`: hash + CRC the
+    /// source, clone verified full mirrors, write the manifest atomically.
+    Import {
+        #[command(flatten)]
+        args: import::ImportArgs,
+    },
 }
 
 fn main() {
@@ -51,6 +54,7 @@ fn main() {
             Ok(())
         }
         Some(Command::Run { args, .. }) => run::run(&args),
+        Some(Command::Import { args }) => import::run(&args),
         Some(Command::ParityOp { dump, quant }) => {
             let quant = match quant.as_str() {
                 "fp32" => golem_engine::Quant::Fp32,

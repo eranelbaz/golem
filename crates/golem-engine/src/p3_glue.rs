@@ -34,6 +34,7 @@ use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use golem_gguf::blk_of;
 use golem_llama_sys::raw;
 use golem_placement::pool::{
     AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PREFETCH_K,
@@ -996,11 +997,6 @@ impl PoolHandle {
         tracing::debug!(tensor = %name, layer, ?kind, stride, "P3 tensor registered");
         Some(entry)
     }
-}
-
-/// `blk.<N>.` prefix parse (shared shape with the pool source's own walker).
-fn blk_of(name: &str) -> Option<u32> {
-    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
 
 #[cfg(test)]

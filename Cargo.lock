@@ -315,6 +315,7 @@ dependencies = [
  "golem-engine",
  "golem-llama-sys",
  "golem-placement",
+ "golem-store",
  "libc",
  "serde",
  "serde_json",
@@ -360,6 +361,7 @@ name = "golem-placement"
 version = "0.1.0"
 dependencies = [
  "golem-gguf",
+ "golem-store",
  "libc",
  "loom",
  "thiserror",
@@ -384,11 +386,14 @@ name = "golem-store"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "golem-gguf",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tracing",
+ "xtask",
 ]
 
 [[package]]

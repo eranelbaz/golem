@@ -1,6 +1,6 @@
 [package]
 name = "golem-cli"
-description = "golem CLI: run, serve, list, stop, plan, pull (tech design section 9)"
+description = "golem CLI: run, parity-op, import (tech design section 9)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +22,7 @@ clap = { workspace = true }
 golem-engine = { path = "../golem-engine" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 golem-placement = { path = "../golem-placement" }
+golem-store = { path = "../golem-store" }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 golem-gguf = { path = "../golem-gguf" }
+golem-store = { path = "../golem-store" }
 libc = { workspace = true }
 # Loom is referenced by lib code (pool/primitives.rs) under `cfg(loom)`, so it
 # must be a regular optional dependency — a dev-dependency is invisible to the
