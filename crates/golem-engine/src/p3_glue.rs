@@ -421,7 +421,34 @@ pub(crate) fn enable(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
     result
 }
 
+/// The header constant and the compiled substrate's reported ABI version must
+/// agree exactly; a mismatch means the pinned substrate must be rebuilt.
+fn check_abi(header: i32, compiled: i32) -> Result<(), EngineError> {
+    if header != compiled {
+        return Err(EngineError::PoolInit(format!(
+            "golem hooks ABI mismatch: header GOLEM_HOOKS_ABI_VERSION={header} vs compiled substrate {compiled}; rebuild the pinned substrate (scripts/build-substrate.sh)"
+        )));
+    }
+    Ok(())
+}
+
+/// `check_abi` narrows the header constant to `i32` to compare against the
+/// getter's `i32` return; fail compilation if it ever outgrows that.
+const _: () = assert!(
+    (raw::GOLEM_HOOKS_ABI_VERSION as i64) >= i32::MIN as i64
+        && (raw::GOLEM_HOOKS_ABI_VERSION as i64) <= i32::MAX as i64
+);
+
 fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
+    // The compiled substrate's hook surface must match the header the bindings
+    // were generated from — checked before any source open or allocation, so a
+    // stale build fails fast instead of silently decoding with a drifted ABI.
+    // Deliberately before the HANDLE short-circuit: a stale substrate reports
+    // the ABI error even on a second enable.
+    check_abi(
+        raw::GOLEM_HOOKS_ABI_VERSION as i32,
+        golem_llama_sys::hooks_abi_version(),
+    )?;
     if HANDLE.get().is_some() {
         return Err(EngineError::PoolInit(
             "a pool-enabled session already exists (one per process: hooks are process-global)"
@@ -1002,6 +1029,26 @@ impl PoolHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abi_mismatch_is_poolinit_with_both_versions() {
+        let e = check_abi(1, 2).unwrap_err();
+        let msg = match e {
+            EngineError::PoolInit(m) => m,
+            other => panic!("want PoolInit, got {other:?}"),
+        };
+        assert!(msg.contains("1") && msg.contains("2") && msg.contains("mismatch"));
+        assert!(check_abi(3, 3).is_ok());
+    }
+
+    #[test]
+    fn abi_check_runs_and_passes_against_pinned_substrate() {
+        check_abi(
+            raw::GOLEM_HOOKS_ABI_VERSION as i32,
+            golem_llama_sys::hooks_abi_version(),
+        )
+        .unwrap_or_else(|e| panic!("pinned substrate ABI mismatch: {e}"));
+    }
 
     fn built(keys: &[u64]) -> Vec<i32> {
         let mut order = vec![0; keys.len()];
