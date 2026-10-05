@@ -468,8 +468,12 @@ fn sweep_tmps(replica: &Path) {
 }
 
 /// Exclusive per-replica import lock: `create_new` on `<replica>/.golem-import.lock`,
-/// staking our pid inside. A live holder (pid in `/proc`) refuses; a stale
-/// lock (dead pid or unparseable) is taken over. `Drop` removes the lock.
+/// staking our pid inside. A live holder (pid in `/proc`) refuses; so does an
+/// empty/unparseable lock — the holder may not have written its pid yet, and
+/// deleting by path would orphan its in-flight import. A stale lock (dead pid)
+/// is taken over by renaming it first and re-verifying the pid on the renamed
+/// inode, so only the process that observed the stale pid ever unlinks it.
+/// `Drop` removes the lock.
 struct ReplicaLock(PathBuf);
 
 impl ReplicaLock {
@@ -494,14 +498,33 @@ impl ReplicaLock {
                     let pid = std::fs::read_to_string(&lock)
                         .ok()
                         .and_then(|s| s.trim().parse::<u32>().ok());
-                    let live = pid.is_some_and(|p| Path::new("/proc").join(p.to_string()).exists());
+                    let live = pid.is_none_or(|p| Path::new("/proc").join(p.to_string()).exists());
                     if live {
                         return Err(source(
                             &lock,
-                            format!("import pid {} holds {}", pid.unwrap(), lock.display()),
+                            match pid {
+                                Some(p) => format!("import pid {} holds {}", p, lock.display()),
+                                None => format!(
+                                    "{} holds an unreadable or empty lock; remove it manually if no import is running",
+                                    lock.display()
+                                ),
+                            },
                         ));
                     }
-                    let _ = std::fs::remove_file(&lock);
+                    // Takeover: rename-then-verify so we only unlink a lock
+                    // whose pid we ourselves observed as dead. If the rename
+                    // or the re-read races with another contender, back off.
+                    let taken = replica.join(format!(".golem-import.lock.{}", std::process::id()));
+                    if std::fs::rename(&lock, &taken).is_err()
+                        || std::fs::read_to_string(&taken)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u32>().ok())
+                            != pid
+                    {
+                        let _ = std::fs::remove_file(&taken);
+                        continue;
+                    }
+                    let _ = std::fs::remove_file(&taken);
                 }
                 Err(e) => {
                     return Err(ImportError::Io {

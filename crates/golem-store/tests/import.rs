@@ -444,7 +444,17 @@ fn stale_tmp_is_swept_and_live_lock_refuses() {
     std::fs::write(r.join("old.gguf.golem-import.123.0.tmp"), b"x").unwrap();
     hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).unwrap();
     assert!(no_tmp(&r));
+    // Empty/unparseable lock is treated as live: the holder may not have
+    // written its pid yet, so taking over could kill a concurrent import.
     std::fs::write(r.join(".golem-import.lock"), b"not-a-pid").unwrap();
+    assert!(hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).is_err());
+    assert!(std::fs::read(r.join(".golem-import.lock")).unwrap() == b"not-a-pid");
+    // Dead-pid lock is taken over and released.
+    let dead = ((1000..100000u32)
+        .find(|&p| !Path::new("/proc").join(p.to_string()).exists())
+        .expect("no free pid"))
+    .to_string();
+    std::fs::write(r.join(".golem-import.lock"), &dead).unwrap();
     hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).unwrap();
     assert!(no_tmp(&r), "stale lock taken over and released");
     std::fs::write(r.join(".golem-import.lock"), std::process::id().to_string()).unwrap();
