@@ -454,14 +454,18 @@ fn reject_aliases(dir: &Path, replicas: &[PathBuf]) -> Result<(), ImportError> {
 }
 
 /// Deletes every leftover `*.golem-import.*.tmp` under `replica`. Only
-/// called while the replica lock is held, so no live writer's tmp exists.
+/// called while the replica lock is held. Also reaps `.golem-import.lock.*`
+/// files abandoned by a crashed takeover: with the main lock held, any such
+/// file holds stale lock content, never a live holder's.
 fn sweep_tmps(replica: &Path) {
     let Ok(rd) = std::fs::read_dir(replica) else {
         return;
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".tmp") && name.contains(".golem-import.") {
+        let stale_tmp = name.ends_with(".tmp") && name.contains(".golem-import.");
+        let stale_lock = name.starts_with(".golem-import.lock.");
+        if stale_tmp || stale_lock {
             let _ = std::fs::remove_file(replica.join(e.file_name()));
         }
     }
@@ -486,11 +490,15 @@ impl ReplicaLock {
                 .open(&lock)
             {
                 Ok(mut f) => {
-                    f.write_all(std::process::id().to_string().as_bytes())
-                        .map_err(|e| ImportError::Io {
-                            path: lock.clone(),
+                    if let Err(e) = f.write_all(std::process::id().to_string().as_bytes()) {
+                        // Never leave an empty lock behind: it would be
+                        // untakeable (see below).
+                        let _ = std::fs::remove_file(&lock);
+                        return Err(ImportError::Io {
+                            path: lock,
                             source: e,
-                        })?;
+                        });
+                    }
                     sweep_tmps(replica);
                     return Ok(Self(lock));
                 }
@@ -511,9 +519,13 @@ impl ReplicaLock {
                             },
                         ));
                     }
-                    // Takeover: rename-then-verify so we only unlink a lock
-                    // whose pid we ourselves observed as dead. If the rename
-                    // or the re-read races with another contender, back off.
+                    // Takeover: rename-then-verify so we only ever unlink
+                    // lock content whose dead pid we ourselves observed. If
+                    // the pid changed under us, another contender owns the
+                    // situation: hard-link the moved file back only if the
+                    // lock path is free (`hard_link` never clobbers), else
+                    // drop our stale copy. Either way the live lock at the
+                    // canonical path is never deleted.
                     let taken = replica.join(format!(".golem-import.lock.{}", std::process::id()));
                     if std::fs::rename(&lock, &taken).is_err()
                         || std::fs::read_to_string(&taken)
@@ -521,6 +533,7 @@ impl ReplicaLock {
                             .and_then(|s| s.trim().parse::<u32>().ok())
                             != pid
                     {
+                        let _ = std::fs::hard_link(&taken, &lock);
                         let _ = std::fs::remove_file(&taken);
                         continue;
                     }
