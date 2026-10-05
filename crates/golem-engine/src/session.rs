@@ -284,7 +284,7 @@ fn forces_expert_offload(config: &EngineConfig) -> bool {
 /// `llama_backend_init` exactly once per process, however many models get
 /// loaded. The first load decides the op-offload threshold: it is read once at
 /// device init, so a later session cannot change it (a pooled session after a
-/// flagless one is caught at runtime by `check_pool_engaged`).
+/// flagless one is caught at runtime by `check_experts_on_gpu`).
 fn init_backend(force_expert_offload: bool) {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -462,8 +462,9 @@ pub struct Session {
     /// this is only the stats/geometry view, so no drop-order coupling with
     /// the substrate.
     p3: Option<p3_glue::PoolEnable>,
-    /// Set once the first pooled offloaded decode has been checked for pool
-    /// traffic (see [`check_pool_engaged`]).
+    /// Set once a pooled offloaded turn's prefill passed
+    /// [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first
+    /// decode step passed [`check_experts_on_gpu`].
     pool_verified: bool,
 }
 
@@ -670,6 +671,14 @@ impl Session {
         let mut n_past: usize = 0;
         let mut last_chunk_len = 0;
         // §6.2: prefill routes nearly every expert; keep it out of recency.
+        // I2 runtime proof window: this turn's prefill and first batch-1 decode
+        // (the op-offload threshold is per ubatch, so both shapes are checked).
+        let verify = !self.pool_verified
+            && self.p3.is_some()
+            && self.offloaded()
+            && substrate_backend() == Backend::Hip;
+        let placement_before = expert_placement();
+        let traffic_before = self.p3.as_ref().map_or(0, |p| pool_traffic(&p.stats));
         let prefill = p3_glue::PrefillScope::enter();
         for chunk in prompt.chunks(chunk_cap) {
             let len = chunk.len();
@@ -720,10 +729,10 @@ impl Session {
         }
         drop(prefill);
 
-        if !self.pool_verified && self.offloaded() && substrate_backend() == Backend::Hip {
+        if verify {
+            check_experts_on_gpu(placement_before, expert_placement())?;
             if let Some(p3) = &self.p3 {
-                check_pool_engaged(&p3.stats)?;
-                self.pool_verified = true;
+                check_pool_engaged(traffic_before, &p3.stats)?;
             }
         }
 
@@ -805,6 +814,10 @@ impl Session {
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += 1;
+            if verify && !self.pool_verified {
+                check_experts_on_gpu(placement_before, expert_placement())?;
+                self.pool_verified = true;
+            }
             // SAFETY: sampler chain and ctx are live; the decode emitted logits for slot 0.
             tok = unsafe { raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), 0) };
             if let Some(steps) = steps.as_mut() {
@@ -1070,21 +1083,84 @@ unsafe fn token_piece(vocab: *const raw::llama_vocab, token: raw::llama_token) -
     buf
 }
 
-/// Runtime proof of design I2 for a pooled offloaded run: after the first
-/// prefill, the pool must have served expert copies (`ensure_host_resident`
-/// fires only from the GPU split's expert-copy path). Zero traffic means the
-/// expert `MUL_MAT_ID` ran somewhere else — silently on the CPU, or the
-/// experts never left the device — and decoding on would be a silent
-/// violation.
-fn check_pool_engaged(stats: &P3Stats) -> Result<(), EngineError> {
+/// Expert copies the pool has served (demand page-ins + fast hits), cumulative.
+fn pool_traffic(stats: &P3Stats) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    if stats.demand_slow_pageins.load(Relaxed) + stats.fast_hits.load(Relaxed) == 0 {
+    stats.demand_slow_pageins.load(Relaxed) + stats.fast_hits.load(Relaxed)
+}
+
+/// Runtime proof of design I2 for a pooled offloaded run: since `before`
+/// (a [`pool_traffic`] snapshot taken before the prefill), the pool must have
+/// served expert copies (`ensure_host_resident` fires only from the GPU
+/// split's expert-copy path). Zero traffic means the expert `MUL_MAT_ID` ran
+/// somewhere else — silently on the CPU, or the experts never left the
+/// device — and decoding on would be a silent violation.
+fn check_pool_engaged(before: u64, stats: &P3Stats) -> Result<(), EngineError> {
+    if pool_traffic(stats) == before {
         return Err(EngineError::PoolInit(
-            "the expert pool served no copies during the first pooled prefill: expert \
+            "the expert pool served no copies during this pooled prefill: expert \
              MUL_MAT_ID is not running through the GPU split (CPU fallback, or experts \
              already device-resident); refusing to decode silently off-pool"
                 .into(),
         ));
+    }
+    Ok(())
+}
+
+/// Expert `MUL_MAT_ID` nodes the scheduler assigned per backend type,
+/// cumulative for the process (counted once per graph build, P1
+/// `golem_get_expert_placement_stats`). Two independent loads, not a
+/// consistent snapshot: compare deltas over a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertPlacement {
+    /// Expert `MUL_MAT_ID` nodes assigned to a GPU backend (cumulative).
+    pub on_gpu: u64,
+    /// Expert `MUL_MAT_ID` nodes assigned to a CPU backend (cumulative).
+    pub on_cpu: u64,
+}
+
+/// Reads the P1 scheduler placement counters (see [`ExpertPlacement`]).
+pub fn expert_placement() -> ExpertPlacement {
+    // SAFETY: FFI getter; returns a process-lifetime static, never null.
+    let block = unsafe { raw::golem_get_expert_placement_stats() };
+    assert!(
+        !block.is_null(),
+        "golem_get_expert_placement_stats returned null"
+    );
+    // SAFETY: layout contract from the C++ definition (bindgen renders the
+    // struct opaque): 2 contiguous lock-free u64 counters, on_gpu then on_cpu.
+    let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 2]>() };
+    let load = |i: usize| counters[i].load(std::sync::atomic::Ordering::Relaxed);
+    ExpertPlacement {
+        on_gpu: load(0),
+        on_cpu: load(1),
+    }
+}
+
+/// Runtime proof of design I2 over the graphs built between `before` and
+/// `after`: every expert `MUL_MAT_ID` on the GPU, and at least one seen (a
+/// zero count would prove nothing). A future opt-in CPU expert-math mode
+/// (§1 O1) would report the CPU count here instead of refusing; the counters are
+/// process-global, so that mode also needs per-session counts if strict and
+/// opted-in sessions can share a process. The window covers graph builds:
+/// a reused graph keeps the placement of the build that produced it. HIP
+/// substrate only (the gate at the call site).
+fn check_experts_on_gpu(
+    before: ExpertPlacement,
+    after: ExpertPlacement,
+) -> Result<(), EngineError> {
+    let on_gpu = after.on_gpu - before.on_gpu;
+    let on_cpu = after.on_cpu - before.on_cpu;
+    if on_cpu != 0 || on_gpu == 0 {
+        return Err(EngineError::BackendUnavailable(format!(
+            "the scheduler placed {on_cpu} expert MUL_MAT_ID node(s) on the CPU and {on_gpu} \
+             on the GPU since this pooled turn began (0 and 0 = no expert graph built); every \
+             expert op must run on the GPU \
+             (design I2). Inspect split causes with GGML_SCHED_DEBUG=2 (1.off/1.wgt); a \
+             flagless session loaded first in this process pins the op-offload threshold \
+             at upstream's 32. The counts are process-global: another session decoding in \
+             this process during the turn is included in them"
+        )));
     }
     Ok(())
 }
@@ -1160,15 +1236,28 @@ mod tests {
     }
 
     #[test]
-    fn pool_engaged_check_rejects_zero_traffic_and_accepts_any() {
+    fn expert_placement_check_requires_gpu_and_rejects_any_cpu() {
+        let p = |on_gpu, on_cpu| ExpertPlacement { on_gpu, on_cpu };
+        let before = p(10, 3);
+        check_experts_on_gpu(before, p(16, 3)).unwrap();
+        let err = check_experts_on_gpu(before, p(16, 4)).unwrap_err();
+        assert!(matches!(err, EngineError::BackendUnavailable(_)), "{err}");
+        let err = check_experts_on_gpu(before, before).unwrap_err();
+        assert!(matches!(err, EngineError::BackendUnavailable(_)), "{err}");
+    }
+
+    #[test]
+    fn pool_engaged_check_counts_only_traffic_since_the_snapshot() {
         let stats = P3Stats::new();
-        let err = check_pool_engaged(&stats).unwrap_err();
+        let err = check_pool_engaged(0, &stats).unwrap_err();
         assert!(matches!(err, EngineError::PoolInit(_)), "{err}");
         stats.fast_hits.store(1, Ordering::Relaxed);
-        check_pool_engaged(&stats).unwrap();
-        let stats = P3Stats::new();
+        check_pool_engaged(0, &stats).unwrap();
+        let before = pool_traffic(&stats);
+        let err = check_pool_engaged(before, &stats).unwrap_err();
+        assert!(matches!(err, EngineError::PoolInit(_)), "{err}");
         stats.demand_slow_pageins.store(1, Ordering::Relaxed);
-        check_pool_engaged(&stats).unwrap();
+        check_pool_engaged(before, &stats).unwrap();
     }
 
     #[test]

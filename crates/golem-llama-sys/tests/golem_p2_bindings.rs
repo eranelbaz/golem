@@ -39,3 +39,22 @@ fn golem_hooks_abi_version_matches_header() {
         raw::GOLEM_HOOKS_ABI_VERSION as i32
     );
 }
+
+#[test]
+fn golem_p1_expert_placement_stats_roundtrip() {
+    // Zero asserts below need a fresh process (no graph built yet).
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "run under cargo nextest: this test needs its own process"
+    );
+    assert_eq!(std::mem::size_of::<raw::golem_expert_placement_stats>(), 0);
+    // SAFETY: FFI getter, no invariants; returns a process-lifetime static, never null.
+    let p = unsafe { raw::golem_get_expert_placement_stats() };
+    assert!(!p.is_null());
+    // SAFETY: layout contract from the C++ definition (opaque to bindgen): 2
+    // contiguous lock-free u64 counters, on_gpu then on_cpu; process-lifetime static.
+    let stats = unsafe { &*(p.cast::<[AtomicU64; 2]>()) };
+    assert_eq!(stats[0].load(Ordering::Relaxed), 0);
+    assert_eq!(stats[1].load(Ordering::Relaxed), 0);
+}

@@ -21,3 +21,15 @@ pub fn offload_config() -> EngineConfig {
         ..Default::default()
     }
 }
+
+/// Precondition for tests that depend on process-global substrate state
+/// (op-offload threshold read once at device init, P1 counters): each test
+/// must own its process. nextest's default mode does; plain `cargo test`
+/// does not, and the test then fails here instead of passing by luck.
+pub fn require_process_per_test() {
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "run under cargo nextest: this test needs its own process"
+    );
+}

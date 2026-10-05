@@ -27,7 +27,7 @@ if [ "$run_upstream" = 1 ]; then
   # builds test-chat, which links server-context — only defined when the server builds.
   # Skip network/fixture-dependent tests; excluding only test-download-model would
   # leave its FIXTURES_REQUIRED dependents Not Run (ctest exits nonzero).
-  # Exclusion list verified with `ctest -N` (60 tests total; regex excludes 7):
+  # Exclusion list verified with `ctest -N` (63 tests total; regex excludes 7):
   #   - test-download-model: HF network download (FIXTURES_SETUP test-download-model)
   #   - test-thread-safety, test-state-restore-fragmented: FIXTURES_REQUIRED
   #     test-download-model → Not Run if the fixture is excluded (ctest exits nonzero)
@@ -35,7 +35,7 @@ if [ "$run_upstream" = 1 ]; then
   #     excluded per gate scope
   #   - test-tokenizers-ggml-vocabs: clones HF vocabs repo
   #   - test-jinja regex also matches test-jinja-py: both need python3 + jinja
-  # Still running (53): test-generate-models (offline synthetic dummy models,
+  # Still running (56): test-generate-models (offline synthetic dummy models,
   # FIXTURES_SETUP generate-models) + the 4 recurrent-state-rollback variants that
   # require it, tokenizer-0/-1 suites, sampling/grammar/gguf/alloc/backend tests.
   ctest --test-dir "$build" --output-on-failure \

@@ -386,6 +386,11 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(golem-p3-copy.cpp)
     target_link_libraries(golem-p3-copy PRIVATE ggml)
     target_include_directories(golem-p3-copy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    # Golem P1 placement counters: expert MUL_MAT_ID nodes counted per
+    # backend device type at graph split (golem_get_expert_placement_stats).
+    llama_build_and_test(golem-p1-placement.cpp)
+    target_link_libraries(golem-p1-placement PRIVATE ggml)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

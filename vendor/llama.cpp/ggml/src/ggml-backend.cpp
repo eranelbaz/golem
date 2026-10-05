@@ -34,6 +34,7 @@
 
 static golem_ensure_host_resident_fn golem_h_ensure_host_resident = NULL;
 static int golem_expert_stem_kind(const char *name); // defined in the P1 section
+static int golem_tensor_is_expert(const struct ggml_tensor *t); // defined in the P1 section
 static int golem_tensor_blk(const char *name); // defined in the P1 section (layer key of the shared slot table)
 
 // Copy a pooled expert run slot by slot: the plan and its slot-overrun
@@ -75,6 +76,14 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && alignof(std::atomic<
               "counters are read from Rust as plain AtomicU64: lock-free and u64-aligned");
 static golem_device_cache_stats golem_h_dc_stats = {};
 const golem_device_cache_stats *golem_get_device_cache_stats(void) { return &golem_h_dc_stats; }
+
+struct golem_expert_placement_stats {
+    std::atomic<uint64_t> on_gpu; // expert MUL_MAT_ID nodes assigned to a non-CPU backend
+    std::atomic<uint64_t> on_cpu; // expert MUL_MAT_ID nodes assigned to the CPU backend (I2 violation unless opted in)
+};
+static_assert(sizeof(golem_expert_placement_stats) == 2 * sizeof(uint64_t), "golem_expert_placement_stats layout must match the Rust [AtomicU64; 2] FFI cast");
+static golem_expert_placement_stats golem_h_placement_stats = {};
+const golem_expert_placement_stats *golem_get_expert_placement_stats(void) { return &golem_h_placement_stats; }
 
 #include "golem-device-cache.hpp" // golem::GolemSlabEntry + slab step: shared with the ctest fuzz TU (ODR)
 
@@ -1377,6 +1386,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+    }
+
+    // Golem I2 proof (design §2.3): node backends are final here and src[0]
+    // still names the weight (pass 5 swaps it for the per-backend copy).
+    {
+        uint64_t on_gpu = 0, on_cpu = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT_ID || !golem_tensor_is_expert(node->src[0])) {
+                continue;
+            }
+            const int b = tensor_backend_id(node);
+            GGML_ASSERT(b != -1);
+            if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                on_cpu++;
+            } else {
+                on_gpu++;
+            }
+        }
+        if (on_gpu) golem_h_placement_stats.on_gpu.fetch_add(on_gpu, std::memory_order_relaxed);
+        if (on_cpu) golem_h_placement_stats.on_cpu.fetch_add(on_cpu, std::memory_order_relaxed);
     }
 
     // pass 5: split graph, find tensors that need to be copied

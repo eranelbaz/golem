@@ -18,7 +18,7 @@ typedef struct golem_policy_state golem_policy_state;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 3
+#define GOLEM_HOOKS_ABI_VERSION 4
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure [first_id, last_id] of `tensor` are resident in the host expert
@@ -90,6 +90,17 @@ void golem_reset_device_cache(void);
 /* P4 counters. Opaque here (C++ side keeps the members atomic); each member is a lock-free 8-byte counter read by Rust as u64. */
 struct golem_device_cache_stats;
 const struct golem_device_cache_stats *golem_get_device_cache_stats(void);
+
+/* I2 runtime proof (design §2.3): expert MUL_MAT_ID nodes counted at
+ * scheduler graph split by the device type of their assigned backend
+ * (on_gpu = any non-CPU device). Cumulative since process start, bumped once
+ * per graph build (never per routed expert); a reused graph is not recounted,
+ * so treat them as a tripwire over a window, not an inventory. Covers the
+ * three split stems only (fused ffn_gate_up_exps is excluded, as in P2).
+ * Opaque here; members are lock-free 8-byte counters read by Rust as u64, in
+ * order on_gpu, on_cpu. */
+struct golem_expert_placement_stats;
+const struct golem_expert_placement_stats *golem_get_expert_placement_stats(void);
 
 #ifdef __cplusplus
 }
