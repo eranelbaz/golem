@@ -39,3 +39,22 @@ fn golem_hooks_abi_version_matches_header() {
         raw::GOLEM_HOOKS_ABI_VERSION as i32
     );
 }
+
+#[test]
+fn golem_p1_expert_placement_stats_roundtrip() {
+    // Zero asserts below need a fresh process (no graph built yet).
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "run under cargo nextest: this test needs its own process"
+    );
+    assert_eq!(std::mem::size_of::<raw::golem_expert_placement_stats>(), 0);
+    // SAFETY: returns a valid pointer to a process-global zero-sized stats struct, or null only on allocator failure.
+    let p = unsafe { raw::golem_get_expert_placement_stats() };
+    assert!(!p.is_null());
+    // Layout contract from the C++ definition: on_gpu, on_cpu as lock-free u64.
+    // SAFETY: the returned pointer outlives the process and points to two consecutive u64 counters (on_gpu, on_cpu).
+    let stats = unsafe { &*(p.cast::<[AtomicU64; 2]>()) };
+    assert_eq!(stats[0].load(Ordering::Relaxed), 0);
+    assert_eq!(stats[1].load(Ordering::Relaxed), 0);
+}
