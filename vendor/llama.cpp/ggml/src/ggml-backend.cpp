@@ -1429,6 +1429,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             const int b = tensor_backend_id(node);
             GGML_ASSERT(b != -1);
+            // Zero-token ubatch (prefill/generation chunk with n_outputs == 0):
+            // the MoE trunk is gated through get_rows(out_ids), so expert MMID
+            // nodes collapse to ne[2] == 0 — no routed experts, no expert math
+            // runs regardless of backend (upstream offload_op rejects batch 0
+            // by design). Real-token builds always differ in n_outputs, so the
+            // graph is rebuilt and placed on the GPU. Exempt from the I2 proof.
+            if (node->ne[2] == 0) {
+                continue;
+            }
             if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 on_cpu++;
             } else {
