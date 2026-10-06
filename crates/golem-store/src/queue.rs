@@ -1414,14 +1414,14 @@ mod tests {
 
     #[test]
     fn faster_drive_self_selects_more_chunks() {
-        // Two replicas on two drives; replica 0 (drive 0) is fast (20 ms/chunk),
-        // replica 1 (drive 1) is slow (200 ms/chunk). 8 chunks, one worker per
+        // Two replicas on two drives; replica 0 (drive 0) is fast (10 ms/chunk),
+        // replica 1 (drive 1) is slow (500 ms/chunk). 10 chunks, one worker per
         // drive: with self-selection (§5.2) both replicas are eligible for every
-        // chunk, so the fast worker pops proportionally more — its served share
-        // must exceed 50% and the drain must beat even a 50/50 split, let alone
-        // the slow-only bound (8 × 200 ms). Timing-tolerant: asserts the share
-        // inequality, not exact percentages.
-        let bytes = crate::stripe::CHUNK * 8;
+        // chunk, so the fast worker pops proportionally more — nominally ~90%.
+        // Even if the fast worker is descheduled several times under parallel
+        // test load, its share must stay ≥60%, and the drain must beat a static
+        // 50/50 split (5 × 500 ms = 2.5 s), let alone the slow-only bound.
+        let bytes = crate::stripe::CHUNK * 10;
         let root = std::env::temp_dir().join("golem-store-queue-self-select");
         let mut replicas = Vec::with_capacity(2);
         for r in 0..2 {
@@ -1448,7 +1448,7 @@ mod tests {
             log,
             drives: vec!["fast0".to_owned(), "slow1".to_owned()],
             delay_ms: 0,
-            delays_ms: vec![20, 200],
+            delays_ms: vec![10, 500],
             conc: None,
             wait_for_pair: None,
         };
@@ -1471,17 +1471,17 @@ mod tests {
         let elapsed = t0.elapsed();
         assert_eq!(dst, pattern(0, bytes));
         let reads = sources.log.lock().unwrap().clone();
-        assert_eq!(reads.len(), 8, "every chunk served once: {reads:?}");
+        assert_eq!(reads.len(), 10, "every chunk served once: {reads:?}");
         let fast = reads.iter().filter(|(r, _)| *r == 0).count();
         let slow = reads.iter().filter(|(r, _)| *r == 1).count();
         assert!(
-            fast > slow && fast * 2 > reads.len(),
-            "fast drive must self-select >50% of chunks: fast={fast} slow={slow}"
+            fast * 10 >= reads.len() * 6,
+            "fast drive must self-select ≥60% of chunks (nominally ~90%): fast={fast} slow={slow}"
         );
-        // Beats a static 50/50 split (4 × 200 ms) — and the slow-only bound.
+        // Beats a static 50/50 split (5 × 500 ms) — and the slow-only bound.
         assert!(
-            elapsed < std::time::Duration::from_millis(4 * 200),
-            "drain ({elapsed:?}) must beat the 50/50 bound of 800 ms"
+            elapsed < std::time::Duration::from_millis(5 * 500),
+            "drain ({elapsed:?}) must beat the 50/50 bound of 2.5 s"
         );
     }
 
