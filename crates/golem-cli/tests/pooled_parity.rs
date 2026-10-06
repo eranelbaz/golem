@@ -12,13 +12,17 @@
 mod common;
 
 fn run_greedy(ram_experts_gib: &str) -> std::process::Output {
+    run_greedy_args(ram_experts_gib, &[])
+}
+
+fn run_greedy_args(ram_experts_gib: &str, extra: &[&str]) -> std::process::Output {
     let model = common::tiny_moe_path();
     std::process::Command::new(env!("CARGO_BIN_EXE_golem"))
         .args([
             "run",
             "--greedy",
             "--n-predict",
-            "16",
+            "32",
             "--n-gpu-layers",
             "99",
             "--cpu-moe-layers",
@@ -26,8 +30,20 @@ fn run_greedy(ram_experts_gib: &str) -> std::process::Output {
             "--ram-experts-gib",
             ram_experts_gib,
         ])
+        .args(extra)
         .arg(&model)
-        .args(["--prompt", "Hello"])
+        .args([
+            "--prompt",
+            // Routing breadth: long and lexically varied so greedy decode
+            // plausibly routes more than K = 4 distinct experts per touched
+            // layer (tiny-moe top-k = 2) — a short prompt could leave the
+            // K = 4 budget unexercised and the comparison vacuous. The
+            // eviction/counter behavior itself is asserted in golem-engine's
+            // `budget_tiny_moe`, where the counters are readable.
+            "MoE routing probe: the quick brown fox jumps over the lazy dog \
+while numbers 1 2 3 4 5 6 7 8 9 march past a completely different \
+subject line",
+        ])
         .output()
         .unwrap()
 }
@@ -61,5 +77,42 @@ fn pooled_and_unpooled_output_are_byte_identical() {
          off={:?} on={:?}",
         String::from_utf8_lossy(&off.stdout),
         String::from_utf8_lossy(&on.stdout)
+    );
+}
+
+/// Cross-budget output parity (review O6/Q5): a device cache budgeted to
+/// K = 4 experts (< tiny-moe n_expert = 8, so the slab evicts under routing
+/// breadth) must produce the same greedy output as the K = 8 (K ≥ n_expert)
+/// baseline. The eviction/counter behavior itself is asserted in
+/// golem-engine's `budget_tiny_moe`; this needs one HIP process per budget,
+/// which only the CLI subprocesses provide (one pool-enabled session per
+/// process). Cost: two more HIP sessions per run.
+#[test]
+fn device_cache_budget_k4_matches_k8() {
+    assert_eq!(
+        golem_llama_sys::substrate_backend(),
+        golem_llama_sys::Backend::Hip,
+        "hip-tests requires a HIP-built substrate (GOLEM_LLAMA_SYS_BACKEND=hip)"
+    );
+    let k4 = run_greedy_args("1", &["--device-cache-experts", "4"]);
+    let k8 = run_greedy_args("1", &["--device-cache-experts", "8"]);
+    assert!(
+        k4.status.success(),
+        "K = 4 run failed: {}",
+        String::from_utf8_lossy(&k4.stderr)
+    );
+    assert!(
+        k8.status.success(),
+        "K = 8 run failed: {}",
+        String::from_utf8_lossy(&k8.stderr)
+    );
+    assert!(!k4.stdout.is_empty(), "K = 4 run produced no output");
+    assert_eq!(
+        k4.stdout,
+        k8.stdout,
+        "a budgeted device cache (K = 4 < n_expert) must not change greedy \
+         output vs the K = 8 baseline: k4={:?} k8={:?}",
+        String::from_utf8_lossy(&k4.stdout),
+        String::from_utf8_lossy(&k8.stdout)
     );
 }

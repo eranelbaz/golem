@@ -131,3 +131,37 @@ fn class_regions_are_disjoint_and_sized_per_class() {
     assert_eq!((a.slot_size_of(2), a.slot_size_of(3)), (4096, 6144));
     assert_eq!((a.class_of(2), a.class_of(3)), (0, 1));
 }
+
+/// Fixture integrity for the shape-moe device budget (review O6/Q5): the
+/// budget constant must stay below the smallest per-expert tensor of the
+/// shape-moe fixture, so a device slab sized from it can never hold a whole
+/// expert tensor and every budgeted run forces P4 evictions. Consumed here
+/// (not only in xtask's own self-test) so the constant has a cross-crate
+/// test consumer.
+#[test]
+#[cfg(not(loom))]
+fn shape_moe_device_budget_is_below_one_expert_tensor() {
+    use xtask::shape_moe::{DEVICE_BUDGET_BYTES, dims};
+
+    let mut f = std::fs::File::open(&xtask::shape_moe::cached_fixture()[1])
+        .expect("shape-moe fixture shard 2");
+    let min_expert_tensor = golem_gguf::tensor_entries(&mut f)
+        .expect("tensor entries")
+        .into_iter()
+        .map(|e| {
+            golem_gguf::ggml_row_bytes(e.ggml_type, e.dims[0]).unwrap() * e.dims[1] * e.dims[2]
+        })
+        .min()
+        .expect("fixture carries expert tensors");
+    // Smallest plane: Q4_K rows (144 B) × ne1 32 × 64 experts = 294 912 B.
+    assert_eq!(min_expert_tensor, 294_912, "fixture geometry changed");
+    assert!(
+        DEVICE_BUDGET_BYTES < min_expert_tensor,
+        "device budget {DEVICE_BUDGET_BYTES} must be < one expert tensor \
+         {min_expert_tensor} to force P4 evictions (dims NE0={}, NE1={}, \
+         N_EXPERT={})",
+        dims::NE0,
+        dims::NE1,
+        dims::N_EXPERT
+    );
+}
