@@ -68,6 +68,11 @@ pub struct RunArgs {
     /// at least the model's top-k.
     #[arg(long, value_name = "EXPERTS")]
     pub device_cache_experts: Option<u32>,
+    /// Store reader threads per drain (§5.4, `EngineConfig::io_threads`);
+    /// omitted derives one thread per physical drive hosting an eligible
+    /// replica (D-12: per-drive threads, never per-file).
+    #[arg(long, value_name = "N")]
+    pub io_threads: Option<usize>,
     /// Write a T2 parity dump (JSONL: line-1 header, then one record per
     /// generation step) to this file instead of streaming the completion;
     /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
@@ -96,6 +101,7 @@ impl RunArgs {
             // (0, 1) therefore disables the pool — the help text says so.
             ram_experts_gib: self.ram_experts_gib.unwrap_or(0.0).max(0.0) as u64,
             device_cache_experts: self.device_cache_experts.unwrap_or(0),
+            io_threads: self.io_threads,
             ..default
         }
     }
@@ -589,6 +595,14 @@ mod tests {
         assert_eq!(config.device_cache_experts, 0, "unset = derive from VRAM");
         let config = parse_run_args(&["run", "m.gguf", "--device-cache-experts", "9"]).to_config();
         assert_eq!(config.device_cache_experts, 9);
+    }
+
+    #[test]
+    fn run_args_map_io_threads_flag_into_config() {
+        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        assert_eq!(config.io_threads, None, "unset = derived per-drive count");
+        let config = parse_run_args(&["run", "m.gguf", "--io-threads", "4"]).to_config();
+        assert_eq!(config.io_threads, Some(4));
     }
 
     #[test]

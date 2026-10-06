@@ -39,6 +39,9 @@ pub struct EngineConfig {
     /// unbounded slabs OOM the 24 GiB card on the real model). A routed set
     /// larger than K aborts loudly, so a K below the model's top-k is rejected at enable.
     pub device_cache_experts: u32,
+    /// Store reader threads per drain (§5.4 `--io-threads`); `None` derives
+    /// one thread per physical drive hosting an eligible replica.
+    pub io_threads: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -56,6 +59,7 @@ impl Default for EngineConfig {
             cpu_moe_layers: None,
             ram_experts_gib: 0,
             device_cache_experts: 0,
+            io_threads: None,
         }
     }
 }
@@ -82,6 +86,10 @@ mod tests {
         assert_eq!(
             c.device_cache_experts, 0,
             "0 = unset: the engine derives a bounded K from free VRAM at enable"
+        );
+        assert_eq!(
+            c.io_threads, None,
+            "io threads default to the derived per-drive count"
         );
     }
 }
