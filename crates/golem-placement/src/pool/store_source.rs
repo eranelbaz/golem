@@ -15,7 +15,7 @@ use std::sync::Arc;
 use golem_gguf::{
     arch_kv_int, blk_of, data_section_offset, ggml_row_bytes, read_kvs, shard_path, tensor_entries,
 };
-use golem_store::{ChunkQueue, ReadJob, ReplicaRegistry, StoreError, load_manifest, plan_aligned};
+use golem_store::{ChunkQueue, ReadJob, ReplicaRegistry, StoreError, load_manifest};
 
 use super::residency::ExpertKind;
 use super::source::{DIRECT_ALIGN, ExpertSource, SourceError, plane_index};
@@ -33,6 +33,13 @@ struct StorePlane {
     stride: u64,
     /// Expert count.
     n_experts: u32,
+    /// Per-expert aligned covering length: `align_up(offset + stride) -
+    /// align_down(offset)` — the byte count the queue requires in `dst`
+    /// (§5.4 O_DIRECT rule). Precomputed at open so the hot path never
+    /// builds a plan `Vec` per routed expert.
+    covering: Vec<u32>,
+    /// `stride × n_experts`, checked at open (bound against overflow).
+    total_bytes: u64,
     /// §5.3 expected CRC32C per expert; `None` skips verification.
     crc: Option<Vec<u32>>,
 }
@@ -68,11 +75,30 @@ const MAX_BLOCKS: u32 = 1 << 16;
 const MAX_SHARDS: u64 = 1 << 12;
 
 thread_local! {
-    /// Reused aligned covering-region scratch for planes whose slot region
-    /// cannot host the queued read themselves (misaligned tensor base or an
-    /// undersized plane buffer). Reserved to the largest plane once, then
-    /// reused: steady-state page-in allocates nothing (§5.4 hot path).
+    /// Reused page-aligned covering-region scratch for planes whose slot
+    /// region cannot host the queued read themselves (misaligned tensor base
+    /// or an undersized plane buffer). Over-allocated by one page and sliced
+    /// at the first page-aligned address (same trick as the §5.4 open-time
+    /// O_DIRECT probe): the queue checks 4 KiB dst alignment, which a plain
+    /// `Vec<u8>` allocation (align 1) would silently fail. Reserved to the
+    /// largest plane at `open` on the opening thread; other threads allocate
+    /// on first use, then never again — steady-state page-in allocates
+    /// nothing (§5.4 hot path).
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Page-aligned window of `need` bytes inside an over-allocated scratch
+/// `Vec`: resizes to `need + DIRECT_ALIGN - 1` and slices at the first
+/// 4 KiB-aligned address. Recomputed per call because a growth-triggered
+/// realloc may move the allocation.
+fn aligned_window(scratch: &mut Vec<u8>, need: usize) -> &mut [u8] {
+    let page = DIRECT_ALIGN as usize;
+    let raw = need + page - 1;
+    if scratch.len() < raw {
+        scratch.resize(raw, 0);
+    }
+    let skip = (page - scratch.as_ptr() as usize % page) % page;
+    &mut scratch[skip..skip + need]
 }
 
 impl StoreExpertSource {
@@ -106,8 +132,8 @@ impl StoreExpertSource {
         // Shard-split arithmetic, same as GgufPreadSource derives from the
         // GGUF headers: shard i's absolute tensor base = data-section start
         // + table offset; expert i's row sits `offsets_bytes[i]` into the
-        // tensor. Walk the FIRST replica only — replicas are byte-identical
-        // by construction (§5.3 digests) and the registry verified sizes.
+        // tensor. The first replica's tables are authoritative; all other
+        // replicas are cross-checked against them below (§5.3).
         let first = manifest.shards[0].replicas[0].join(&manifest.shards[0].file);
         let mut f0 = File::open(&first)?;
         let kvs = read_kvs(&mut f0)?;
@@ -131,6 +157,9 @@ impl StoreExpertSource {
 
         // tensor name → (shard, absolute base, row stride, n_experts).
         let mut tables: HashMap<String, (usize, u64, u64, u32)> = HashMap::new();
+        // tensor name → (tensor-table offset, ggml type, dims): the replica
+        // identity signature all replicas must match byte-for-byte (§5.3).
+        let mut sig: HashMap<String, (u64, u32, [u64; 3])> = HashMap::new();
         for shard in 0..split_count {
             let shard_ix = shard as usize;
             let sp = shard_path(&first, shard, split_count)?;
@@ -162,10 +191,9 @@ impl StoreExpertSource {
             let mut f = File::open(&sp)?;
             let data_start = data_section_offset(&mut f)?;
             for e in tensor_entries(&mut f)? {
-                let Some(kind) = e.expert_kind() else {
+                if e.expert_kind().is_none() {
                     continue;
-                };
-                let _ = kind;
+                }
                 let stride = ggml_row_bytes(e.ggml_type, e.dims[0])
                     .ok_or(SourceError::UnknownGgmlType {
                         name: e.name.clone(),
@@ -185,11 +213,57 @@ impl StoreExpertSource {
                         name: e.name.clone(),
                     })?;
                 tables.insert(e.name.clone(), (shard_ix, base, stride, n_experts));
+                sig.insert(e.name.clone(), (e.offset, e.ggml_type, e.dims));
+            }
+        }
+        // Cross-check every remaining replica's tensor table against the
+        // first: size and layout must match, or planes would resolve to
+        // different bytes depending on which replica served the read (§5.3).
+        for (s, shard) in manifest
+            .shards
+            .iter()
+            .enumerate()
+            .take(split_count as usize)
+        {
+            for (r, rep) in shard.replicas.iter().enumerate() {
+                let rp = rep.join(&shard.file);
+                let first_replica = s == 0 && r == 0;
+                if first_replica || rp == shard_path(&first, s as u64, split_count)? {
+                    continue; // already walked above
+                }
+                let mut f = File::open(&rp)?;
+                let mut seen = 0usize;
+                for e in tensor_entries(&mut f)? {
+                    match sig.get(&e.name) {
+                        Some(&(off, ty, dims))
+                            if off == e.offset && ty == e.ggml_type && dims == e.dims => {}
+                        _ => {
+                            return Err(SourceError::Store(StoreError::Invalid {
+                                msg: format!(
+                                    "replica {} tensor `{}` differs from the first replica's tensor table (§5.3)",
+                                    rp.display(),
+                                    e.name
+                                ),
+                            }));
+                        }
+                    }
+                    seen += 1;
+                }
+                if seen != sig.len() {
+                    return Err(SourceError::Store(StoreError::Invalid {
+                        msg: format!(
+                            "replica {} has {seen} expert tensors, first replica has {} (§5.3)",
+                            rp.display(),
+                            sig.len()
+                        ),
+                    }));
+                }
             }
         }
 
         let mut planes: Vec<Option<StorePlane>> = Vec::new();
-        let mut crc_enabled = false;
+        let mut crc_count = 0usize;
+        let mut max_covering = 0usize;
         for entry in &index {
             let kind = ExpertKind::from_tensor_name(&entry.tensor)
                 .ok_or_else(|| SourceError::UnnamedBlock(entry.tensor.clone()))?;
@@ -242,7 +316,29 @@ impl StoreExpertSource {
                 }
                 offsets.push(abs);
             }
-            crc_enabled |= entry.crc32c.is_some();
+            if entry.crc32c.is_some() {
+                crc_count += 1;
+            }
+            // §5.4 covering length per expert, computed arithmetically (no
+            // plan Vec, no per-expert allocation at open either).
+            let mut covering = Vec::with_capacity(offsets.len());
+            for &abs in &offsets {
+                let start = abs - abs % DIRECT_ALIGN;
+                let end = (abs + stride).div_ceil(DIRECT_ALIGN) * DIRECT_ALIGN;
+                let cov =
+                    usize::try_from(end - start).map_err(|_| SourceError::StrideOverflow {
+                        name: entry.tensor.clone(),
+                    })?;
+                max_covering = max_covering.max(cov);
+                covering.push(u32::try_from(cov).map_err(|_| SourceError::StrideOverflow {
+                    name: entry.tensor.clone(),
+                })?);
+            }
+            let total_bytes = stride.checked_mul(u64::from(n_experts)).ok_or_else(|| {
+                SourceError::StrideOverflow {
+                    name: entry.tensor.clone(),
+                }
+            })?;
             let ix = plane_index(layer, kind);
             if planes.len() <= ix {
                 planes.resize_with(ix + 1, || None);
@@ -252,14 +348,30 @@ impl StoreExpertSource {
                 offsets,
                 stride,
                 n_experts,
+                covering,
+                total_bytes,
                 crc: entry.crc32c.clone(),
             });
         }
+        // Reserve the aligned scratch to the largest covering region up
+        // front (plus page slack) so the opening thread never reallocs.
+        SCRATCH.with(|s| {
+            s.borrow_mut()
+                .reserve(max_covering + DIRECT_ALIGN as usize - 1)
+        });
+        let crc_enabled = crc_count > 0;
         if !crc_enabled {
             // Once at startup, not once per read (§5.3 D-4 opt-out).
             tracing::info!(
                 manifest = %manifest_path.display(),
                 "manifest carries no crc32c digests; plane CRC verification is skipped"
+            );
+        } else if crc_count < index.len() {
+            // Partially digested manifest: only some planes are verified.
+            tracing::warn!(
+                manifest = %manifest_path.display(),
+                "manifest carries crc32c for {crc_count} of {} planes; the rest skip verification",
+                index.len()
             );
         }
         Ok(Self {
@@ -275,13 +387,10 @@ impl StoreExpertSource {
         self.crc_enabled
     }
 
-    /// Total pageable expert bytes (Σ `stride × n_experts` over live planes).
+    /// Total pageable expert bytes (Σ `stride × n_experts` over live planes;
+    /// each product was checked at open).
     pub fn expert_bytes(&self) -> u64 {
-        self.planes
-            .iter()
-            .flatten()
-            .map(|p| p.stride * u64::from(p.n_experts))
-            .sum()
+        self.planes.iter().flatten().map(|p| p.total_bytes).sum()
     }
 
     /// The opened replica registry, for health diagnostics.
@@ -331,8 +440,11 @@ impl ExpertSource for StoreExpertSource {
         let expected = p.crc.as_ref().map(|c| c[expert as usize]);
         // One queued drain per plane (§5.2): enqueue the aligned covering
         // chunks, wait — per-drive striping and replica failover happen
-        // inside the drain, never a blocking QD1 read.
-        let covering: usize = plan_aligned(offset, stride).iter().map(|c| c.1).sum();
+        // inside the drain, never a blocking QD1 read. The covering length
+        // was precomputed at open (`StorePlane::covering`); the plan `Vec`
+        // that `ChunkQueue::enqueue` builds internally remains an accepted
+        // per-read cost of the shared queue, not paid here.
+        let covering = p.covering[expert as usize] as usize;
         let logical_at = (offset % DIRECT_ALIGN) as usize;
         // Fast path: the plane buffer can host the aligned covering read
         // itself (aligned base + head scratch room) — bytes land in place,
@@ -342,9 +454,9 @@ impl ExpertSource for StoreExpertSource {
         }
         SCRATCH.with(|s| -> io::Result<()> {
             let mut scratch = s.borrow_mut();
-            scratch.resize(covering, 0);
-            self.drain(p.shard, offset, stride, expected, &mut scratch)?;
-            into[head..head + stride].copy_from_slice(&scratch[logical_at..logical_at + stride]);
+            let buf = aligned_window(&mut scratch, covering);
+            self.drain(p.shard, offset, stride, expected, buf)?;
+            into[head..head + stride].copy_from_slice(&buf[logical_at..logical_at + stride]);
             Ok(())
         })
     }
@@ -440,8 +552,10 @@ mod tests {
     use std::io::Write as _;
 
     /// Two-shard fixture: blk.1 gate in shard 0, up in shard 1; dense lead 1.
+    /// `crc`: `None` — no digests; `Some(true)` — correct digests;
+    /// `Some(false)` — deliberately wrong digests (mismatch injection).
     /// Returns (manifest path, shard-0 data-section offset).
-    fn fixture(tag: &str, crc: bool) -> (PathBuf, u64, u64) {
+    fn fixture(tag: &str, crc: Option<bool>) -> (PathBuf, u64, u64) {
         let dir =
             std::env::temp_dir().join(format!("golem-store-src-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -467,11 +581,15 @@ mod tests {
         let d1 = write_shard(&dir, SHARD1, 1, &kvs1);
 
         let crc_json = |shard: usize| -> String {
-            if !crc {
+            let Some(good) = crc else {
                 return String::new();
+            };
+            let mut c0 = crc32c::crc32c(&row_bytes(shard, 0));
+            let mut c1 = crc32c::crc32c(&row_bytes(shard, 1));
+            if !good {
+                c0 = c0.wrapping_add(1);
+                c1 = c1.wrapping_add(1);
             }
-            let c0 = crc32c::crc32c(&row_bytes(shard, 0));
-            let c1 = crc32c::crc32c(&row_bytes(shard, 1));
             format!(r#", "crc32c": [{c0}, {c1}]"#)
         };
         let sha = "0".repeat(64);
@@ -500,7 +618,7 @@ mod tests {
 
     #[test]
     fn maps_layer_kind_expert_to_manifest_shard_offset() {
-        let (mpath, d0, d1) = fixture("map", true);
+        let (mpath, d0, d1) = fixture("map", Some(true));
         let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
         // plane(): entry offsets_bytes position + tensor base (dense lead 1 →
         // pool layer 0). Gate lives in shard 0 at tensor offset 0.
@@ -540,7 +658,7 @@ mod tests {
 
     #[test]
     fn absent_crc32c_skips_verification_and_logs_once() {
-        let (mpath, _, _) = fixture("nocrc", false);
+        let (mpath, _, _) = fixture("nocrc", None);
         let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
         assert!(
             !src.crc_enabled(),
@@ -552,14 +670,76 @@ mod tests {
             .unwrap();
         assert_eq!(buf, row_bytes(0, 0));
 
-        let (mpath, _, _) = fixture("withcrc", true);
+        // The flag is the observable hook for the once-at-open skip log:
+        // absent digests → off, present digests → on.
+        let (mpath, _, _) = fixture("withcrc", Some(true));
         let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
         assert!(src.crc_enabled());
     }
 
     #[test]
+    fn fast_in_place_path_when_buffer_hosts_covering_region() {
+        let (mpath, _, _) = fixture("fastpath", Some(true));
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        for (kind, shard) in [(ExpertKind::Gate, 0usize), (ExpertKind::Up, 1)] {
+            for expert in 0..2u32 {
+                let (off, stride) = src.plane(0, kind, expert).unwrap();
+                // The queue's aligned covering region, computed arithmetically.
+                let start = off - off % DIRECT_ALIGN;
+                let end = (off + stride).div_ceil(DIRECT_ALIGN) * DIRECT_ALIGN;
+                let covering = (end - start) as usize;
+                let head = (off % DIRECT_ALIGN) as usize;
+                // Aligned head + adequately sized dst → bytes land in place.
+                let mut buf = vec![0u8; covering];
+                src.read_expert(0, kind, expert, &mut buf, head).unwrap();
+                assert_eq!(
+                    &buf[head..head + stride as usize],
+                    &row_bytes(shard, expert)[..]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_tensor_table_mismatch_fails_open() {
+        let (mpath, _, _) = fixture("mismatch", None);
+        // Lie about bytes_per_expert: 15 ≠ the tensor table's 16 B stride.
+        let json = std::fs::read_to_string(&mpath)
+            .unwrap()
+            .replace("\"bytes_per_expert\": 16", "\"bytes_per_expert\": 15");
+        std::fs::write(&mpath, json).unwrap();
+        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap_err();
+        assert!(err.to_string().contains("tensor table says"), "{err}");
+    }
+
+    #[test]
+    fn offset_past_shard_size_fails_open() {
+        let (mpath, _, _) = fixture("overrun", None);
+        // Second expert's row would extend past the registry-verified shard
+        // size (§5.3): offsets [0, 8192] with 16 B rows in an 8192 B file.
+        let json = std::fs::read_to_string(&mpath)
+            .unwrap()
+            .replace("\"offsets_bytes\": [0, 16]", "\"offsets_bytes\": [0, 8192]");
+        std::fs::write(&mpath, json).unwrap();
+        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap_err();
+        assert!(err.to_string().contains("exceeds shard size"), "{err}");
+    }
+
+    #[test]
+    fn crc_mismatch_surfaces_as_invalid_data_read_error() {
+        let (mpath, _, _) = fixture("badcrc", Some(false));
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        assert!(src.crc_enabled());
+        let mut buf = vec![0u8; 8192];
+        let err = src
+            .read_expert(0, ExpertKind::Gate, 0, &mut buf, 0)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    }
+
+    #[test]
     fn read_expert_returns_io_error_when_all_replicas_unavailable() {
-        let (mpath, _, _) = fixture("unavail", true);
+        let (mpath, _, _) = fixture("unavail", Some(true));
         let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
         for s in src.registry().shards() {
             for r in &s.replicas {
