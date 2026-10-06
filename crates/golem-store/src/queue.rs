@@ -692,9 +692,9 @@ fn drain_reads(
         for w in 0..workers {
             let shared = Arc::clone(&shared);
             // Home drive for striping (§5.2): workers are pinned round-robin
-            // to drives so healthy reads stripe across devices instead of
-            // every worker contending for the lowest replica index. A fast
-            // drive's worker pops more chunks — it self-selects.
+            // to drives; at pop time each worker self-selects the chunks its
+            // drive can serve, so the faster drive consumes proportionally
+            // more chunks.
             let home = if drives == 0 { 0 } else { w % drives };
             s.spawn(move || {
                 loop {
@@ -704,8 +704,32 @@ fn drain_reads(
                         let (lock, cv) = &*shared;
                         let mut sh = lock.lock().unwrap_or_else(PoisonError::into_inner);
                         loop {
-                            if let Some(j) = sh.list.pop_front() {
-                                break j;
+                            // §5.2 self-selection: take the first job whose
+                            // healthy replicas include this worker's home
+                            // drive, but only if no queued job is exclusively
+                            // served by another drive (that job is that
+                            // drive's worker's to take — no starvation). With
+                            // all-multi-eligible chunks this is the front
+                            // job, so workers race on the list and the faster
+                            // drive (shorter per-chunk latency) pops more.
+                            // Fallback: front, so a job whose home worker is
+                            // busy still drains; exhaustion semantics unchanged.
+                            let home_first = sh.list.iter().position(|j| {
+                                let Some(c) = &ctxs[j.shard] else {
+                                    return true;
+                                };
+                                let elig = healthy_mask(c.sources, c.shard, c.slots.len())
+                                    & !j.job.exclude_mask;
+                                (0..c.slots.len())
+                                    .any(|r| elig & (1 << r) != 0 && c.replica_drive[r] == home)
+                            });
+                            match home_first {
+                                Some(i) => break sh.list.remove(i).unwrap(),
+                                None => {
+                                    if let Some(j) = sh.list.pop_front() {
+                                        break j;
+                                    }
+                                }
                             }
                             if sh.remaining == 0 {
                                 return;
@@ -998,6 +1022,9 @@ mod tests {
         /// Per-read throttle (0 = none); widens the pop window so multi-worker
         /// striping is deterministic.
         delay_ms: u64,
+        /// Per-replica throttle override (index = replica, empty = use
+        /// `delay_ms`); models drives of different speeds.
+        delays_ms: Vec<u64>,
         /// Shared peak-concurrency tracker (None = untracked).
         conc: Option<Arc<Concurrency>>,
         /// Pair-achievement flag handed to every source (see
@@ -1026,7 +1053,11 @@ mod tests {
                         fail_nth: AtomicUsize::new(nth),
                         id: replica,
                         log: Arc::clone(&self.log),
-                        delay_ms: self.delay_ms,
+                        delay_ms: self
+                            .delays_ms
+                            .get(replica)
+                            .copied()
+                            .unwrap_or(self.delay_ms),
                         conc: self.conc.clone(),
                         wait_for_pair: self.wait_for_pair.clone(),
                     }) as Arc<dyn ChunkSource>
@@ -1079,6 +1110,7 @@ mod tests {
             log: Arc::new(std::sync::Mutex::new(Vec::new())),
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1123,6 +1155,7 @@ mod tests {
             log: Arc::new(std::sync::Mutex::new(Vec::new())),
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1173,6 +1206,7 @@ mod tests {
             log: Arc::new(std::sync::Mutex::new(Vec::new())),
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1238,6 +1272,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1278,6 +1313,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1348,6 +1384,7 @@ mod tests {
             // Wide per-chunk window: worker 1 must pop while worker 0 still
             // serves its chunk, even under heavy CI load.
             delay_ms: 250,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1376,6 +1413,79 @@ mod tests {
     }
 
     #[test]
+    fn faster_drive_self_selects_more_chunks() {
+        // Two replicas on two drives; replica 0 (drive 0) is fast (20 ms/chunk),
+        // replica 1 (drive 1) is slow (200 ms/chunk). 8 chunks, one worker per
+        // drive: with self-selection (§5.2) both replicas are eligible for every
+        // chunk, so the fast worker pops proportionally more — its served share
+        // must exceed 50% and the drain must beat even a 50/50 split, let alone
+        // the slow-only bound (8 × 200 ms). Timing-tolerant: asserts the share
+        // inequality, not exact percentages.
+        let bytes = crate::stripe::CHUNK * 8;
+        let root = std::env::temp_dir().join("golem-store-queue-self-select");
+        let mut replicas = Vec::with_capacity(2);
+        for r in 0..2 {
+            let dir = root.join(format!("r{r}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SHARD_FILE), pattern(0, bytes)).unwrap();
+            replicas.push(dir);
+        }
+        let manifest = crate::manifest::ModelManifest {
+            name: "self-select".to_owned(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: SHARD_FILE.to_owned(),
+                bytes: bytes as u64,
+                sha256: "0".repeat(64),
+                replicas,
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: vec!["fast0".to_owned(), "slow1".to_owned()],
+            delay_ms: 0,
+            delays_ms: vec![20, 200],
+            conc: None,
+            wait_for_pair: None,
+        };
+        let queue = Arc::new(ChunkQueue::new(0)); // derived: one worker per drive
+        let mut dst = vec![0u8; bytes];
+        let t0 = std::time::Instant::now();
+        queue
+            .enqueue(ReadJob {
+                shard_index: 0,
+                offset: 0,
+                len: bytes,
+                expected_crc: crc32c::crc32c(&pattern(0, bytes)),
+                verify_crc: true,
+                prefetch: false,
+                sources: &sources,
+                dst: &mut dst,
+            })
+            .wait()
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(dst, pattern(0, bytes));
+        let reads = sources.log.lock().unwrap().clone();
+        assert_eq!(reads.len(), 8, "every chunk served once: {reads:?}");
+        let fast = reads.iter().filter(|(r, _)| *r == 0).count();
+        let slow = reads.iter().filter(|(r, _)| *r == 1).count();
+        assert!(
+            fast > slow && fast * 2 > reads.len(),
+            "fast drive must self-select >50% of chunks: fast={fast} slow={slow}"
+        );
+        // Beats a static 50/50 split (4 × 200 ms) — and the slow-only bound.
+        assert!(
+            elapsed < std::time::Duration::from_millis(4 * 200),
+            "drain ({elapsed:?}) must beat the 50/50 bound of 800 ms"
+        );
+    }
+
+    #[test]
     fn wrong_dst_length_returns_invalid_not_panic() {
         // Destination shorter than the aligned covering region: `Err(Invalid)`
         // from the public API — never a `split_at_mut` panic.
@@ -1387,6 +1497,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1439,6 +1550,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: Some(Arc::clone(&conc)),
             wait_for_pair: Some(Arc::clone(&pair)),
         };
@@ -1483,6 +1595,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1524,6 +1637,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1547,6 +1661,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1595,6 +1710,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1619,6 +1735,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1646,6 +1763,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1672,6 +1790,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1713,6 +1832,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         };
@@ -1746,6 +1866,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            delays_ms: Vec::new(),
             conc: None,
             wait_for_pair: None,
         });
