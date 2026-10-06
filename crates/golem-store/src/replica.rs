@@ -114,6 +114,10 @@ pub struct ReplicaSlot {
     /// Chunks served successfully from this replica since open (diagnostics:
     /// measured share vs. the uniform striping expectation).
     served_chunks: AtomicU64,
+    /// Subset of `served_chunks` served through the `O_DIRECT` handle
+    /// (diagnostics: `served_chunks - served_direct` = buffered-fallback
+    /// chunks; nonzero means a bench's GB/s is not a disk number).
+    served_direct: AtomicU64,
 }
 
 impl ReplicaSlot {
@@ -148,6 +152,17 @@ impl ReplicaSlot {
         self.direct_ok.load(Ordering::Relaxed)
     }
 
+    /// Chunks served through the direct (`O_DIRECT`) handle since open.
+    pub fn served_direct(&self) -> u64 {
+        self.served_direct.load(Ordering::Relaxed)
+    }
+
+    /// Whether the open-time direct probe passed (a direct handle exists);
+    /// `false` means every read on this slot is buffered from the start.
+    pub fn direct_available(&self) -> bool {
+        self.direct.is_some()
+    }
+
     /// Test-only view: whether a direct handle exists at all.
     #[cfg(test)]
     fn has_direct(&self) -> bool {
@@ -174,6 +189,7 @@ impl ReplicaSlot {
                     }
                 } else {
                     self.served_chunks.fetch_add(1, Ordering::Relaxed);
+                    self.served_direct.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
             }
@@ -263,6 +279,7 @@ impl ReplicaRegistry {
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
                     errors: AtomicU64::new(0),
                     served_chunks: AtomicU64::new(0),
+                    served_direct: AtomicU64::new(0),
                 }));
             }
             shards.push(ShardReplicas {
@@ -501,6 +518,7 @@ mod tests {
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
             served_chunks: AtomicU64::new(0),
+            served_direct: AtomicU64::new(0),
         };
         let (mut v, skip) = aligned_storage(4096);
         let buf = &mut v[skip..skip + 4096];
@@ -527,6 +545,7 @@ mod tests {
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
             served_chunks: AtomicU64::new(0),
+            served_direct: AtomicU64::new(0),
         };
         let (buffered, calls) = FakeReads::buffered();
         let mut slot = slot;
