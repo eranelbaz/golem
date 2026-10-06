@@ -12,8 +12,8 @@ OUT="${GOLEM_M14_WORK:-$REPO/.m14-work}"
 LEG="$OUT/$NAME"
 mkdir -p "$LEG"
 
-# Fixed decode prompt: long enough that greedy runs to the 64-token cap
-# (a short prompt hit EOG at 11 tokens in m3.11 and compressed decode timing).
+# Fixed decode prompt: long enough that greedy decode reaches the 64-token cap
+# (the model must not hit EOG before the cap, or decode timing compresses).
 PROMPT="$OUT/prompt.txt"
 if [[ ! -s "$PROMPT" ]]; then
   python3 - > "$PROMPT" <<'EOF'
@@ -22,8 +22,10 @@ text = ("The harbor town woke slowly under a grey sky, fishing boats knocking "
         "against the pier as the tide pulled back and gulls circled the masts. ")
 print(text * 6 + " Continue the story.")
 EOF
-  # chisle: rough length; verify prompt_tokens in the log before trusting decode tok/s
 fi
+
+# The pool is mlocked: memlock must be unlimited or the engine preflight refuses.
+[[ "$(ulimit -l)" == unlimited ]] || { echo "FATAL: RLIMIT_MEMLOCK=$(ulimit -l), need unlimited" >&2; exit 2; }
 
 if [[ "$TEMP" == cold ]]; then
   mapfile -t SHARDS < <(compgen -G "${MODEL%-00001-of-00006.gguf}"-0000?-of-00006.gguf)
@@ -33,7 +35,7 @@ fi
 
 {
   echo "leg=$NAME gib=$GIB temp=$TEMP model=$MODEL manifest=$MANIFEST"
-  echo "flags=--n-gpu-layers 99 --cpu-moe-layers 99 --greedy --timing-csv $LEG/timing.csv --manifest $MANIFEST"
+  echo "flags=--n-gpu-layers 99 --cpu-moe-layers 99 --greedy --ram-experts-gib $GIB --timing-csv $LEG/timing.csv --manifest $MANIFEST --prompt $PROMPT"
   echo "host=$(hostname) date=$(date -Is) memlock=$(ulimit -l) avail_kib_before=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
 } > "$LEG/meta.txt"
 
@@ -45,7 +47,21 @@ if (( GIB * 4 > AVAIL_GIB * 3 )); then
   exit 2
 fi
 
+rm -f "$LEG/timing.csv"  # never reuse a stale CSV from a previous leg
+
+set +e
 "$BIN" run "$MODEL" --n-gpu-layers 99 --cpu-moe-layers 99 --greedy \
   --ram-experts-gib "$GIB" --timing-csv "$LEG/timing.csv" --manifest "$MANIFEST" \
   --prompt "$(cat "$PROMPT")" > "$LEG/stdout.log" 2>&1
+rc=$?
+set -e
+
 awk '/MemAvailable/{print "avail_kib_after=" $2}' /proc/meminfo >> "$LEG/meta.txt"
+# Current builds emit no prompt-token line; grep known formats, else mark unknown.
+PT=$(sed -n -E -e 's/.*[Pp]rompt[_ ]tokens?[ =:]+([0-9]+).*/\1/p' \
+               -e 's/.*[Pp]rompt[_ ]eval[_ ]tokens?[ =:]+([0-9]+).*/\1/p' \
+               -e 's/.*"n_prompt_tokens":[ ]*([0-9]+).*/\1/p' \
+               "$LEG/stdout.log" | head -1)
+echo "prompt_tokens=${PT:-unknown}" >> "$LEG/meta.txt"
+echo "exit=$rc" >> "$LEG/meta.txt"
+exit "$rc"
