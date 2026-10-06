@@ -40,6 +40,8 @@ struct Args {
     n: usize,
     plane_bytes: usize,
     seed: u64,
+    io_threads: usize,
+    sequential: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -47,9 +49,21 @@ fn parse_args() -> Result<Args, String> {
     let mut n = DEFAULT_N;
     let mut plane_bytes = DEFAULT_PLANE_BYTES;
     let mut seed = 0u64;
+    let mut io_threads = 0usize;
+    let mut sequential = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--sequential" => {
+                sequential = true;
+            }
+            "--io-threads" => {
+                io_threads = it
+                    .next()
+                    .ok_or("--io-threads needs a value")?
+                    .parse()
+                    .map_err(|_| "--io-threads must be an integer")?;
+            }
             "--manifest" => {
                 manifest = Some(it.next().ok_or("--manifest needs a path")?);
             }
@@ -86,6 +100,8 @@ fn parse_args() -> Result<Args, String> {
         n,
         plane_bytes,
         seed,
+        io_threads,
+        sequential,
     })
 }
 
@@ -106,7 +122,7 @@ fn run() -> Result<(), golem_store::StoreError> {
         });
     }
     let registry = ReplicaRegistry::open(&manifest)?;
-    let queue = Arc::new(ChunkQueue::new(0)); // 0 = one reader thread per physical drive (§5.2)
+    let queue = Arc::new(ChunkQueue::new(args.io_threads)); // 0 = one reader thread per physical drive (§5.2); 2 = two per drive (D-12)
 
     // Startup hygiene (H-9): a replica whose open-time probe failed serves
     // buffered from byte 0 — its GB/s is a page-cache number, not a disk one.
@@ -122,8 +138,12 @@ fn run() -> Result<(), golem_store::StoreError> {
     }
 
     // Per-read covering region ≤ logical len + head scratch + one chunk tail
-    // (§5.4 plan shape); one preallocation, reused for every read.
-    let mut buf = vec![0u8; args.plane_bytes + 2 * CHUNK + 4096];
+    // (§5.4 plan shape); one preallocation, reused for every read. The region
+    // start must be 4 KiB-aligned or every read silently takes the buffered
+    // fallback (§5.4 direct reads require an aligned buffer).
+    let mut raw = vec![0u8; args.plane_bytes + 2 * CHUNK + 2 * 4096];
+    let skip = 4096 - raw.as_ptr() as usize % 4096;
+    let buf = &mut raw[skip..];
 
     // Seed-scattered offsets: hash(seed, i) spread over the shard's usable
     // range in CHUNK-aligned plane steps, so different seeds touch different
@@ -139,7 +159,13 @@ fn run() -> Result<(), golem_store::StoreError> {
         let shard = &manifest.shards[s];
         let usable = shard.bytes.saturating_sub(args.plane_bytes as u64).max(1);
         let steps = (usable / CHUNK as u64).max(1);
-        let offset = (mix64(args.seed ^ mix64(i as u64)) % steps) * CHUNK as u64;
+        let offset = if args.sequential {
+            // Real page_in shape: a cold layer's planes are contiguous per
+            // shard, so consecutive reads walk the file forward.
+            ((i / shard_count) as u64 * args.plane_bytes as u64) % usable
+        } else {
+            (mix64(args.seed ^ mix64(i as u64)) % steps) * CHUNK as u64
+        };
         let plan = plan_aligned(offset, args.plane_bytes);
         let covering: usize = plan.iter().map(|c| c.1).sum();
         let (dst, rest) = buf.split_at_mut(covering);
