@@ -21,7 +21,7 @@ vendor/        vendored llama.cpp fork (squashed import + Golem hook patches)
 crates/        Rust workspace (golem-cli, -server, -engine, -llama-sys, -gguf,
                -placement, -store, -plan, -api, -registry) + xtask
 scripts/       substrate build + hardware test scripts
-docs/          baselines/ (measured numbers), procedures/ (hardware test procedures)
+docs/          tech-design.md, baselines/ (measured numbers), procedures/ (hardware test procedures)
 ```
 
 Engineering rules for contributors and agents: [`AGENTS.md`](AGENTS.md).
