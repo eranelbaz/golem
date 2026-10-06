@@ -19,7 +19,7 @@ use crate::engine::{ChunkSource, ShardSources};
 use crate::replica::ReplicaHealth;
 use crate::stripe::plan_aligned;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// Everything a drain needs to settle one logical read.
@@ -116,6 +116,11 @@ pub struct ChunkQueue {
     /// An explicit override wins over the derived per-drive count (D-12
     /// bounds the default at 1–2 per drive; the operator's flag does not).
     io_threads: usize,
+    /// Cumulative disk time (ns) and bytes served by this queue's drains
+    /// (§11 timing): per-chunk atomics on the slow path are acceptable; the
+    /// timing consumer takes (swap-to-zero) snapshots per decode step.
+    disk_ns: AtomicU64,
+    disk_bytes: AtomicU64,
 }
 
 impl ChunkQueue {
@@ -125,7 +130,18 @@ impl ChunkQueue {
         Self {
             inner: Mutex::new(QueueInner::default()),
             io_threads,
+            disk_ns: AtomicU64::new(0),
+            disk_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Drains the accumulated disk time (ns) and byte counters, resetting
+    /// both to zero (§11 per-step snapshots: the caller owns the interval).
+    pub fn take_disk_stats(&self) -> (u64, u64) {
+        (
+            self.disk_ns.swap(0, Ordering::Relaxed),
+            self.disk_bytes.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// Queues a logical read without touching its destination; call
@@ -687,7 +703,7 @@ fn drain_reads(
                     let ctx = ctxs[job.shard]
                         .as_ref()
                         .expect("ctx exists for every enqueued job's shard");
-                    run_chunk(&shared, ctx, home, job);
+                    run_chunk(queue, &shared, ctx, home, job);
                 }
             });
         }
@@ -700,6 +716,7 @@ fn drain_reads(
 /// On failure degrades the replica, requeues onto the same drain-local list
 /// with the replica's bit set, and lets a healthy drive retry.
 fn run_chunk<'a>(
+    queue: &ChunkQueue,
     shared: &(Mutex<Shared<'a>>, Condvar),
     ctx: &ShardCtx<'_>,
     home: usize,
@@ -749,8 +766,14 @@ fn run_chunk<'a>(
         };
         // Read directly into the destination sub-slice: expert bytes are
         // copied disk→destination exactly once (§5.2).
+        let t0 = std::time::Instant::now();
         match slots[replica].read_chunk(offset, job.dst) {
             Ok(()) => {
+                let ns = t0.elapsed().as_nanos() as u64;
+                queue.disk_ns.fetch_add(ns, Ordering::Relaxed);
+                queue
+                    .disk_bytes
+                    .fetch_add(job.dst.len() as u64, Ordering::Relaxed);
                 read.served.fetch_or(1 << replica, Ordering::Relaxed);
                 settle(shared, read, Ok(()));
             }

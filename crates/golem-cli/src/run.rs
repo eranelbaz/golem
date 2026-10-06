@@ -13,6 +13,7 @@ use golem_engine::atomic::write_atomic;
 use golem_engine::config::EngineConfig;
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
+use golem_engine::timing::TimingRecorder;
 use golem_llama_sys::substrate_backend;
 use golem_placement::pool::{GgufPreadSource, StoreExpertSource};
 use golem_store::ChunkQueue;
@@ -86,6 +87,12 @@ pub struct RunArgs {
     /// never a path.
     #[arg(long, value_name = "FILE")]
     pub parity_dump: Option<PathBuf>,
+    /// §11 per-step timing CSV destination: opened/truncated with a header
+    /// (engine version, fork commit, resolved config), then one row per
+    /// generation decode step, flushed at each turn end. H2D columns are
+    /// `unmeasured` (no fork event pair on the copy stream yet).
+    #[arg(long, value_name = "FILE")]
+    pub timing_csv: Option<PathBuf>,
 }
 
 impl RunArgs {
@@ -110,6 +117,7 @@ impl RunArgs {
             device_cache_experts: self.device_cache_experts.unwrap_or(0),
             io_threads: self.io_threads,
             manifest_path: self.manifest.clone(),
+            timing_csv: self.timing_csv.clone(),
             ..default
         }
     }
@@ -122,6 +130,21 @@ impl RunArgs {
 /// loop continues.
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     let config = args.to_config();
+    // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
+    let mut timing_out = match &config.timing_csv {
+        Some(path) => {
+            let mut f = std::fs::File::create(path)?;
+            TimingRecorder::header(
+                &mut f,
+                env!("CARGO_PKG_VERSION"),
+                option_env!("GOLEM_FORK_COMMIT").unwrap_or("unknown"),
+                &resolved_config_line(&config),
+            )?;
+            f.flush()?;
+            Some(f)
+        }
+        None => None,
+    };
     if config.ram_experts_gib > 0 {
         preflight_ram_pool(
             &args.model,
@@ -135,11 +158,11 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         (Some(prompt), Some(dump)) => {
             one_shot_parity(&mut session, &args.model, prompt, dump, args.n_predict)
         }
-        (Some(prompt), None) => one_shot(&mut session, prompt),
+        (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out),
         // The dump records exactly one prompt (header `prompt_tokens`), so a
         // multi-turn REPL dump would be ill-defined — refuse it up front.
         (None, Some(_)) => Err("--parity-dump requires --prompt".into()),
-        (None, None) => repl(&mut session),
+        (None, None) => repl(&mut session, &mut timing_out),
     }
 }
 
@@ -233,7 +256,11 @@ fn expert_plane_bytes(model: &Path, manifest: Option<&Path>) -> Result<u64, Box<
     Ok(src.geometry()?.map(|g| g.expert_bytes).unwrap_or(0))
 }
 
-fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
+fn one_shot(
+    session: &mut Session,
+    prompt: &str,
+    timing_out: &mut Option<std::fs::File>,
+) -> Result<(), Box<dyn Error>> {
     session.chat_turn(
         &[ChatTurn {
             role: "user",
@@ -241,8 +268,46 @@ fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
         }],
         &mut emit_stdout,
     )?;
+    flush_timing(session, timing_out)?;
     println!();
     Ok(())
+}
+
+/// §11: appends the turn's recorded rows to the CSV file (the recorder is
+/// preallocated per turn; `take` resets it for the next one).
+fn flush_timing(
+    session: &mut Session,
+    timing_out: &mut Option<std::fs::File>,
+) -> Result<(), Box<dyn Error>> {
+    if let (Some(mut rec), Some(f)) = (session.take_timing(), timing_out.as_mut()) {
+        use std::io::Write;
+        rec.flush(f)?;
+        f.flush()?;
+    }
+    Ok(())
+}
+
+/// One-line resolved-config string for the CSV header comment (§11).
+fn resolved_config_line(config: &EngineConfig) -> String {
+    format!(
+        "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} cpu_moe={:?} \
+         ram_experts_gib={} device_cache_experts={} io_threads={:?} manifest={:?} \
+         model_size={}",
+        config.n_ctx,
+        config.batch_tokens,
+        config.n_predict,
+        config.threads,
+        config.n_gpu_layers,
+        config.flash_attn_on,
+        config.cpu_moe_layers,
+        config.ram_experts_gib,
+        config.device_cache_experts,
+        config.io_threads,
+        config.manifest_path,
+        std::fs::metadata(&config.model_path)
+            .map(|m| m.len())
+            .unwrap_or(0),
+    )
 }
 
 /// `--prompt --parity-dump <FILE>`: one parity turn (same greedy decode as
@@ -346,7 +411,10 @@ fn model_identity(path: &Path) -> std::io::Result<(String, u64)> {
     Ok((hex, total))
 }
 
-fn repl(session: &mut Session) -> Result<(), Box<dyn Error>> {
+fn repl(
+    session: &mut Session,
+    timing_out: &mut Option<std::fs::File>,
+) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
@@ -362,7 +430,12 @@ fn repl(session: &mut Session) -> Result<(), Box<dyn Error>> {
             content: line.as_str(),
         }];
         match session.chat_turn(&turn, &mut emit_stdout) {
-            Ok(_) => println!(),
+            Ok(_) => {
+                if let Err(e) = flush_timing(session, timing_out) {
+                    eprintln!("error: timing csv: {e}");
+                }
+                println!()
+            }
             Err(e) => {
                 println!();
                 eprintln!("error: {e}");

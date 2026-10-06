@@ -395,6 +395,12 @@ impl StoreExpertSource {
         self.crc_enabled
     }
 
+    /// Takes (and resets) the shared queue's cumulative disk time (ns) and
+    /// byte counters (§11 per-step timing snapshots).
+    pub fn take_disk_stats(&self) -> (u64, u64) {
+        self.queue.take_disk_stats()
+    }
+
     /// Total pageable expert bytes (Σ `stride × n_experts` over live planes;
     /// each product was checked at open).
     pub fn expert_bytes(&self) -> u64 {

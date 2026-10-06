@@ -47,6 +47,10 @@ pub struct EngineConfig {
     /// through the shared chunk queue; `None` (the default) reads the single
     /// GGUF replica via pread.
     pub manifest_path: Option<PathBuf>,
+    /// §11 per-step timing CSV destination: when set, each generation step's
+    /// timings are recorded and flushed at turn end; `None` (the default)
+    /// records nothing.
+    pub timing_csv: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -66,6 +70,7 @@ impl Default for EngineConfig {
             device_cache_experts: 0,
             io_threads: None,
             manifest_path: None,
+            timing_csv: None,
         }
     }
 }

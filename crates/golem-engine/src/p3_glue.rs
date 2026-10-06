@@ -114,6 +114,9 @@ struct PoolHandle {
     tensors: Mutex<HashMap<usize, TensorEntry>>,
     /// `ensure_host_resident` invocations, for the per-1000 slow-path line.
     slow_calls: AtomicUsize,
+    /// Cumulative ns spent inside the P1 trampoline's page-in section
+    /// (§11 per-step timing; taken (swap-to-zero) per decode step).
+    p3_wait_ns: AtomicU64,
     /// P2/P4 policy state (order building + access bookkeeping), leaked
     /// alongside the handle and shared with the prefetch feed by reference.
     policy: &'static PolicyQueryState,
@@ -384,6 +387,37 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
 pub(crate) fn advance_decode_step() {
     if let Some(h) = HANDLE.get() {
         h.policy.step.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-step I/O timing snapshot (§11): P3 wait is always measured once the
+/// hooks exist; disk time/bytes only when the store-backed source is live.
+pub(crate) struct StepIoStats {
+    pub p3_wait_ns: u64,
+    pub disk_ns: Option<u64>,
+    pub disk_bytes: Option<u64>,
+}
+
+/// Takes (swap-to-zero) the timing accumulators at a decode step boundary.
+/// No-op while hooks are unregistered: unmeasured fields come back `None`.
+pub(crate) fn take_step_io_stats() -> StepIoStats {
+    match HANDLE.get() {
+        None => StepIoStats {
+            p3_wait_ns: 0,
+            disk_ns: None,
+            disk_bytes: None,
+        },
+        Some(h) => {
+            let (disk_ns, disk_bytes) = h.store.as_ref().map_or((None, None), |s| {
+                let (ns, bytes) = s.take_disk_stats();
+                (Some(ns), Some(bytes))
+            });
+            StepIoStats {
+                p3_wait_ns: h.p3_wait_ns.swap(0, Ordering::Relaxed),
+                disk_ns,
+                disk_bytes,
+            }
+        }
     }
 }
 
@@ -669,6 +703,7 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
         n_experts: geo.n_experts,
         tensors: Mutex::new(HashMap::new()),
         slow_calls: AtomicUsize::new(0),
+        p3_wait_ns: AtomicU64::new(0),
         policy,
     }));
     // CAS reservation above ⇒ no concurrent setter and `get()` was None.
@@ -905,10 +940,14 @@ fn ensure_host_resident_inner(
     // The pool IS the H2D source. Claim + page-in each unit once per compute
     // and hand the slot's plane pointer to C; the lease stays held until
     // `copy_done`, so eviction cannot recycle a slot mid-DMA.
+    // §11: a few `Instant::now()` per layer is the sanctioned hot-path cost.
+    let t0 = std::time::Instant::now();
     let paged = STEP_CLAIMS.with_borrow_mut(|step| {
         step.get_or_insert_with(|| StepClaims::new(h.pool.clone()))
             .ensure_range_leased(entry.layer, entry.kind, first, last, out)
     });
+    h.p3_wait_ns
+        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if let Err(e) = paged {
         p3_fatal(format!(
             "P3 page-in failed (layer {}, {kind:?}, experts [{first}, {last}]): {e}; \

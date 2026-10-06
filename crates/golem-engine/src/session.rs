@@ -462,6 +462,9 @@ pub struct Session {
     /// this is only the stats/geometry view, so no drop-order coupling with
     /// the substrate.
     p3: Option<p3_glue::PoolEnable>,
+    /// §11 per-step recorder when `config.timing_csv` is set; drained by the
+    /// caller (`take_timing`) at turn end. Fixed-capacity, preallocated.
+    timing: Option<crate::timing::TimingRecorder>,
     /// Set once a pooled offloaded turn's prefill passed
     /// [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first
     /// decode step passed [`check_experts_on_gpu`].
@@ -527,6 +530,10 @@ impl Session {
                 template,
                 last_prompt_tokens: Vec::new(),
                 p3,
+                timing: config
+                    .timing_csv
+                    .as_ref()
+                    .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                 pool_verified: false,
             }
         })
@@ -575,6 +582,12 @@ impl Session {
         let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 3]>() };
         let load = |i: usize| counters[i].load(std::sync::atomic::Ordering::Relaxed);
         Some(DeviceCacheStats::new(load(0), load(1), load(2)))
+    }
+
+    /// Drains the §11 per-step recorder (`None` unless `config.timing_csv`
+    /// is set); the caller writes it to the CSV file at turn end.
+    pub fn take_timing(&mut self) -> Option<crate::timing::TimingRecorder> {
+        self.timing.take()
     }
 
     /// Runs one chat turn: renders `messages` with the session template,
@@ -773,7 +786,12 @@ impl Session {
 
         let mut generated: u32 = 0;
         let mut scratch = String::new();
+        if let Some(t) = self.timing.as_mut() {
+            t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
+        }
         loop {
+            // §11: step wall time starts at the loop head (emit + decode).
+            let step_t0 = std::time::Instant::now();
             // SAFETY: vocab is live; tok is a valid token id from the sampler.
             if unsafe { raw::llama_vocab_is_eog(vocab, tok) } {
                 break;
@@ -814,6 +832,24 @@ impl Session {
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += 1;
+            if let Some(t) = self.timing.as_mut() {
+                // §11 step boundary: snapshot (and reset) the P3/store
+                // accumulators into this step's row. H2D and policy stay
+                // unmeasured (no fork event pair / no P2 instrumentation).
+                let io = p3_glue::take_step_io_stats();
+                let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
+                t.row(crate::timing::StepTiming {
+                    step: generated as u64,
+                    tokens: 1,
+                    wall_ms: step_t0.elapsed().as_secs_f64() * 1_000.0,
+                    p3_wait_ms: ns2ms(io.p3_wait_ns),
+                    disk_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
+                    disk_bytes: io.disk_bytes.unwrap_or(0),
+                    h2d_ms: f64::NAN,
+                    h2d_bytes: 0,
+                    policy_ms: f64::NAN,
+                });
+            }
             if verify && !self.pool_verified {
                 check_experts_on_gpu(placement_before, expert_placement())?;
                 self.pool_verified = true;
