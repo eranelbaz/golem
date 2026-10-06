@@ -23,10 +23,10 @@ vendor/llama.cpp/build/
 __pycache__/
 *.pyc
 
-# Local-only docs: docs/ carries baselines (and similar evidence) only;
-# planning/process material (superpowers plans, worklog, tech-design,
-# product-spec, adr, …) never enters the repo
+# docs/ carries the tech design, baselines and procedures; plans and the
+# product spec stay local
 docs/*
+!docs/tech-design.md
 !docs/baselines/
 !docs/procedures/
 
