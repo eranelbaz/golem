@@ -42,6 +42,11 @@ pub struct EngineConfig {
     /// Store reader threads per drain (§5.4 `--io-threads`); `None` derives
     /// one thread per physical drive hosting an eligible replica.
     pub io_threads: Option<usize>,
+    /// Model manifest (§4.2) for the store-backed expert source: when set,
+    /// the P3 slow path reads expert planes from the manifest's replica set
+    /// through the shared chunk queue; `None` (the default) reads the single
+    /// GGUF replica via pread.
+    pub manifest_path: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -60,6 +65,7 @@ impl Default for EngineConfig {
             ram_experts_gib: 0,
             device_cache_experts: 0,
             io_threads: None,
+            manifest_path: None,
         }
     }
 }

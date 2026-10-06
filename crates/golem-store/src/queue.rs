@@ -36,6 +36,9 @@ pub(crate) struct ReadState {
     pub crc_len: usize,
     /// §5.3 expected CRC32C over the logical window (one per plane read).
     pub expected_crc: u32,
+    /// Set when the §5.3 checksum must be verified; callers that have no
+    /// trusted per-plane digest (manifest `crc32c` absent) disable it.
+    pub verify_crc: bool,
     /// Settled chunk results plus the first terminal error.
     pub progress: Mutex<Progress>,
     /// Replicas that successfully served at least one chunk of this read —
@@ -142,6 +145,7 @@ impl ChunkQueue {
             crc_at: (job.offset - align_down(job.offset)) as usize,
             crc_len: job.len,
             expected_crc: job.expected_crc,
+            verify_crc: job.verify_crc,
             progress: Mutex::new(Progress {
                 failed: false,
                 error: None,
@@ -205,6 +209,9 @@ pub struct ReadJob<'a> {
     pub len: usize,
     /// §5.3 expected CRC32C over the logical range (one per plane read).
     pub expected_crc: u32,
+    /// Verify [`ReadJob::expected_crc`] once the drain lands (`false` when
+    /// the manifest carries no per-plane digest).
+    pub verify_crc: bool,
     /// Prefetch reads drain strictly after all queued demand reads.
     pub prefetch: bool,
     /// Replica sources of the shard.
@@ -339,6 +346,9 @@ impl ReadHandle<'_> {
         // over the logical window once every chunk has landed.
         if let Some(e) = read.take_error() {
             return Err(e);
+        }
+        if !read.verify_crc {
+            return Ok(());
         }
         let crc = crc32c::crc32c(&dst[read.crc_at..read.crc_at + read.crc_len]);
         if crc != read.expected_crc {
@@ -600,7 +610,7 @@ mod tests {
     use crate::replica::{ReplicaRegistry, ReplicaSlot};
     use std::io;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     const SHARD_BYTES: usize = 4096;
     const SHARD_FILE: &str = "s0.gguf";
@@ -661,6 +671,10 @@ mod tests {
         log: Arc<std::sync::Mutex<Vec<(usize, u64)>>>,
         delay_ms: u64,
         conc: Option<Arc<Concurrency>>,
+        /// When set, each read spins (bounded) until two readers are
+        /// concurrently inside `read_chunk` — a deterministic "≥2 workers
+        /// ran" signal, robust to scheduler noise.
+        wait_for_pair: Option<Arc<AtomicBool>>,
     }
 
     impl Concurrency {
@@ -679,6 +693,18 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
             }
             let _g = self.conc.as_ref().map(|c| c.enter());
+            if let Some(flag) = &self.wait_for_pair {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    if let Some(c) = &self.conc {
+                        if c.active.load(Ordering::SeqCst) >= 2 {
+                            flag.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
             // usize::MAX = always fail (never decremented).
             if self.fail_nth.load(Ordering::SeqCst) == 0
                 || self.fail_nth.load(Ordering::SeqCst) == usize::MAX
@@ -704,6 +730,9 @@ mod tests {
         delay_ms: u64,
         /// Shared peak-concurrency tracker (None = untracked).
         conc: Option<Arc<Concurrency>>,
+        /// Pair-achievement flag handed to every source (see
+        /// [`FailingSource::wait_for_pair`]).
+        wait_for_pair: Option<Arc<AtomicBool>>,
     }
 
     impl ShardSources for TestSources {
@@ -728,6 +757,7 @@ mod tests {
                         log: Arc::clone(&self.log),
                         delay_ms: self.delay_ms,
                         conc: self.conc.clone(),
+                        wait_for_pair: self.wait_for_pair.clone(),
                     }) as Arc<dyn ChunkSource>
                 })
                 .collect()
@@ -760,6 +790,7 @@ mod tests {
             offset: 0,
             len: SHARD_BYTES,
             expected_crc: crc32c::crc32c(&pattern(0, SHARD_BYTES)),
+            verify_crc: true,
             prefetch: false,
             sources,
             dst,
@@ -780,6 +811,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -819,6 +851,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let plan = plan_aligned(0, SHARD_BYTES);
@@ -830,6 +863,7 @@ mod tests {
             offset: 0,
             len: SHARD_BYTES,
             expected_crc: crc32c::crc32c(&pattern(0, SHARD_BYTES)),
+            verify_crc: true,
             prefetch: true,
             sources: &sources,
             dst: &mut prefetch_dst,
@@ -883,10 +917,11 @@ mod tests {
             fail: Vec::new(),
             log,
             drives: vec!["drv0".to_owned(), "drv1".to_owned()],
-            // 50 ms per chunk: while worker 0 serves its home-drive chunk,
-            // worker 1 pops the second — deterministic striping.
-            delay_ms: 50,
+            // Wide per-chunk window: worker 1 must pop while worker 0 still
+            // serves its chunk, even under heavy CI load.
+            delay_ms: 250,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(0)); // 0 = derived, one worker per drive
         let mut dst = vec![0u8; bytes];
@@ -896,6 +931,7 @@ mod tests {
                 offset: 0,
                 len: bytes,
                 expected_crc: crc32c::crc32c(&pattern(0, bytes)),
+                verify_crc: true,
                 prefetch: false,
                 sources: &sources,
                 dst: &mut dst,
@@ -924,6 +960,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let covering = plan_aligned(0, SHARD_BYTES)
@@ -967,16 +1004,15 @@ mod tests {
         let reg = ReplicaRegistry::open(&manifest).unwrap();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let conc = Arc::new(Concurrency::default());
+        let pair = Arc::new(AtomicBool::new(false));
         let sources = TestSources {
             reg,
             fail: Vec::new(),
             log,
             drives: Vec::new(),
-            // 50 ms per chunk: 4 concurrent workers finish in ~50 ms while a
-            // single worker would serialize to ~200 ms, so the pop window
-            // spans all 4 chunks.
-            delay_ms: 50,
+            delay_ms: 0,
             conc: Some(Arc::clone(&conc)),
+            wait_for_pair: Some(Arc::clone(&pair)),
         };
         let queue = Arc::new(ChunkQueue::new(4));
         let mut dst = vec![0u8; bytes];
@@ -986,6 +1022,7 @@ mod tests {
                 offset: 0,
                 len: bytes,
                 expected_crc: crc32c::crc32c(&pattern(0, bytes)),
+                verify_crc: true,
                 prefetch: false,
                 sources: &sources,
                 dst: &mut dst,
@@ -994,9 +1031,10 @@ mod tests {
             .unwrap();
         assert_eq!(dst, pattern(0, bytes));
         assert!(
-            conc.max.load(Ordering::SeqCst) >= 2,
+            pair.load(Ordering::SeqCst),
             "override ran >= 2 workers; derived 1-drive count is 1"
         );
+        assert!(conc.max.load(Ordering::SeqCst) >= 2);
     }
 
     /// (demand, prefetch) queue depths, for purge assertions.
@@ -1018,6 +1056,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst_a = vec![0u8; SHARD_BYTES];
@@ -1028,6 +1067,7 @@ mod tests {
             offset: 0,
             len: SHARD_BYTES,
             expected_crc: crc32c::crc32c(&pattern(0, SHARD_BYTES)),
+            verify_crc: true,
             prefetch: true,
             sources: &sources,
             dst: &mut dst_b,
@@ -1057,6 +1097,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut short = vec![0u8; SHARD_BYTES - 1];
@@ -1079,6 +1120,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let chunks = plan_aligned(0, SHARD_BYTES).len();
@@ -1126,6 +1168,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -1149,6 +1192,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -1175,6 +1219,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(4));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -1200,6 +1245,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         // Read [512, 512+2048): covering region is [0, 4096).
@@ -1212,6 +1258,7 @@ mod tests {
                 offset: 512,
                 len: 2048,
                 expected_crc: crc32c::crc32c(&pattern(512, 2048)),
+                verify_crc: true,
                 prefetch: false,
                 sources: &sources,
                 dst: &mut dst,
@@ -1239,6 +1286,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(2));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -1271,6 +1319,7 @@ mod tests {
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
+            wait_for_pair: None,
         });
         let queue = Arc::new(ChunkQueue::new(4));
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -1290,6 +1339,7 @@ mod tests {
                                 offset: 0,
                                 len: SHARD_BYTES,
                                 expected_crc: crc32c::crc32c(&pattern(0, SHARD_BYTES)),
+                                verify_crc: true,
                                 prefetch: (t + i) % 2 == 1,
                                 sources: sources.as_ref(),
                                 dst: &mut dst,

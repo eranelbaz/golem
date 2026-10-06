@@ -19,9 +19,11 @@ mod pager;
 pub mod prefetch;
 mod residency;
 mod source;
+mod store_source;
 
 pub use arena::{Arena, SlotClass};
 pub use pager::{ExpertPool, Lease, PoolError, SnapshotHandle, StepClaims};
 pub use prefetch::{AccessFeed, PREFETCH_K, PrefetchHandle, spawn_prefetch};
 pub use residency::{ExpertKind, P3Stats, PolicySnapshot, PoolConfigError};
 pub use source::{ExpertSource, GgufPreadSource, PoolGeometry, SourceError, UnitLayout};
+pub use store_source::StoreExpertSource;

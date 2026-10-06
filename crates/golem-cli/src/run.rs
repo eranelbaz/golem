@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use golem_engine::ParityStep;
 use golem_engine::atomic::write_atomic;
@@ -13,7 +14,8 @@ use golem_engine::config::EngineConfig;
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_llama_sys::substrate_backend;
-use golem_placement::pool::GgufPreadSource;
+use golem_placement::pool::{GgufPreadSource, StoreExpertSource};
+use golem_store::ChunkQueue;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -73,6 +75,11 @@ pub struct RunArgs {
     /// replica (D-12: per-drive threads, never per-file).
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
+    /// Model manifest (§4.2): the P3 expert pool then reads expert planes
+    /// from the manifest's replica set through the shared chunk queue
+    /// (striped, CRC-checked) instead of the single GGUF replica.
+    #[arg(long, value_name = "PATH")]
+    pub manifest: Option<PathBuf>,
     /// Write a T2 parity dump (JSONL: line-1 header, then one record per
     /// generation step) to this file instead of streaming the completion;
     /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
@@ -102,6 +109,7 @@ impl RunArgs {
             ram_experts_gib: self.ram_experts_gib.unwrap_or(0.0).max(0.0) as u64,
             device_cache_experts: self.device_cache_experts.unwrap_or(0),
             io_threads: self.io_threads,
+            manifest_path: self.manifest.clone(),
             ..default
         }
     }
@@ -115,7 +123,11 @@ impl RunArgs {
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     let config = args.to_config();
     if config.ram_experts_gib > 0 {
-        preflight_ram_pool(&args.model, config.ram_experts_gib)?;
+        preflight_ram_pool(
+            &args.model,
+            args.manifest.as_deref(),
+            config.ram_experts_gib,
+        )?;
     }
     let mut session = Session::new(&config)?;
 
@@ -148,13 +160,17 @@ fn memlock_limit() -> Option<u64> {
 /// requested pool cannot be locked (`RLIMIT_MEMLOCK` too low) or would exceed
 /// 75% of free RAM, each with an actionable `min(75% free RAM, expert bytes)`
 /// suggestion (§5.4: mlock is a correctness feature — never fall back).
-fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
+fn preflight_ram_pool(
+    model: &Path,
+    manifest: Option<&Path>,
+    gib: u64,
+) -> Result<(), Box<dyn Error>> {
     let want_bytes = gib
         .checked_mul(1 << 30)
         .ok_or("--ram-experts-gib overflows")?;
 
     // Expert bytes from the GGUF tensor table (header walk only).
-    let expert_bytes = expert_plane_bytes(model).unwrap_or_else(|e| {
+    let expert_bytes = expert_plane_bytes(model, manifest).unwrap_or_else(|e| {
         eprintln!("warning: cannot pre-scan expert tensors from {model:?}: {e}");
         0
     });
@@ -195,7 +211,14 @@ fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
 
 /// Total pageable expert bytes: sum of `stride × n_experts` over the model's
 /// expert planes (dense lead excluded), via the same GGUF walk the pool uses.
-fn expert_plane_bytes(model: &Path) -> Result<u64, Box<dyn Error>> {
+fn expert_plane_bytes(model: &Path, manifest: Option<&Path>) -> Result<u64, Box<dyn Error>> {
+    // Store-backed run: the manifest's expert_index is the source of truth
+    // (already cross-checked against the replica tensor tables at open).
+    if let Some(mpath) = manifest {
+        let queue = Arc::new(ChunkQueue::new(0));
+        let src = StoreExpertSource::open(mpath, queue)?;
+        return Ok(src.expert_bytes());
+    }
     let metadata = read_metadata(model)?;
     let arch = metadata
         .kv_str("general.architecture")
@@ -609,7 +632,7 @@ mod tests {
     fn preflight_refuses_an_impossible_pool_with_err_not_exit() {
         // 2^60 GiB-bytes exceeds both RLIMIT_MEMLOCK and available RAM; the
         // preflight must return Err (a process::exit would kill this test).
-        let err = preflight_ram_pool(Path::new("/nonexistent.gguf"), 1 << 30).unwrap_err();
+        let err = preflight_ram_pool(Path::new("/nonexistent.gguf"), None, 1 << 30).unwrap_err();
         assert!(err.to_string().contains("--ram-experts-gib"), "{err}");
     }
 

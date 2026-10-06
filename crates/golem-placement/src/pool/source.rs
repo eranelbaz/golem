@@ -206,6 +206,8 @@ pub enum SourceError {
         /// Dense-lead-adjusted layer missing a plane.
         layer: u32,
     },
+    /// Store-layer failure (manifest, replica registry, or queued read).
+    Store(golem_store::StoreError),
 }
 
 impl fmt::Display for SourceError {
@@ -225,6 +227,7 @@ impl fmt::Display for SourceError {
             Self::IncompleteLayer { layer } => {
                 write!(f, "expert layer {layer} is missing one of gate/up/down")
             }
+            Self::Store(e) => write!(f, "store: {e}"),
         }
     }
 }
@@ -240,6 +243,12 @@ impl From<io::Error> for SourceError {
 impl From<golem_gguf::Error> for SourceError {
     fn from(e: golem_gguf::Error) -> Self {
         Self::Gguf(e)
+    }
+}
+
+impl From<golem_store::StoreError> for SourceError {
+    fn from(e: golem_store::StoreError) -> Self {
+        Self::Store(e)
     }
 }
 
@@ -285,7 +294,7 @@ pub struct GgufPreadSource {
 }
 
 /// Flat index of one `(layer, kind)` plane: no hashing on the page-in path.
-fn plane_index(layer: u32, kind: ExpertKind) -> usize {
+pub(super) fn plane_index(layer: u32, kind: ExpertKind) -> usize {
     layer as usize * ExpertKind::ALL.len() + kind.ordinal()
 }
 

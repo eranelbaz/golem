@@ -40,8 +40,9 @@ use golem_gguf::blk_of;
 use golem_llama_sys::raw;
 use golem_placement::pool::{
     AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PREFETCH_K,
-    PolicySnapshot, PrefetchHandle, SnapshotHandle, StepClaims, spawn_prefetch,
+    PolicySnapshot, PrefetchHandle, SnapshotHandle, StepClaims, StoreExpertSource, spawn_prefetch,
 };
+use golem_store::ChunkQueue;
 
 use crate::config::EngineConfig;
 use crate::error::EngineError;
@@ -94,8 +95,15 @@ struct PoolHandle {
     // Never read directly: its whole job is Drop (stop + join).
     #[allow(dead_code)]
     prefetch: PrefetchHandle,
-    /// GGUF-side expert source, kept for registration-time cross-checks.
-    source: Arc<GgufPreadSource>,
+    /// Expert byte source: the GGUF pread path or the store-backed reader
+    /// (`--manifest`); the [`ExpertSource`] seam is what the registration
+    /// cross-checks and the pool page-in both drive.
+    source: Arc<dyn ExpertSource>,
+    /// Concrete store-backed source when `config.manifest_path` was set:
+    /// its `Arc<ChunkQueue>` owns the shared queue's lifetime inside the
+    /// leaked handle (never read directly).
+    #[allow(dead_code)]
+    store: Option<Arc<StoreExpertSource>>,
     /// The demand pager (arena + residency + stats).
     pool: Arc<ExpertPool>,
     /// Aggregate expert geometry from the GGUF walk.
@@ -526,14 +534,40 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
         EngineError::PoolInit(format!("leading_dense_block_count {dense_lead} < 0"))
     })?;
 
-    let source = Arc::new(
-        GgufPreadSource::open(&config.model_path, dense_lead)
-            .map_err(|e| EngineError::PoolInit(e.to_string()))?,
-    );
-    let geo = source
+    // Pool geometry from the GGUF walk (header + tensor table only) in both
+    // modes: the manifest path cross-checks its own offsets against the same
+    // tables at open, so a divergence here is a construction error, not a
+    // silent geometry mismatch.
+    let geo = GgufPreadSource::open(&config.model_path, dense_lead)
+        .map_err(|e| EngineError::PoolInit(e.to_string()))?
         .geometry()
         .map_err(|e| EngineError::PoolInit(e.to_string()))?
         .ok_or_else(|| EngineError::PoolInit("model has no expert tensors".into()))?;
+
+    // Expert byte source: the store-backed reader when a manifest is
+    // configured (§5.2 — the shared queue drives the P3 slow path; the
+    // queue lives in the leaked handle via the store source's Arc), else
+    // the single-replica GGUF pread path (byte-identical to pre-manifest
+    // behavior).
+    let (source, store): (Arc<dyn ExpertSource>, Option<Arc<StoreExpertSource>>) =
+        match &config.manifest_path {
+            Some(manifest_path) => {
+                let queue = Arc::new(ChunkQueue::new(config.io_threads.unwrap_or(0)));
+                let store = Arc::new(
+                    StoreExpertSource::open(manifest_path, queue)
+                        .map_err(|e| EngineError::PoolInit(e.to_string()))?,
+                );
+                let source: Arc<dyn ExpertSource> = store.clone();
+                (source, Some(store))
+            }
+            None => {
+                let source = Arc::new(
+                    GgufPreadSource::open(&config.model_path, dense_lead)
+                        .map_err(|e| EngineError::PoolInit(e.to_string()))?,
+                );
+                (source, None)
+            }
+        };
 
     let n_layers = geo.n_layers();
     let pool_bytes = config
@@ -630,6 +664,7 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
         dense_lead,
         prefetch,
         source,
+        store,
         pool: pool.clone(),
         n_experts: geo.n_experts,
         tensors: Mutex::new(HashMap::new()),
