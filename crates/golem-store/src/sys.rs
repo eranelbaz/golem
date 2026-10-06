@@ -1,5 +1,5 @@
-//! Raw syscall wrappers (§5.4): page-cache hygiene and filesystem capacity
-//! queries. The only `unsafe` in golem-store, each block with its invariant
+//! Raw syscall wrappers (§5.4): page-cache hygiene, `O_DIRECT` reads and
+//! filesystem capacity queries. The only `unsafe` in golem-store, each block with its invariant
 //! named.
 
 use std::path::Path;
@@ -37,6 +37,44 @@ pub fn drop_page_cache(file: &std::fs::File, off: u64, len: usize) -> bool {
         )
     };
     rc == 0
+}
+
+/// `O_DIRECT` alignment for offset, length and buffer address (§5.4): one
+/// page, a multiple of every logical block size in use (512 / 4096).
+pub const DIRECT_ALIGN: u64 = 4096;
+
+/// Opens `path` with `O_DIRECT` (§5.4): expert bytes bypass the page cache
+/// entirely. Fails where the filesystem (or kernel) refuses the flag; the
+/// caller then keeps a buffered handle only.
+pub fn open_direct(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+}
+
+/// Full `O_DIRECT` read of exactly `buf.len()` bytes at `offset`. The caller
+/// guarantees the §5.4 alignment invariant (offset, length, buffer address
+/// all multiples of [`DIRECT_ALIGN`]); the kernel enforces it with `EINVAL`
+/// otherwise. Retries short reads; errors on premature EOF.
+pub fn read_direct(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read_at(&mut buf[filled..], offset + filled as u64) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short O_DIRECT read at end of file",
+                ));
+            }
+            Ok(n) => filled += n,
+        }
+    }
+    Ok(())
 }
 
 /// Free bytes available to this user on the filesystem holding `path`.
