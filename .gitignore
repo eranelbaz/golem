@@ -33,3 +33,4 @@ docs/*
 # Split substrate build trees (Task 7)
 /target-cpu/
 /target-hip/
+.m14-work/
