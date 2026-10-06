@@ -28,7 +28,7 @@ fi
 [[ "$(ulimit -l)" == unlimited ]] || { echo "FATAL: RLIMIT_MEMLOCK=$(ulimit -l), need unlimited" >&2; exit 2; }
 
 if [[ "$TEMP" == cold ]]; then
-  mapfile -t SHARDS < <(compgen -G "${MODEL%-00001-of-00006.gguf}"-0000?-of-00006.gguf)
+  mapfile -t SHARDS < <(compgen -G "${MODEL%-00001-of-00006.gguf}-0000?-of-00006.gguf")
   (( ${#SHARDS[@]} == 6 )) || { echo "FATAL: expected 6 shards, got ${#SHARDS[@]}" >&2; exit 2; }
   python3 "$REPO/scripts/evict-model-cache.py" "${SHARDS[@]}"
 fi
