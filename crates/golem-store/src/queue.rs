@@ -241,17 +241,13 @@ fn purge(queue: &ChunkQueue, read: &Arc<ReadState>) -> VecDeque<Job> {
     let QueueInner {
         demand, prefetch, ..
     } = &mut *q;
+    // Single pass per deque: one lock acquisition, no O(n) `remove` per hit.
     for dq in [demand, prefetch] {
-        let mut i = 0;
-        while i < dq.len() {
-            if Arc::ptr_eq(&dq[i].read, read) {
-                if let Some(job) = dq.remove(i) {
-                    work.push_back(job);
-                }
-            } else {
-                i += 1;
-            }
-        }
+        let (mine, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(dq)
+            .into_iter()
+            .partition(|j| Arc::ptr_eq(&j.read, read));
+        work.extend(mine);
+        *dq = rest;
     }
     work
 }
@@ -639,6 +635,22 @@ mod tests {
         (replicas, ReplicaRegistry::open(&manifest).unwrap())
     }
 
+    /// Fails source: tracks peak concurrent `read_chunk` calls so tests can
+    /// observe the actual worker count.
+    #[derive(Default)]
+    struct Concurrency {
+        active: AtomicUsize,
+        max: AtomicUsize,
+    }
+
+    struct ConcurrencyGuard<'a>(&'a Concurrency);
+
+    impl Drop for ConcurrencyGuard<'_> {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     /// Delegates to the real slot until the countdown hits 0, then fails with
     /// EIO; records every attempt (replica id, offset) in a shared log.
     /// `delay_ms` throttles each read (striping determinism).
@@ -648,6 +660,16 @@ mod tests {
         id: usize,
         log: Arc<std::sync::Mutex<Vec<(usize, u64)>>>,
         delay_ms: u64,
+        conc: Option<Arc<Concurrency>>,
+    }
+
+    impl Concurrency {
+        /// RAII enter; peak count observable via `max` after all reads settle.
+        fn enter(self: &Arc<Self>) -> ConcurrencyGuard<'_> {
+            let a = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max.fetch_max(a, Ordering::SeqCst);
+            ConcurrencyGuard(self)
+        }
     }
 
     impl ChunkSource for FailingSource {
@@ -656,6 +678,7 @@ mod tests {
             if self.delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
             }
+            let _g = self.conc.as_ref().map(|c| c.enter());
             // usize::MAX = always fail (never decremented).
             if self.fail_nth.load(Ordering::SeqCst) == 0
                 || self.fail_nth.load(Ordering::SeqCst) == usize::MAX
@@ -679,6 +702,8 @@ mod tests {
         /// Per-read throttle (0 = none); widens the pop window so multi-worker
         /// striping is deterministic.
         delay_ms: u64,
+        /// Shared peak-concurrency tracker (None = untracked).
+        conc: Option<Arc<Concurrency>>,
     }
 
     impl ShardSources for TestSources {
@@ -702,6 +727,7 @@ mod tests {
                         id: replica,
                         log: Arc::clone(&self.log),
                         delay_ms: self.delay_ms,
+                        conc: self.conc.clone(),
                     }) as Arc<dyn ChunkSource>
                 })
                 .collect()
@@ -753,6 +779,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -791,6 +818,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let plan = plan_aligned(0, SHARD_BYTES);
@@ -858,6 +886,7 @@ mod tests {
             // 50 ms per chunk: while worker 0 serves its home-drive chunk,
             // worker 1 pops the second — deterministic striping.
             delay_ms: 50,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(0)); // 0 = derived, one worker per drive
         let mut dst = vec![0u8; bytes];
@@ -894,6 +923,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let covering = plan_aligned(0, SHARD_BYTES)
@@ -911,10 +941,75 @@ mod tests {
 
     #[test]
     fn io_threads_override_is_not_clamped_to_replica_count() {
-        // `--io-threads 4` over 2 replicas runs 4 workers (2 per drive), not
-        // 2: the explicit flag replaces the derived per-drive count (D-12
-        // bounds only the default). The read must still complete correctly.
-        let (_paths, reg) = fixture(2, "io-override");
+        // `--io-threads 4` over 2 replicas on ONE real drive runs 4 workers,
+        // not the derived 1-per-drive (nor 2-per-replica): the explicit flag
+        // replaces the derived count (D-12 bounds only the default). Peak
+        // concurrent reads must exceed the derived count of 1.
+        let bytes = crate::stripe::CHUNK * 4; // 4 chunks, one per worker
+        let root = std::env::temp_dir().join("golem-store-queue-io-override");
+        let mut replicas = Vec::with_capacity(2);
+        for r in 0..2 {
+            let dir = root.join(format!("r{r}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SHARD_FILE), pattern(0, bytes)).unwrap();
+            replicas.push(dir);
+        }
+        let manifest = crate::manifest::ModelManifest {
+            name: "io-override".to_owned(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: SHARD_FILE.to_owned(),
+                bytes: bytes as u64,
+                sha256: "0".repeat(64),
+                replicas,
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let conc = Arc::new(Concurrency::default());
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: Vec::new(),
+            // 50 ms per chunk: 4 concurrent workers finish in ~50 ms while a
+            // single worker would serialize to ~200 ms, so the pop window
+            // spans all 4 chunks.
+            delay_ms: 50,
+            conc: Some(Arc::clone(&conc)),
+        };
+        let queue = Arc::new(ChunkQueue::new(4));
+        let mut dst = vec![0u8; bytes];
+        queue
+            .enqueue(ReadJob {
+                shard_index: 0,
+                offset: 0,
+                len: bytes,
+                expected_crc: crc32c::crc32c(&pattern(0, bytes)),
+                prefetch: false,
+                sources: &sources,
+                dst: &mut dst,
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(dst, pattern(0, bytes));
+        assert!(
+            conc.max.load(Ordering::SeqCst) >= 2,
+            "override ran >= 2 workers; derived 1-drive count is 1"
+        );
+    }
+
+    /// (demand, prefetch) queue depths, for purge assertions.
+    fn queued(queue: &ChunkQueue) -> (usize, usize) {
+        let q = queue.lock();
+        (q.demand.len(), q.prefetch.len())
+    }
+
+    #[test]
+    fn dropping_an_unwaited_handle_empties_the_queue() {
+        // Dropping a handle without wait()ing purges ALL of its queued
+        // chunks (demand and prefetch) — nothing leaks into later drains.
+        let (_paths, reg) = fixture(1, "drop-purge");
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sources = TestSources {
             reg,
@@ -922,11 +1017,81 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
-        let queue = Arc::new(ChunkQueue::new(4));
-        let mut dst = vec![0u8; SHARD_BYTES];
-        read_whole(&queue, &sources, &mut dst).wait().unwrap();
-        assert_eq!(dst, pattern(0, SHARD_BYTES));
+        let queue = Arc::new(ChunkQueue::new(1));
+        let mut dst_a = vec![0u8; SHARD_BYTES];
+        let mut dst_b = vec![0u8; SHARD_BYTES];
+        let a = read_whole(&queue, &sources, &mut dst_a);
+        let b = queue.enqueue(ReadJob {
+            shard_index: 0,
+            offset: 0,
+            len: SHARD_BYTES,
+            expected_crc: crc32c::crc32c(&pattern(0, SHARD_BYTES)),
+            prefetch: true,
+            sources: &sources,
+            dst: &mut dst_b,
+        });
+        assert_eq!(
+            queued(&queue),
+            (
+                plan_aligned(0, SHARD_BYTES).len(),
+                plan_aligned(0, SHARD_BYTES).len()
+            )
+        );
+        drop(a);
+        drop(b);
+        assert_eq!(queued(&queue), (0, 0), "un-waited handles leave no jobs");
+    }
+
+    #[test]
+    fn early_return_wait_purges_queued_jobs() {
+        // wait() that returns early (dst length mismatch) must still leave
+        // the queue empty — the purge happens before any early-return path.
+        let (_paths, reg) = fixture(1, "early-return-purge");
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: Vec::new(),
+            delay_ms: 0,
+            conc: None,
+        };
+        let queue = Arc::new(ChunkQueue::new(1));
+        let mut short = vec![0u8; SHARD_BYTES - 1];
+        let handle = read_whole(&queue, &sources, &mut short);
+        let err = handle.wait().unwrap_err();
+        assert!(matches!(err, StoreError::Invalid { .. }), "got {err:?}");
+        assert_eq!(queued(&queue), (0, 0), "early-return wait purges its jobs");
+    }
+
+    #[test]
+    fn dropping_handle_a_leaves_handle_b_drainable() {
+        // Purge is per-read: dropping handle A removes only A's chunks; B's
+        // jobs stay queued and drain to a correct result afterwards.
+        let (_paths, reg) = fixture(1, "purge-isolation");
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: Vec::new(),
+            delay_ms: 0,
+            conc: None,
+        };
+        let queue = Arc::new(ChunkQueue::new(1));
+        let chunks = plan_aligned(0, SHARD_BYTES).len();
+        let mut dst_a = vec![0u8; SHARD_BYTES];
+        let mut dst_b = vec![0u8; SHARD_BYTES];
+        let a = read_whole(&queue, &sources, &mut dst_a);
+        let b = read_whole(&queue, &sources, &mut dst_b);
+        assert_eq!(queued(&queue), (2 * chunks, 0));
+        drop(a);
+        assert_eq!(queued(&queue), (chunks, 0), "only A's chunks purged");
+        b.wait().unwrap();
+        assert_eq!(dst_b, pattern(0, SHARD_BYTES));
+        assert_eq!(queued(&queue), (0, 0));
     }
 
     #[test]
@@ -960,11 +1125,14 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
         let err = read_whole(&queue, &sources, &mut dst).wait().unwrap_err();
         assert!(matches!(err, StoreError::Invalid { .. }), "got {err:?}");
+        // The early return also purged this read's queued chunks.
+        assert_eq!(queued(&queue), (0, 0));
     }
 
     #[test]
@@ -980,6 +1148,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -1005,6 +1174,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(4));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -1029,6 +1199,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         // Read [512, 512+2048): covering region is [0, 4096).
@@ -1067,6 +1238,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         };
         let queue = Arc::new(ChunkQueue::new(2));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -1098,6 +1270,7 @@ mod tests {
             log,
             drives: Vec::new(),
             delay_ms: 0,
+            conc: None,
         });
         let queue = Arc::new(ChunkQueue::new(4));
         let (tx, rx) = std::sync::mpsc::channel::<()>();
