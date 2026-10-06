@@ -89,7 +89,7 @@ const golem_expert_placement_stats *golem_get_expert_placement_stats(void) { ret
 
 // Allocate the pinned staging under the SAME condition as the ids_dev realloc
 // (ids shape change): the caller invokes this only from inside that realloc
-// block, so the pinned registration tracks the same device as ids_dev — never
+// block, so the pinned registration tracks the same device as ids_dev -- never
 // a size-only reuse check, which could keep a buffer registered against a
 // different device after a backend switch.
 static void golem_ids_pin_alloc(golem::GolemSlabEntry &st, ggml_backend_t split_backend, int64_t ne0, int64_t ne1) {
@@ -109,6 +109,7 @@ static void golem_ids_pin_alloc(golem::GolemSlabEntry &st, ggml_backend_t split_
     st.ids_pin_buft = buft;
     st.ids_pin = ggml_backend_buffer_get_base(st.ids_pin_buf);
     st.ids_pin_bytes = (size_t) ne0 * (size_t) ne1 * sizeof(int32_t);
+    st.ids_pin_step = 0;
 }
 
 namespace golem { // same namespace as the shared header's inline types
@@ -138,6 +139,7 @@ void golem_reset_device_cache(void) {
             kv.second.ids_pin_buf = nullptr;
             kv.second.ids_pin = nullptr;
             kv.second.ids_pin_buft = nullptr;
+            kv.second.ids_pin_step = 0;
         }
         if (kv.second.ids_ctx != nullptr) {
             ggml_free(kv.second.ids_ctx);
@@ -2157,7 +2159,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // below into ids_pin must never overlap the step-N DMA
                             // reading it. This holds because compute_splits drains
                             // every backend at entry when golem_h_copy_done is set
-                            // (engine registers it alongside policy_query — see
+                            // (engine registers it alongside policy_query -- see
                             // p3_glue.rs), so step N's H2D is complete before this
                             // code runs again; a sync-granularity change must not
                             // silently tear the remap. Defensive drain for any

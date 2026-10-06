@@ -21,7 +21,7 @@ jobs:
         run: |
           cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'; }
           got=$(cs vendor/llama.cpp)
-          want=$(grep '^content_sha256' vendor/VENDOR_SHA | cut -d= -f2)
+          want=$(grep '^content_sha256' vendor/VENDOR_SHA | cut -d= -f2 | tr -d ' ')
           test "$got" = "$want" || { echo "PIN DRIFT: $got != $want"; exit 1; }
           grep -q "^content_sha256 = $got" engine/llama-cpp.lock || { echo "lock mismatch"; exit 1; }
           n=$(find vendor/llama.cpp -path vendor/llama.cpp/.git -prune -o -path vendor/llama.cpp/build -prune -o -type f -print | wc -l)
