@@ -462,8 +462,9 @@ pub struct Session {
     /// this is only the stats/geometry view, so no drop-order coupling with
     /// the substrate.
     p3: Option<p3_glue::PoolEnable>,
-    /// §11 per-step recorder when `config.timing_csv` is set; drained by the
-    /// caller (`take_timing`) at turn end. Fixed-capacity, preallocated.
+    /// §11 per-step recorder when `config.timing_csv` is set; flushed by the
+    /// caller (`write_timing`) at turn end and reused across turns.
+    /// Fixed-capacity, preallocated.
     timing: Option<crate::timing::TimingRecorder>,
     /// Set once a pooled offloaded turn's prefill passed
     /// [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first
@@ -584,10 +585,14 @@ impl Session {
         Some(DeviceCacheStats::new(load(0), load(1), load(2)))
     }
 
-    /// Drains the §11 per-step recorder (`None` unless `config.timing_csv`
-    /// is set); the caller writes it to the CSV file at turn end.
-    pub fn take_timing(&mut self) -> Option<crate::timing::TimingRecorder> {
-        self.timing.take()
+    /// Flushes the §11 per-step rows into `w` without destroying the
+    /// recorder — every turn records (a `take`-style drain would leave turns
+    /// 2+ empty). No-op when the timing CSV is disabled.
+    pub fn write_timing(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        match self.timing.as_mut() {
+            Some(t) => t.flush(w),
+            None => Ok(()),
+        }
     }
 
     /// Runs one chat turn: renders `messages` with the session template,
@@ -789,11 +794,19 @@ impl Session {
         if let Some(t) = self.timing.as_mut() {
             t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
         }
+        // Prefill activity must not bleed into step 0's row: take-and-discard
+        // the P3/store accumulators right before the decode loop (also
+        // prevents an EOG-exited turn from bleeding into the next one).
+        let _ = p3_glue::take_step_io_stats();
         loop {
             // §11: step wall time starts at the loop head (emit + decode).
             let step_t0 = std::time::Instant::now();
             // SAFETY: vocab is live; tok is a valid token id from the sampler.
             if unsafe { raw::llama_vocab_is_eog(vocab, tok) } {
+                // EOG is never decoded, so it has no row: every decode step
+                // (0-based, numbered below) already wrote its row before the
+                // follow-up sample. The pre-loop accumulator reset above
+                // keeps this exit from bleeding into the next turn.
                 break;
             }
             // SAFETY: vocab is live; tok is a valid token id from the sampler.
@@ -839,11 +852,13 @@ impl Session {
                 let io = p3_glue::take_step_io_stats();
                 let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
                 t.row(crate::timing::StepTiming {
-                    step: generated as u64,
+                    // 0-based: `generated` was incremented for this step's
+                    // emit above, matching the StepTiming::step doc.
+                    step: generated as u64 - 1,
                     tokens: 1,
                     wall_ms: step_t0.elapsed().as_secs_f64() * 1_000.0,
                     p3_wait_ms: ns2ms(io.p3_wait_ns),
-                    disk_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
+                    disk_worker_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
                     disk_bytes: io.disk_bytes.unwrap_or(0),
                     h2d_ms: f64::NAN,
                     h2d_bytes: 0,

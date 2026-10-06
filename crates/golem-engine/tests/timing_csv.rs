@@ -28,7 +28,7 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
         tokens: 1,
         wall_ms: 100.0,
         p3_wait_ms: 60.0,
-        disk_ms: 55.0,
+        disk_worker_ms: 55.0,
         disk_bytes: 121_634_816,
         h2d_ms: f64::NAN,
         h2d_bytes: 0,
@@ -48,15 +48,16 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
 }
 
 #[test]
-fn compute_is_wall_minus_measured_parts() {
+fn compute_is_wall_minus_p3_h2d_policy_not_disk_worker() {
     let mut r = TimingRecorder::new(64);
-    // 100 − (60 + 4.5) = 35.5: only measured columns are subtracted.
+    // 100 − (60 + 4.5) = 35.5: the disk worker runs inside the p3_wait
+    // window (parallel) and is deliberately not subtracted.
     r.row(StepTiming {
         step: 0,
         tokens: 1,
         wall_ms: 100.0,
         p3_wait_ms: 60.0,
-        disk_ms: f64::NAN,
+        disk_worker_ms: f64::NAN,
         disk_bytes: 0,
         h2d_ms: f64::NAN,
         h2d_bytes: 0,

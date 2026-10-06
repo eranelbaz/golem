@@ -137,7 +137,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
             TimingRecorder::header(
                 &mut f,
                 env!("CARGO_PKG_VERSION"),
-                option_env!("GOLEM_FORK_COMMIT").unwrap_or("unknown"),
+                &fork_commit(),
                 &resolved_config_line(&config),
             )?;
             f.flush()?;
@@ -256,6 +256,23 @@ fn expert_plane_bytes(model: &Path, manifest: Option<&Path>) -> Result<u64, Box<
     Ok(src.geometry()?.map(|g| g.expert_bytes).unwrap_or(0))
 }
 
+/// Vendored llama.cpp fork commit for the CSV header comment: read from the
+/// checkout's `vendor/VENDOR_SHA` (`commit=` line) so the header carries the
+/// real fork; `GOLEM_FORK_COMMIT` env overrides (e.g. for out-of-tree builds
+/// without `vendor/`).
+fn fork_commit() -> String {
+    if let Some(c) = option_env!("GOLEM_FORK_COMMIT") {
+        return c.to_owned();
+    }
+    const VENDOR_SHA: &str = include_str!("../../../vendor/VENDOR_SHA");
+    VENDOR_SHA
+        .lines()
+        .find_map(|l| l.strip_prefix("commit="))
+        .unwrap_or("unknown")
+        .trim()
+        .to_owned()
+}
+
 fn one_shot(
     session: &mut Session,
     prompt: &str,
@@ -268,20 +285,23 @@ fn one_shot(
         }],
         &mut emit_stdout,
     )?;
-    flush_timing(session, timing_out)?;
+    // Timing CSV is best-effort post-streaming: log, don't fail the run
+    // (matches the REPL path).
+    if let Err(e) = flush_timing(session, timing_out) {
+        eprintln!("error: timing csv: {e}");
+    }
     println!();
     Ok(())
 }
 
-/// §11: appends the turn's recorded rows to the CSV file (the recorder is
-/// preallocated per turn; `take` resets it for the next one).
+/// §11: appends the turn's recorded rows to the CSV file (the recorder
+/// survives the flush; it is reset by the engine at the next turn start).
 fn flush_timing(
     session: &mut Session,
     timing_out: &mut Option<std::fs::File>,
 ) -> Result<(), Box<dyn Error>> {
-    if let (Some(mut rec), Some(f)) = (session.take_timing(), timing_out.as_mut()) {
-        use std::io::Write;
-        rec.flush(f)?;
+    if let Some(f) = timing_out.as_mut() {
+        session.write_timing(f)?;
         f.flush()?;
     }
     Ok(())
