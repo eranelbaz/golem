@@ -129,10 +129,9 @@ impl ChunkQueue {
     ///
     /// Lifetime: the returned handle owns the read's chunks via its `Arc`
     /// (the queue itself is cloned into the handle, so handles keep it alive
-    /// past engine drop). A handle that is never `wait`ed holds its jobs in
-    /// the global queue until the handle — and with them the destination
-    /// borrow — drops; at queue shutdown they fail at their next `wait()`
-    /// instead of draining. There is no queue-side reaper.
+    /// past engine drop). Dropping a handle without `wait`ing it purges its
+    /// jobs from the global queue; a read that is `wait`ed after queue shutdown
+    /// fails instead of draining. There is no queue-side reaper.
     pub fn enqueue<'a>(self: &Arc<Self>, job: ReadJob<'a>) -> ReadHandle<'a> {
         let chunks = plan_aligned(job.offset, job.len);
         let state = Arc::new(ReadState {
@@ -166,11 +165,13 @@ impl ChunkQueue {
             }
         }
         ReadHandle {
-            // Cloned Arc: the handle keeps the queue alive past engine drop.
-            queue: Arc::clone(self),
-            read: state,
-            dst: job.dst,
-            sources: job.sources,
+            inner: Some(HandleInner {
+                // Cloned Arc: the handle keeps the queue alive past engine drop.
+                queue: Arc::clone(self),
+                read: state,
+                dst: job.dst,
+                sources: job.sources,
+            }),
         }
     }
 
@@ -216,12 +217,52 @@ pub struct ReadJob<'a> {
 /// Handle to a queued read; [`ReadHandle::wait`] drains exactly this read's
 /// chunks (demand-first within the drain) and blocks until they settle.
 pub struct ReadHandle<'a> {
+    // `None` once `wait` has taken ownership; `Drop` purges any remaining
+    // queued jobs so an un-waited (or early-failed) handle never leaks its
+    // `Arc<ReadState>` chunks in the global queue.
+    inner: Option<HandleInner<'a>>,
+}
+
+struct HandleInner<'a> {
     // Arc, not a borrow of the enqueuing engine: handles may outlive the
     // engine (drop then fails queued-but-undrained reads at their wait()).
     queue: Arc<ChunkQueue>,
     read: Arc<ReadState>,
     dst: &'a mut [u8],
     sources: &'a dyn ShardSources,
+}
+
+/// Removes every queued job belonging to `read` from the global queue
+/// (demand first). Called by `wait` and by `Drop for ReadHandle`, so a read
+/// that is never (or only partially) drained cannot leak its chunks.
+fn purge(queue: &ChunkQueue, read: &Arc<ReadState>) -> VecDeque<Job> {
+    let mut work = VecDeque::new();
+    let mut q = queue.lock();
+    let QueueInner {
+        demand, prefetch, ..
+    } = &mut *q;
+    for dq in [demand, prefetch] {
+        let mut i = 0;
+        while i < dq.len() {
+            if Arc::ptr_eq(&dq[i].read, read) {
+                if let Some(job) = dq.remove(i) {
+                    work.push_back(job);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    work
+}
+
+impl Drop for ReadHandle<'_> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let HandleInner { queue, read, .. } = inner;
+            purge(&queue, &read);
+        }
+    }
 }
 
 impl ReadHandle<'_> {
@@ -236,15 +277,20 @@ impl ReadHandle<'_> {
     /// covers every healthy replica of the shard (immediately when no
     /// eligible reader exists at all — a 1-replica failure never hangs), and
     /// with [`StoreError::Crc`] on a §5.3 checksum mismatch.
-    pub fn wait(self) -> Result<(), StoreError> {
-        let ReadHandle {
+    pub fn wait(mut self) -> Result<(), StoreError> {
+        let HandleInner {
             queue,
             read,
             dst,
             sources,
-        } = self;
+        } = self.inner.take().expect("handle consumed at most once");
         let shard = read.shard_index;
         let replica_count = sources.slots(shard).len();
+        // Take this read's chunks out of the global queue up front (demand
+        // first) so every early-return path below — and the Drop fallback —
+        // leave no jobs behind. A failed chunk can then requeue drain-locally
+        // instead of deadlocking on a queue nobody else drains.
+        let work = purge(&queue, &read);
         // Exclude masks (and the §5.3 `served` set) are `u32` bitmasks over
         // replica indices: bound the shard rather than widen — real
         // topologies are ≤6 replicas, and a 33rd replica is a manifest bug
@@ -265,40 +311,18 @@ impl ReadHandle<'_> {
         if dst.len() != covering {
             return Err(StoreError::Invalid {
                 msg: format!(
-                    "destination is {} bytes but the covering region of [{}..] is {covering}",
+                    "destination is {} bytes but the aligned covering region is {covering} bytes",
                     dst.len(),
-                    read.crc_at,
                 ),
             });
         }
 
-        // Take this read's chunks out of the global queue, demand first, so a
-        // failed chunk can requeue drain-locally instead of deadlocking on a
-        // queue nobody else drains.
-        let mut work: VecDeque<Job> = VecDeque::new();
-        {
-            let mut q = queue.lock();
-            if q.shutdown {
-                // Queue closed before this read drained: fail, never hang.
-                return Err(StoreError::Unavailable {
-                    shard: read.shard_name.clone(),
-                });
-            }
-            let QueueInner {
-                demand, prefetch, ..
-            } = &mut *q;
-            for dq in [demand, prefetch] {
-                let mut i = 0;
-                while i < dq.len() {
-                    if Arc::ptr_eq(&dq[i].read, &read) {
-                        if let Some(job) = dq.remove(i) {
-                            work.push_back(job);
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
+        if queue.lock().shutdown {
+            // Queue closed before this read drained: fail, never hang (its
+            // jobs were already purged above).
+            return Err(StoreError::Unavailable {
+                shard: read.shard_name.clone(),
+            });
         }
         debug_assert_eq!(work.len(), read.chunks.len());
 
@@ -394,13 +418,14 @@ fn drain<'a>(
 
     // Reader threads per drain (§5.2, D-12): one thread per physical drive
     // hosting an eligible replica by default — per-drive, not per-file. An
-    // explicit `--io-threads` override REPLACES the derived count (it is not
-    // clamped to the replica count); extra workers wrap around the drives.
-    let workers = if queue.io_threads > 0 {
+    // explicit `--io-threads` override REPLACES the derived count, capped at
+    // the pending chunk count: more workers than chunks would idle.
+    let workers = (if queue.io_threads > 0 {
         queue.io_threads
     } else {
         drives.drives.max(1)
-    };
+    })
+    .min(list.len().max(1));
 
     let shared = Arc::new((Mutex::new(Shared { list, remaining }), Condvar::new()));
     std::thread::scope(|s| {
