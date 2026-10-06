@@ -32,6 +32,12 @@ pub trait ShardSources: Send + Sync {
     fn slot(&self, shard_index: usize, replica_index: usize) -> &ReplicaSlot;
     /// Shard file name (e.g. `s0.gguf`) used in errors and logs.
     fn shard_name(&self, shard_index: usize) -> &str;
+    /// Cached physical device identity of one replica (§5.1), resolved at
+    /// registry open — the drain's drive→replica map reads this once per
+    /// drain, never sysfs per read.
+    fn replica_drive(&self, shard_index: usize, replica_index: usize) -> &str {
+        self.slot(shard_index, replica_index).drive.as_str()
+    }
 }
 
 impl ShardSources for ReplicaRegistry {
@@ -114,10 +120,8 @@ impl IoEngine {
     /// `buf` must be exactly the aligned covering region
     /// (`plan_aligned(offset, len)` bytes): chunk 0 lands at the region base,
     /// so the bytes before the logical range are head scratch; expert bytes
-    /// are copied disk→destination exactly once.
-    ///
-    /// # Panics
-    /// When `buf.len()` differs from the covering region length.
+    /// are copied disk→destination exactly once. Any other length →
+    /// [`StoreError::Invalid`].
     pub fn read_page(
         &self,
         sources: &dyn ShardSources,
@@ -125,11 +129,17 @@ impl IoEngine {
         buf: &mut [u8],
     ) -> Result<(), StoreError> {
         let covering: usize = plan_aligned(req.offset, req.len).iter().map(|c| c.1).sum();
-        assert_eq!(
-            buf.len(),
-            covering,
-            "destination must be the aligned covering region"
-        );
+        if buf.len() != covering {
+            // Caller contract violation: `Err`, never a `split_at_mut` panic
+            // inside the queue (§5.4 destination contract).
+            return Err(StoreError::Invalid {
+                msg: format!(
+                    "destination is {} bytes but the covering region of [{}..] is {covering}",
+                    buf.len(),
+                    req.offset - req.offset % 4096
+                ),
+            });
+        }
         self.enqueue(ReadJob {
             shard_index: req.shard_index,
             offset: req.offset,

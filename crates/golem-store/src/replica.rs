@@ -39,6 +39,10 @@ pub struct ReplicaSlot {
     pub path: PathBuf,
     /// Open handle for positioned reads.
     pub file: std::fs::File,
+    /// Cached physical device identity (§5.1): sysfs block name or numeric
+    /// `st_dev` fallback, resolved once at open — never re-stat'ed on the
+    /// read path (§5.2 hot loop is allocation- and syscall-light).
+    pub drive: String,
     /// 0 = Healthy, 1 = Degraded ([`ReplicaHealth`] as u8).
     pub health: AtomicU8,
     /// Count of one-way degradations since open; feeds diagnostics and
@@ -127,8 +131,10 @@ impl ReplicaRegistry {
                         ),
                     )));
                 }
+                let drive = physical_device_name(&path).unwrap_or_else(|| "unknown".to_owned());
                 replicas.push(Arc::new(ReplicaSlot {
                     path,
+                    drive,
                     file,
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
                     errors: AtomicU64::new(0),

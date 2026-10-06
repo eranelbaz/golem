@@ -83,6 +83,13 @@ pub enum StoreError {
         /// Details of the mismatch.
         msg: String,
     },
+    #[error("invalid read: {msg}")]
+    /// Caller violated a read contract (e.g. destination length ≠ the
+    /// aligned covering region, or a shard with more than 32 replicas).
+    Invalid {
+        /// What was wrong.
+        msg: String,
+    },
     #[error("all replicas of shard {shard} unreadable")]
     /// Every replica of a shard failed.
     Unavailable {

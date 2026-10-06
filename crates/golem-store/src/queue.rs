@@ -14,14 +14,13 @@
 //! - Health is read once per replica-choice decision, so a concurrent
 //!   `mark_degraded` cannot flip the predicate mid-check.
 
+use crate::StoreError;
+use crate::engine::{ChunkSource, ShardSources};
+use crate::replica::ReplicaHealth;
+use crate::stripe::plan_aligned;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-
-use crate::StoreError;
-use crate::engine::{ChunkSource, ShardSources};
-use crate::replica::{ReplicaHealth, physical_device_name};
-use crate::stripe::plan_aligned;
 
 /// Everything a drain needs to settle one logical read.
 pub(crate) struct ReadState {
@@ -108,9 +107,9 @@ struct QueueInner {
 /// One shared queue of chunk reads (§5.2).
 pub struct ChunkQueue {
     inner: Mutex<QueueInner>,
-    /// Wakes potential waiters on shutdown; drains themselves are synchronous.
-    cv: Condvar,
     /// Reader threads per drain; 0 = derive one thread per physical drive.
+    /// An explicit override wins over the derived per-drive count (D-12
+    /// bounds the default at 1–2 per drive; the operator's flag does not).
     io_threads: usize,
 }
 
@@ -120,7 +119,6 @@ impl ChunkQueue {
     pub fn new(io_threads: usize) -> Self {
         Self {
             inner: Mutex::new(QueueInner::default()),
-            cv: Condvar::new(),
             io_threads,
         }
     }
@@ -128,6 +126,13 @@ impl ChunkQueue {
     /// Queues a logical read without touching its destination; call
     /// [`ReadHandle::wait`] to drain it. Prefetch reads queue strictly behind
     /// demand reads.
+    ///
+    /// Lifetime: the returned handle owns the read's chunks via its `Arc`
+    /// (the queue itself is cloned into the handle, so handles keep it alive
+    /// past engine drop). A handle that is never `wait`ed holds its jobs in
+    /// the global queue until the handle — and with them the destination
+    /// borrow — drops; at queue shutdown they fail at their next `wait()`
+    /// instead of draining. There is no queue-side reaper.
     pub fn enqueue<'a>(self: &Arc<Self>, job: ReadJob<'a>) -> ReadHandle<'a> {
         let chunks = plan_aligned(job.offset, job.len);
         let state = Arc::new(ReadState {
@@ -160,7 +165,6 @@ impl ChunkQueue {
                 });
             }
         }
-        self.cv.notify_all();
         ReadHandle {
             // Cloned Arc: the handle keeps the queue alive past engine drop.
             queue: Arc::clone(self),
@@ -174,7 +178,6 @@ impl ChunkQueue {
     /// draining reads (which own their chunks) are unaffected.
     pub fn shutdown(&self) {
         self.lock().shutdown = true;
-        self.cv.notify_all();
     }
 
     /// Poisoning can only follow a panic; the queue's bookkeeping stays
@@ -242,6 +245,32 @@ impl ReadHandle<'_> {
         } = self;
         let shard = read.shard_index;
         let replica_count = sources.slots(shard).len();
+        // Exclude masks (and the §5.3 `served` set) are `u32` bitmasks over
+        // replica indices: bound the shard rather than widen — real
+        // topologies are ≤6 replicas, and a 33rd replica is a manifest bug
+        // surfaced as `Err`, not a shift-overflow panic.
+        if replica_count > 32 {
+            return Err(StoreError::Invalid {
+                msg: format!(
+                    "shard {} has {replica_count} replicas; the u32 exclude mask supports at most 32",
+                    read.shard_name
+                ),
+            });
+        }
+        // Destination contract (§5.4): exactly the aligned covering region,
+        // chunk 0 at the region base. Wrong length is a caller bug → `Err`,
+        // never a `split_at_mut` panic; also proves the CRC window below is
+        // in bounds.
+        let covering: usize = read.chunks.iter().map(|c| c.1).sum();
+        if dst.len() != covering {
+            return Err(StoreError::Invalid {
+                msg: format!(
+                    "destination is {} bytes but the covering region of [{}..] is {covering}",
+                    dst.len(),
+                    read.crc_at,
+                ),
+            });
+        }
 
         // Take this read's chunks out of the global queue, demand first, so a
         // failed chunk can requeue drain-locally instead of deadlocking on a
@@ -330,6 +359,17 @@ struct Shared<'a> {
     remaining: usize,
 }
 
+/// Per-drain drive map (§5.2): `replica_drive[r]` is the index of the
+/// physical drive hosting replica r, computed **once per drain** from the
+/// device identity cached at replica open — the hot loop never touches
+/// `/sys/dev/block` nor allocates per read.
+struct DriveMap {
+    /// Distinct drives hosting the shard's replicas.
+    drives: usize,
+    /// Physical-drive index per replica.
+    replica_drive: Vec<usize>,
+}
+
 /// Runs the drain to completion: splits `dst` into per-chunk disjoint slices,
 /// builds the drain-local work list, and runs the reader threads inside
 /// `thread::scope`.
@@ -343,6 +383,7 @@ fn drain<'a>(
     let shard = read.shard_index;
     let slots: Arc<[Arc<dyn ChunkSource>]> = sources.slots(shard).into(); // once per drain
     let replica_count = slots.len();
+    let drives = drive_map(sources, shard, replica_count);
     let lens: Vec<usize> = work.iter().map(|j| read.chunks[j.chunk_index].1).collect();
     let list: VecDeque<DrainJob<'_>> = work
         .into_iter()
@@ -352,29 +393,31 @@ fn drain<'a>(
     let remaining = list.len();
 
     // Reader threads per drain (§5.2, D-12): one thread per physical drive
-    // hosting an eligible replica by default — per-drive, not per-file; the
-    // `--io-threads` override caps the count.
+    // hosting an eligible replica by default — per-drive, not per-file. An
+    // explicit `--io-threads` override REPLACES the derived count (it is not
+    // clamped to the replica count); extra workers wrap around the drives.
     let workers = if queue.io_threads > 0 {
-        queue.io_threads.min(replica_count.max(1))
+        queue.io_threads
     } else {
-        let drives: Vec<Option<String>> = (0..replica_count)
-            .map(|r| physical_device_name(&sources.slot(shard, r).path))
-            .collect();
-        let mut seen: Vec<&str> = Vec::new();
-        for d in drives.iter().flatten() {
-            if !seen.contains(&d.as_str()) {
-                seen.push(d);
-            }
-        }
-        seen.len().max(1)
+        drives.drives.max(1)
     };
 
     let shared = Arc::new((Mutex::new(Shared { list, remaining }), Condvar::new()));
     std::thread::scope(|s| {
-        for _ in 0..workers {
+        for w in 0..workers {
             let shared = Arc::clone(&shared);
             let read = Arc::clone(read);
             let slots = Arc::clone(&slots);
+            // Home drive for striping (§5.2): workers are pinned round-robin
+            // to drives so healthy reads stripe across devices instead of
+            // every worker contending for the lowest replica index. A fast
+            // drive's worker pops more chunks — it self-selects.
+            let home = if drives.drives == 0 {
+                0
+            } else {
+                w % drives.drives
+            };
+            let replica_drive = &drives.replica_drive;
             s.spawn(move || {
                 loop {
                     // Pop a job (any drive's thread may serve it — the slice
@@ -392,21 +435,48 @@ fn drain<'a>(
                             sh = cv.wait(sh).unwrap_or_else(PoisonError::into_inner);
                         }
                     };
-                    run_chunk(&shared, &read, sources, &slots, job);
+                    run_chunk(&shared, &read, sources, &slots, replica_drive, home, job);
                 }
             });
         }
     });
 }
 
-/// Serves one chunk from the first healthy replica not excluded by the job's
-/// mask; on failure degrades the replica, requeues onto the same drain-local
-/// list with the replica's bit set, and lets a healthy drive retry.
+/// Groups the shard's replicas by cached physical device (§5.1/§5.2). No
+/// sysfs calls here: `ReplicaSlot::drive` was resolved at registry open.
+fn drive_map(sources: &dyn ShardSources, shard: usize, replica_count: usize) -> DriveMap {
+    let mut names: Vec<&str> = Vec::with_capacity(replica_count);
+    let mut replica_drive = Vec::with_capacity(replica_count);
+    for r in 0..replica_count {
+        let name = sources.replica_drive(shard, r);
+        let idx = match names.iter().position(|n| *n == name) {
+            Some(i) => i,
+            None => {
+                names.push(name);
+                names.len() - 1
+            }
+        };
+        replica_drive.push(idx);
+    }
+    DriveMap {
+        drives: names.len(),
+        replica_drive,
+    }
+}
+
+/// Serves one chunk, preferring replicas on the worker's home drive (§5.2
+/// striping: each worker self-selects the chunks its drive can serve; a
+/// worker whose home drive is degraded falls back to any eligible replica).
+/// On failure degrades the replica, requeues onto the same drain-local list
+/// with the replica's bit set, and lets a healthy drive retry.
+#[allow(clippy::too_many_arguments)]
 fn run_chunk<'a>(
     shared: &(Mutex<Shared<'a>>, Condvar),
     read: &ReadState,
     sources: &dyn ShardSources,
     slots: &Arc<[Arc<dyn ChunkSource>]>,
+    replica_drive: &[usize],
+    home: usize,
     mut job: DrainJob<'a>,
 ) {
     let shard = read.shard_index;
@@ -427,9 +497,12 @@ fn run_chunk<'a>(
             );
         }
         // Health read once per decision: a concurrent mark_degraded on
-        // another thread cannot flip this predicate mid-check.
+        // another thread cannot flip this predicate mid-check. Home-drive
+        // match first (§5.2 striping), then any eligible replica.
         let eligible = healthy_mask(sources, shard, replica_count) & !mask;
-        let replica = (0..replica_count).find(|&r| eligible & (1 << r) != 0);
+        let replica = (0..replica_count)
+            .find(|&r| eligible & (1 << r) != 0 && replica_drive[r] == home)
+            .or_else(|| (0..replica_count).find(|&r| eligible & (1 << r) != 0));
         let replica = match replica {
             Some(r) => r,
             None => {
@@ -488,6 +561,9 @@ fn settle(shared: &(Mutex<Shared<'_>>, Condvar), read: &ReadState, result: Resul
 
 /// Splits `whole` into consecutive disjoint sub-slices of `lens` lengths.
 fn split_disjoint<'a>(mut whole: &'a mut [u8], lens: &[usize]) -> Vec<&'a mut [u8]> {
+    // Precondition enforced by the public entry point (`wait` validates the
+    // destination length): the lens sum to exactly `whole.len()`.
+    debug_assert_eq!(lens.iter().sum::<usize>(), whole.len());
     let mut out = Vec::with_capacity(lens.len());
     for &l in lens {
         let (head, tail) = whole.split_at_mut(l);
@@ -540,16 +616,21 @@ mod tests {
 
     /// Delegates to the real slot until the countdown hits 0, then fails with
     /// EIO; records every attempt (replica id, offset) in a shared log.
+    /// `delay_ms` throttles each read (striping determinism).
     struct FailingSource {
         inner: Arc<ReplicaSlot>,
         fail_nth: AtomicUsize,
         id: usize,
         log: Arc<std::sync::Mutex<Vec<(usize, u64)>>>,
+        delay_ms: u64,
     }
 
     impl ChunkSource for FailingSource {
         fn read_chunk(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
             self.log.lock().unwrap().push((self.id, offset));
+            if self.delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            }
             // usize::MAX = always fail (never decremented).
             if self.fail_nth.load(Ordering::SeqCst) == 0
                 || self.fail_nth.load(Ordering::SeqCst) == usize::MAX
@@ -562,11 +643,17 @@ mod tests {
     }
 
     /// Real registry + per-replica FailingSources; health marking flows
-    /// through `slot()`.
+    /// through `slot()`. `drives` overrides the cached per-replica device
+    /// identity (empty = use the real one) so multi-drive striping is
+    /// testable on one filesystem.
     struct TestSources {
         reg: ReplicaRegistry,
         fail: Vec<(usize, usize)>,
         log: Arc<std::sync::Mutex<Vec<(usize, u64)>>>,
+        drives: Vec<String>,
+        /// Per-read throttle (0 = none); widens the pop window so multi-worker
+        /// striping is deterministic.
+        delay_ms: u64,
     }
 
     impl ShardSources for TestSources {
@@ -589,6 +676,7 @@ mod tests {
                         fail_nth: AtomicUsize::new(nth),
                         id: replica,
                         log: Arc::clone(&self.log),
+                        delay_ms: self.delay_ms,
                     }) as Arc<dyn ChunkSource>
                 })
                 .collect()
@@ -600,6 +688,13 @@ mod tests {
 
         fn shard_name(&self, shard_index: usize) -> &str {
             self.reg.shard_name(shard_index)
+        }
+
+        fn replica_drive(&self, shard_index: usize, replica_index: usize) -> &str {
+            match self.drives.get(replica_index) {
+                Some(d) => d,
+                None => self.slot(shard_index, replica_index).drive.as_str(),
+            }
         }
     }
 
@@ -631,6 +726,8 @@ mod tests {
             reg,
             fail: vec![(0, 0)],
             log,
+            drives: Vec::new(),
+            delay_ms: 0,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -658,8 +755,8 @@ mod tests {
 
     #[test]
     fn demand_chunks_drain_before_prefetch() {
-        // 1 reader thread; enqueue demand + prefetch; the demand read's
-        // chunks are served strictly before any prefetch chunk.
+        // 1 reader thread; the PREFETCH read is enqueued first, demand
+        // second — demand must still be served strictly first.
         let (_paths, reg) = fixture(1, "demand-first");
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sources = TestSources {
@@ -667,6 +764,8 @@ mod tests {
             reg,
             fail: vec![(0, 1_000_000)],
             log,
+            drives: Vec::new(),
+            delay_ms: 0,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let plan = plan_aligned(0, SHARD_BYTES);
@@ -682,15 +781,165 @@ mod tests {
             sources: &sources,
             dst: &mut prefetch_dst,
         });
+        // Prefetch is IN the queue first; draining the demand read must still
+        // serve all of its chunks before any prefetch chunk — a FIFO-serving
+        // queue would log the earlier-enqueued prefetch chunks first.
         demand.wait().unwrap();
+        let demand_reads = sources.log.lock().unwrap().clone();
+        let expected: Vec<(usize, u64)> = plan.iter().map(|c| (0, c.0)).collect();
+        assert_eq!(
+            demand_reads, expected,
+            "demand chunks served first, in plan order"
+        );
+        // Then the queued prefetch read drains untouched.
         prefetch.wait().unwrap();
         assert_eq!(demand_dst, pattern(0, SHARD_BYTES));
         assert_eq!(prefetch_dst, pattern(0, SHARD_BYTES));
-        // 1 reader thread ⇒ deterministic: the first plan.len() records are
-        // exactly the demand plan's chunks, in order.
+        assert_eq!(sources.log.lock().unwrap().len(), 2 * plan.len());
+    }
+
+    #[test]
+    fn healthy_reads_stripe_across_drives() {
+        // 2 replicas on 2 distinct drives, derived worker count (one per
+        // drive), 2 chunks. Each worker prefers its home drive, so the chunks
+        // land on different replicas — a lowest-eligible pick would serve
+        // both chunks from replica 0 (no striping, §5.2).
+        let bytes = crate::stripe::CHUNK + 8192; // 2 chunks: 2 MiB + 8 KiB
+        let root = std::env::temp_dir().join("golem-store-queue-stripe");
+        let mut replicas = Vec::with_capacity(2);
+        for r in 0..2 {
+            let dir = root.join(format!("r{r}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SHARD_FILE), pattern(0, bytes)).unwrap();
+            replicas.push(dir);
+        }
+        let manifest = crate::manifest::ModelManifest {
+            name: "stripe".to_owned(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: SHARD_FILE.to_owned(),
+                bytes: bytes as u64,
+                sha256: "0".repeat(64),
+                replicas,
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: vec!["drv0".to_owned(), "drv1".to_owned()],
+            // 50 ms per chunk: while worker 0 serves its home-drive chunk,
+            // worker 1 pops the second — deterministic striping.
+            delay_ms: 50,
+        };
+        let queue = Arc::new(ChunkQueue::new(0)); // 0 = derived, one worker per drive
+        let mut dst = vec![0u8; bytes];
+        queue
+            .enqueue(ReadJob {
+                shard_index: 0,
+                offset: 0,
+                len: bytes,
+                expected_crc: crc32c::crc32c(&pattern(0, bytes)),
+                prefetch: false,
+                sources: &sources,
+                dst: &mut dst,
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(dst, pattern(0, bytes));
         let reads = sources.log.lock().unwrap().clone();
-        let expected: Vec<(usize, u64)> = plan.iter().map(|c| (0, c.0)).collect();
-        assert_eq!(&reads[..plan.len()], &expected[..]);
+        assert_eq!(reads.len(), 2, "both chunks served once: {reads:?}");
+        assert_ne!(
+            reads[0].0, reads[1].0,
+            "chunks served by different replicas (striped across drives)"
+        );
+    }
+
+    #[test]
+    fn wrong_dst_length_returns_invalid_not_panic() {
+        // Destination shorter than the aligned covering region: `Err(Invalid)`
+        // from the public API — never a `split_at_mut` panic.
+        let (_paths, reg) = fixture(1, "dst-len");
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: Vec::new(),
+            delay_ms: 0,
+        };
+        let queue = Arc::new(ChunkQueue::new(1));
+        let covering = plan_aligned(0, SHARD_BYTES)
+            .iter()
+            .map(|c| c.1)
+            .sum::<usize>();
+        let mut short = vec![0u8; covering - 1];
+        let err = read_whole(&queue, &sources, &mut short).wait().unwrap_err();
+        assert!(matches!(err, StoreError::Invalid { .. }), "got {err:?}");
+        // Same for a too-long destination (CRC window would be inconsistent).
+        let mut long = vec![0u8; covering + 1];
+        let err = read_whole(&queue, &sources, &mut long).wait().unwrap_err();
+        assert!(matches!(err, StoreError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn io_threads_override_is_not_clamped_to_replica_count() {
+        // `--io-threads 4` over 2 replicas runs 4 workers (2 per drive), not
+        // 2: the explicit flag replaces the derived per-drive count (D-12
+        // bounds only the default). The read must still complete correctly.
+        let (_paths, reg) = fixture(2, "io-override");
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: Vec::new(),
+            delay_ms: 0,
+        };
+        let queue = Arc::new(ChunkQueue::new(4));
+        let mut dst = vec![0u8; SHARD_BYTES];
+        read_whole(&queue, &sources, &mut dst).wait().unwrap();
+        assert_eq!(dst, pattern(0, SHARD_BYTES));
+    }
+
+    #[test]
+    fn more_than_32_replicas_is_invalid_not_shift_overflow() {
+        // The u32 exclude mask bounds shards at 32 replicas; the 33rd is a
+        // manifest bug surfaced as `Err(Invalid)`, not a `1 << r` panic.
+        let bytes = SHARD_BYTES;
+        let root = std::env::temp_dir().join("golem-store-queue-33");
+        let mut replicas = Vec::with_capacity(33);
+        for r in 0..33 {
+            let dir = root.join(format!("r{r}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SHARD_FILE), pattern(0, bytes)).unwrap();
+            replicas.push(dir);
+        }
+        let manifest = crate::manifest::ModelManifest {
+            name: "too-many".to_owned(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: SHARD_FILE.to_owned(),
+                bytes: bytes as u64,
+                sha256: "0".repeat(64),
+                replicas,
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log,
+            drives: Vec::new(),
+            delay_ms: 0,
+        };
+        let queue = Arc::new(ChunkQueue::new(1));
+        let mut dst = vec![0u8; SHARD_BYTES];
+        let err = read_whole(&queue, &sources, &mut dst).wait().unwrap_err();
+        assert!(matches!(err, StoreError::Invalid { .. }), "got {err:?}");
     }
 
     #[test]
@@ -704,6 +953,8 @@ mod tests {
             reg,
             fail: vec![(0, usize::MAX)],
             log,
+            drives: Vec::new(),
+            delay_ms: 0,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -727,6 +978,8 @@ mod tests {
             reg,
             fail: vec![(0, 0), (1, 0), (2, 0)],
             log,
+            drives: Vec::new(),
+            delay_ms: 0,
         };
         let queue = Arc::new(ChunkQueue::new(4));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -749,6 +1002,8 @@ mod tests {
             reg,
             fail: Vec::new(),
             log,
+            drives: Vec::new(),
+            delay_ms: 0,
         };
         let queue = Arc::new(ChunkQueue::new(1));
         // Read [512, 512+2048): covering region is [0, 4096).
@@ -785,6 +1040,8 @@ mod tests {
             reg,
             fail: Vec::new(),
             log,
+            drives: Vec::new(),
+            delay_ms: 0,
         };
         let queue = Arc::new(ChunkQueue::new(2));
         let mut dst = vec![0u8; SHARD_BYTES];
@@ -814,6 +1071,8 @@ mod tests {
             reg,
             fail: Vec::new(),
             log,
+            drives: Vec::new(),
+            delay_ms: 0,
         });
         let queue = Arc::new(ChunkQueue::new(4));
         let (tx, rx) = std::sync::mpsc::channel::<()>();
