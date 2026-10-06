@@ -18,7 +18,7 @@ use crate::StoreError;
 use crate::engine::{ChunkSource, ShardSources};
 use crate::replica::ReplicaHealth;
 use crate::stripe::plan_aligned;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
@@ -94,6 +94,8 @@ struct Job {
 struct DrainJob<'a> {
     job: Job,
     dst: &'a mut [u8],
+    /// Resolved once at list-build time: index into the drain's ctx Vec.
+    shard: usize,
 }
 
 #[derive(Default)]
@@ -359,8 +361,8 @@ impl ReadHandle<'_> {
             });
         }
 
-        let mut ctxs = HashMap::new();
-        ctxs.insert(shard, ShardCtx::new(sources, shard));
+        let mut ctxs: Vec<Option<ShardCtx<'_>>> = (0..=shard).map(|_| None).collect();
+        ctxs[shard] = Some(ShardCtx::new(sources, shard));
         if read.lock_progress().error.is_none() {
             // Reborrow: the drain only needs the destination for its own
             // duration; CRC verification reads it again below.
@@ -474,12 +476,19 @@ impl<'a> ReadBatch<'a> {
         }
 
         // Per-shard drain context, built once per drain (§5.2 hot path: no
-        // per-chunk replica-slot or drive lookups).
-        let mut ctxs: HashMap<usize, ShardCtx<'_>> = HashMap::new();
+        // per-chunk replica-slot or drive lookups), indexed by shard index —
+        // a flat Vec, no per-drain HashMap.
+        let max_shard = reads
+            .iter()
+            .map(|(r, _, _)| r.shard_index)
+            .max()
+            .unwrap_or(0);
+        let mut ctxs: Vec<Option<ShardCtx<'_>>> = (0..=max_shard).map(|_| None).collect();
         for (read, dst, sources) in &reads {
             let shard = read.shard_index;
-            ctxs.entry(shard)
-                .or_insert_with(|| ShardCtx::new(*sources, shard));
+            if ctxs[shard].is_none() {
+                ctxs[shard] = Some(ShardCtx::new(*sources, shard));
+            }
             let replica_count = sources.slots(shard).len();
             if replica_count > 32 {
                 return Err(StoreError::Invalid {
@@ -516,11 +525,22 @@ impl<'a> ReadBatch<'a> {
                 .collect();
             drain_reads(&self.queue, &ctxs, &mut slice, work);
         }
-        // Collect per read; the first failure fails the whole batch.
+        // Collect per read: settle EVERY read even when one already failed —
+        // a CRC mismatch on read B must still mark its serving replicas
+        // Degraded when read A failed with Unavailable — then return the
+        // first error. (A batch-wide "stop after first failure" flag is
+        // deliberately absent: it would leave B's chunks undrained and its
+        // replicas un-degraded.)
+        let mut first_err: Option<StoreError> = None;
         for (read, dst, sources) in &reads {
-            finish_read(read, dst, *sources, read.shard_index)?;
+            if let Err(e) = finish_read(read, dst, *sources, read.shard_index) {
+                first_err.get_or_insert(e);
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -588,7 +608,7 @@ impl<'a> ShardCtx<'a> {
 /// its own read's destination. Reader threads run inside `thread::scope`.
 fn drain_reads(
     queue: &ChunkQueue,
-    ctxs: &HashMap<usize, ShardCtx<'_>>,
+    ctxs: &[Option<ShardCtx<'_>>],
     reads: &mut [(Arc<ReadState>, &mut [u8])],
     work: VecDeque<Job>,
 ) {
@@ -607,6 +627,7 @@ fn drain_reads(
         .collect();
     let mut list: VecDeque<DrainJob<'_>> = VecDeque::with_capacity(work.len());
     for job in work {
+        let shard = job.read.shard_index;
         let (_, parts) = slices
             .iter_mut()
             .find(|(r, _)| Arc::ptr_eq(r, &job.read))
@@ -614,7 +635,7 @@ fn drain_reads(
         let dst = parts[job.chunk_index]
             .take()
             .expect("exactly one job per chunk");
-        list.push_back(DrainJob { job, dst });
+        list.push_back(DrainJob { job, dst, shard });
     }
     let remaining = list.len();
 
@@ -622,7 +643,12 @@ fn drain_reads(
     // hosting an eligible replica by default — per-drive, not per-file. An
     // explicit `--io-threads` override REPLACES the derived count, capped at
     // the pending chunk count: more workers than chunks would idle.
-    let drives = ctxs.values().map(|c| c.drives).max().unwrap_or(0);
+    let drives = ctxs
+        .iter()
+        .filter_map(|c| c.as_ref())
+        .map(|c| c.drives)
+        .max()
+        .unwrap_or(0);
     let workers = (if queue.io_threads > 0 {
         queue.io_threads
     } else {
@@ -656,7 +682,11 @@ fn drain_reads(
                             sh = cv.wait(sh).unwrap_or_else(PoisonError::into_inner);
                         }
                     };
-                    let ctx = &ctxs[&job.job.read.shard_index];
+                    // Shard ctx resolved once per job at list-build time
+                    // (flat Vec index, §5.2 hot path).
+                    let ctx = ctxs[job.shard]
+                        .as_ref()
+                        .expect("ctx exists for every enqueued job's shard");
                     run_chunk(&shared, ctx, home, job);
                 }
             });
@@ -1051,6 +1081,68 @@ mod tests {
         });
         assert!(matches!(batch.wait(), Err(StoreError::Crc { .. })));
         assert_eq!(good, pattern(0, 4096));
+    }
+
+    /// Mixed batch failure: one read is Unavailable (all replicas degraded
+    /// up front), another lands and fails CRC. finish_read still runs for
+    /// EVERY read — the CRC read's serving replicas are marked Degraded even
+    /// though the first read already failed — and the first read's error is
+    /// returned.
+    #[test]
+    fn batch_settles_every_read_on_mixed_failure() {
+        let (_paths, reg) = fixture(2, "batch-mixed");
+        let sources = TestSources {
+            reg,
+            fail: vec![],
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            drives: Vec::new(),
+            delay_ms: 0,
+            conc: None,
+            wait_for_pair: None,
+        };
+        let replica_count = sources.slots(0).len();
+        assert!(replica_count > 0);
+        // Kill every replica of the first read up front: Unavailable with no
+        // bytes moved for that read.
+        for r in 0..replica_count {
+            sources.slot(0, r).mark_degraded();
+        }
+        let queue = Arc::new(ChunkQueue::new(0));
+        let mut dead = vec![0u8; 4096];
+        let mut bad = vec![0u8; 4096];
+        let mut batch = queue.batch();
+        batch.push(ReadJob {
+            shard_index: 0,
+            offset: 0,
+            len: 512,
+            expected_crc: crc32c::crc32c(&pattern(0, 512)),
+            verify_crc: true,
+            prefetch: false,
+            sources: &sources,
+            dst: &mut dead,
+        });
+        // Wrong digest on the second read: lands, then fails CRC.
+        batch.push(ReadJob {
+            shard_index: 0,
+            offset: 512,
+            len: 512,
+            expected_crc: 0xdead_beef,
+            verify_crc: true,
+            prefetch: false,
+            sources: &sources,
+            dst: &mut bad,
+        });
+        // First read's error wins, but only after BOTH reads settled.
+        assert!(matches!(batch.wait(), Err(StoreError::Unavailable { .. })));
+        // Both degradations recorded: the pre-killed replicas AND the CRC
+        // read's serving replicas.
+        for r in 0..replica_count {
+            assert_eq!(
+                sources.slot(0, r).health(),
+                crate::replica::ReplicaHealth::Degraded,
+                "replica {r} must be Degraded"
+            );
+        }
     }
 
     #[test]

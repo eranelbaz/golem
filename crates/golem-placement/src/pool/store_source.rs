@@ -1,6 +1,6 @@
 //! Store-backed [`ExpertSource`] (§5.2–5.4): the manifest's replica set,
 //! read through the shared [`ChunkQueue`] — one queued, per-drive drain per
-//! expert plane instead of a blocking QD1 pread. Plane addressing comes from
+//! expert unit instead of a blocking QD1 pread. Plane addressing comes from
 //! the manifest's `expert_index` (`offsets_bytes` per expert), verified at
 //! construction against the replica files' GGUF tensor tables (§5.3: sizes
 //! re-checked on open).
@@ -496,7 +496,9 @@ impl ExpertSource for StoreExpertSource {
         // plane must fail the unit before any bytes move (§3.4).
         let page = DIRECT_ALIGN as usize;
         struct Planned {
-            plane_index: usize,
+            /// Position of the shard in the manifest (resolved at planning;
+            /// no post-drain re-lookup of the plane table).
+            shard: usize,
             offset: u64,
             stride: usize,
             covering: usize,
@@ -548,7 +550,7 @@ impl ExpertSource for StoreExpertSource {
                 scratch_planes.push(i);
             }
             plans.push(Planned {
-                plane_index: plane_index(layer, kind),
+                shard: p.shard,
                 offset,
                 stride,
                 covering,
@@ -592,13 +594,12 @@ impl ExpertSource for StoreExpertSource {
             for ((into, _), plan) in targets.iter_mut().zip(plans.iter()) {
                 let dst: &mut [u8] = match plan.in_place {
                     Some(_) => &mut into[..plan.covering],
-                    None => windows[wi]
-                        .take()
-                        .unwrap_or_else(|| unreachable!("more scratch planes than windows")),
+                    // Invariant: scratch_covs (driven by the same plans) has
+                    // one entry per non-in-place plane, so windows covers it.
+                    None => windows[wi].take().expect("one window per scratch plane"),
                 };
-                let p = self.planes[plan.plane_index].as_ref().unwrap();
                 rb.push(ReadJob {
-                    shard_index: p.shard,
+                    shard_index: plan.shard,
                     offset: plan.offset,
                     len: plan.stride,
                     expected_crc: plan.expected.unwrap_or(0),
@@ -686,6 +687,7 @@ impl StoreExpertSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use golem_store::ShardSources as _;
     use std::path::PathBuf;
     const SHARD0: &str = "m-00001-of-00002.gguf";
     const SHARD1: &str = "m-00002-of-00002.gguf";
@@ -933,6 +935,28 @@ mod tests {
         }
         assert_eq!(g, row_bytes(shard_of(ExpertKind::Gate), 1));
         assert_eq!(u, row_bytes(shard_of(ExpertKind::Up), 0));
+    }
+
+    /// Cross-shard batch where one shard's replicas are all dead: the whole
+    /// batched read fails (Unavailable from the dead shard) without hanging.
+    #[test]
+    fn read_expert_batched_fails_when_a_shards_replicas_die() {
+        let (mpath, _, _) = fixture("batched-dead", Some(true));
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        // Kill shard 1's replicas (the up plane); gate (shard 0) is healthy.
+        let replica_count = src.registry().slots(1).len();
+        assert!(replica_count > 0);
+        for r in 0..replica_count {
+            src.registry().slot(1, r).mark_degraded();
+        }
+        let batch = [(ExpertKind::Gate, 1u32), (ExpertKind::Up, 0u32)];
+        let mut g = vec![0u8; STRIDE as usize];
+        let mut u = vec![0u8; STRIDE as usize];
+        let mut targets = [(&mut g[..], 0usize), (&mut u[..], 0)];
+        let err = src
+            .read_expert_batched(0, &batch, &mut targets)
+            .expect_err("dead shard fails the batched read");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     }
 
     #[test]
