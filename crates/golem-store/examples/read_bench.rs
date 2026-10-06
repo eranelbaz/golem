@@ -1,0 +1,182 @@
+//! Store read benchmark (design §5.2, §12.3): N plane-sized reads through
+//! the shared [`ChunkQueue`] against a manifest's replica set. Stands in for
+//! the decode hot path's disk leg so A/B bandwidth (one drive vs both) is
+//! reproducible without a full model run.
+//!
+//! Cold vs warm: the caller controls the page cache. For a cold run, drop
+//! caches first as root:
+//!
+//! ```text
+//! sync
+//! echo 3 | sudo tee /proc/sys/vm/drop_caches
+//! ```
+//!
+//! (or unmount/remount. A warm
+//! run is just a second invocation without the drop. Record the two
+//! separately; never average them.
+//!
+//! Usage:
+//! ```text
+//! cargo run -p golem-store --example read_bench -- \
+//!     --manifest /path/to/manifest.json --n 200 --plane-bytes 5898496
+//! ```
+//!
+//! Prints per-replica expected chunk share, wall-clock and disk-time GB/s,
+//! and final replica health. Errors return `Err` from `run`; `main` exits
+//! nonzero on error (the one documented exit path in this binary).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use golem_store::{
+    CHUNK, ChunkQueue, ReadJob, ReplicaHealth, ReplicaRegistry, load_manifest, plan_aligned,
+};
+
+const DEFAULT_N: usize = 200;
+const DEFAULT_PLANE_BYTES: usize = 5_898_496; // GLM-5.3-Flash sparse plane ≈5.9 MB
+
+struct Args {
+    manifest: PathBuf,
+    n: usize,
+    plane_bytes: usize,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut manifest = None;
+    let mut n = DEFAULT_N;
+    let mut plane_bytes = DEFAULT_PLANE_BYTES;
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--manifest" => {
+                manifest = Some(it.next().ok_or("--manifest needs a path")?);
+            }
+            "--n" => {
+                n = it
+                    .next()
+                    .ok_or("--n needs a value")?
+                    .parse()
+                    .map_err(|_| "--n must be a usize")?;
+            }
+            "--plane-bytes" => {
+                plane_bytes = it
+                    .next()
+                    .ok_or("--plane-bytes needs a value")?
+                    .parse()
+                    .map_err(|_| "--plane-bytes must be a usize")?;
+            }
+            _ => {
+                return Err(format!(
+                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>]"
+                ));
+            }
+        }
+    }
+    Ok(Args {
+        manifest: PathBuf::from(manifest.ok_or("--manifest <path> is required")?),
+        n,
+        plane_bytes,
+    })
+}
+
+fn run() -> Result<(), golem_store::StoreError> {
+    let args = parse_args().map_err(|e| golem_store::StoreError::Invalid { msg: e })?;
+    let manifest = load_manifest(&args.manifest)?;
+    if manifest.shards.is_empty() {
+        return Err(golem_store::StoreError::Invalid {
+            msg: "manifest has no shards".into(),
+        });
+    }
+    let registry = ReplicaRegistry::open(&manifest)?;
+    let queue = Arc::new(ChunkQueue::new(0)); // 0 = one reader thread per physical drive (§5.2)
+
+    // Per-read covering region ≤ logical len + head scratch + one chunk tail
+    // (§5.4 plan shape); one preallocation, reused for every read.
+    let mut buf = vec![0u8; args.plane_bytes + 2 * CHUNK + 4096];
+
+    // Round-robin shards and walk each shard's file forward; offsets wrap so
+    // the loop works on any shard size.
+    let mut total_logical = 0u64;
+    let mut total_chunks = 0usize;
+    let shard_count = manifest.shards.len();
+    let t0 = Instant::now();
+    for i in 0..args.n {
+        let s = i % shard_count;
+        let shard = &manifest.shards[s];
+        let usable = shard.bytes.saturating_sub(args.plane_bytes as u64).max(1);
+        let offset = ((i / shard_count) as u64 * args.plane_bytes as u64) % usable;
+        let plan = plan_aligned(offset, args.plane_bytes);
+        let covering: usize = plan.iter().map(|c| c.1).sum();
+        let (dst, rest) = buf.split_at_mut(covering);
+        let handle = queue.enqueue(ReadJob {
+            shard_index: s,
+            offset,
+            len: args.plane_bytes,
+            expected_crc: 0,
+            verify_crc: false, // bandwidth bench, not integrity
+            prefetch: false,
+            sources: &registry,
+            dst,
+        });
+        handle.wait()?;
+        let _ = rest;
+        total_logical += args.plane_bytes as u64;
+        total_chunks += plan.len();
+    }
+    let wall = t0.elapsed();
+
+    let healthy: Vec<usize> = registry.shards()[0]
+        .replicas
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.health() == ReplicaHealth::Healthy)
+        .map(|(i, _)| i)
+        .collect();
+    let replica_count = registry.shards()[0].replicas.len();
+    eprintln!("shard 0: {replica_count} replica(s), healthy: {healthy:?}");
+
+    // §5.2 striping homes chunks round-robin across healthy replicas, so the
+    // expected share is uniform; skew shows up in the A/B timings, not here.
+    if !healthy.is_empty() {
+        let per = total_chunks as f64 / healthy.len() as f64;
+        for &r in &healthy {
+            eprintln!(
+                "replica {r}: ~{}/{} chunks ({:.1}%)",
+                per,
+                total_chunks,
+                100.0 * per / total_chunks as f64
+            );
+        }
+    }
+
+    let (disk_ns, disk_bytes) = queue.take_disk_stats();
+    let wall_gbs = total_logical as f64 / wall.as_secs_f64() / 1e9;
+    let disk_gbs = if disk_ns > 0 {
+        disk_bytes as f64 / disk_ns as f64
+    } else {
+        0.0
+    };
+    println!("reads: {} × {} B (logical)", args.n, args.plane_bytes);
+    println!("chunks total: {total_chunks}");
+    println!("wall: {:.3?} → {:.2} GB/s", wall, wall_gbs);
+    println!("disk (measured): {:.2} GB/s", disk_gbs);
+    println!("degraded replicas after run: {:?}", {
+        registry
+            .shards()
+            .iter()
+            .flat_map(|s| s.replicas.iter())
+            .filter(|r| r.health() == ReplicaHealth::Degraded)
+            .map(|r| r.path.display().to_string())
+            .collect::<Vec<_>>()
+    });
+    Ok(())
+}
+
+fn main() {
+    // Documented error exit: the bench has no other sensible recovery.
+    if let Err(e) = run() {
+        eprintln!("read_bench: {e}");
+        std::process::exit(1);
+    }
+}

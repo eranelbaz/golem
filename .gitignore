@@ -28,6 +28,7 @@ __pycache__/
 # product-spec, adr, …) never enters the repo
 docs/*
 !docs/baselines/
+!docs/procedures/
 
 # Split substrate build trees (Task 7)
 /target-cpu/
