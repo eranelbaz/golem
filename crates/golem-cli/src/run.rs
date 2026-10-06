@@ -145,6 +145,16 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    // §3.4 P3: the store path only exists behind the RAM expert pool; a
+    // --manifest without the pool would silently decode off the plain GGUF
+    // path while the user believes replicas are serving experts.
+    if args.manifest.is_some() && config.ram_experts_gib == 0 {
+        return Err(
+            "--manifest requires --ram-experts-gib > 0: the expert pool \
+             is the only consumer of the store-backed source"
+                .into(),
+        );
+    }
     if config.ram_experts_gib > 0 {
         preflight_ram_pool(
             &args.model,
