@@ -5,7 +5,7 @@ use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::StoreError;
 use crate::manifest::ModelManifest;
@@ -41,6 +41,10 @@ pub struct ReplicaSlot {
     pub file: std::fs::File,
     /// 0 = Healthy, 1 = Degraded ([`ReplicaHealth`] as u8).
     pub health: AtomicU8,
+    /// Count of one-way degradations since open; feeds diagnostics and
+    /// burn-down decisions upstream (health itself is `health()`, never this
+    /// counter).
+    errors: AtomicU64,
 }
 
 impl ReplicaSlot {
@@ -52,10 +56,17 @@ impl ReplicaSlot {
         }
     }
 
-    /// One-way transition to [`ReplicaHealth::Degraded`].
+    /// One-way transition to [`ReplicaHealth::Degraded`]; increments the
+    /// degradation counter.
     pub fn mark_degraded(&self) {
         self.health
             .store(ReplicaHealth::Degraded as u8, Ordering::Relaxed);
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Degradations since open.
+    pub fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
     }
 
     /// Read exactly `buf.len()` bytes at `offset`; retries short reads, errors
@@ -120,6 +131,7 @@ impl ReplicaRegistry {
                     path,
                     file,
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
+                    errors: AtomicU64::new(0),
                 }));
             }
             shards.push(ShardReplicas {
@@ -303,6 +315,31 @@ mod tests {
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("no bandwidth aggregation"));
         assert_eq!(reg.healthy_replicas(0).len(), 2);
+    }
+
+    #[test]
+    fn error_counter_increments_on_degrade() {
+        let dir = std::env::temp_dir().join("golem-store-replica-test");
+        let shard_dir = dir.join("shard-errctr");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(shard_dir.join("a.gguf"), [0u8; 64]).unwrap();
+        let manifest = crate::manifest::ModelManifest {
+            name: "t".into(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: "a.gguf".into(),
+                bytes: 64,
+                sha256: "0".repeat(64),
+                replicas: vec![shard_dir],
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let slot = &*reg.shards()[0].replicas[0];
+        assert_eq!(slot.errors(), 0);
+        slot.mark_degraded();
+        slot.mark_degraded();
+        assert_eq!(slot.errors(), 2);
+        assert_eq!(slot.health(), ReplicaHealth::Degraded);
     }
 
     #[test]
