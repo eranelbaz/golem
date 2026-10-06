@@ -11,11 +11,15 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use golem_gguf::{
     arch_kv_int, blk_of, data_section_offset, ggml_row_bytes, read_kvs, shard_path, tensor_entries,
 };
-use golem_store::{ChunkQueue, ReadJob, ReplicaRegistry, StoreError, load_manifest};
+use golem_store::{
+    ChunkQueue, InstanceHealth, ReadJob, ReplicaRegistry, StoreError, instance_health,
+    load_manifest,
+};
 
 use super::residency::ExpertKind;
 use super::source::{DIRECT_ALIGN, ExpertSource, SourceError, plane_index};
@@ -53,6 +57,9 @@ pub struct StoreExpertSource {
     planes: Vec<Option<StorePlane>>,
     /// Whether §5.3 CRC verification is active (manifest carried `crc32c`).
     crc_enabled: bool,
+    /// Last surfaced instance health (§5.2/§11, `InstanceHealth` ordinal):
+    /// read-failure paths recompute and `warn` only on transition.
+    last_health: AtomicU8,
 }
 
 impl fmt::Debug for StoreExpertSource {
@@ -387,6 +394,7 @@ impl StoreExpertSource {
             registry,
             planes,
             crc_enabled,
+            last_health: AtomicU8::new(InstanceHealth::Healthy as u8),
         })
     }
 
@@ -618,15 +626,18 @@ impl ExpertSource for StoreExpertSource {
                     wi += 1;
                 }
             }
-            rb.wait().map_err(|e| match e {
-                StoreError::Io { source, .. } => source,
-                other @ StoreError::Unavailable { .. } => {
-                    io::Error::new(io::ErrorKind::NotFound, other.to_string())
+            rb.wait().map_err(|e| {
+                self.note_read_failure(matches!(e, StoreError::Crc { .. }));
+                match e {
+                    StoreError::Io { source, .. } => source,
+                    other @ StoreError::Unavailable { .. } => {
+                        io::Error::new(io::ErrorKind::NotFound, other.to_string())
+                    }
+                    other @ StoreError::Crc { .. } => {
+                        io::Error::new(io::ErrorKind::InvalidData, other.to_string())
+                    }
+                    other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
                 }
-                other @ StoreError::Crc { .. } => {
-                    io::Error::new(io::ErrorKind::InvalidData, other.to_string())
-                }
-                other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
             })?;
 
             // Scratch-served planes land in their window: copy the logical
@@ -655,6 +666,36 @@ impl ExpertSource for StoreExpertSource {
 }
 
 impl StoreExpertSource {
+    /// Recomputes instance health (§5.2/§11) after a read failure and warns
+    /// on transition. `checksum_degraded` is set iff the failure was a §5.3
+    /// CRC mismatch (the CRC degradation path already marked its serving
+    /// replicas; the flag records that checksums, not only media, are
+    /// suspect). Cheap: shard-wide atomic health reads, no I/O.
+    fn note_read_failure(&self, checksum_degraded: bool) {
+        let now = instance_health(&self.registry, checksum_degraded);
+        let prev = self.last_health.swap(now as u8, Ordering::Relaxed);
+        if prev != now as u8 {
+            // Invariant: `prev` was only ever written from `now as u8`, so
+            // this match round-trips; the fallback keeps a library panic
+            // impossible if that invariant were ever broken.
+            let from = match prev {
+                0 => InstanceHealth::Healthy,
+                1 => InstanceHealth::DegradedReplica,
+                2 => InstanceHealth::DegradedChecksum,
+                3 => InstanceHealth::FatalIo,
+                _ => {
+                    tracing::warn!("store health ordinal {prev} unknown; treating as healthy");
+                    InstanceHealth::Healthy
+                }
+            };
+            tracing::warn!(
+                from = ?from,
+                to = ?now,
+                "store instance health degraded (§5.2/§11)"
+            );
+        }
+    }
+
     /// Enqueues one plane's logical read and drains it through the shared
     /// queue, mapping [`StoreError`] onto [`io::Error`].
     fn drain(
@@ -677,15 +718,18 @@ impl StoreExpertSource {
                 dst,
             })
             .wait()
-            .map_err(|e| match e {
-                StoreError::Io { source, .. } => source,
-                other @ StoreError::Unavailable { .. } => {
-                    io::Error::new(io::ErrorKind::NotFound, other.to_string())
+            .map_err(|e| {
+                self.note_read_failure(matches!(e, StoreError::Crc { .. }));
+                match e {
+                    StoreError::Io { source, .. } => source,
+                    other @ StoreError::Unavailable { .. } => {
+                        io::Error::new(io::ErrorKind::NotFound, other.to_string())
+                    }
+                    other @ StoreError::Crc { .. } => {
+                        io::Error::new(io::ErrorKind::InvalidData, other.to_string())
+                    }
+                    other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
                 }
-                other @ StoreError::Crc { .. } => {
-                    io::Error::new(io::ErrorKind::InvalidData, other.to_string())
-                }
-                other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
             })
     }
 }

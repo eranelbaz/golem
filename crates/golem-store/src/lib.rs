@@ -18,6 +18,9 @@
 //! replica I/O, striping, and the pread engine ([`engine`]).
 
 mod engine;
+/// Instance-level health state machine (§5.2, §11): per-replica health +
+/// checksum degradation → one classification, with transition surfacing.
+pub mod health;
 /// `golem import` (§5.5): local source discovery + expert-plane geometry.
 pub mod import;
 mod manifest;
@@ -32,6 +35,7 @@ mod stripe;
 pub mod sys;
 
 pub use engine::{ChunkSource, DEFAULT_IO_THREADS, IoEngine, PageRead, ShardSources};
+pub use health::{InstanceHealth, instance_health};
 pub use manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, load_manifest};
 pub use queue::{ChunkQueue, ReadBatch, ReadHandle, ReadJob};
 pub use replica::{
