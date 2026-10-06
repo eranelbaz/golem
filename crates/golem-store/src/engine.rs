@@ -1,24 +1,22 @@
-//! §5.2–5.4 pread engine: thread-pool chunk reads, CRC32C validation, and
-//! per-chunk failover across replicas.
+//! §5.2–5.4 pread engine: the shared chunk queue plus per-plane CRC32C
+//! validation; failover happens drain-locally via exclude-mask requeue.
 
-use std::io;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 
 use crate::StoreError;
-use crate::replica::{ReplicaHealth, ReplicaRegistry, ReplicaSlot};
-use crate::stripe::{Chunk, plan_striped};
+use crate::queue::{ChunkQueue, ReadHandle, ReadJob};
+use crate::replica::{ReplicaRegistry, ReplicaSlot};
+use crate::stripe::plan_aligned;
 
 /// Byte source for one chunk. Production impl wraps a [`ReplicaSlot`];
 /// tests substitute failing sources (EIO injection without unsafe).
 pub trait ChunkSource: Send + Sync {
     /// Read exactly `buf.len()` bytes at `offset` into `buf`.
-    fn read_chunk(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+    fn read_chunk(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()>;
 }
 
 impl ChunkSource for ReplicaSlot {
-    fn read_chunk(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    fn read_chunk(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
         // `read_at` already loops until the buffer is full.
         self.read_at(offset, buf)
     }
@@ -34,6 +32,12 @@ pub trait ShardSources: Send + Sync {
     fn slot(&self, shard_index: usize, replica_index: usize) -> &ReplicaSlot;
     /// Shard file name (e.g. `s0.gguf`) used in errors and logs.
     fn shard_name(&self, shard_index: usize) -> &str;
+    /// Cached physical device identity of one replica (§5.1), resolved at
+    /// registry open — the drain's drive→replica map reads this once per
+    /// drain, never sysfs per read.
+    fn replica_drive(&self, shard_index: usize, replica_index: usize) -> &str {
+        self.slot(shard_index, replica_index).drive.as_str()
+    }
 }
 
 impl ShardSources for ReplicaRegistry {
@@ -60,244 +64,102 @@ impl ShardSources for ReplicaRegistry {
     }
 }
 
-/// A logical page read: shard, byte range, and the §5.3 expected CRC32C
-/// per striped chunk (caller's page table supplies them).
-pub struct PageRead<'a> {
+/// A logical page read: shard, byte range, and the §5.3 expected CRC32C over
+/// the plane (one entry per `read_plane` call; verified once every chunk of
+/// the plane has landed).
+pub struct PageRead {
     /// Position of the shard in the manifest.
     pub shard_index: usize,
     /// Absolute byte offset of the logical read.
     pub offset: u64,
     /// Length of the logical read in bytes.
     pub len: usize,
-    /// Expected CRC32C per striped chunk; `len == plan_striped(..).len()`.
-    pub expected_crcs: &'a [u32],
+    /// Expected CRC32C over the logical range.
+    pub expected_crc: u32,
 }
 
-/// Default worker count for [`IoEngine::new`], a total across all drives, not
-/// per drive: a stopgap until the per-replica count is derived from the drive
-/// set. Measured t8 legs regress to ~2 GiB/s per drive (vs 5.8/2.2 at t1);
-/// 1–2 in-flight reads per drive is the measured optimum.
+/// Default total reader threads for [`IoEngine::new`] when
+/// `EngineConfig::io_threads` is unset: 1–2 in-flight reads per drive is the
+/// measured optimum (t8 legs regress to ~2 GiB/s per drive vs 5.8/2.2 at t1).
 pub const DEFAULT_IO_THREADS: usize = 2;
 
-/// One queued chunk read; `index` is the chunk's position in the striped plan
-/// and is echoed back through `reply` so results reassemble out of order.
-struct Job {
-    index: usize,
-    source: Arc<dyn ChunkSource>,
-    offset: u64,
-    len: usize,
-    reply: mpsc::Sender<(usize, io::Result<Vec<u8>>)>,
-}
-
-/// Fixed pool of chunk-read workers over `std::sync::mpsc` (§5.2). Workers
-/// loop until the queue closes; [`Drop`] closes it, then joins.
+/// §5.2 pread engine: owns the shared [`ChunkQueue`] feeding demand-first
+/// drains. No persistent worker threads — each `wait()` spawns its own
+/// scoped, per-drive readers, so [`Drop`] only fails queued-but-undrained
+/// reads.
 pub struct IoEngine {
-    workers: Vec<JoinHandle<()>>,
-    job_tx: Option<mpsc::Sender<Job>>,
+    queue: Arc<ChunkQueue>,
 }
 
 impl IoEngine {
-    /// Spawn `threads` workers.
+    /// New engine; `threads` caps each drain's reader threads (0 = derive one
+    /// per physical drive hosting an eligible replica).
     ///
     /// # Panics
-    /// Asserts `threads > 0` (zero-worker pool would deadlock reply collection).
+    /// Never (the queue validates nothing here); a zero cap means derived.
     pub fn new(threads: usize) -> Self {
-        assert!(threads > 0, "IoEngine needs at least one worker");
-        let (tx, rx) = mpsc::channel::<Job>();
-        // `Receiver` is Send-but-not-Sync: share one queue via Mutex.
-        let rx = Arc::new(Mutex::new(rx));
-        let workers = (0..threads)
-            .map(|_| {
-                let rx = Arc::clone(&rx);
-                std::thread::spawn(move || {
-                    loop {
-                        let job = {
-                            let Ok(rx) = rx.lock() else { continue };
-                            match rx.recv() {
-                                Ok(job) => job,
-                                Err(_) => return, // queue closed: no more senders
-                            }
-                        };
-                        let mut buf = vec![0u8; job.len];
-                        let res = job.source.read_chunk(job.offset, &mut buf).map(|()| buf);
-                        let _ = job.reply.send((job.index, res));
-                    }
-                })
-            })
-            .collect();
         Self {
-            workers,
-            job_tx: Some(tx),
+            queue: Arc::new(ChunkQueue::new(threads)),
         }
     }
 
-    /// Read `[offset, offset+len)` of one shard into `buf` (§5.2–5.4): stripe
-    /// the range across replicas, verify each chunk's CRC32C against
-    /// `expected_crcs`, and on I/O error or checksum mismatch mark the source
-    /// replica [`ReplicaHealth::Degraded`] and retry that chunk from the next
-    /// healthy replica with the same expected CRC (mirrored content is
-    /// byte-identical). No healthy replica remains =>
-    /// [`StoreError::Unavailable`].
+    /// Queues a logical read without draining it; the returned handle's
+    /// `wait()` does the drain. Exposed so a batch of reads can enqueue
+    /// demand-first, then drain together.
+    pub fn enqueue<'a>(&self, job: ReadJob<'a>) -> ReadHandle<'a> {
+        self.queue.enqueue(job)
+    }
+
+    /// Read `[offset, offset+len)` of one shard into `buf` (§5.2–5.4): plan
+    /// the aligned covering range in ≤2 MiB chunks, drain them demand-first
+    /// across replicas (failed chunks requeue with the failed replica
+    /// excluded until a healthy one serves them), then verify the §5.3 plane
+    /// CRC32C. All healthy replicas exhausted → [`StoreError::Unavailable`];
+    /// checksum mismatch → [`StoreError::Crc`].
     ///
-    /// # Panics
-    /// When `expected_crcs.len()` differs from the striped plan length, or
-    /// `buf.len() != req.len`.
-    ///
-    /// # Panics
-    /// When `expected_crcs.len()` differs from the striped plan length.
+    /// `buf` must be exactly the aligned covering region
+    /// (`plan_aligned(offset, len)` bytes): chunk 0 lands at the region base,
+    /// so the bytes before the logical range are head scratch; expert bytes
+    /// are copied disk→destination exactly once. Any other length →
+    /// [`StoreError::Invalid`].
     pub fn read_page(
         &self,
         sources: &dyn ShardSources,
-        req: &PageRead<'_>,
+        req: &PageRead,
         buf: &mut [u8],
     ) -> Result<(), StoreError> {
-        let slots = sources.slots(req.shard_index);
-        let plan = plan_striped(req.offset, req.len, slots.len());
-        assert_eq!(
-            plan.len(),
-            req.expected_crcs.len(),
-            "expected_crcs must have one entry per striped chunk"
-        );
-
-        // Dispatch one job per striped chunk. Chunks whose assigned replica is
-        // already Degraded are re-served whole from the first healthy replica
-        // (plan_single semantics), consuming their CRC by striped-plan
-        // position.
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let mut server = Vec::with_capacity(plan.len());
-        for (index, chunk) in plan.iter().enumerate() {
-            let replica =
-                self.assigned_replica(sources, &slots, req.shard_index, chunk.replica_index)?;
-            server.push(replica);
-            let job = Job {
-                index,
-                source: Arc::clone(&slots[replica]),
-                offset: chunk.offset,
-                len: chunk.len,
-                reply: reply_tx.clone(),
-            };
-            self.job_tx
-                .as_ref()
-                .expect("job_tx lives until Drop")
-                .send(job)
-                .expect("io worker dropped the reply channel");
+        let covering: usize = plan_aligned(req.offset, req.len).iter().map(|c| c.1).sum();
+        if buf.len() != covering {
+            // Caller contract violation: `Err`, never a `split_at_mut` panic
+            // inside the queue (§5.4 destination contract).
+            return Err(StoreError::Invalid {
+                msg: format!(
+                    "destination is {} bytes but the covering region of [{}..] is {covering}",
+                    buf.len(),
+                    req.offset - req.offset % 4096
+                ),
+            });
         }
-        drop(reply_tx);
-
-        let mut parts: Vec<Option<io::Result<Vec<u8>>>> = (0..plan.len()).map(|_| None).collect();
-        while let Ok((index, res)) = reply_rx.recv() {
-            parts[index] = Some(res);
-        }
-
-        for (((chunk, &expected_crc), part), &served_by) in
-            plan.iter().zip(req.expected_crcs).zip(parts).zip(&server)
-        {
-            let first = part.expect("every dispatched job gets a reply");
-            let data = self.serve_chunk(
-                sources,
-                req.shard_index,
-                *chunk,
-                served_by,
-                expected_crc,
-                first,
-                &slots,
-            )?;
-            let at = (chunk.offset - req.offset) as usize;
-            buf[at..at + chunk.len].copy_from_slice(&data);
-        }
-        Ok(())
-    }
-
-    /// Replica to serve a chunk from: its assigned replica unless already
-    /// [`ReplicaHealth::Degraded`], else the first healthy replica.
-    fn assigned_replica(
-        &self,
-        sources: &dyn ShardSources,
-        slots: &[Arc<dyn ChunkSource>],
-        shard_index: usize,
-        assigned: usize,
-    ) -> Result<usize, StoreError> {
-        if sources.slot(shard_index, assigned).health() == ReplicaHealth::Healthy {
-            return Ok(assigned);
-        }
-        (0..slots.len())
-            .find(|&r| sources.slot(shard_index, r).health() == ReplicaHealth::Healthy)
-            .ok_or_else(|| StoreError::Unavailable {
-                shard: sources.shard_name(shard_index).to_owned(),
-            })
-    }
-
-    /// First-attempt result plus failover for one chunk: verify the first
-    /// read (I/O or CRC32C mismatch), degrade the replica that failed, then
-    /// retry the whole chunk from each remaining healthy replica until one
-    /// verifies (same expected CRC: mirrors are byte-identical).
-    #[allow(clippy::too_many_arguments)]
-    fn serve_chunk(
-        &self,
-        sources: &dyn ShardSources,
-        shard_index: usize,
-        chunk: Chunk,
-        served_by: usize,
-        expected_crc: u32,
-        first: io::Result<Vec<u8>>,
-        slots: &[Arc<dyn ChunkSource>],
-    ) -> Result<Vec<u8>, StoreError> {
-        let first = match first {
-            Ok(data) if crc32c::crc32c(&data) == expected_crc => return Ok(data),
-            Ok(_) => format!("crc32c mismatch at offset {}", chunk.offset),
-            Err(e) => format!("io error: {e}"),
-        };
-        self.degrade(sources, shard_index, served_by, &chunk, &first);
-        for (replica, source) in slots.iter().enumerate() {
-            if sources.slot(shard_index, replica).health() != ReplicaHealth::Healthy {
-                continue;
-            }
-            let mut data = vec![0u8; chunk.len];
-            let attempt: Result<Vec<u8>, String> = match source.read_chunk(chunk.offset, &mut data)
-            {
-                Ok(()) if crc32c::crc32c(&data) == expected_crc => Ok(data),
-                Ok(()) => Err(format!("crc32c mismatch at offset {}", chunk.offset)),
-                Err(e) => Err(format!("io error: {e}")),
-            };
-            match attempt {
-                Ok(data) => return Ok(data),
-                Err(why) => self.degrade(sources, shard_index, replica, &chunk, &why),
-            }
-        }
-        Err(StoreError::Unavailable {
-            shard: sources.shard_name(shard_index).to_owned(),
+        self.enqueue(ReadJob {
+            shard_index: req.shard_index,
+            offset: req.offset,
+            len: req.len,
+            expected_crc: req.expected_crc,
+            verify_crc: true,
+            prefetch: false,
+            sources,
+            dst: buf,
         })
-    }
-
-    /// One-way health flip plus a §5.3 log line naming shard, replica, and
-    /// chunk range.
-    fn degrade(
-        &self,
-        sources: &dyn ShardSources,
-        shard_index: usize,
-        replica_index: usize,
-        chunk: &Chunk,
-        why: &str,
-    ) {
-        sources.slot(shard_index, replica_index).mark_degraded();
-        tracing::warn!(
-            shard = sources.shard_name(shard_index),
-            replica = replica_index,
-            offset = chunk.offset,
-            len = chunk.len,
-            reason = %why,
-            "chunk read failed; replica marked Degraded"
-        );
+        .wait()
     }
 }
 
 impl Drop for IoEngine {
     fn drop(&mut self) {
-        // Close the queue so workers exit, then join them.
-        self.job_tx = None;
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        // Queued-but-undrained reads fail at their next wait(); in-flight
+        // drains own their chunks and are unaffected (they are scope-joined
+        // by their own wait()).
+        self.queue.shutdown();
     }
 }
 
@@ -306,12 +168,12 @@ mod tests {
     use super::*;
     use crate::manifest::{ModelManifest, ShardEntry};
     use crate::replica::ReplicaHealth;
+    use crate::stripe::CHUNK;
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const SHARD_BYTES: usize = 4096;
+    const SHARD_BYTES: usize = 8192;
     const SHARD_FILE: &str = "s0.gguf";
 
     /// Deterministic fixture pattern over absolute byte index: byte i =
@@ -323,9 +185,8 @@ mod tests {
     }
 
     /// Builds manifest + fixture files over `n` replica dirs, each with the
-    /// same deterministic 4 KiB pattern. `tag` MUST be unique per test
-    /// (nextest runs parallel processes over shared /tmp).
-    /// Returns (root_dir, manifest).
+    /// same deterministic pattern. `tag` MUST be unique per test (nextest
+    /// runs parallel processes over shared /tmp).
     fn fixture(n: usize, tag: &str) -> (PathBuf, ModelManifest) {
         let root = std::env::temp_dir().join(format!("golem-store-engine-{tag}"));
         let mut replicas = Vec::with_capacity(n);
@@ -359,19 +220,15 @@ mod tests {
         std::fs::write(path, data).unwrap();
     }
 
-    /// Expected §5.3 CRC32C per striped chunk, computed from the pristine
-    /// pattern (mirrored replicas are byte-identical, so the CRCs are
-    /// replica-independent).
-    fn crcs(off: u64, len: usize, replicas: usize) -> Vec<u32> {
-        plan_striped(off, len, replicas)
-            .iter()
-            .map(|c| crc32c::crc32c(&pattern(c.offset as usize, c.len)))
-            .collect()
+    /// §5.3 expected plane CRC32C, computed from the pristine pattern
+    /// (mirrored replicas are byte-identical).
+    fn crc(off: u64, len: usize) -> u32 {
+        crc32c::crc32c(&pattern(off as usize, len))
     }
 
     /// Delegates to the real slot until the countdown hits 0, then fails with
-    /// `fail_with` (EIO flavored; `InvalidData` would simulate rot) — no
-    /// unsafe, no touching the real file.
+    /// `fail_with` (EIO flavored; `InvalidData` simulates rot) — no unsafe,
+    /// no touching the real file.
     struct FailingSource {
         inner: Arc<ReplicaSlot>,
         fail_nth: AtomicUsize,
@@ -393,8 +250,7 @@ mod tests {
     }
 
     /// Test [`ShardSources`]: real registry + per-replica FailingSources via
-    /// `(replica_index, fail_nth, ErrorKind)` triples. Health marking flows
-    /// through `slot()` — the engine's normal path.
+    /// `(replica_index, fail_nth, ErrorKind)` triples.
     struct TestSources {
         reg: ReplicaRegistry,
         fail: Vec<(usize, usize, ErrorKind)>,
@@ -428,8 +284,25 @@ mod tests {
         }
     }
 
+    /// Full-shard read through the engine into a fresh covering region.
+    fn read_whole(engine: &IoEngine, sources: &TestSources) -> Result<Vec<u8>, StoreError> {
+        let covering: usize = plan_aligned(0, SHARD_BYTES).iter().map(|c| c.1).sum();
+        let mut buf = vec![0u8; covering];
+        engine.read_page(
+            sources,
+            &PageRead {
+                shard_index: 0,
+                offset: 0,
+                len: SHARD_BYTES,
+                expected_crc: crc(0, SHARD_BYTES),
+            },
+            &mut buf,
+        )?;
+        Ok(buf)
+    }
+
     #[test]
-    fn striped_read_matches_pattern_for_1_2_4_replicas() {
+    fn aligned_reads_match_pattern_for_1_2_4_replicas() {
         for n in [1, 2, 4] {
             for (off, len) in [
                 (0usize, 4096usize),
@@ -438,7 +311,7 @@ mod tests {
                 (4000, 96),
                 (0, 1),
             ] {
-                let tag = format!("striped-{n}-{off}-{len}");
+                let tag = format!("aligned-{n}-{off}-{len}");
                 let (_root, manifest) = fixture(n, &tag);
                 let reg = ReplicaRegistry::open(&manifest).unwrap();
                 let sources = TestSources {
@@ -446,16 +319,26 @@ mod tests {
                     fail: Vec::new(),
                 };
                 let engine = IoEngine::new(4);
-                let expected_crcs = crcs(off as u64, len, n);
-                let req = PageRead {
-                    shard_index: 0,
-                    offset: off as u64,
-                    len,
-                    expected_crcs: &expected_crcs,
-                };
-                let mut buf = vec![0u8; len];
-                engine.read_page(&sources, &req, &mut buf).unwrap();
-                assert_eq!(buf, pattern(off, len), "n={n} off={off} len={len}");
+                let covering: usize = plan_aligned(off as u64, len).iter().map(|c| c.1).sum();
+                let mut buf = vec![0u8; covering];
+                engine
+                    .read_page(
+                        &sources,
+                        &PageRead {
+                            shard_index: 0,
+                            offset: off as u64,
+                            len,
+                            expected_crc: crc(off as u64, len),
+                        },
+                        &mut buf,
+                    )
+                    .unwrap();
+                let head = off % 4096; // logical window inside the covering region
+                assert_eq!(
+                    &buf[head..head + len],
+                    &pattern(off, len)[..],
+                    "n={n} off={off} len={len}"
+                );
             }
         }
     }
@@ -469,15 +352,7 @@ mod tests {
             fail: vec![(0, 0, ErrorKind::Other)],
         };
         let engine = IoEngine::new(4);
-        let expected_crcs = crcs(0, SHARD_BYTES, 2);
-        let req = PageRead {
-            shard_index: 0,
-            offset: 0,
-            len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
-        };
-        let mut buf = vec![0u8; SHARD_BYTES];
-        engine.read_page(&sources, &req, &mut buf).unwrap();
+        let buf = read_whole(&engine, &sources).unwrap();
         assert_eq!(buf, pattern(0, SHARD_BYTES));
         assert_eq!(sources.slot(0, 0).health(), ReplicaHealth::Degraded);
         assert_eq!(sources.slot(0, 1).health(), ReplicaHealth::Healthy);
@@ -485,33 +360,30 @@ mod tests {
 
     #[test]
     fn eio_fails_over_mid_read_4_replicas() {
+        // 3 dead replicas: only replica 3 remains, the read still completes.
         let (_root, manifest) = fixture(4, "eio-failover-4");
         let reg = ReplicaRegistry::open(&manifest).unwrap();
         let sources = TestSources {
             reg,
-            fail: vec![(0, 0, ErrorKind::Other), (2, 0, ErrorKind::Other)],
+            fail: vec![
+                (0, 0, ErrorKind::Other),
+                (1, 0, ErrorKind::Other),
+                (2, 0, ErrorKind::Other),
+            ],
         };
         let engine = IoEngine::new(4);
-        let expected_crcs = crcs(0, SHARD_BYTES, 4);
-        let req = PageRead {
-            shard_index: 0,
-            offset: 0,
-            len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
-        };
-        let mut buf = vec![0u8; SHARD_BYTES];
-        engine.read_page(&sources, &req, &mut buf).unwrap();
+        let buf = read_whole(&engine, &sources).unwrap();
         assert_eq!(buf, pattern(0, SHARD_BYTES));
-        assert_eq!(sources.slot(0, 0).health(), ReplicaHealth::Degraded);
-        assert_eq!(sources.slot(0, 1).health(), ReplicaHealth::Healthy);
-        assert_eq!(sources.slot(0, 2).health(), ReplicaHealth::Degraded);
+        for r in 0..3 {
+            assert_eq!(sources.slot(0, r).health(), ReplicaHealth::Degraded);
+        }
         assert_eq!(sources.slot(0, 3).health(), ReplicaHealth::Healthy);
     }
 
     #[test]
-    fn degraded_replica_is_reassigned_without_double_failure() {
-        // First read degrades replica 0 (chunk 0); the second read must
-        // reassign chunk 0 to the first healthy replica and still be correct.
+    fn degraded_replica_is_not_used_on_the_next_read() {
+        // First read degrades replica 0; the second read must still be
+        // correct (the degraded replica stays excluded).
         let (_root, manifest) = fixture(4, "reassign");
         let reg = ReplicaRegistry::open(&manifest).unwrap();
         let sources = TestSources {
@@ -519,19 +391,10 @@ mod tests {
             fail: vec![(0, 0, ErrorKind::Other)],
         };
         let engine = IoEngine::new(2);
-        let expected_crcs = crcs(0, SHARD_BYTES, 4);
-        let mut buf = vec![0u8; SHARD_BYTES];
-        let req = PageRead {
-            shard_index: 0,
-            offset: 0,
-            len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
-        };
-        engine.read_page(&sources, &req, &mut buf).unwrap();
-        assert_eq!(buf, pattern(0, SHARD_BYTES));
-        buf.fill(0);
-        engine.read_page(&sources, &req, &mut buf).unwrap();
-        assert_eq!(buf, pattern(0, SHARD_BYTES));
+        let first = read_whole(&engine, &sources).unwrap();
+        assert_eq!(first, pattern(0, SHARD_BYTES));
+        let second = read_whole(&engine, &sources).unwrap();
+        assert_eq!(second, pattern(0, SHARD_BYTES));
     }
 
     #[test]
@@ -543,15 +406,7 @@ mod tests {
             fail: vec![(0, 0, ErrorKind::Other)],
         };
         let engine = IoEngine::new(1);
-        let expected_crcs = crcs(0, SHARD_BYTES, 1);
-        let req = PageRead {
-            shard_index: 0,
-            offset: 0,
-            len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
-        };
-        let mut buf = vec![0u8; SHARD_BYTES];
-        match engine.read_page(&sources, &req, &mut buf) {
+        match read_whole(&engine, &sources) {
             Err(StoreError::Unavailable { shard }) => assert_eq!(shard, SHARD_FILE),
             other => panic!("expected Unavailable, got {other:?}"),
         }
@@ -566,25 +421,18 @@ mod tests {
             fail: vec![(0, 0, ErrorKind::Other), (1, 0, ErrorKind::Other)],
         };
         let engine = IoEngine::new(2);
-        let expected_crcs = crcs(0, SHARD_BYTES, 2);
-        let req = PageRead {
-            shard_index: 0,
-            offset: 0,
-            len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
-        };
-        let mut buf = vec![0u8; SHARD_BYTES];
-        match engine.read_page(&sources, &req, &mut buf) {
+        match read_whole(&engine, &sources) {
             Err(StoreError::Unavailable { shard }) => assert_eq!(shard, SHARD_FILE),
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 
     #[test]
-    fn rot_on_one_replica_is_detected_and_failed_over() {
+    fn rot_is_detected_and_degrades_serving_replicas() {
+        // §5.3 with the per-plane CRC: a rotted replica poisons the plane
+        // digest, the read errors with Crc, and every replica that served a
+        // chunk is degraded (the plane CRC cannot attribute one replica).
         let (root, manifest) = fixture(2, "rot-one");
-        // Expected CRCs from the pristine pattern BEFORE flipping bytes.
-        let expected_crcs = crcs(0, SHARD_BYTES, 2);
         flip(&root.join("r0"), 100..108);
         let reg = ReplicaRegistry::open(&manifest).unwrap();
         let sources = TestSources {
@@ -592,21 +440,21 @@ mod tests {
             fail: Vec::new(),
         };
         let engine = IoEngine::new(2);
-        let req = PageRead {
-            shard_index: 0,
-            offset: 0,
-            len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
-        };
-        let mut buf = vec![0u8; SHARD_BYTES];
-        engine.read_page(&sources, &req, &mut buf).unwrap();
-        assert_eq!(buf, pattern(0, SHARD_BYTES));
+        match read_whole(&engine, &sources) {
+            Err(StoreError::Crc { shard }) => assert_eq!(shard, SHARD_FILE),
+            other => panic!("expected Crc, got {other:?}"),
+        }
+        // Only the replica that actually served chunks is degraded (all
+        // workers pick the first healthy replica, so that is replica 0).
         assert_eq!(sources.slot(0, 0).health(), ReplicaHealth::Degraded);
         assert_eq!(sources.slot(0, 1).health(), ReplicaHealth::Healthy);
+        // The pristine mirror still serves the read.
+        let buf = read_whole(&engine, &sources).unwrap();
+        assert_eq!(buf, pattern(0, SHARD_BYTES));
     }
 
     /// T5 acceptance: manifest JSON on disk → load_manifest →
-    /// ReplicaRegistry::open → IoEngine, real-file rot on all four replicas.
+    /// ReplicaRegistry::open → IoEngine, real-file rot.
     #[test]
     fn t5_end_to_end_manifest_to_engine_with_real_file_rot() {
         let (root, manifest) = fixture(4, "t5e2e");
@@ -615,67 +463,81 @@ mod tests {
         let loaded = crate::manifest::load_manifest(&manifest_path).unwrap();
         let reg = ReplicaRegistry::open(&loaded).unwrap();
         let engine = IoEngine::new(DEFAULT_IO_THREADS);
-        let expected_crcs = crcs(0, SHARD_BYTES, 4);
         let req = PageRead {
             shard_index: 0,
             offset: 0,
             len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
+            expected_crc: crc(0, SHARD_BYTES),
         };
 
-        // Pristine read: full shard, PASS, all replicas Healthy.
-        let mut buf = vec![0u8; SHARD_BYTES];
+        // Pristine read: PASS, all replicas Healthy.
+        let covering: usize = plan_aligned(0, SHARD_BYTES).iter().map(|c| c.1).sum();
+        let mut buf = vec![0u8; covering];
         engine.read_page(&reg, &req, &mut buf).unwrap();
         assert_eq!(buf, pattern(0, SHARD_BYTES));
         for r in 0..4 {
             assert_eq!(reg.slot(0, r).health(), ReplicaHealth::Healthy);
         }
 
-        // Rot: 3 bytes inside each damaged replica's own striped chunk
-        // (4 replicas × 4096 bytes → chunk i covers [i*1024, (i+1)*1024)).
-        // Expected CRCs unchanged (pristine pattern). Chunks 0/1 fail CRC on
-        // their assigned replica and fail over to the pristine mirrors.
+        // Rot on one replica: plane CRC mismatches → Err(Crc), the serving
+        // replica (first healthy = r0) is degraded — silent corruption is
+        // impossible.
         flip(&root.join("r0"), 100..103);
-        flip(&root.join("r1"), 1100..1103);
+        match engine.read_page(&reg, &req, &mut buf) {
+            Err(StoreError::Crc { shard }) => assert_eq!(shard, SHARD_FILE),
+            other => panic!("expected Crc, got {other:?}"),
+        }
+        assert_eq!(reg.slot(0, 0).health(), ReplicaHealth::Degraded);
+        assert_eq!(reg.slot(0, 1).health(), ReplicaHealth::Healthy);
+
+        // The pristine mirrors still serve the read.
         engine.read_page(&reg, &req, &mut buf).unwrap();
         assert_eq!(buf, pattern(0, SHARD_BYTES));
-        assert_eq!(reg.slot(0, 0).health(), ReplicaHealth::Degraded);
-        assert_eq!(reg.slot(0, 1).health(), ReplicaHealth::Degraded);
-        assert_eq!(reg.slot(0, 2).health(), ReplicaHealth::Healthy);
-        assert_eq!(reg.slot(0, 3).health(), ReplicaHealth::Healthy);
-
-        // Rot the same bytes on the remaining replicas: chunk 0 now fails on
-        // every replica → Unavailable, not silent corruption.
-        flip(&root.join("r2"), 100..103);
-        flip(&root.join("r3"), 100..103);
-        match engine.read_page(&reg, &req, &mut buf) {
-            Err(StoreError::Unavailable { shard }) => assert_eq!(shard, SHARD_FILE),
-            other => panic!("expected Unavailable, got {other:?}"),
-        }
     }
 
     #[test]
-    fn rot_on_all_replicas_is_unavailable_not_silent() {
-        let (root, manifest) = fixture(2, "rot-all");
-        let expected_crcs = crcs(0, SHARD_BYTES, 2);
-        flip(&root.join("r0"), 100..108);
-        flip(&root.join("r1"), 100..108);
+    fn queued_but_undrained_reads_fail_on_engine_drop() {
+        // Drop the engine with a second read still queued: its wait() gets
+        // Err (no hang).
+        let (_root, manifest) = fixture(2, "drop-queued");
         let reg = ReplicaRegistry::open(&manifest).unwrap();
         let sources = TestSources {
             reg,
             fail: Vec::new(),
         };
-        let engine = IoEngine::new(2);
-        let req = PageRead {
+        let engine = IoEngine::new(1);
+        let mut first_dst = vec![0u8; SHARD_BYTES];
+        let mut second_dst = vec![0u8; SHARD_BYTES];
+        let first = engine.enqueue(ReadJob {
             shard_index: 0,
             offset: 0,
             len: SHARD_BYTES,
-            expected_crcs: &expected_crcs,
-        };
-        let mut buf = vec![0u8; SHARD_BYTES];
-        match engine.read_page(&sources, &req, &mut buf) {
+            expected_crc: crc(0, SHARD_BYTES),
+            verify_crc: true,
+            prefetch: false,
+            sources: &sources,
+            dst: &mut first_dst,
+        });
+        let second = engine.enqueue(ReadJob {
+            shard_index: 0,
+            offset: 0,
+            len: SHARD_BYTES,
+            expected_crc: crc(0, SHARD_BYTES),
+            verify_crc: true,
+            prefetch: true,
+            sources: &sources,
+            dst: &mut second_dst,
+        });
+        first.wait().unwrap();
+        drop(engine);
+        match second.wait() {
             Err(StoreError::Unavailable { shard }) => assert_eq!(shard, SHARD_FILE),
-            other => panic!("expected Unavailable, got {other:?}"),
+            other => panic!("expected Unavailable after drop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chunk_size_is_two_mib() {
+        assert_eq!(CHUNK, 2 * 1024 * 1024);
     }
 }

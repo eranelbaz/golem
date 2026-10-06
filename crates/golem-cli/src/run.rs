@@ -6,14 +6,17 @@
 use std::error::Error;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use golem_engine::ParityStep;
 use golem_engine::atomic::write_atomic;
 use golem_engine::config::EngineConfig;
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
+use golem_engine::timing::TimingRecorder;
 use golem_llama_sys::substrate_backend;
-use golem_placement::pool::GgufPreadSource;
+use golem_placement::pool::{GgufPreadSource, StoreExpertSource};
+use golem_store::ChunkQueue;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -68,12 +71,28 @@ pub struct RunArgs {
     /// at least the model's top-k.
     #[arg(long, value_name = "EXPERTS")]
     pub device_cache_experts: Option<u32>,
+    /// Store reader threads per drain (§5.4, `EngineConfig::io_threads`);
+    /// omitted derives one thread per physical drive hosting an eligible
+    /// replica (D-12: per-drive threads, never per-file).
+    #[arg(long, value_name = "N")]
+    pub io_threads: Option<usize>,
+    /// Model manifest (§4.2): the P3 expert pool then reads expert planes
+    /// from the manifest's replica set through the shared chunk queue
+    /// (striped, CRC-checked) instead of the single GGUF replica.
+    #[arg(long, value_name = "PATH")]
+    pub manifest: Option<PathBuf>,
     /// Write a T2 parity dump (JSONL: line-1 header, then one record per
     /// generation step) to this file instead of streaming the completion;
     /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
     /// never a path.
     #[arg(long, value_name = "FILE")]
     pub parity_dump: Option<PathBuf>,
+    /// §11 per-step timing CSV destination: opened/truncated with a header
+    /// (engine version, fork commit, resolved config), then one row per
+    /// generation decode step, flushed at each turn end. H2D columns are
+    /// `unmeasured` (no fork event pair on the copy stream yet).
+    #[arg(long, value_name = "FILE")]
+    pub timing_csv: Option<PathBuf>,
 }
 
 impl RunArgs {
@@ -96,6 +115,9 @@ impl RunArgs {
             // (0, 1) therefore disables the pool — the help text says so.
             ram_experts_gib: self.ram_experts_gib.unwrap_or(0.0).max(0.0) as u64,
             device_cache_experts: self.device_cache_experts.unwrap_or(0),
+            io_threads: self.io_threads,
+            manifest_path: self.manifest.clone(),
+            timing_csv: self.timing_csv.clone(),
             ..default
         }
     }
@@ -108,8 +130,37 @@ impl RunArgs {
 /// loop continues.
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     let config = args.to_config();
+    // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
+    let mut timing_out = match &config.timing_csv {
+        Some(path) => {
+            let mut f = std::fs::File::create(path)?;
+            TimingRecorder::header(
+                &mut f,
+                env!("CARGO_PKG_VERSION"),
+                &fork_commit(),
+                &resolved_config_line(&config),
+            )?;
+            f.flush()?;
+            Some(f)
+        }
+        None => None,
+    };
+    // §3.4 P3: the store path only exists behind the RAM expert pool; a
+    // --manifest without the pool would silently decode off the plain GGUF
+    // path while the user believes replicas are serving experts.
+    if args.manifest.is_some() && config.ram_experts_gib == 0 {
+        return Err(
+            "--manifest requires --ram-experts-gib > 0: the expert pool \
+             is the only consumer of the store-backed source"
+                .into(),
+        );
+    }
     if config.ram_experts_gib > 0 {
-        preflight_ram_pool(&args.model, config.ram_experts_gib)?;
+        preflight_ram_pool(
+            &args.model,
+            args.manifest.as_deref(),
+            config.ram_experts_gib,
+        )?;
     }
     let mut session = Session::new(&config)?;
 
@@ -117,11 +168,11 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         (Some(prompt), Some(dump)) => {
             one_shot_parity(&mut session, &args.model, prompt, dump, args.n_predict)
         }
-        (Some(prompt), None) => one_shot(&mut session, prompt),
+        (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out),
         // The dump records exactly one prompt (header `prompt_tokens`), so a
         // multi-turn REPL dump would be ill-defined — refuse it up front.
         (None, Some(_)) => Err("--parity-dump requires --prompt".into()),
-        (None, None) => repl(&mut session),
+        (None, None) => repl(&mut session, &mut timing_out),
     }
 }
 
@@ -142,13 +193,17 @@ fn memlock_limit() -> Option<u64> {
 /// requested pool cannot be locked (`RLIMIT_MEMLOCK` too low) or would exceed
 /// 75% of free RAM, each with an actionable `min(75% free RAM, expert bytes)`
 /// suggestion (§5.4: mlock is a correctness feature — never fall back).
-fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
+fn preflight_ram_pool(
+    model: &Path,
+    manifest: Option<&Path>,
+    gib: u64,
+) -> Result<(), Box<dyn Error>> {
     let want_bytes = gib
         .checked_mul(1 << 30)
         .ok_or("--ram-experts-gib overflows")?;
 
     // Expert bytes from the GGUF tensor table (header walk only).
-    let expert_bytes = expert_plane_bytes(model).unwrap_or_else(|e| {
+    let expert_bytes = expert_plane_bytes(model, manifest).unwrap_or_else(|e| {
         eprintln!("warning: cannot pre-scan expert tensors from {model:?}: {e}");
         0
     });
@@ -189,7 +244,14 @@ fn preflight_ram_pool(model: &Path, gib: u64) -> Result<(), Box<dyn Error>> {
 
 /// Total pageable expert bytes: sum of `stride × n_experts` over the model's
 /// expert planes (dense lead excluded), via the same GGUF walk the pool uses.
-fn expert_plane_bytes(model: &Path) -> Result<u64, Box<dyn Error>> {
+fn expert_plane_bytes(model: &Path, manifest: Option<&Path>) -> Result<u64, Box<dyn Error>> {
+    // Store-backed run: the manifest's expert_index is the source of truth
+    // (already cross-checked against the replica tensor tables at open).
+    if let Some(mpath) = manifest {
+        let queue = Arc::new(ChunkQueue::new(0));
+        let src = StoreExpertSource::open(mpath, queue)?;
+        return Ok(src.expert_bytes());
+    }
     let metadata = read_metadata(model)?;
     let arch = metadata
         .kv_str("general.architecture")
@@ -204,7 +266,28 @@ fn expert_plane_bytes(model: &Path) -> Result<u64, Box<dyn Error>> {
     Ok(src.geometry()?.map(|g| g.expert_bytes).unwrap_or(0))
 }
 
-fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
+/// Vendored llama.cpp fork commit for the CSV header comment: read from the
+/// checkout's `vendor/VENDOR_SHA` (`commit=` line) so the header carries the
+/// real fork; `GOLEM_FORK_COMMIT` env overrides (e.g. for out-of-tree builds
+/// without `vendor/`).
+fn fork_commit() -> String {
+    if let Some(c) = option_env!("GOLEM_FORK_COMMIT") {
+        return c.to_owned();
+    }
+    const VENDOR_SHA: &str = include_str!("../../../vendor/VENDOR_SHA");
+    VENDOR_SHA
+        .lines()
+        .find_map(|l| l.strip_prefix("commit="))
+        .unwrap_or("unknown")
+        .trim()
+        .to_owned()
+}
+
+fn one_shot(
+    session: &mut Session,
+    prompt: &str,
+    timing_out: &mut Option<std::fs::File>,
+) -> Result<(), Box<dyn Error>> {
     session.chat_turn(
         &[ChatTurn {
             role: "user",
@@ -212,8 +295,49 @@ fn one_shot(session: &mut Session, prompt: &str) -> Result<(), Box<dyn Error>> {
         }],
         &mut emit_stdout,
     )?;
+    // Timing CSV is best-effort post-streaming: log, don't fail the run
+    // (matches the REPL path).
+    if let Err(e) = flush_timing(session, timing_out) {
+        eprintln!("error: timing csv: {e}");
+    }
     println!();
     Ok(())
+}
+
+/// §11: appends the turn's recorded rows to the CSV file (the recorder
+/// survives the flush; it is reset by the engine at the next turn start).
+fn flush_timing(
+    session: &mut Session,
+    timing_out: &mut Option<std::fs::File>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(f) = timing_out.as_mut() {
+        session.write_timing(f)?;
+        f.flush()?;
+    }
+    Ok(())
+}
+
+/// One-line resolved-config string for the CSV header comment (§11).
+fn resolved_config_line(config: &EngineConfig) -> String {
+    format!(
+        "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} cpu_moe={:?} \
+         ram_experts_gib={} device_cache_experts={} io_threads={:?} manifest={:?} \
+         model_size={}",
+        config.n_ctx,
+        config.batch_tokens,
+        config.n_predict,
+        config.threads,
+        config.n_gpu_layers,
+        config.flash_attn_on,
+        config.cpu_moe_layers,
+        config.ram_experts_gib,
+        config.device_cache_experts,
+        config.io_threads,
+        config.manifest_path,
+        std::fs::metadata(&config.model_path)
+            .map(|m| m.len())
+            .unwrap_or(0),
+    )
 }
 
 /// `--prompt --parity-dump <FILE>`: one parity turn (same greedy decode as
@@ -317,7 +441,10 @@ fn model_identity(path: &Path) -> std::io::Result<(String, u64)> {
     Ok((hex, total))
 }
 
-fn repl(session: &mut Session) -> Result<(), Box<dyn Error>> {
+fn repl(
+    session: &mut Session,
+    timing_out: &mut Option<std::fs::File>,
+) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
@@ -333,7 +460,12 @@ fn repl(session: &mut Session) -> Result<(), Box<dyn Error>> {
             content: line.as_str(),
         }];
         match session.chat_turn(&turn, &mut emit_stdout) {
-            Ok(_) => println!(),
+            Ok(_) => {
+                if let Err(e) = flush_timing(session, timing_out) {
+                    eprintln!("error: timing csv: {e}");
+                }
+                println!()
+            }
             Err(e) => {
                 println!();
                 eprintln!("error: {e}");
@@ -592,10 +724,18 @@ mod tests {
     }
 
     #[test]
+    fn run_args_map_io_threads_flag_into_config() {
+        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        assert_eq!(config.io_threads, None, "unset = derived per-drive count");
+        let config = parse_run_args(&["run", "m.gguf", "--io-threads", "4"]).to_config();
+        assert_eq!(config.io_threads, Some(4));
+    }
+
+    #[test]
     fn preflight_refuses_an_impossible_pool_with_err_not_exit() {
         // 2^60 GiB-bytes exceeds both RLIMIT_MEMLOCK and available RAM; the
         // preflight must return Err (a process::exit would kill this test).
-        let err = preflight_ram_pool(Path::new("/nonexistent.gguf"), 1 << 30).unwrap_err();
+        let err = preflight_ram_pool(Path::new("/nonexistent.gguf"), None, 1 << 30).unwrap_err();
         assert!(err.to_string().contains("--ram-experts-gib"), "{err}");
     }
 

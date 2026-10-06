@@ -162,6 +162,31 @@ pub trait ExpertSource: Send + Sync {
     /// Absolute file offset + stride of one plane, for construction-time
     /// cross-checks against live tensors.
     fn plane(&self, layer: u32, kind: ExpertKind, expert: u32) -> Option<(u64, u64)>;
+
+    /// Reads one expert unit's planes in one call: `batch[i]` is the
+    /// `(kind, expert)` of plane i and `targets[i]` its `(region, head)`
+    /// destination — the same contract as [`ExpertSource::read_expert`] per
+    /// plane (§5.2: one queued drain per unit instead of N blocking reads).
+    /// `batch` and `targets` have equal length.
+    ///
+    /// The default loops [`ExpertSource::read_expert`] so sources without a
+    /// queued drain keep working; queue-backed sources override this to
+    /// enqueue every plane before waiting once.
+    ///
+    /// # Errors
+    /// Any plane's failure fails the whole batch; earlier planes' bytes are
+    /// scratch (the caller discards the unit on error).
+    fn read_expert_batched(
+        &self,
+        layer: u32,
+        batch: &[(ExpertKind, u32)],
+        targets: &mut [(&mut [u8], usize)],
+    ) -> io::Result<()> {
+        for (&(kind, expert), (into, head)) in batch.iter().zip(targets.iter_mut()) {
+            self.read_expert(layer, kind, expert, into, *head)?;
+        }
+        Ok(())
+    }
 }
 
 /// Source failures that are not plain I/O.
@@ -206,6 +231,8 @@ pub enum SourceError {
         /// Dense-lead-adjusted layer missing a plane.
         layer: u32,
     },
+    /// Store-layer failure (manifest, replica registry, or queued read).
+    Store(golem_store::StoreError),
 }
 
 impl fmt::Display for SourceError {
@@ -225,6 +252,7 @@ impl fmt::Display for SourceError {
             Self::IncompleteLayer { layer } => {
                 write!(f, "expert layer {layer} is missing one of gate/up/down")
             }
+            Self::Store(e) => write!(f, "store: {e}"),
         }
     }
 }
@@ -240,6 +268,12 @@ impl From<io::Error> for SourceError {
 impl From<golem_gguf::Error> for SourceError {
     fn from(e: golem_gguf::Error) -> Self {
         Self::Gguf(e)
+    }
+}
+
+impl From<golem_store::StoreError> for SourceError {
+    fn from(e: golem_store::StoreError) -> Self {
+        Self::Store(e)
     }
 }
 
@@ -285,7 +319,7 @@ pub struct GgufPreadSource {
 }
 
 /// Flat index of one `(layer, kind)` plane: no hashing on the page-in path.
-fn plane_index(layer: u32, kind: ExpertKind) -> usize {
+pub(super) fn plane_index(layer: u32, kind: ExpertKind) -> usize {
     layer as usize * ExpertKind::ALL.len() + kind.ordinal()
 }
 
@@ -480,8 +514,9 @@ impl GgufPreadSource {
 }
 
 /// Upper bound on a plausible `blk.N` index; a larger one is a corrupt name,
-/// not a model (and would size the plane table).
-const MAX_BLOCKS: u32 = 1 << 16;
+/// not a model (and would size the plane table). Shared with the store
+/// source's manifest walk.
+pub(crate) const MAX_BLOCKS: u32 = 1 << 16;
 
 fn open_direct(path: &Path) -> io::Result<File> {
     OpenOptions::new()

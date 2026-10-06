@@ -4,10 +4,12 @@
 //! Design coverage:
 //! - §5.1 replica registry: per-slot health, same-drive detection
 //!   ([`replica`], [`ReplicaRegistry::shared_device_warnings`]).
-//! - §5.2 deterministic striped chunk planning ([`stripe`]) and the
-//!   fixed thread-pool pread engine ([`IoEngine`]).
-//! - §5.3 CRC32C per-chunk validation against caller-supplied page-table
-//!   digests ([`PageRead::expected_crcs`]).
+//! - §5.2 shared-queue striping ([`queue`], [`stripe`]): one queue of chunk
+//!   reads drained demand-first by per-drive scoped threads, with exclude-mask
+//!   requeue onto the drain-local work list.
+//! - §5.3 CRC32C validation against the caller-supplied per-plane digest
+//!   ([`PageRead::expected_crc`]); mismatch degrades the serving replicas and
+//!   surfaces [`StoreError::Crc`] (never silent corruption).
 //! - §5.4 per-chunk failover to the next healthy replica with one-way
 //!   [`ReplicaHealth::Degraded`] marking; all replicas down →
 //!   [`StoreError::Unavailable`] (never silent corruption).
@@ -16,9 +18,15 @@
 //! replica I/O, striping, and the pread engine ([`engine`]).
 
 mod engine;
+/// Instance-level health state machine (§5.2, §11): per-replica health +
+/// checksum degradation → one classification, with transition surfacing.
+pub mod health;
 /// `golem import` (§5.5): local source discovery + expert-plane geometry.
 pub mod import;
 mod manifest;
+/// §5.2 shared chunk queue: demand-first drain scheduling with per-drive
+/// scoped reader threads.
+mod queue;
 mod replica;
 mod stripe;
 
@@ -27,12 +35,14 @@ mod stripe;
 pub mod sys;
 
 pub use engine::{ChunkSource, DEFAULT_IO_THREADS, IoEngine, PageRead, ShardSources};
+pub use health::{InstanceHealth, instance_health};
 pub use manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, load_manifest};
+pub use queue::{ChunkQueue, ReadBatch, ReadHandle, ReadJob};
 pub use replica::{
     ReplicaHealth, ReplicaRegistry, ReplicaSlot, ShardReplicas, parent_device_name,
     physical_device_name,
 };
-pub use stripe::{Chunk, plan_single, plan_striped};
+pub use stripe::{CHUNK, plan_aligned};
 
 use std::path::PathBuf;
 
@@ -77,9 +87,23 @@ pub enum StoreError {
         /// Details of the mismatch.
         msg: String,
     },
+    #[error("invalid read: {msg}")]
+    /// Caller violated a read contract (e.g. destination length ≠ the
+    /// aligned covering region, or a shard with more than 32 replicas).
+    Invalid {
+        /// What was wrong.
+        msg: String,
+    },
     #[error("all replicas of shard {shard} unreadable")]
     /// Every replica of a shard failed.
     Unavailable {
+        /// Shard file name.
+        shard: String,
+    },
+    #[error("crc mismatch in shard {shard}")]
+    /// §5.3: replica data failed its checksum; the serving replicas were
+    /// marked degraded.
+    Crc {
         /// Shard file name.
         shard: String,
     },

@@ -516,20 +516,26 @@ impl ExpertPool {
         // claimed slot's plane regions (split from the single slot_mut
         // borrow — no bounce buffer, §3.4; each region is sized for an
         // aligned direct read of its plane, §5.4).
-        let mut rest = self.arena.slot_mut(&mut claim);
-        let result: std::io::Result<()> = 'fill: {
-            for kind in ExpertKind::ALL {
-                let k = kind.ordinal();
-                let (region, tail) = rest.split_at_mut(unit.region[k] as usize);
-                rest = tail;
-                if let Err(e) =
-                    self.source
-                        .read_expert(layer, kind, expert, region, unit.head[k] as usize)
-                {
-                    break 'fill Err(e);
-                }
-            }
-            Ok(())
+        let rest = self.arena.slot_mut(&mut claim);
+        // One disk→pool copy per unit: one batched read landing all three
+        // planes straight in the claimed slot's regions (split from the
+        // single slot_mut borrow — no bounce buffer, §3.4; each region is
+        // sized for an aligned direct read of its plane, §5.4; one queued
+        // drain per unit, §5.2).
+        let result: std::io::Result<()> = {
+            let (t0, rest) = rest.split_at_mut(unit.region[0] as usize);
+            let (t1, t2) = rest.split_at_mut(unit.region[1] as usize);
+            let batch = [
+                (ExpertKind::Gate, expert),
+                (ExpertKind::Up, expert),
+                (ExpertKind::Down, expert),
+            ];
+            let mut targets = [
+                (t0, unit.head[0] as usize),
+                (t1, unit.head[1] as usize),
+                (t2, unit.head[2] as usize),
+            ];
+            self.source.read_expert_batched(layer, &batch, &mut targets)
         };
         match result {
             Ok(()) => {
@@ -755,6 +761,158 @@ mod tests {
         assert!(!pool.residency.is_resident(0, 2));
         pool.ensure_range(true, 0, ExpertKind::Gate, 2, 2, &mut |_| {})
             .unwrap();
+    }
+
+    /// Source that only serves the batched path: records every batched call
+    /// (kind, expert, head, region length) and optionally fails the Down
+    /// plane a bounded number of times (§5.2: one queued drain per unit).
+    #[cfg(not(loom))]
+    struct BatchedSource {
+        stride: usize,
+        fail_down_times: std::sync::atomic::AtomicUsize,
+        calls: Mutex<Vec<(ExpertKind, u32, usize, usize)>>,
+    }
+
+    #[cfg(not(loom))]
+    impl BatchedSource {
+        fn new(stride: usize, fail_down_times: usize) -> Self {
+            Self {
+                stride,
+                fail_down_times: std::sync::atomic::AtomicUsize::new(fail_down_times),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn plane_byte(&self, kind: ExpertKind, expert: u32) -> u8 {
+            0x10 * (kind.ordinal() as u8 + 1) + expert as u8
+        }
+    }
+
+    #[cfg(not(loom))]
+    impl ExpertSource for BatchedSource {
+        fn read_expert(
+            &self,
+            _: u32,
+            _: ExpertKind,
+            _: u32,
+            _: &mut [u8],
+            _: usize,
+        ) -> io::Result<()> {
+            panic!("serial read_expert used; page_in must batch (§5.2)");
+        }
+
+        fn read_expert_batched(
+            &self,
+            _layer: u32,
+            batch: &[(ExpertKind, u32)],
+            targets: &mut [(&mut [u8], usize)],
+        ) -> io::Result<()> {
+            for (&(kind, expert), (into, head)) in batch.iter().zip(targets.iter_mut()) {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((kind, expert, *head, into.len()));
+                if kind == ExpertKind::Down
+                    && self
+                        .fail_down_times
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        > 0
+                {
+                    self.fail_down_times
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(io::Error::other("injected batched plane failure"));
+                }
+                into[*head..*head + self.stride].fill(self.plane_byte(kind, expert));
+            }
+            Ok(())
+        }
+
+        fn plane(&self, _: u32, _: ExpertKind, _: u32) -> Option<(u64, u64)> {
+            None
+        }
+    }
+
+    /// Pool over one layer with the given layout, backed by a shared
+    /// [`BatchedSource`] failing the Down plane `fail_down_times` times.
+    #[cfg(not(loom))]
+    fn batched_pool(
+        layout: UnitLayout,
+        fail_down_times: usize,
+    ) -> (Arc<ExpertPool>, Arc<BatchedSource>) {
+        let arena = Arena::new(&[SlotClass {
+            slot_size: layout.region.iter().sum::<u64>() as usize,
+            slots: 2,
+        }])
+        .unwrap();
+        let src = Arc::new(BatchedSource::new(
+            layout.stride[0] as usize,
+            fail_down_times,
+        ));
+        let source: Arc<dyn ExpertSource> = src.clone();
+        let pool = ExpertPool::new(
+            arena,
+            source,
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            PoolGeometry {
+                layers: vec![layout],
+                n_experts: N_EXPERTS,
+                expert_bytes: 0,
+            },
+            vec![0; 1],
+        );
+        (pool, src)
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn page_in_submits_one_batched_call_for_the_three_planes() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [Some(5), None, Some(13)]).unwrap();
+        let (pool, src) = batched_pool(layout, 0);
+        for &kind in ExpertKind::ALL.iter() {
+            let byte = 0x10 * (kind.ordinal() as u8 + 1) + 3;
+            pool.ensure_range(true, 0, kind, 3, 3, &mut |p| assert_eq!(p, [byte; 64]))
+                .unwrap();
+        }
+        // Exactly one page-in: one batched call, three plane targets at the
+        // layout's heads and region lengths, one unit resident.
+        let calls = src.calls.lock().unwrap().clone();
+        let want: Vec<(ExpertKind, u32, usize, usize)> = ExpertKind::ALL
+            .iter()
+            .map(|&k| {
+                (
+                    k,
+                    3,
+                    layout.head[k.ordinal()] as usize,
+                    layout.region[k.ordinal()] as usize,
+                )
+            })
+            .collect();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls, want);
+        assert_eq!(pool.stats.demand_slow_pageins.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.stats.bytes_paged.load(Ordering::Relaxed), 3 * stride);
+        assert!(pool.residency.is_resident(0, 3));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn batched_failure_cancels_claim_without_ghost_residency() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, _) = batched_pool(layout, 1);
+        assert!(
+            pool.ensure_range(true, 0, ExpertKind::Gate, 3, 3, &mut |_| {})
+                .is_err()
+        );
+        assert!(!pool.residency.is_resident(0, 3), "no ghost residency");
+        // Slot recycled: a clean retry succeeds.
+        pool.ensure_range(true, 0, ExpertKind::Gate, 3, 3, &mut |p| {
+            assert_eq!(p, [0x13; 64])
+        })
+        .unwrap();
+        assert!(pool.residency.is_resident(0, 3));
     }
 
     /// Source that panics in `read_expert` the first time it is called.

@@ -11,6 +11,7 @@ publish = false
 golem-gguf = { path = "../golem-gguf" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 golem-placement = { path = "../golem-placement" }
+golem-store = { path = "../golem-store" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

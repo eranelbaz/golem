@@ -39,6 +39,18 @@ pub struct EngineConfig {
     /// unbounded slabs OOM the 24 GiB card on the real model). A routed set
     /// larger than K aborts loudly, so a K below the model's top-k is rejected at enable.
     pub device_cache_experts: u32,
+    /// Store reader threads per drain (§5.4 `--io-threads`); `None` derives
+    /// one thread per physical drive hosting an eligible replica.
+    pub io_threads: Option<usize>,
+    /// Model manifest (§4.2) for the store-backed expert source: when set,
+    /// the P3 slow path reads expert planes from the manifest's replica set
+    /// through the shared chunk queue; `None` (the default) reads the single
+    /// GGUF replica via pread.
+    pub manifest_path: Option<PathBuf>,
+    /// §11 per-step timing CSV destination: when set, each generation step's
+    /// timings are recorded and flushed at turn end; `None` (the default)
+    /// records nothing.
+    pub timing_csv: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -56,6 +68,9 @@ impl Default for EngineConfig {
             cpu_moe_layers: None,
             ram_experts_gib: 0,
             device_cache_experts: 0,
+            io_threads: None,
+            manifest_path: None,
+            timing_csv: None,
         }
     }
 }
@@ -82,6 +97,10 @@ mod tests {
         assert_eq!(
             c.device_cache_experts, 0,
             "0 = unset: the engine derives a bounded K from free VRAM at enable"
+        );
+        assert_eq!(
+            c.io_threads, None,
+            "io threads default to the derived per-drive count"
         );
     }
 }

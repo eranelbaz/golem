@@ -2,13 +2,65 @@
 //! health, and best-effort same-drive detection (§5.1).
 
 use std::fs::File;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::StoreError;
 use crate::manifest::ModelManifest;
+use crate::sys::{self, DIRECT_ALIGN};
+
+/// Read seam over one open replica handle (§5.4): full reads plus explicit
+/// page-cache eviction, so the direct/buffered fallback is testable without
+/// real filesystems. Implemented for [`std::fs::File`]; tests inject fakes.
+pub trait FileRead: Send + Sync {
+    /// Read exactly `buf.len()` bytes at `off`, retrying short reads.
+    fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()>;
+    /// Best-effort page-cache eviction of `[off, off + len)`; advisory, so a
+    /// failure is reported and swallowed by the caller — never a read error.
+    fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()>;
+}
+
+impl FileRead for std::fs::File {
+    fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.read_at(&mut buf[filled..], off + filled as u64) {
+                // `File::read_at` does not retry EINTR; a spurious interrupt
+                // must not surface as a device error.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short read at end of file",
+                    ));
+                }
+                Ok(n) => filled += n,
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()> {
+        if sys::drop_page_cache(self, off, len) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("posix_fadvise failed"))
+        }
+    }
+}
+
+impl FileRead for Box<dyn FileRead> {
+    fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        (**self).read_full(off, buf)
+    }
+    fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()> {
+        (**self).drop_cache(off, len)
+    }
+}
 
 /// Health of one replica path. One-way Healthy → Degraded this task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,14 +85,39 @@ pub struct ShardReplicas {
     pub replicas: Vec<Arc<ReplicaSlot>>,
 }
 
-/// One opened replica file plus its health state.
+/// One opened replica file plus its health state and its direct/buffered
+/// read handles (§5.4, H-9).
 pub struct ReplicaSlot {
     /// Full path: replica dir joined with the shard file name.
     pub path: PathBuf,
-    /// Open handle for positioned reads.
-    pub file: std::fs::File,
+    /// `O_DIRECT` handle, `None` where the open-time probe failed.
+    direct: Option<Box<dyn FileRead>>,
+    /// Buffered handle, always present: the fallback needs it even when the
+    /// direct handle exists.
+    buffered: Box<dyn FileRead>,
+    /// Cleared on the first direct-read failure (H-9 runtime fallback, not a
+    /// degrade); the slot then stays buffered + `DONTNEED`.
+    direct_ok: AtomicBool,
+    /// Cleared after the first `DONTNEED` failure so the warn fires once per
+    /// slot, not once per read (a per-read warn floods the log).
+    warned_dontneed: AtomicBool,
+    /// Cached physical device identity (§5.1): sysfs block name or numeric
+    /// `st_dev` fallback, resolved once at open — never re-stat'ed on the
+    /// read path (§5.2 hot loop is allocation- and syscall-light).
+    pub drive: String,
     /// 0 = Healthy, 1 = Degraded ([`ReplicaHealth`] as u8).
     pub health: AtomicU8,
+    /// Count of one-way degradations since open; feeds diagnostics and
+    /// burn-down decisions upstream (health itself is `health()`, never this
+    /// counter).
+    errors: AtomicU64,
+    /// Chunks served successfully from this replica since open (diagnostics:
+    /// measured share vs. the uniform striping expectation).
+    served_chunks: AtomicU64,
+    /// Subset of `served_chunks` served through the `O_DIRECT` handle
+    /// (diagnostics: `served_chunks - served_direct` = buffered-fallback
+    /// chunks; nonzero means a bench's GB/s is not a disk number).
+    served_direct: AtomicU64,
 }
 
 impl ReplicaSlot {
@@ -52,40 +129,81 @@ impl ReplicaSlot {
         }
     }
 
-    /// One-way transition to [`ReplicaHealth::Degraded`].
+    /// One-way transition to [`ReplicaHealth::Degraded`]; increments the
+    /// degradation counter.
     pub fn mark_degraded(&self) {
         self.health
             .store(ReplicaHealth::Degraded as u8, Ordering::Relaxed);
+        self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Read exactly `buf.len()` bytes at `offset`; retries short reads, errors
-    /// on premature EOF.
+    /// Degradations since open.
+    pub fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Successful chunk reads served since open.
+    pub fn served_chunks(&self) -> u64 {
+        self.served_chunks.load(Ordering::Relaxed)
+    }
+
+    /// Whether direct (`O_DIRECT`) reads are still attempted for this slot.
+    pub fn direct_ok(&self) -> bool {
+        self.direct_ok.load(Ordering::Relaxed)
+    }
+
+    /// Chunks served through the direct (`O_DIRECT`) handle since open.
+    pub fn served_direct(&self) -> u64 {
+        self.served_direct.load(Ordering::Relaxed)
+    }
+
+    /// Whether the open-time direct probe passed (a direct handle exists);
+    /// `false` means every read on this slot is buffered from the start.
+    pub fn direct_available(&self) -> bool {
+        self.direct.is_some()
+    }
+
+    /// Test-only view: whether a direct handle exists at all.
+    #[cfg(test)]
+    fn has_direct(&self) -> bool {
+        self.direct.is_some()
+    }
+
+    /// Read exactly `buf.len()` bytes at `offset` (§5.4, H-9). Direct when
+    /// the read is 4 KiB-aligned and the probe passed; any direct failure is
+    /// a one-way fallback to buffered + `DONTNEED` — never a degrade. The
+    /// buffered fallback never populates the page cache.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            let n = match self
-                .file
-                .read_at(&mut buf[filled..], offset + filled as u64)
-            {
-                // `File::read_at` does not retry EINTR (unlike `read`):
-                // §5.2 degrades on device errors, not signals — a one-way
-                // health flip must not be triggerable by a spurious
-                // interrupt.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "short read at offset {offset}: {} of {} bytes",
-                            filled,
-                            buf.len()
-                        ),
-                    ));
+        let aligned = offset % DIRECT_ALIGN == 0
+            && buf.len() as u64 % DIRECT_ALIGN == 0
+            && buf.as_ptr() as u64 % DIRECT_ALIGN == 0;
+        if aligned && self.direct_ok() {
+            if let Some(d) = &self.direct {
+                if let Err(e) = d.read_full(offset, buf) {
+                    if self.direct_ok.swap(false, Ordering::Relaxed) {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            error = %e,
+                            "O_DIRECT replica read failed; slot falls back to buffered + DONTNEED"
+                        );
+                    }
+                } else {
+                    self.served_chunks.fetch_add(1, Ordering::Relaxed);
+                    self.served_direct.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
                 }
-                Ok(n) => n,
-            };
-            filled += n;
+            }
+        }
+        self.buffered.read_full(offset, buf)?;
+        self.served_chunks.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = self.buffered.drop_cache(offset, buf.len()) {
+            if self.warned_dontneed.swap(false, Ordering::Relaxed) {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "POSIX_FADV_DONTNEED failed; page-cache pressure only"
+                );
+            }
         }
         Ok(())
     }
@@ -116,10 +234,52 @@ impl ReplicaRegistry {
                         ),
                     )));
                 }
+                let drive = physical_device_name(&path).unwrap_or_else(|| "unknown".to_owned());
+                // Open-time probe (§5.4, H-9): open + one aligned 4 KiB read.
+                // Failure of open or probe → buffered only; never an open error.
+                let direct: Option<Box<dyn FileRead>> = match sys::open_direct(&path) {
+                    Ok(f) if shard.bytes >= DIRECT_ALIGN => {
+                        let f = Box::new(f);
+                        // Page-aligned scratch for the probe read: allocate
+                        // one extra block, then slice at the first aligned
+                        // offset (allocation addresses are never aligned
+                        // themselves).
+                        let mut scratch = vec![0u8; DIRECT_ALIGN as usize * 2];
+                        let skip = scratch.as_ptr() as usize % DIRECT_ALIGN as usize;
+                        let probe = &mut scratch[skip..skip + DIRECT_ALIGN as usize];
+                        match f.read_full(0, probe) {
+                            Ok(()) => Some(f),
+                            Err(e) => {
+                                tracing::warn!(
+                                    replica = %replica.display(),
+                                    error = %e,
+                                    "O_DIRECT probe read failed; replica reads buffered + DONTNEED"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Ok(_) => None, // file smaller than one aligned probe block
+                    Err(e) => {
+                        tracing::warn!(
+                            replica = %replica.display(),
+                            error = %e,
+                            "O_DIRECT open failed; replica reads buffered + DONTNEED"
+                        );
+                        None
+                    }
+                };
                 replicas.push(Arc::new(ReplicaSlot {
                     path,
-                    file,
+                    drive,
+                    direct,
+                    buffered: Box::new(file),
+                    direct_ok: AtomicBool::new(true),
+                    warned_dontneed: AtomicBool::new(true),
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
+                    errors: AtomicU64::new(0),
+                    served_chunks: AtomicU64::new(0),
+                    served_direct: AtomicU64::new(0),
                 }));
             }
             shards.push(ShardReplicas {
@@ -261,6 +421,140 @@ pub fn parent_device_name(partition: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Test storage whose data can sit at a 4 KiB-aligned address: the
+    /// returned `skip` marks the aligned window inside the over-allocation.
+    fn aligned_storage(len: usize) -> (Vec<u8>, usize) {
+        let v = vec![0u8; len + 4096];
+        let off = v.as_ptr() as usize % 4096;
+        let skip = (4096 - off) % 4096;
+        (v, skip)
+    }
+
+    fn small_manifest(
+        dir: &std::path::Path,
+        _name: &str,
+        bytes: usize,
+    ) -> crate::manifest::ModelManifest {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("a.gguf"), vec![0u8; bytes]).unwrap();
+        crate::manifest::ModelManifest {
+            name: "t".into(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: "a.gguf".into(),
+                bytes: bytes as u64,
+                sha256: "0".repeat(64),
+                replicas: vec![dir.to_path_buf()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn probe_opens_direct_or_falls_back_and_reads_correctly() {
+        let dir = std::env::temp_dir().join("golem-store-replica-test");
+        let manifest = small_manifest(&dir.join("probe"), "probe", 8192);
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let slot = &*reg.shards()[0].replicas[0];
+        // Exactly one of {direct probe ok, direct None} holds.
+        assert!(slot.direct_ok() == slot.has_direct());
+        let (mut v, skip) = aligned_storage(4096);
+        let buf = &mut v[skip..skip + 4096];
+        slot.read_at(0, buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    /// Test interposition: direct handle always EIOs; buffered handle serves
+    /// pattern bytes and records `drop_cache` calls.
+    type DropCalls = std::sync::Arc<Mutex<Vec<(u64, usize)>>>;
+
+    struct FakeReads {
+        direct_err: bool,
+        drop_calls: DropCalls,
+    }
+
+    impl FakeReads {
+        fn buffered() -> (Box<Self>, DropCalls) {
+            let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+            (
+                Box::new(Self {
+                    direct_err: false,
+                    drop_calls: calls.clone(),
+                }),
+                calls,
+            )
+        }
+    }
+
+    impl FileRead for FakeReads {
+        fn read_full(&self, _off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            if self.direct_err {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            for b in buf.iter_mut() {
+                *b = 0xAB;
+            }
+            Ok(())
+        }
+        fn drop_cache(&self, _off: u64, _len: usize) -> std::io::Result<()> {
+            self.drop_calls.lock().unwrap().push((_off, _len));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn direct_eio_falls_back_to_buffered_without_degrading() {
+        let slot = ReplicaSlot {
+            path: PathBuf::from("fake"),
+            drive: "fake".into(),
+            direct: Some(Box::new(FakeReads {
+                direct_err: true,
+                drop_calls: Default::default(),
+            })),
+            buffered: FakeReads::buffered().0,
+            direct_ok: AtomicBool::new(true),
+            warned_dontneed: AtomicBool::new(true),
+            health: AtomicU8::new(ReplicaHealth::Healthy as u8),
+            errors: AtomicU64::new(0),
+            served_chunks: AtomicU64::new(0),
+            served_direct: AtomicU64::new(0),
+        };
+        let (mut v, skip) = aligned_storage(4096);
+        let buf = &mut v[skip..skip + 4096];
+        slot.read_at(0, buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xAB));
+        assert!(!slot.direct_ok(), "direct_ok flips false after EIO");
+        assert_eq!(
+            slot.health(),
+            ReplicaHealth::Healthy,
+            "fallback is not a degrade"
+        );
+        assert_eq!(slot.errors(), 0);
+    }
+
+    #[test]
+    fn fallback_reads_invoke_dontneed() {
+        let slot = ReplicaSlot {
+            path: PathBuf::from("fake"),
+            drive: "fake".into(),
+            direct: None,
+            buffered: FakeReads::buffered().0,
+            direct_ok: AtomicBool::new(false),
+            warned_dontneed: AtomicBool::new(true),
+            health: AtomicU8::new(ReplicaHealth::Healthy as u8),
+            errors: AtomicU64::new(0),
+            served_chunks: AtomicU64::new(0),
+            served_direct: AtomicU64::new(0),
+        };
+        let (buffered, calls) = FakeReads::buffered();
+        let mut slot = slot;
+        slot.buffered = buffered;
+        let (mut v, skip) = aligned_storage(4096);
+        let buf = &mut v[skip..skip + 4096];
+        slot.read_at(0, buf).unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![(0, 4096)]);
+    }
 
     #[test]
     fn parent_device_parses_partition_suffixes() {
@@ -303,6 +597,31 @@ mod tests {
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("no bandwidth aggregation"));
         assert_eq!(reg.healthy_replicas(0).len(), 2);
+    }
+
+    #[test]
+    fn error_counter_increments_on_degrade() {
+        let dir = std::env::temp_dir().join("golem-store-replica-test");
+        let shard_dir = dir.join("shard-errctr");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(shard_dir.join("a.gguf"), [0u8; 64]).unwrap();
+        let manifest = crate::manifest::ModelManifest {
+            name: "t".into(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: "a.gguf".into(),
+                bytes: 64,
+                sha256: "0".repeat(64),
+                replicas: vec![shard_dir],
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let slot = &*reg.shards()[0].replicas[0];
+        assert_eq!(slot.errors(), 0);
+        slot.mark_degraded();
+        slot.mark_degraded();
+        assert_eq!(slot.errors(), 2);
+        assert_eq!(slot.health(), ReplicaHealth::Degraded);
     }
 
     #[test]
