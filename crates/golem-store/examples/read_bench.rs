@@ -90,7 +90,7 @@ fn parse_args() -> Result<Args, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>]"
+                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>] [--sequential] [--io-threads <usize>]"
                 ));
             }
         }

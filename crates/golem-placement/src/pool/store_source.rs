@@ -22,7 +22,7 @@ use golem_store::{
 };
 
 use super::residency::ExpertKind;
-use super::source::{DIRECT_ALIGN, ExpertSource, SourceError, plane_index};
+use super::source::{DIRECT_ALIGN, ExpertSource, MAX_BLOCKS, SourceError, plane_index};
 
 /// Absolute per-expert addressing for one `(layer, kind)` plane, resolved
 /// from the manifest entry plus the shard's GGUF tensor table.
@@ -80,12 +80,32 @@ impl fmt::Debug for StoreExpertSource {
     }
 }
 
-/// Upper bound on a plausible `blk.N` index (same rule as the GGUF walk).
-const MAX_BLOCKS: u32 = 1 << 16;
-
 /// Upper bound on shard split count: bounded reservation, same defense as
 /// the GGUF source (a bogus count fails on the first missing shard).
 const MAX_SHARDS: u64 = 1 << 12;
+
+/// One plane's resolved read plan for a batched page-in.
+struct Planned {
+    /// Position of the shard in the manifest (resolved at planning; no
+    /// post-drain re-lookup of the plane table).
+    shard: usize,
+    offset: u64,
+    stride: usize,
+    covering: usize,
+    expected: Option<u32>,
+    /// `Some(i)`: plane i reads in place; `None`: scratch window.
+    in_place: Option<usize>,
+    logical_at: usize,
+}
+
+thread_local! {
+    /// Batched page-in planning buffers (plans, scratch-plane indices,
+    /// scratch covering lengths), cleared and reused per call so the §5.4
+    /// hot path allocates nothing steady-state.
+    static PLAN: std::cell::RefCell<(Vec<Planned>, Vec<usize>, Vec<usize>)> = const {
+        std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new()))
+    };
+}
 
 thread_local! {
     /// Reused page-aligned covering-region scratch for planes whose slot
@@ -516,153 +536,139 @@ impl ExpertSource for StoreExpertSource {
         // Resolve + validate every plane before enqueueing anything: a bad
         // plane must fail the unit before any bytes move (§3.4).
         let page = DIRECT_ALIGN as usize;
-        struct Planned {
-            /// Position of the shard in the manifest (resolved at planning;
-            /// no post-drain re-lookup of the plane table).
-            shard: usize,
-            offset: u64,
-            stride: usize,
-            covering: usize,
-            expected: Option<u32>,
-            /// `Some(i)`: plane i reads in place; `None`: scratch window.
-            in_place: Option<usize>,
-            logical_at: usize,
-        }
-        let mut plans: Vec<Planned> = Vec::with_capacity(batch.len());
-        let mut scratch_planes: Vec<usize> = Vec::new();
-        for (i, &(kind, expert)) in batch.iter().enumerate() {
-            let Some(p) = self
-                .planes
-                .get(plane_index(layer, kind))
-                .and_then(Option::as_ref)
-            else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no expert plane layer {layer} kind {kind:?}"),
-                ));
-            };
-            if expert >= p.n_experts {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("expert {expert} out of range (n={})", p.n_experts),
-                ));
-            }
-            let stride = usize::try_from(p.stride).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "plane stride exceeds usize")
-            })?;
-            let (into, head) = &targets[i];
-            if into.len() < head.saturating_add(stride) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "buffer {} < head {head} + plane stride {stride}",
-                        into.len()
-                    ),
-                ));
-            }
-            let offset = p.offsets[expert as usize];
-            let covering = p.covering[expert as usize] as usize;
-            let logical_at = (offset % DIRECT_ALIGN) as usize;
-            let in_place = (*head == logical_at
-                && into.len() >= covering
-                && into.as_ptr() as usize % page == 0)
-                .then_some(i);
-            if in_place.is_none() {
-                scratch_planes.push(i);
-            }
-            plans.push(Planned {
-                shard: p.shard,
-                offset,
-                stride,
-                covering,
-                expected: p.crc.as_ref().map(|c| c[expert as usize]),
-                in_place,
-                logical_at,
-            });
-        }
-
-        // Shared scratch for planes that cannot host their covering read:
-        // one resize, then consecutive page-aligned windows (each window is
-        // rounded to a page multiple so the next stays aligned).
-        fn scratch_windows<'a>(scratch: &'a mut [u8], covs: &[usize]) -> Vec<Option<&'a mut [u8]>> {
-            let page = DIRECT_ALIGN as usize;
-            let mut out = Vec::with_capacity(covs.len());
-            let mut rest: &mut [u8] = scratch;
-            for &cov in covs {
-                let rounded = cov.div_ceil(page) * page;
-                let skip = (page - rest.as_ptr() as usize % page) % page;
-                let (head, tail) = rest.split_at_mut(skip + rounded);
-                out.push(Some(&mut head[skip..skip + cov]));
-                rest = tail;
-            }
-            out
-        }
-        let scratch_covs: Vec<usize> = scratch_planes.iter().map(|&i| plans[i].covering).collect();
-        SCRATCH.with(|s| -> io::Result<()> {
-            let mut scratch = s.borrow_mut();
-            if !scratch_planes.is_empty() {
-                let need: usize = scratch_covs.iter().map(|c| c.div_ceil(page) * page).sum();
-                let raw = need + page - 1;
-                if scratch.len() < raw {
-                    scratch.resize(raw, 0);
-                }
-            }
-
-            // Enqueue all planes first, drain once (§5.2).
-            let degraded_before = self.queue.degraded_reads();
-            let mut rb = self.queue.batch();
-            let mut windows = scratch_windows(&mut scratch, &scratch_covs);
-            let mut wi = 0usize;
-            for ((into, _), plan) in targets.iter_mut().zip(plans.iter()) {
-                let dst: &mut [u8] = match plan.in_place {
-                    Some(_) => &mut into[..plan.covering],
-                    // Invariant: scratch_covs (driven by the same plans) has
-                    // one entry per non-in-place plane, so windows covers it.
-                    None => windows[wi].take().expect("one window per scratch plane"),
+        PLAN.with(|pb| -> io::Result<()> {
+            let (plans, scratch_planes, scratch_covs) = &mut *pb.borrow_mut();
+            plans.clear();
+            scratch_planes.clear();
+            scratch_covs.clear();
+            for (i, &(kind, expert)) in batch.iter().enumerate() {
+                let Some(p) = self
+                    .planes
+                    .get(plane_index(layer, kind))
+                    .and_then(Option::as_ref)
+                else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no expert plane layer {layer} kind {kind:?}"),
+                    ));
                 };
-                rb.push(ReadJob {
-                    shard_index: plan.shard,
-                    offset: plan.offset,
-                    len: plan.stride,
-                    expected_crc: plan.expected.unwrap_or(0),
-                    verify_crc: plan.expected.is_some(),
-                    prefetch: false,
-                    sources: &self.registry,
-                    dst,
+                if expert >= p.n_experts {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("expert {expert} out of range (n={})", p.n_experts),
+                    ));
+                }
+                let stride = usize::try_from(p.stride).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "plane stride exceeds usize")
+                })?;
+                let (into, head) = &targets[i];
+                if into.len() < head.saturating_add(stride) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "buffer {} < head {head} + plane stride {stride}",
+                            into.len()
+                        ),
+                    ));
+                }
+                let offset = p.offsets[expert as usize];
+                let covering = p.covering[expert as usize] as usize;
+                let logical_at = (offset % DIRECT_ALIGN) as usize;
+                let in_place = (*head == logical_at
+                    && into.len() >= covering
+                    && into.as_ptr() as usize % page == 0)
+                    .then_some(i);
+                if in_place.is_none() {
+                    scratch_planes.push(i);
+                }
+                plans.push(Planned {
+                    shard: p.shard,
+                    offset,
+                    stride,
+                    covering,
+                    expected: p.crc.as_ref().map(|c| c[expert as usize]),
+                    in_place,
+                    logical_at,
                 });
-                if plan.in_place.is_none() {
-                    wi += 1;
-                }
             }
-            let result = rb.wait();
-            self.note_wait_outcome(degraded_before, &result);
-            result.map_err(|e| match e {
-                StoreError::Io { source, .. } => source,
-                other @ StoreError::Unavailable { .. } => {
-                    io::Error::new(io::ErrorKind::NotFound, other.to_string())
-                }
-                other @ StoreError::Crc { .. } => {
-                    io::Error::new(io::ErrorKind::InvalidData, other.to_string())
-                }
-                other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
-            })?;
+            scratch_covs.extend(scratch_planes.iter().map(|&i| plans[i].covering));
 
-            // Scratch-served planes land in their window: copy the logical
-            // row out (the only second copy, same rule as read_expert). The
-            // windows were consumed by the drain; re-derive them from the
-            // same scratch buffer.
-            let windows = scratch_windows(&mut scratch, &scratch_covs);
-            let mut wi = 0usize;
-            for ((into, head), plan) in targets.iter_mut().zip(plans.iter()) {
-                if plan.in_place.is_some() {
-                    continue;
+            SCRATCH.with(|s| -> io::Result<()> {
+                let mut scratch = s.borrow_mut();
+                if !scratch_planes.is_empty() {
+                    let need: usize = scratch_covs.iter().map(|c| c.div_ceil(page) * page).sum();
+                    let raw = need + page - 1;
+                    if scratch.len() < raw {
+                        scratch.resize(raw, 0);
+                    }
                 }
-                let w = windows[wi].as_ref().unwrap();
-                wi += 1;
-                into[*head..*head + plan.stride]
-                    .copy_from_slice(&w[plan.logical_at..plan.logical_at + plan.stride]);
-            }
-            Ok(())
+
+                // Enqueue all planes first, drain once (§5.2). Scratch planes
+                // split page-aligned windows off the scratch in plan order —
+                // each window is rounded to a page multiple so the next stays
+                // aligned — with no per-call window allocation.
+                let degraded_before = self.queue.degraded_reads();
+                let mut rb = self.queue.batch();
+                let mut rest: &mut [u8] = scratch.as_mut_slice();
+                let mut si = 0usize;
+                for ((into, _), plan) in targets.iter_mut().zip(plans.iter()) {
+                    let dst: &mut [u8] = match plan.in_place {
+                        Some(_) => &mut into[..plan.covering],
+                        None => {
+                            let cov = scratch_covs[si];
+                            si += 1;
+                            let rounded = cov.div_ceil(page) * page;
+                            let skip = (page - rest.as_ptr() as usize % page) % page;
+                            let (head, tail) = rest.split_at_mut(skip + rounded);
+                            rest = tail;
+                            &mut head[skip..skip + cov]
+                        }
+                    };
+                    rb.push(ReadJob {
+                        shard_index: plan.shard,
+                        offset: plan.offset,
+                        len: plan.stride,
+                        expected_crc: plan.expected.unwrap_or(0),
+                        verify_crc: plan.expected.is_some(),
+                        prefetch: false,
+                        sources: &self.registry,
+                        dst,
+                    });
+                }
+                let result = rb.wait();
+                self.note_wait_outcome(degraded_before, &result);
+                result.map_err(|e| match e {
+                    StoreError::Io { source, .. } => source,
+                    other @ StoreError::Unavailable { .. } => {
+                        io::Error::new(io::ErrorKind::NotFound, other.to_string())
+                    }
+                    other @ StoreError::Crc { .. } => {
+                        io::Error::new(io::ErrorKind::InvalidData, other.to_string())
+                    }
+                    other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
+                })?;
+
+                // Scratch-served planes land in their window: copy the logical
+                // row out (the only second copy, same rule as read_expert). The
+                // drain did not move the scratch; re-walk it from the start.
+                let mut rest: &mut [u8] = scratch.as_mut_slice();
+                let mut si = 0usize;
+                for ((into, head), plan) in targets.iter_mut().zip(plans.iter()) {
+                    if plan.in_place.is_some() {
+                        continue;
+                    }
+                    let cov = scratch_covs[si];
+                    si += 1;
+                    let rounded = cov.div_ceil(page) * page;
+                    let skip = (page - rest.as_ptr() as usize % page) % page;
+                    let (head_win, tail) = rest.split_at_mut(skip + rounded);
+                    rest = tail;
+                    let w = &head_win[skip..skip + cov];
+                    into[*head..*head + plan.stride]
+                        .copy_from_slice(&w[plan.logical_at..plan.logical_at + plan.stride]);
+                }
+                Ok(())
+            })
         })
     }
 

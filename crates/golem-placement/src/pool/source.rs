@@ -514,8 +514,9 @@ impl GgufPreadSource {
 }
 
 /// Upper bound on a plausible `blk.N` index; a larger one is a corrupt name,
-/// not a model (and would size the plane table).
-const MAX_BLOCKS: u32 = 1 << 16;
+/// not a model (and would size the plane table). Shared with the store
+/// source's manifest walk.
+pub(crate) const MAX_BLOCKS: u32 = 1 << 16;
 
 fn open_direct(path: &Path) -> io::Result<File> {
     OpenOptions::new()
