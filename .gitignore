@@ -34,3 +34,4 @@ docs/*
 /target-cpu/
 /target-hip/
 .m14-work/
+.m3.14-sdd/
