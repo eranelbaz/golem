@@ -31,6 +31,8 @@
 use golem_placement::pool::SlotClass;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
+#[cfg(test)]
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -462,6 +464,22 @@ pub(crate) fn enable(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
 
 /// The header constant and the compiled substrate's reported ABI version must
 /// agree exactly; a mismatch means the pinned substrate must be rebuilt.
+/// Unit tests inject a mismatched header here to prove enable_inner checks
+/// the ABI before touching the model path; 0 means "use the real constant".
+#[cfg(test)]
+static TEST_ABI_HEADER: AtomicI32 = AtomicI32::new(0);
+
+fn abi_header_for_check() -> i32 {
+    #[cfg(test)]
+    {
+        let injected = TEST_ABI_HEADER.load(Ordering::Relaxed);
+        if injected != 0 {
+            return injected;
+        }
+    }
+    raw::GOLEM_HOOKS_ABI_VERSION as i32
+}
+
 fn check_abi(header: i32, compiled: i32) -> Result<(), EngineError> {
     if header != compiled {
         return Err(EngineError::PoolInit(format!(
@@ -484,10 +502,7 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
     // stale build fails fast instead of silently decoding with a drifted ABI.
     // Deliberately before the HANDLE short-circuit: a stale substrate reports
     // the ABI error even on a second enable.
-    check_abi(
-        raw::GOLEM_HOOKS_ABI_VERSION as i32,
-        golem_llama_sys::hooks_abi_version(),
-    )?;
+    check_abi(abi_header_for_check(), golem_llama_sys::hooks_abi_version())?;
     if HANDLE.get().is_some() {
         return Err(EngineError::PoolInit(
             "a pool-enabled session already exists (one per process: hooks are process-global)"
@@ -1095,14 +1110,12 @@ mod tests {
 
     #[test]
     fn enable_path_runs_abi_check_before_open() {
-        // Drive the real enable entry point with an unopenable model:
-        // check_abi runs before read_metadata, so reaching the open error
-        // proves the check executed and passed against the pinned substrate.
-        // If the check_abi call in enable_inner were deleted this test would
-        // still see the open error — but the failure mode it guards (stale
-        // substrate) is covered by abi_check_runs_and_passes_..., and the
-        // ordering invariant (check before open) is what this pins: the error
-        // must be an open failure, never an ABI mismatch on this path.
+        // Inject a header that cannot match the compiled substrate. If the
+        // check_abi call in enable_inner were deleted (or moved after the
+        // model open), this test would see the model-open Io failure instead
+        // of the ABI mismatch — so the PoolInit/ABI assertion is the proof
+        // that the check runs, and runs strictly before read_metadata.
+        TEST_ABI_HEADER.store(raw::GOLEM_HOOKS_ABI_VERSION as i32 + 1, Ordering::Relaxed);
         let config = EngineConfig {
             model_path: PathBuf::from("/nonexistent/golem-abi-test.gguf"),
             ram_experts_gib: 16,
@@ -1110,16 +1123,17 @@ mod tests {
         };
         let err = match enable(&config) {
             Err(e) => e,
-            Ok(_) => panic!("enable must fail on an unopenable model path"),
+            Ok(_) => panic!("enable must fail on an ABI mismatch"),
         };
-        // Execution must reach read_metadata (the open failure), i.e. the
-        // ABI check — which runs strictly earlier — passed.
-        assert!(
-            matches!(err, EngineError::Io(_)),
-            "expected the model-open failure, got: {err:?}"
-        );
-        if let EngineError::PoolInit(m) = &err {
-            panic!("ABI mismatch on pinned substrate: {m}");
+        TEST_ABI_HEADER.store(0, Ordering::Relaxed);
+        match &err {
+            EngineError::PoolInit(m) => {
+                assert!(
+                    m.contains("ABI mismatch"),
+                    "expected ABI mismatch, got: {m}"
+                );
+            }
+            other => panic!("expected the ABI mismatch, got: {other:?}"),
         }
     }
 

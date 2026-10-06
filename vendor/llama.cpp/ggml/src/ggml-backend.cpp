@@ -2104,6 +2104,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // change (slot validity is independent of it).
                             if (st.ids_dev == nullptr || st.ids_ne0 != (int64_t) ids_tensor->ne[0] ||
                                 st.ids_ne1 != (int64_t) ids_tensor->ne[1]) {
+                                // A prior step's H2D may still be reading the old
+                                // ids_pin (and the old ids_dev may be queued behind
+                                // graph work); drain before freeing either buffer.
+                                // One sync per ids-shape change, not per step.
+                                ggml_backend_synchronize(split_backend);
                                 if (st.ids_buf != nullptr) {
                                     ggml_backend_buffer_free(st.ids_buf);
                                 }
