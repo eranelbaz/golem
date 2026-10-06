@@ -5,8 +5,8 @@ Usage: python3 pool-size-report.py <workdir>
 Each leg is a dir containing timing.csv; legs named asc|desc|smoke|probe-<gib>-<temp>.
 Constants: 336 expert-layer loads/token, 15.2 MB per expert unit, 27 GB/s pinned
 H2D bus, 4.73 GB/s disk (measured, scripts/disk-bandwidth.py).
-Total expert bytes: 12,096 units x 15.34 MB = 172.8 GiB (185.5 GB); the 15.2 MB
-figure is rounded. Plan-authoritative total: 172.8 GiB.
+Total expert bytes: 12,096 units x 15.34 MB = 172.8 GiB (185.5 GB); tables
+below use the plan-verbatim rounded constant EXPERT_BYTES = 15.2 MB (<1% low).
 """
 import argparse, csv, glob, os, re, statistics, sys
 
@@ -68,6 +68,7 @@ def leg_stats(rows):
 
 def predict(s):
     """§2.4 arithmetic against the real model: 12,096 expert units x ~15.34 MB = 172.8 GiB
+    (tables compute with the plan's rounded 15.2 MB constant, <1% low)
     total; 336 expert-layer loads/token. Pool R=GB/token resident, disk D=GB/token."""
     d = s["disk_share"]
     total = EXPERT_LAYER_LOADS * EXPERT_BYTES / 1e9  # GB/token demanded
@@ -79,7 +80,7 @@ def predict(s):
 
 
 def leg_gib_temp(name):
-    m = re.match(r"(asc|desc|smoke|probe-.*)-(\d+)-(cold|warm)$", name)
+    m = re.match(r"(asc|desc)-(\d+)-(cold|warm)$", name)   # smoke/probe legs excluded from pool means
     if not m:
         return None
     return int(m.group(2)), m.group(3), m.group(1)
@@ -153,7 +154,7 @@ def main():
 
     print("\n## §2.4 predicted vs measured\n")
     print("d = measured disk share; total expert bytes = 12,096 units x ~15.34 MB = 172.8 GiB; "
-          "GB/token = d x 336 x 15.34 MB; t_pred = max(R/27, D/4.73) + D/27 GB/s, x1000 ms.\n")
+          "GB/token = d x 336 x 15.2 MB (rounded constant); t_pred = max(R/27, D/4.73) + D/27 GB/s, x1000 ms.\n")
     print("| leg | disk share d | D GB/tok | R GB/tok | pred ms/tok | meas ms/tok | delta % | arithmetic |")
     print("|---|---|---|---|---|---|---|---|")
     for name, s in legs.items():
