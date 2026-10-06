@@ -157,9 +157,14 @@ impl StoreExpertSource {
 
         // tensor name → (shard, absolute base, row stride, n_experts).
         let mut tables: HashMap<String, (usize, u64, u64, u32)> = HashMap::new();
-        // tensor name → (tensor-table offset, ggml type, dims): the replica
-        // identity signature all replicas must match byte-for-byte (§5.3).
-        let mut sig: HashMap<String, (u64, u32, [u64; 3])> = HashMap::new();
+        // Per-shard expert-tensor signatures (tensor-table offset, ggml
+        // type, dims): the replica identity each shard's replicas must match
+        // byte-for-byte (§5.3). Only expert tensors participate — attention,
+        // norm, and embedding tensors may legitimately differ in count and
+        // are not routed through this source.
+        /// One shard's expert-tensor signature: name → (offset, ggml type, dims).
+        type ShardSig = HashMap<String, (u64, u32, [u64; 3])>;
+        let mut sig: Vec<ShardSig> = vec![HashMap::new(); split_count as usize];
         for shard in 0..split_count {
             let shard_ix = shard as usize;
             let sp = shard_path(&first, shard, split_count)?;
@@ -213,7 +218,7 @@ impl StoreExpertSource {
                         name: e.name.clone(),
                     })?;
                 tables.insert(e.name.clone(), (shard_ix, base, stride, n_experts));
-                sig.insert(e.name.clone(), (e.offset, e.ggml_type, e.dims));
+                sig[shard_ix].insert(e.name.clone(), (e.offset, e.ggml_type, e.dims));
             }
         }
         // Cross-check every remaining replica's tensor table against the
@@ -234,13 +239,16 @@ impl StoreExpertSource {
                 let mut f = File::open(&rp)?;
                 let mut seen = 0usize;
                 for e in tensor_entries(&mut f)? {
-                    match sig.get(&e.name) {
+                    if e.expert_kind().is_none() {
+                        continue; // non-expert tensors are not routed here
+                    }
+                    match sig[s].get(&e.name) {
                         Some(&(off, ty, dims))
                             if off == e.offset && ty == e.ggml_type && dims == e.dims => {}
                         _ => {
                             return Err(SourceError::Store(StoreError::Invalid {
                                 msg: format!(
-                                    "replica {} tensor `{}` differs from the first replica's tensor table (§5.3)",
+                                    "replica {} tensor `{}` differs from the first replica's shard-{s} tensor table (§5.3)",
                                     rp.display(),
                                     e.name
                                 ),
@@ -249,12 +257,12 @@ impl StoreExpertSource {
                     }
                     seen += 1;
                 }
-                if seen != sig.len() {
+                if seen != sig[s].len() {
                     return Err(SourceError::Store(StoreError::Invalid {
                         msg: format!(
-                            "replica {} has {seen} expert tensors, first replica has {} (§5.3)",
+                            "replica {} has {seen} expert tensors, first replica's shard {s} has {} (§5.3)",
                             rp.display(),
-                            sig.len()
+                            sig[s].len()
                         ),
                     }));
                 }
@@ -449,7 +457,10 @@ impl ExpertSource for StoreExpertSource {
         // Fast path: the plane buffer can host the aligned covering read
         // itself (aligned base + head scratch room) — bytes land in place,
         // no copy.
-        if head == logical_at && into.len() >= covering {
+        if head == logical_at
+            && into.len() >= covering
+            && into.as_ptr() as usize % DIRECT_ALIGN as usize == 0
+        {
             return self.drain(p.shard, offset, stride, expected, &mut into[..covering]);
         }
         SCRATCH.with(|s| -> io::Result<()> {
@@ -547,6 +558,49 @@ mod tests {
             .write_all(&vec![0u8; (FILE_BYTES - len) as usize])
             .unwrap();
         data_start
+    }
+
+    /// Like `write_shard`, but writes into a replica directory and may add
+    /// a non-expert tensor (`blk.1.attn_norm.weight`), which replica
+    /// cross-checks must ignore (§5.3).
+    fn write_replica_shard(
+        dir: &Path,
+        name: &str,
+        shard_no: u64,
+        kvs: &[xtask::gguf::GgufKv],
+        extra_non_expert: bool,
+    ) {
+        let kind = match shard_no {
+            0 => "ffn_gate_exps",
+            _ => "ffn_up_exps",
+        };
+        let mut payload = row_bytes(shard_no as usize, 0);
+        payload.extend(row_bytes(shard_no as usize, 1));
+        let expert = xtask::gguf::GgufTensorMeta {
+            name: format!("blk.1.{kind}.weight"),
+            dims: vec![4, 1, u64::from(N_EXPERTS)],
+            ggml_type: 0,
+        };
+        let mut tensors = vec![(expert, payload)];
+        if extra_non_expert {
+            tensors.push((
+                xtask::gguf::GgufTensorMeta {
+                    name: "blk.1.attn_norm.weight".into(),
+                    dims: vec![4, 1, 1],
+                    ggml_type: 0,
+                },
+                vec![7u8; 16],
+            ));
+        }
+        let f = std::fs::File::create(dir.join(name)).unwrap();
+        xtask::gguf::write_gguf(&mut &f, kvs, &tensors).unwrap();
+        let len = dir.join(name).metadata().unwrap().len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(name))
+            .unwrap()
+            .write_all(&vec![0u8; (FILE_BYTES - len) as usize])
+            .unwrap();
     }
 
     use std::io::Write as _;
@@ -689,15 +743,64 @@ mod tests {
                 let end = (off + stride).div_ceil(DIRECT_ALIGN) * DIRECT_ALIGN;
                 let covering = (end - start) as usize;
                 let head = (off % DIRECT_ALIGN) as usize;
-                // Aligned head + adequately sized dst → bytes land in place.
-                let mut buf = vec![0u8; covering];
-                src.read_expert(0, kind, expert, &mut buf, head).unwrap();
+                // Aligned, page-aligned head + adequately sized dst → bytes
+                // land in place. Over-allocate and slice at a page-aligned
+                // address so the fast path's dst-alignment guard holds.
+                let mut raw = vec![0u8; covering + DIRECT_ALIGN as usize];
+                let skip = DIRECT_ALIGN as usize - raw.as_ptr() as usize % DIRECT_ALIGN as usize;
+                let buf = &mut raw[skip..skip + covering];
+                src.read_expert(0, kind, expert, buf, head).unwrap();
                 assert_eq!(
                     &buf[head..head + stride as usize],
                     &row_bytes(shard, expert)[..]
                 );
             }
         }
+    }
+
+    #[test]
+    fn replica_with_extra_non_expert_tensor_opens() {
+        // Real GGUFs carry attention/norm/embedding tensors in every shard;
+        // a genuine second replica differs there and must still open.
+        let (mpath, _, _) = fixture("rep-nonexp", None);
+        let dir = mpath.parent().unwrap();
+        let rep2 = dir.join("replica2");
+        std::fs::create_dir_all(&rep2).unwrap();
+        let kvs0 = vec![xtask::gguf::GgufKv {
+            key: "split.count".into(),
+            value: xtask::gguf::GgufValue::U32(2),
+        }];
+        write_replica_shard(&rep2, SHARD0, 0, &kvs0, true);
+        write_replica_shard(&rep2, SHARD1, 1, &kvs0, true);
+        let json = std::fs::read_to_string(&mpath).unwrap().replace(
+            &format!(r#"replicas": ["{}"]"#, dir.display()),
+            &format!(r#"replicas": ["{}", "{}"]"#, dir.display(), rep2.display()),
+        );
+        std::fs::write(&mpath, json).unwrap();
+        StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+    }
+
+    #[test]
+    fn wrong_shard_tensor_in_replica_fails_open() {
+        // Shard 1's expert tensor must match shard 1's signature: a replica
+        // carrying the gate tensor (shard 0's) in shard 1 is rejected.
+        let (mpath, _, _) = fixture("rep-wrongshard", None);
+        let dir = mpath.parent().unwrap();
+        let rep2 = dir.join("replica2");
+        std::fs::create_dir_all(&rep2).unwrap();
+        let kvs0 = vec![xtask::gguf::GgufKv {
+            key: "split.count".into(),
+            value: xtask::gguf::GgufValue::U32(2),
+        }];
+        write_replica_shard(&rep2, SHARD0, 0, &kvs0, false);
+        write_replica_shard(&rep2, SHARD1, 0, &kvs0, false); // gate layout in shard 1 file
+        let json = std::fs::read_to_string(&mpath).unwrap().replace(
+            &format!(r#"replicas": ["{}"]"#, dir.display()),
+            &format!(r#"replicas": ["{}", "{}"]"#, dir.display(), rep2.display()),
+        );
+        std::fs::write(&mpath, json).unwrap();
+        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap_err();
+        assert!(err.to_string().contains("shard-1 tensor table"), "{err}");
     }
 
     #[test]
