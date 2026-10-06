@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use golem_gguf::{
     arch_kv_int, blk_of, data_section_offset, ggml_row_bytes, read_kvs, shard_path, tensor_entries,
@@ -58,8 +58,14 @@ pub struct StoreExpertSource {
     /// Whether §5.3 CRC verification is active (manifest carried `crc32c`).
     crc_enabled: bool,
     /// Last surfaced instance health (§5.2/§11, `InstanceHealth` ordinal):
-    /// read-failure paths recompute and `warn` only on transition.
+    /// every `wait` outcome (success or failure) recomputes and `warn`s only
+    /// on transition.
     last_health: AtomicU8,
+    /// §5.3 checksum degradation, sticky until the store is re-opened: set
+    /// on any CRC mismatch (even one a surviving replica later heals) and
+    /// passed into every `instance_health` recomputation, so a later failure
+    /// can never recompute a state below `DegradedChecksum`.
+    checksum_degraded: AtomicBool,
 }
 
 impl fmt::Debug for StoreExpertSource {
@@ -395,6 +401,7 @@ impl StoreExpertSource {
             planes,
             crc_enabled,
             last_health: AtomicU8::new(InstanceHealth::Healthy as u8),
+            checksum_degraded: AtomicBool::new(false),
         })
     }
 
@@ -602,6 +609,7 @@ impl ExpertSource for StoreExpertSource {
             }
 
             // Enqueue all planes first, drain once (§5.2).
+            let degraded_before = self.queue.degraded_reads();
             let mut rb = self.queue.batch();
             let mut windows = scratch_windows(&mut scratch, &scratch_covs);
             let mut wi = 0usize;
@@ -626,18 +634,17 @@ impl ExpertSource for StoreExpertSource {
                     wi += 1;
                 }
             }
-            rb.wait().map_err(|e| {
-                self.note_read_failure(matches!(e, StoreError::Crc { .. }));
-                match e {
-                    StoreError::Io { source, .. } => source,
-                    other @ StoreError::Unavailable { .. } => {
-                        io::Error::new(io::ErrorKind::NotFound, other.to_string())
-                    }
-                    other @ StoreError::Crc { .. } => {
-                        io::Error::new(io::ErrorKind::InvalidData, other.to_string())
-                    }
-                    other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
+            let result = rb.wait();
+            self.note_wait_outcome(degraded_before, &result);
+            result.map_err(|e| match e {
+                StoreError::Io { source, .. } => source,
+                other @ StoreError::Unavailable { .. } => {
+                    io::Error::new(io::ErrorKind::NotFound, other.to_string())
                 }
+                other @ StoreError::Crc { .. } => {
+                    io::Error::new(io::ErrorKind::InvalidData, other.to_string())
+                }
+                other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
             })?;
 
             // Scratch-served planes land in their window: copy the logical
@@ -666,33 +673,43 @@ impl ExpertSource for StoreExpertSource {
 }
 
 impl StoreExpertSource {
-    /// Recomputes instance health (§5.2/§11) after a read failure and warns
-    /// on transition. `checksum_degraded` is set iff the failure was a §5.3
-    /// CRC mismatch (the CRC degradation path already marked its serving
-    /// replicas; the flag records that checksums, not only media, are
-    /// suspect). Cheap: shard-wide atomic health reads, no I/O.
-    fn note_read_failure(&self, checksum_degraded: bool) {
-        let now = instance_health(&self.registry, checksum_degraded);
+    /// Recomputes instance health (§5.2/§11) and warns on transition. The
+    /// §5.3 flag is sticky (`checksum_degraded`), so once a CRC mismatch has
+    /// been recorded no later outcome can recompute a state below
+    /// `DegradedChecksum`. Cheap: shard-wide atomic health reads, no I/O.
+    fn note_health(&self) {
+        let now = instance_health(
+            &self.registry,
+            self.checksum_degraded.load(Ordering::Relaxed),
+        );
         let prev = self.last_health.swap(now as u8, Ordering::Relaxed);
+        // Relaxed is sufficient: health only moves toward worse states, so a
+        // lost race between concurrent waiters costs at most a duplicate
+        // transition warn — accepted noise, never a state regression.
         if prev != now as u8 {
             // Invariant: `prev` was only ever written from `now as u8`, so
-            // this match round-trips; the fallback keeps a library panic
+            // `from_u8` round-trips; the `unwrap_or` keeps a library panic
             // impossible if that invariant were ever broken.
-            let from = match prev {
-                0 => InstanceHealth::Healthy,
-                1 => InstanceHealth::DegradedReplica,
-                2 => InstanceHealth::DegradedChecksum,
-                3 => InstanceHealth::FatalIo,
-                _ => {
-                    tracing::warn!("store health ordinal {prev} unknown; treating as healthy");
-                    InstanceHealth::Healthy
-                }
-            };
+            let from = InstanceHealth::from_u8(prev).unwrap_or(InstanceHealth::Healthy);
             tracing::warn!(
                 from = ?from,
                 to = ?now,
-                "store instance health degraded (§5.2/§11)"
+                "store instance health transition (§5.2/§11)"
             );
+        }
+    }
+
+    /// Records one `wait` outcome (§5.2/§11). A CRC mismatch latches the
+    /// sticky §5.3 flag; health is recomputed on failure AND whenever the
+    /// queue reported replica degradation during the drain, so a
+    /// degraded-with-survivor failover that succeeds still surfaces its
+    /// `DegradedReplica`/`DegradedChecksum` transition.
+    fn note_wait_outcome(&self, degraded_before: u64, result: &Result<(), StoreError>) {
+        if matches!(result, Err(StoreError::Crc { .. })) {
+            self.checksum_degraded.store(true, Ordering::Relaxed);
+        }
+        if result.is_err() || self.queue.degraded_reads() != degraded_before {
+            self.note_health();
         }
     }
 
@@ -706,7 +723,9 @@ impl StoreExpertSource {
         expected: Option<u32>,
         dst: &mut [u8],
     ) -> io::Result<()> {
-        self.queue
+        let degraded_before = self.queue.degraded_reads();
+        let result = self
+            .queue
             .enqueue(ReadJob {
                 shard_index: shard,
                 offset,
@@ -717,20 +736,18 @@ impl StoreExpertSource {
                 sources: &self.registry,
                 dst,
             })
-            .wait()
-            .map_err(|e| {
-                self.note_read_failure(matches!(e, StoreError::Crc { .. }));
-                match e {
-                    StoreError::Io { source, .. } => source,
-                    other @ StoreError::Unavailable { .. } => {
-                        io::Error::new(io::ErrorKind::NotFound, other.to_string())
-                    }
-                    other @ StoreError::Crc { .. } => {
-                        io::Error::new(io::ErrorKind::InvalidData, other.to_string())
-                    }
-                    other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
-                }
-            })
+            .wait();
+        self.note_wait_outcome(degraded_before, &result);
+        result.map_err(|e| match e {
+            StoreError::Io { source, .. } => source,
+            other @ StoreError::Unavailable { .. } => {
+                io::Error::new(io::ErrorKind::NotFound, other.to_string())
+            }
+            other @ StoreError::Crc { .. } => {
+                io::Error::new(io::ErrorKind::InvalidData, other.to_string())
+            }
+            other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
+        })
     }
 }
 
@@ -831,6 +848,13 @@ mod tests {
     /// `Some(false)` — deliberately wrong digests (mismatch injection).
     /// Returns (manifest path, shard-0 data-section offset).
     fn fixture(tag: &str, crc: Option<bool>) -> (PathBuf, u64, u64) {
+        fixture_in(tag, [crc, crc], 1)
+    }
+
+    /// `crc` per expert_index entry (gate/shard0, up/shard1); `reps`:
+    /// replica dirs per shard (each written identically) so tests can
+    /// exercise failover-with-survivor.
+    fn fixture_in(tag: &str, crc: [Option<bool>; 2], reps: usize) -> (PathBuf, u64, u64) {
         let dir =
             std::env::temp_dir().join(format!("golem-store-src-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -854,9 +878,18 @@ mod tests {
         }];
         let d0 = write_shard(&dir, SHARD0, 0, &kvs0);
         let d1 = write_shard(&dir, SHARD1, 1, &kvs1);
+        // Additional replicas get identical copies in their own dirs.
+        let mut rep_dirs = vec![dir.clone()];
+        for r in 1..reps {
+            let rd = dir.join(format!("rep{r}"));
+            std::fs::create_dir_all(&rd).unwrap();
+            write_shard(&rd, SHARD0, 0, &kvs0);
+            write_shard(&rd, SHARD1, 1, &kvs1);
+            rep_dirs.push(rd);
+        }
 
         let crc_json = |shard: usize| -> String {
-            let Some(good) = crc else {
+            let Some(good) = crc[shard] else {
                 return String::new();
             };
             let mut c0 = crc32c::crc32c(&row_bytes(shard, 0));
@@ -868,13 +901,17 @@ mod tests {
             format!(r#", "crc32c": [{c0}, {c1}]"#)
         };
         let sha = "0".repeat(64);
-        let rep = dir.display();
+        let rep_list = rep_dirs
+            .iter()
+            .map(|d| format!("\"{}\"", d.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
         let json = format!(
             r#"{{
                 "name": "{tag}",
                 "shards": [
-                    {{"file": "{SHARD0}", "bytes": {FILE_BYTES}, "sha256": "{sha}", "replicas": ["{rep}"]}},
-                    {{"file": "{SHARD1}", "bytes": {FILE_BYTES}, "sha256": "{sha}", "replicas": ["{rep}"]}}
+                    {{"file": "{SHARD0}", "bytes": {FILE_BYTES}, "sha256": "{sha}", "replicas": [{rep_list}]}},
+                    {{"file": "{SHARD1}", "bytes": {FILE_BYTES}, "sha256": "{sha}", "replicas": [{rep_list}]}}
                 ],
                 "expert_index": [
                     {{"tensor": "blk.1.ffn_gate_exps.weight", "layer": 1, "experts": {N_EXPERTS},
@@ -1137,6 +1174,75 @@ mod tests {
             .read_expert(0, ExpertKind::Gate, 0, &mut buf, 0)
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        // §5.3/§5.2: the CRC mismatch latches the sticky flag and drives the
+        // aggregate state (single replica marked degraded → FatalIo wins
+        // precedence, §11).
+        assert!(src.checksum_degraded.load(Ordering::Relaxed));
+        assert_eq!(
+            src.last_health.load(Ordering::Relaxed),
+            InstanceHealth::FatalIo as u8
+        );
+    }
+
+    /// Truncates one replica's shard file below the covering region so its
+    /// chunk read fails at EOF while the surviving replica still serves.
+    fn truncate_replica(tag: &str, shard_file: &str) {
+        let dir =
+            std::env::temp_dir().join(format!("golem-store-src-{tag}-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(shard_file))
+            .unwrap();
+        f.set_len(1024).unwrap();
+    }
+
+    #[test]
+    fn degraded_with_survivor_success_drives_degraded_replica() {
+        // Failover success must still surface the health transition: the
+        // failed chunk marks its replica Degraded mid-drain (§5.2) even
+        // though the read completes via the survivor.
+        let tag = "failover";
+        let (mpath, _, _) = fixture_in(tag, [Some(true), Some(true)], 2);
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        truncate_replica(tag, SHARD0);
+        let mut buf = vec![0u8; STRIDE as usize];
+        src.read_expert(0, ExpertKind::Gate, 0, &mut buf, 0)
+            .unwrap();
+        assert!(!src.checksum_degraded.load(Ordering::Relaxed));
+        assert_eq!(
+            src.last_health.load(Ordering::Relaxed),
+            InstanceHealth::DegradedReplica as u8
+        );
+    }
+
+    #[test]
+    fn checksum_flag_is_sticky_across_later_non_crc_outcomes() {
+        // §5.3: degradation persists until re-open. After a CRC failure on
+        // shard 0, a later degraded-with-survivor success on shard 1 (CRC
+        // verified there and passing) must NOT recompute a state below
+        // DegradedChecksum — the sticky flag feeds every recomputation.
+        let tag = "sticky";
+        let (mpath, _, _) = fixture_in(tag, [Some(false), Some(true)], 2);
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let mut buf = vec![0u8; STRIDE as usize];
+        let err = src
+            .read_expert(0, ExpertKind::Gate, 0, &mut buf, 0)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(src.checksum_degraded.load(Ordering::Relaxed));
+        assert_eq!(
+            src.last_health.load(Ordering::Relaxed),
+            InstanceHealth::DegradedChecksum as u8
+        );
+        // Non-CRC failover on shard 1 (no digest → no verification):
+        // succeeds, marks one replica Degraded, state stays DegradedChecksum.
+        truncate_replica(tag, SHARD1);
+        src.read_expert(0, ExpertKind::Up, 0, &mut buf, 0).unwrap();
+        assert!(src.checksum_degraded.load(Ordering::Relaxed));
+        assert_eq!(
+            src.last_health.load(Ordering::Relaxed),
+            InstanceHealth::DegradedChecksum as u8
+        );
     }
 
     #[test]
@@ -1153,5 +1259,10 @@ mod tests {
             .read_expert(0, ExpertKind::Gate, 0, &mut buf, 0)
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        // Fully-dead shard → FatalIo surfaced on the failure path (§5.2).
+        assert_eq!(
+            src.last_health.load(Ordering::Relaxed),
+            InstanceHealth::FatalIo as u8
+        );
     }
 }

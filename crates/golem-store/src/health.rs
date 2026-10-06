@@ -26,6 +26,21 @@ pub enum InstanceHealth {
     FatalIo = 3,
 }
 
+impl InstanceHealth {
+    /// Total inverse of the explicit ordinals. `None` only for values that
+    /// no `self as u8` produces; lock-free trackers round-trip through this
+    /// so the ordinal mapping exists in exactly one place.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Healthy),
+            1 => Some(Self::DegradedReplica),
+            2 => Some(Self::DegradedChecksum),
+            3 => Some(Self::FatalIo),
+            _ => None,
+        }
+    }
+}
+
 /// Classifies the instance from the registry's per-replica health and the
 /// checksum-degradation flag (§5.2, §11). Pure: reads atomic health words,
 /// performs no I/O, never panics.
@@ -128,5 +143,13 @@ mod tests {
     fn all_healthy_is_healthy() {
         let reg = registry("healthy", &[&["a", "b"]]);
         assert_eq!(instance_health(&reg, false), InstanceHealth::Healthy);
+    }
+
+    #[test]
+    fn from_u8_round_trips_every_ordinal() {
+        for v in 0..=3u8 {
+            assert_eq!(InstanceHealth::from_u8(v).map(|h| h as u8), Some(v));
+        }
+        assert_eq!(InstanceHealth::from_u8(4), None);
     }
 }

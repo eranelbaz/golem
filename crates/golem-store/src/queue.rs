@@ -121,6 +121,12 @@ pub struct ChunkQueue {
     /// timing consumer takes (swap-to-zero) snapshots per decode step.
     disk_ns: AtomicU64,
     disk_bytes: AtomicU64,
+    /// Count of in-drain replica degradation events (chunk read failure or
+    /// §5.3 CRC mismatch), §5.2. Monotonic: callers diff this across a
+    /// `wait()` to notice that a drain degraded a replica even when the
+    /// read itself succeeded (failover-with-survivor), so health transitions
+    /// surface on success paths, not only on read errors.
+    degraded_reads: AtomicU64,
 }
 
 impl ChunkQueue {
@@ -132,7 +138,14 @@ impl ChunkQueue {
             io_threads,
             disk_ns: AtomicU64::new(0),
             disk_bytes: AtomicU64::new(0),
+            degraded_reads: AtomicU64::new(0),
         }
+    }
+
+    /// Cumulative in-drain replica degradation events (§5.2): snapshot
+    /// before/after a `wait()` to detect failover on success paths.
+    pub fn degraded_reads(&self) -> u64 {
+        self.degraded_reads.load(Ordering::Relaxed)
     }
 
     /// Drains the accumulated disk time (ns) and byte counters, resetting
@@ -388,7 +401,7 @@ impl ReadHandle<'_> {
 
         // Collect: first terminal error wins; else verify the §5.3 plane CRC
         // over the logical window once every chunk has landed.
-        finish_read(&read, dst, sources, shard)
+        finish_read(&queue, &read, dst, sources, shard)
     }
 }
 
@@ -396,6 +409,7 @@ impl ReadHandle<'_> {
 /// §5.3 CRC over the logical window; a mismatch degrades every replica that
 /// served a chunk (a plane-granular CRC cannot attribute one replica, §5.3).
 fn finish_read(
+    queue: &ChunkQueue,
     read: &ReadState,
     dst: &[u8],
     sources: &dyn ShardSources,
@@ -417,6 +431,7 @@ fn finish_read(
                 sources.slot(shard, r).mark_degraded();
             }
         }
+        queue.degraded_reads.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             shard = %read.shard_name,
             expected = read.expected_crc,
@@ -549,7 +564,7 @@ impl<'a> ReadBatch<'a> {
         // replicas un-degraded.)
         let mut first_err: Option<StoreError> = None;
         for (read, dst, sources) in &reads {
-            if let Err(e) = finish_read(read, dst, *sources, read.shard_index) {
+            if let Err(e) = finish_read(&self.queue, read, dst, *sources, read.shard_index) {
                 first_err.get_or_insert(e);
             }
         }
@@ -779,6 +794,7 @@ fn run_chunk<'a>(
             }
             Err(e) => {
                 sources.slot(shard, replica).mark_degraded();
+                queue.degraded_reads.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     shard = %read.shard_name,
                     replica,
