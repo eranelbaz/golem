@@ -111,6 +111,9 @@ pub struct ReplicaSlot {
     /// burn-down decisions upstream (health itself is `health()`, never this
     /// counter).
     errors: AtomicU64,
+    /// Chunks served successfully from this replica since open (diagnostics:
+    /// measured share vs. the uniform striping expectation).
+    served_chunks: AtomicU64,
 }
 
 impl ReplicaSlot {
@@ -133,6 +136,11 @@ impl ReplicaSlot {
     /// Degradations since open.
     pub fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Successful chunk reads served since open.
+    pub fn served_chunks(&self) -> u64 {
+        self.served_chunks.load(Ordering::Relaxed)
     }
 
     /// Whether direct (`O_DIRECT`) reads are still attempted for this slot.
@@ -165,11 +173,13 @@ impl ReplicaSlot {
                         );
                     }
                 } else {
+                    self.served_chunks.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
             }
         }
         self.buffered.read_full(offset, buf)?;
+        self.served_chunks.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self.buffered.drop_cache(offset, buf.len()) {
             if self.warned_dontneed.swap(false, Ordering::Relaxed) {
                 tracing::warn!(
@@ -252,6 +262,7 @@ impl ReplicaRegistry {
                     warned_dontneed: AtomicBool::new(true),
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
                     errors: AtomicU64::new(0),
+                    served_chunks: AtomicU64::new(0),
                 }));
             }
             shards.push(ShardReplicas {
@@ -489,6 +500,7 @@ mod tests {
             warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
+            served_chunks: AtomicU64::new(0),
         };
         let (mut v, skip) = aligned_storage(4096);
         let buf = &mut v[skip..skip + 4096];
@@ -514,6 +526,7 @@ mod tests {
             warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
+            served_chunks: AtomicU64::new(0),
         };
         let (buffered, calls) = FakeReads::buffered();
         let mut slot = slot;

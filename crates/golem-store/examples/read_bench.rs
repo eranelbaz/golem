@@ -99,6 +99,7 @@ fn run() -> Result<(), golem_store::StoreError> {
     // the loop works on any shard size.
     let mut total_logical = 0u64;
     let mut total_chunks = 0usize;
+    let mut shard0_chunks = 0usize;
     let shard_count = manifest.shards.len();
     let t0 = Instant::now();
     for i in 0..args.n {
@@ -123,6 +124,9 @@ fn run() -> Result<(), golem_store::StoreError> {
         let _ = rest;
         total_logical += args.plane_bytes as u64;
         total_chunks += plan.len();
+        if s == 0 {
+            shard0_chunks += plan.len();
+        }
     }
     let wall = t0.elapsed();
 
@@ -136,18 +140,18 @@ fn run() -> Result<(), golem_store::StoreError> {
     let replica_count = registry.shards()[0].replicas.len();
     eprintln!("shard 0: {replica_count} replica(s), healthy: {healthy:?}");
 
-    // §5.2 striping homes chunks round-robin across healthy replicas, so the
-    // expected share is uniform; skew shows up in the A/B timings, not here.
-    if !healthy.is_empty() {
-        let per = total_chunks as f64 / healthy.len() as f64;
-        for &r in &healthy {
-            eprintln!(
-                "replica {r}: ~{}/{} chunks ({:.1}%)",
-                per,
-                total_chunks,
-                100.0 * per / total_chunks as f64
-            );
-        }
+    // Measured share: chunks each replica actually served (§5.2 striping
+    // homes chunks round-robin across healthy replicas; skew shows up here).
+    for (r, slot) in registry.shards()[0].replicas.iter().enumerate() {
+        let served = slot.served_chunks();
+        eprintln!(
+            "replica {r}: {served}/{shard0_chunks} chunks ({:.1}%)",
+            if shard0_chunks > 0 {
+                100.0 * served as f64 / shard0_chunks as f64
+            } else {
+                0.0
+            }
+        );
     }
 
     let (disk_ns, disk_bytes) = queue.take_disk_stats();
