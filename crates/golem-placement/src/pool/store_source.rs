@@ -1028,6 +1028,33 @@ mod tests {
         }
         assert_eq!(g, row_bytes(shard_of(ExpertKind::Gate), 1));
         assert_eq!(u, row_bytes(shard_of(ExpertKind::Up), 0));
+
+        // Mixed batch: plane 0 in place, plane 1 through scratch — the
+        // scratch windows must skip the in-place plane in both passes.
+        let (mut raw, skip, cov, head) = aligned_target(&src, ExpertKind::Gate, 1);
+        let mut u = vec![0u8; STRIDE as usize];
+        {
+            let mut targets = [(&mut raw[skip..skip + cov], head), (&mut u[..], 0usize)];
+            src.read_expert_batched(0, &batch, &mut targets).unwrap();
+        }
+        assert_eq!(
+            &raw[skip + head..skip + head + STRIDE as usize],
+            &row_bytes(shard_of(ExpertKind::Gate), 1)[..]
+        );
+        assert_eq!(u, row_bytes(shard_of(ExpertKind::Up), 0));
+
+        // Reversed order: scratch first, in place second.
+        let (mut raw, skip, cov, head) = aligned_target(&src, ExpertKind::Up, 0);
+        let mut g = vec![0u8; STRIDE as usize];
+        {
+            let mut targets = [(&mut g[..], 0usize), (&mut raw[skip..skip + cov], head)];
+            src.read_expert_batched(0, &batch, &mut targets).unwrap();
+        }
+        assert_eq!(g, row_bytes(shard_of(ExpertKind::Gate), 1));
+        assert_eq!(
+            &raw[skip + head..skip + head + STRIDE as usize],
+            &row_bytes(shard_of(ExpertKind::Up), 0)[..]
+        );
     }
 
     /// Cross-shard batch where one shard's replicas are all dead: the whole
