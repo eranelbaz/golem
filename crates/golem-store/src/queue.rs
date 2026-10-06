@@ -821,6 +821,36 @@ mod tests {
             .collect()
     }
 
+    /// Fixture files over `replica_counts.len()` shards, shard `s` with
+    /// `replica_counts[s]` replica dirs; returns (paths, registry).
+    fn fixture_shards(replica_counts: &[usize], tag: &str) -> (Vec<PathBuf>, ReplicaRegistry) {
+        let root = std::env::temp_dir().join(format!("golem-store-queue-{tag}"));
+        let mut shards = Vec::new();
+        let mut paths = Vec::new();
+        for (s, &n) in replica_counts.iter().enumerate() {
+            let mut replicas = Vec::with_capacity(n);
+            for r in 0..n {
+                let dir = root.join(format!("s{s}-r{r}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(format!("s{s}.gguf")), pattern(0, SHARD_BYTES)).unwrap();
+                replicas.push(dir.clone());
+            }
+            paths.extend(replicas.iter().cloned());
+            shards.push(crate::manifest::ShardEntry {
+                file: format!("s{s}.gguf"),
+                bytes: SHARD_BYTES as u64,
+                sha256: "0".repeat(64),
+                replicas,
+            });
+        }
+        let manifest = crate::manifest::ModelManifest {
+            name: tag.to_owned(),
+            shards,
+            ..Default::default()
+        };
+        (paths, ReplicaRegistry::open(&manifest).unwrap())
+    }
+
     /// Fixture files over `n` replica dirs; returns (paths, registry).
     fn fixture(n: usize, tag: &str) -> (Vec<PathBuf>, ReplicaRegistry) {
         let root = std::env::temp_dir().join(format!("golem-store-queue-{tag}"));
@@ -921,7 +951,9 @@ mod tests {
     /// testable on one filesystem.
     struct TestSources {
         reg: ReplicaRegistry,
-        fail: Vec<(usize, usize)>,
+        /// Per-(shard, replica) failure budget; entry (s, r, n) fails the
+        /// first n chunk reads of replica r of shard s (usize::MAX = always).
+        fail: Vec<(usize, usize, usize)>,
         log: Arc<std::sync::Mutex<Vec<(usize, u64)>>>,
         drives: Vec<String>,
         /// Per-read throttle (0 = none); widens the pop window so multi-worker
@@ -941,13 +973,14 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(replica, slot)| {
-                    // Every replica is logged; `fail` sets the per-replica
-                    // failure budget (default: effectively never fails).
+                    // Every replica is logged; `fail` sets the per-(shard,
+                    // replica) failure budget (default: effectively never
+                    // fails).
                     let nth = self
                         .fail
                         .iter()
-                        .find(|(r, _)| *r == replica)
-                        .map(|(_, n)| *n)
+                        .find(|(s, r, _)| *s == shard_index && *r == replica)
+                        .map(|(_, _, n)| *n)
                         .unwrap_or(1_000_000);
                     Arc::new(FailingSource {
                         inner: Arc::clone(slot),
@@ -1083,34 +1116,33 @@ mod tests {
         assert_eq!(good, pattern(0, 4096));
     }
 
-    /// Mixed batch failure: one read is Unavailable (all replicas degraded
-    /// up front), another lands and fails CRC. finish_read still runs for
-    /// EVERY read — the CRC read's serving replicas are marked Degraded even
-    /// though the first read already failed — and the first read's error is
-    /// returned.
+    /// Mixed batch failure: the first read's chunks fail at runtime (EIO
+    /// from the source on every replica, then requeue-until-exhausted), the
+    /// second read lands and fails CRC. finish_read still runs for EVERY
+    /// read — the CRC read's serving replica is marked Degraded even though
+    /// the first read already failed, and its untouched replica stays
+    /// Healthy — and the FIRST read's error is returned.
     #[test]
     fn batch_settles_every_read_on_mixed_failure() {
-        let (_paths, reg) = fixture(2, "batch-mixed");
+        // Two shards: shard 0 for the runtime-failing read, shard 1 for the
+        // CRC-failing read, so the failure injection can't shadow the CRC
+        // read's replica choices.
+        let (_paths, reg) = fixture_shards(&[2, 2], "batch-mixed");
         let sources = TestSources {
             reg,
-            fail: vec![],
+            fail: vec![(0, 0, usize::MAX), (0, 1, usize::MAX)],
             log: Arc::new(std::sync::Mutex::new(Vec::new())),
             drives: Vec::new(),
             delay_ms: 0,
             conc: None,
             wait_for_pair: None,
         };
-        let replica_count = sources.slots(0).len();
-        assert!(replica_count > 0);
-        // Kill every replica of the first read up front: Unavailable with no
-        // bytes moved for that read.
-        for r in 0..replica_count {
-            sources.slot(0, r).mark_degraded();
-        }
         let queue = Arc::new(ChunkQueue::new(0));
         let mut dead = vec![0u8; 4096];
         let mut bad = vec![0u8; 4096];
         let mut batch = queue.batch();
+        // Every chunk attempt of this read fails EIO at runtime; the chunk
+        // requeues until every replica is excluded → Unavailable.
         batch.push(ReadJob {
             shard_index: 0,
             offset: 0,
@@ -1123,7 +1155,7 @@ mod tests {
         });
         // Wrong digest on the second read: lands, then fails CRC.
         batch.push(ReadJob {
-            shard_index: 0,
+            shard_index: 1,
             offset: 512,
             len: 512,
             expected_crc: 0xdead_beef,
@@ -1134,15 +1166,24 @@ mod tests {
         });
         // First read's error wins, but only after BOTH reads settled.
         assert!(matches!(batch.wait(), Err(StoreError::Unavailable { .. })));
-        // Both degradations recorded: the pre-killed replicas AND the CRC
-        // read's serving replicas.
-        for r in 0..replica_count {
+        // Runtime failures degraded both shard-0 replicas; exactly one
+        // shard-1 replica served the CRC read (one chunk) and is Degraded,
+        // the other served nothing and is still Healthy.
+        for r in 0..2 {
             assert_eq!(
                 sources.slot(0, r).health(),
                 crate::replica::ReplicaHealth::Degraded,
-                "replica {r} must be Degraded"
+                "shard-0 replica {r} must be Degraded after runtime EIO"
             );
         }
+        let degraded = (0..2)
+            .filter(|&r| sources.slot(1, r).health() == crate::replica::ReplicaHealth::Degraded)
+            .count();
+        let healthy = (0..2)
+            .filter(|&r| sources.slot(1, r).health() == crate::replica::ReplicaHealth::Healthy)
+            .count();
+        assert_eq!(degraded, 1, "exactly the CRC read's serving replica");
+        assert_eq!(healthy, 1, "untouched shard-1 replica stays Healthy");
     }
 
     #[test]
@@ -1154,7 +1195,7 @@ mod tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sources = TestSources {
             reg,
-            fail: vec![(0, 0)],
+            fail: vec![(0, 0, 0)],
             log,
             drives: Vec::new(),
             delay_ms: 0,
@@ -1194,7 +1235,7 @@ mod tests {
         let sources = TestSources {
             // Logging wrapper with an effectively inexhaustible budget.
             reg,
-            fail: vec![(0, 1_000_000)],
+            fail: vec![(0, 0, 1_000_000)],
             log,
             drives: Vec::new(),
             delay_ms: 0,
@@ -1535,7 +1576,7 @@ mod tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sources = TestSources {
             reg,
-            fail: vec![(0, usize::MAX)],
+            fail: vec![(0, 0, usize::MAX)],
             log,
             drives: Vec::new(),
             delay_ms: 0,
@@ -1562,7 +1603,7 @@ mod tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sources = TestSources {
             reg,
-            fail: vec![(0, 0), (1, 0), (2, 0)],
+            fail: vec![(0, 0, 0), (0, 1, 0), (0, 2, 0)],
             log,
             drives: Vec::new(),
             delay_ms: 0,
