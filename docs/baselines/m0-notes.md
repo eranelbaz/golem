@@ -90,3 +90,17 @@ Verbatim PARITY lines:
   PARITY: a=hip b=cpu-t4 match=2/8 prefixes=[49,25,33,31,34,27,None,None]
   PARITY-LEG: name=smoke-cpu ok=1/1 / cpu-t16 ok=8/8 / cpu-t4 ok=8/8 / hip ok=8/8
 Floor 100% (CPU-only pair) ⇒ threshold 100 ⇒ parity 25% < 100 → RE-SCOPE (method-level; token-ID T2 brought forward to M1.4). See m0-exit-review.md.
+
+## Lazy-regime recipe for the warm/cold re-baseline
+
+The 2026-09-21 kernel update (linux-omarchy 7.2.5-4) livelocks llama.cpp's `MAP_POPULATE` expert pre-fault, so `baseline-001.json`'s warm/cold tok/s pair is deferred. Re-run cold and warm under this exact regime, then gate:
+
+- Flags: `-ngl 99 -ncmoe 45 -fa on -t 16 -c 4096 --seed 42 --lazy-mode on --ctx-checkpoints 0 --no-op-offload`.
+  - `--lazy-mode on` switches CPU-resident experts to per-row `read()`, bypassing the broken `MAP_POPULATE` fault path.
+  - `--ctx-checkpoints 0` avoids an embedded-server task-queue deadlock.
+  - `-st` deadlocks the server flow, so it is not used.
+  - Use `-p` (not `-f`) and pipe `/exit` to stdin for a clean rc=0.
+- An `LD_PRELOAD` shim (machine-local, `.m0-work/m04/mmapshim4.c`) strips `MAP_POPULATE` from `.gguf` mappings and sets `MADV_NOHUGEPAGE`. It affects the load path only, not generation math.
+- 5-leg protocol, warm-up leg discarded; tok/s = `gen_ts` from the GLM-RUN summary.
+- Cold legs need page-cache eviction first (`scripts/evict-model-cache.py`; no root on the rig).
+- Model: unsloth/GLM-5.3-Flash-GGUF@621d456 UD-Q4_K_XL.

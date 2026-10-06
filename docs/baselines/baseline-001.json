@@ -34,7 +34,7 @@
   ],
   "warm_gen_tok_s": {
    "status": "deferred",
-   "reason": "2026-09-21 kernel update (linux-omarchy 7.2.5-4) livelocks pinned llama.cpp MAP_POPULATE expert pre-fault; warm/cold tok/s pair requires a comparable regime; measurement recipe (lazy-regime flags + shim + 5-leg protocol) in docs/worklog.md"
+   "reason": "2026-09-21 kernel update (linux-omarchy 7.2.5-4) livelocks pinned llama.cpp MAP_POPULATE expert pre-fault; warm/cold tok/s pair requires a comparable regime; measurement recipe (lazy-regime flags + shim + 5-leg protocol) in docs/baselines/m0-notes.md"
   },
   "cold_expert_penalty": {
    "status": "deferred",

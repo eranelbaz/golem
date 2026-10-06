@@ -1,1 +1,0 @@
-/home/eranelbaz/Projects/golem/docs/worklog.md
