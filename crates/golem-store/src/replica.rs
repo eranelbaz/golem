@@ -18,8 +18,8 @@ pub trait FileRead: Send + Sync {
     /// Read exactly `buf.len()` bytes at `off`, retrying short reads.
     fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()>;
     /// Best-effort page-cache eviction of `[off, off + len)`; advisory, so a
-    /// failure is logged and swallowed — never a read error.
-    fn drop_cache(&self, off: u64, len: usize);
+    /// failure is reported and swallowed by the caller — never a read error.
+    fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()>;
 }
 
 impl FileRead for std::fs::File {
@@ -44,13 +44,11 @@ impl FileRead for std::fs::File {
         Ok(())
     }
 
-    fn drop_cache(&self, off: u64, len: usize) {
-        if !sys::drop_page_cache(self, off, len) {
-            tracing::warn!(
-                off,
-                len,
-                "POSIX_FADV_DONTNEED failed; page-cache pressure only"
-            );
+    fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()> {
+        if sys::drop_page_cache(self, off, len) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("posix_fadvise failed"))
         }
     }
 }
@@ -59,7 +57,7 @@ impl FileRead for Box<dyn FileRead> {
     fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
         (**self).read_full(off, buf)
     }
-    fn drop_cache(&self, off: u64, len: usize) {
+    fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()> {
         (**self).drop_cache(off, len)
     }
 }
@@ -100,6 +98,9 @@ pub struct ReplicaSlot {
     /// Cleared on the first direct-read failure (H-9 runtime fallback, not a
     /// degrade); the slot then stays buffered + `DONTNEED`.
     direct_ok: AtomicBool,
+    /// Cleared after the first `DONTNEED` failure so the warn fires once per
+    /// slot, not once per read (a per-read warn floods the log).
+    warned_dontneed: AtomicBool,
     /// Cached physical device identity (§5.1): sysfs block name or numeric
     /// `st_dev` fallback, resolved once at open — never re-stat'ed on the
     /// read path (§5.2 hot loop is allocation- and syscall-light).
@@ -169,7 +170,15 @@ impl ReplicaSlot {
             }
         }
         self.buffered.read_full(offset, buf)?;
-        self.buffered.drop_cache(offset, buf.len());
+        if let Err(e) = self.buffered.drop_cache(offset, buf.len()) {
+            if self.warned_dontneed.swap(false, Ordering::Relaxed) {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "POSIX_FADV_DONTNEED failed; page-cache pressure only"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -205,14 +214,12 @@ impl ReplicaRegistry {
                 let direct: Option<Box<dyn FileRead>> = match sys::open_direct(&path) {
                     Ok(f) if shard.bytes >= DIRECT_ALIGN => {
                         let f = Box::new(f);
-                        // Page-aligned scratch for the probe read.
+                        // Page-aligned scratch for the probe read: allocate
+                        // one extra block, then slice at the first aligned
+                        // offset (allocation addresses are never aligned
+                        // themselves).
                         let mut scratch = vec![0u8; DIRECT_ALIGN as usize * 2];
                         let skip = scratch.as_ptr() as usize % DIRECT_ALIGN as usize;
-                        let skip = if skip == 0 {
-                            0
-                        } else {
-                            DIRECT_ALIGN as usize - skip
-                        };
                         let probe = &mut scratch[skip..skip + DIRECT_ALIGN as usize];
                         match f.read_full(0, probe) {
                             Ok(()) => Some(f),
@@ -242,6 +249,7 @@ impl ReplicaRegistry {
                     direct,
                     buffered: Box::new(file),
                     direct_ok: AtomicBool::new(true),
+                    warned_dontneed: AtomicBool::new(true),
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
                     errors: AtomicU64::new(0),
                 }));
@@ -461,8 +469,9 @@ mod tests {
             }
             Ok(())
         }
-        fn drop_cache(&self, off: u64, len: usize) {
-            self.drop_calls.lock().unwrap().push((off, len));
+        fn drop_cache(&self, _off: u64, _len: usize) -> std::io::Result<()> {
+            self.drop_calls.lock().unwrap().push((_off, _len));
+            Ok(())
         }
     }
 
@@ -477,6 +486,7 @@ mod tests {
             })),
             buffered: FakeReads::buffered().0,
             direct_ok: AtomicBool::new(true),
+            warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
         };
@@ -501,6 +511,7 @@ mod tests {
             direct: None,
             buffered: FakeReads::buffered().0,
             direct_ok: AtomicBool::new(false),
+            warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
         };

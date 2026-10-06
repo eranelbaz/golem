@@ -54,29 +54,6 @@ pub fn open_direct(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Full `O_DIRECT` read of exactly `buf.len()` bytes at `offset`. The caller
-/// guarantees the §5.4 alignment invariant (offset, length, buffer address
-/// all multiples of [`DIRECT_ALIGN`]); the kernel enforces it with `EINVAL`
-/// otherwise. Retries short reads; errors on premature EOF.
-pub fn read_direct(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    let mut filled = 0;
-    while filled < buf.len() {
-        match file.read_at(&mut buf[filled..], offset + filled as u64) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "short O_DIRECT read at end of file",
-                ));
-            }
-            Ok(n) => filled += n,
-        }
-    }
-    Ok(())
-}
-
 /// Free bytes available to this user on the filesystem holding `path`.
 pub fn available_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;

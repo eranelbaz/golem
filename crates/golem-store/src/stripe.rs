@@ -3,11 +3,10 @@
 //! satisfies the O_DIRECT offset+length alignment rule and no forced tiny head
 //! chunk exists.
 
+use crate::sys::DIRECT_ALIGN;
+
 /// Chunk size cap (§5.4): plans never exceed 2 MiB per chunk.
 pub const CHUNK: usize = 2 * 1024 * 1024;
-
-/// Direct-I/O alignment: offsets and lengths are multiples of this.
-const DIRECT_ALIGN: u64 = 4096;
 
 /// Plans the aligned covering range `[align_down(base, 4096),
 /// align_up(base+len, 4096))` cut at 2 MiB boundaries counted from
