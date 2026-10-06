@@ -18,7 +18,7 @@ use crate::StoreError;
 use crate::engine::{ChunkSource, ShardSources};
 use crate::replica::ReplicaHealth;
 use crate::stripe::plan_aligned;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
@@ -136,6 +136,35 @@ impl ChunkQueue {
     /// jobs from the global queue; a read that is `wait`ed after queue shutdown
     /// fails instead of draining. There is no queue-side reaper.
     pub fn enqueue<'a>(self: &Arc<Self>, job: ReadJob<'a>) -> ReadHandle<'a> {
+        let (read, dst, sources) = self.submit(job);
+        ReadHandle {
+            inner: Some(HandleInner {
+                // Cloned Arc: the handle keeps the queue alive past engine drop.
+                queue: Arc::clone(self),
+                read,
+                dst,
+                sources,
+            }),
+        }
+    }
+
+    /// Starts an empty batch (§5.2): push several logical reads — typically
+    /// one expert unit's planes — then drain them all in a single
+    /// [`ReadBatch::wait`] instead of one blocking drain per read.
+    pub fn batch(self: &Arc<Self>) -> ReadBatch<'_> {
+        ReadBatch {
+            queue: Arc::clone(self),
+            reads: Vec::new(),
+        }
+    }
+
+    /// Shared enqueue path: builds the read state and queues its chunks.
+    /// Returns the parts the caller's handle keeps (the destination slices
+    /// never enter the global queue).
+    fn submit<'a>(
+        self: &Arc<Self>,
+        job: ReadJob<'a>,
+    ) -> (Arc<ReadState>, &'a mut [u8], &'a dyn ShardSources) {
         let chunks = plan_aligned(job.offset, job.len);
         let state = Arc::new(ReadState {
             shard_index: job.shard_index,
@@ -168,15 +197,7 @@ impl ChunkQueue {
                 });
             }
         }
-        ReadHandle {
-            inner: Some(HandleInner {
-                // Cloned Arc: the handle keeps the queue alive past engine drop.
-                queue: Arc::clone(self),
-                read: state,
-                dst: job.dst,
-                sources: job.sources,
-            }),
-        }
+        (state, job.dst, job.sources)
     }
 
     /// Fails every queued-but-undrained read at its next `wait()`; already
@@ -338,38 +359,166 @@ impl ReadHandle<'_> {
             });
         }
 
+        let mut ctxs = HashMap::new();
+        ctxs.insert(shard, ShardCtx::new(sources, shard));
         if read.lock_progress().error.is_none() {
-            drain(&queue, &read, sources, dst, work);
+            // Reborrow: the drain only needs the destination for its own
+            // duration; CRC verification reads it again below.
+            let mut reads = [(Arc::clone(&read), &mut *dst)];
+            drain_reads(&queue, &ctxs, &mut reads, work);
         }
 
         // Collect: first terminal error wins; else verify the §5.3 plane CRC
         // over the logical window once every chunk has landed.
-        if let Some(e) = read.take_error() {
-            return Err(e);
+        finish_read(&read, dst, sources, shard)
+    }
+}
+
+/// Post-drain collection for one read: first terminal error wins, else the
+/// §5.3 CRC over the logical window; a mismatch degrades every replica that
+/// served a chunk (a plane-granular CRC cannot attribute one replica, §5.3).
+fn finish_read(
+    read: &ReadState,
+    dst: &[u8],
+    sources: &dyn ShardSources,
+    shard: usize,
+) -> Result<(), StoreError> {
+    if let Some(e) = read.take_error() {
+        return Err(e);
+    }
+    if !read.verify_crc {
+        return Ok(());
+    }
+    let replica_count = sources.slots(shard).len();
+    let crc = crc32c::crc32c(&dst[read.crc_at..read.crc_at + read.crc_len]);
+    if crc != read.expected_crc {
+        // §5.3: treat as a corrupted replica, same path as EIO.
+        let served = read.served.load(Ordering::Relaxed);
+        for r in 0..replica_count {
+            if served & (1 << r) != 0 {
+                sources.slot(shard, r).mark_degraded();
+            }
         }
-        if !read.verify_crc {
+        tracing::warn!(
+            shard = %read.shard_name,
+            expected = read.expected_crc,
+            got = crc,
+            "plane crc mismatch; serving replicas marked Degraded"
+        );
+        return Err(StoreError::Crc {
+            shard: read.shard_name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// One logical read of a batch: its state plus the handle-owned parts the
+/// global queue never sees.
+struct BatchEntry<'a> {
+    read: Arc<ReadState>,
+    dst: &'a mut [u8],
+    sources: &'a dyn ShardSources,
+}
+
+/// A batch of queued reads drained together (§5.2): typically one expert
+/// unit's planes, enqueued first and drained once. Reads may span shards;
+/// each read keeps its own [`ReadState`] (chunk plan, CRC window, progress).
+/// Dropping the batch without `wait`ing purges every read's queued chunks.
+pub struct ReadBatch<'a> {
+    queue: Arc<ChunkQueue>,
+    reads: Vec<BatchEntry<'a>>,
+}
+
+impl Drop for ReadBatch<'_> {
+    fn drop(&mut self) {
+        for e in &mut self.reads {
+            purge(&self.queue, &e.read);
+        }
+    }
+}
+
+impl<'a> ReadBatch<'a> {
+    /// Queues one more logical read into the batch (chunks enter the global
+    /// queue immediately; the drain happens at [`ReadBatch::wait`]).
+    pub fn push(&mut self, job: ReadJob<'a>) {
+        let (read, dst, sources) = self.queue.submit(job);
+        self.reads.push(BatchEntry { read, dst, sources });
+    }
+
+    /// Drains every read in the batch in one pass: one drain-local work list
+    /// over all reads' chunks, one set of per-drive reader threads. Each
+    /// read's CRC is verified on landing; the first failing read fails the
+    /// whole batch (the caller discards the unit and requeues).
+    ///
+    /// # Errors
+    /// [`StoreError::Unavailable`] when a read's replicas are exhausted (or
+    /// the queue was shut down), [`StoreError::Crc`] on a checksum mismatch.
+    pub fn wait(mut self) -> Result<(), StoreError> {
+        let entries = std::mem::take(&mut self.reads);
+        if entries.is_empty() {
             return Ok(());
         }
-        let crc = crc32c::crc32c(&dst[read.crc_at..read.crc_at + read.crc_len]);
-        if crc != read.expected_crc {
-            // §5.3: treat as a corrupted replica, same path as EIO. A
-            // plane-granular CRC cannot attribute one replica, so every
-            // replica that served a chunk of this read is degraded.
-            let served = read.served.load(Ordering::Relaxed);
-            for r in 0..replica_count {
-                if served & (1 << r) != 0 {
-                    sources.slot(shard, r).mark_degraded();
-                }
-            }
-            tracing::warn!(
-                shard = %read.shard_name,
-                expected = read.expected_crc,
-                got = crc,
-                "plane crc mismatch; serving replicas marked Degraded"
-            );
-            return Err(StoreError::Crc {
-                shard: read.shard_name.clone(),
+        // Take every read's queued chunks out of the global queue up front
+        // (demand first) so all early returns below — and the Drop fallback
+        // — leave no jobs behind.
+        let mut work: VecDeque<Job> = VecDeque::new();
+        let mut reads: Vec<(Arc<ReadState>, &mut [u8], &dyn ShardSources)> = Vec::new();
+        for BatchEntry { read, dst, sources } in entries {
+            work.extend(purge(&self.queue, &read));
+            reads.push((read, dst, sources));
+        }
+        if self.queue.lock().shutdown {
+            return Err(StoreError::Unavailable {
+                shard: reads[0].0.shard_name.clone(),
             });
+        }
+
+        // Per-shard drain context, built once per drain (§5.2 hot path: no
+        // per-chunk replica-slot or drive lookups).
+        let mut ctxs: HashMap<usize, ShardCtx<'_>> = HashMap::new();
+        for (read, dst, sources) in &reads {
+            let shard = read.shard_index;
+            ctxs.entry(shard)
+                .or_insert_with(|| ShardCtx::new(*sources, shard));
+            let replica_count = sources.slots(shard).len();
+            if replica_count > 32 {
+                return Err(StoreError::Invalid {
+                    msg: format!(
+                        "shard {} has {replica_count} replicas; the u32 exclude mask supports at most 32",
+                        read.shard_name
+                    ),
+                });
+            }
+            // Destination contract (§5.4): exactly the aligned covering
+            // region per read; also proves the CRC window below is in bounds.
+            let covering: usize = read.chunks.iter().map(|c| c.1).sum();
+            if dst.len() != covering {
+                return Err(StoreError::Invalid {
+                    msg: format!(
+                        "destination is {} bytes but the aligned covering region is {covering} bytes",
+                        dst.len(),
+                    ),
+                });
+            }
+            // Fail immediately when no eligible reader exists at all.
+            if healthy_mask(*sources, shard, replica_count) == 0 {
+                let mut p = read.lock_progress();
+                p.failed = true;
+                p.error = Some(StoreError::Unavailable {
+                    shard: read.shard_name.clone(),
+                });
+            }
+        }
+        {
+            let mut slice: Vec<(Arc<ReadState>, &mut [u8])> = reads
+                .iter_mut()
+                .map(|(r, d, _)| (Arc::clone(r), &mut **d))
+                .collect();
+            drain_reads(&self.queue, &ctxs, &mut slice, work);
+        }
+        // Collect per read; the first failure fails the whole batch.
+        for (read, dst, sources) in &reads {
+            finish_read(read, dst, *sources, read.shard_index)?;
         }
         Ok(())
     }
@@ -389,47 +538,95 @@ struct Shared<'a> {
     remaining: usize,
 }
 
-/// Per-drain drive map (§5.2): `replica_drive[r]` is the index of the
-/// physical drive hosting replica r, computed **once per drain** from the
-/// device identity cached at replica open — the hot loop never touches
-/// `/sys/dev/block` nor allocates per read.
-struct DriveMap {
+/// Per-drain context for one shard (§5.2): resolved once per drain — the hot
+/// loop never touches sysfs nor allocates per chunk.
+struct ShardCtx<'a> {
+    /// Shard this context serves.
+    shard: usize,
+    /// The shard's replica slots (chunk readers).
+    slots: Arc<[Arc<dyn ChunkSource>]>,
+    /// Physical-drive index per replica (drive-grouped striping, §5.2).
+    replica_drive: Vec<usize>,
     /// Distinct drives hosting the shard's replicas.
     drives: usize,
-    /// Physical-drive index per replica.
-    replica_drive: Vec<usize>,
+    /// Health marking on chunk failure / CRC degradation.
+    sources: &'a dyn ShardSources,
 }
 
-/// Runs the drain to completion: splits `dst` into per-chunk disjoint slices,
-/// builds the drain-local work list, and runs the reader threads inside
-/// `thread::scope`.
-fn drain<'a>(
+impl<'a> ShardCtx<'a> {
+    /// Resolves the shard's replica slots and drive map (one sysfs-free pass:
+    /// device identity was cached at replica open, §5.1/§5.2).
+    fn new(sources: &'a dyn ShardSources, shard: usize) -> Self {
+        let slots: Arc<[Arc<dyn ChunkSource>]> = sources.slots(shard).into();
+        let replica_count = slots.len();
+        let mut names: Vec<&str> = Vec::with_capacity(replica_count);
+        let mut replica_drive = Vec::with_capacity(replica_count);
+        for r in 0..replica_count {
+            let name = sources.replica_drive(shard, r);
+            let idx = match names.iter().position(|n| *n == name) {
+                Some(i) => i,
+                None => {
+                    names.push(name);
+                    names.len() - 1
+                }
+            };
+            replica_drive.push(idx);
+        }
+        ShardCtx {
+            shard,
+            slots,
+            replica_drive,
+            drives: names.len(),
+            sources,
+        }
+    }
+}
+
+/// Runs the drain to completion over a batch of reads: chunks from every
+/// read (possibly spanning shards) share one drain-local work list and one
+/// set of reader threads; each chunk's slice is the disjoint sub-slice of
+/// its own read's destination. Reader threads run inside `thread::scope`.
+fn drain_reads(
     queue: &ChunkQueue,
-    read: &Arc<ReadState>,
-    sources: &'a dyn ShardSources,
-    dst: &'a mut [u8],
+    ctxs: &HashMap<usize, ShardCtx<'_>>,
+    reads: &mut [(Arc<ReadState>, &mut [u8])],
     work: VecDeque<Job>,
 ) {
-    let shard = read.shard_index;
-    let slots: Arc<[Arc<dyn ChunkSource>]> = sources.slots(shard).into(); // once per drain
-    let replica_count = slots.len();
-    let drives = drive_map(sources, shard, replica_count);
-    let lens: Vec<usize> = work.iter().map(|j| read.chunks[j.chunk_index].1).collect();
-    let list: VecDeque<DrainJob<'_>> = work
-        .into_iter()
-        .zip(split_disjoint(dst, &lens))
-        .map(|(job, dst)| DrainJob { job, dst })
+    // Chunk i of a read reads into the i-th disjoint sub-slice of that
+    // read's destination (§5.2: disk→destination exactly once). Reborrowed
+    // per call so the caller can re-read `dst` for CRC verification.
+    type ReadSlices<'x> = Vec<(Arc<ReadState>, Vec<Option<&'x mut [u8]>>)>;
+    let mut slices: ReadSlices<'_> = reads
+        .iter_mut()
+        .map(|(read, dst)| {
+            let lens: Vec<usize> = read.chunks.iter().map(|c| c.1).collect();
+            let parts: Vec<Option<&mut [u8]>> =
+                split_disjoint(dst, &lens).into_iter().map(Some).collect();
+            (Arc::clone(read), parts)
+        })
         .collect();
+    let mut list: VecDeque<DrainJob<'_>> = VecDeque::with_capacity(work.len());
+    for job in work {
+        let (_, parts) = slices
+            .iter_mut()
+            .find(|(r, _)| Arc::ptr_eq(r, &job.read))
+            .expect("queued job belongs to a batched read");
+        let dst = parts[job.chunk_index]
+            .take()
+            .expect("exactly one job per chunk");
+        list.push_back(DrainJob { job, dst });
+    }
     let remaining = list.len();
 
     // Reader threads per drain (§5.2, D-12): one thread per physical drive
     // hosting an eligible replica by default — per-drive, not per-file. An
     // explicit `--io-threads` override REPLACES the derived count, capped at
     // the pending chunk count: more workers than chunks would idle.
+    let drives = ctxs.values().map(|c| c.drives).max().unwrap_or(0);
     let workers = (if queue.io_threads > 0 {
         queue.io_threads
     } else {
-        drives.drives.max(1)
+        drives.max(1)
     })
     .min(list.len().max(1));
 
@@ -437,18 +634,11 @@ fn drain<'a>(
     std::thread::scope(|s| {
         for w in 0..workers {
             let shared = Arc::clone(&shared);
-            let read = Arc::clone(read);
-            let slots = Arc::clone(&slots);
             // Home drive for striping (§5.2): workers are pinned round-robin
             // to drives so healthy reads stripe across devices instead of
             // every worker contending for the lowest replica index. A fast
             // drive's worker pops more chunks — it self-selects.
-            let home = if drives.drives == 0 {
-                0
-            } else {
-                w % drives.drives
-            };
-            let replica_drive = &drives.replica_drive;
+            let home = if drives == 0 { 0 } else { w % drives };
             s.spawn(move || {
                 loop {
                     // Pop a job (any drive's thread may serve it — the slice
@@ -466,33 +656,12 @@ fn drain<'a>(
                             sh = cv.wait(sh).unwrap_or_else(PoisonError::into_inner);
                         }
                     };
-                    run_chunk(&shared, &read, sources, &slots, replica_drive, home, job);
+                    let ctx = &ctxs[&job.job.read.shard_index];
+                    run_chunk(&shared, ctx, home, job);
                 }
             });
         }
     });
-}
-
-/// Groups the shard's replicas by cached physical device (§5.1/§5.2). No
-/// sysfs calls here: `ReplicaSlot::drive` was resolved at registry open.
-fn drive_map(sources: &dyn ShardSources, shard: usize, replica_count: usize) -> DriveMap {
-    let mut names: Vec<&str> = Vec::with_capacity(replica_count);
-    let mut replica_drive = Vec::with_capacity(replica_count);
-    for r in 0..replica_count {
-        let name = sources.replica_drive(shard, r);
-        let idx = match names.iter().position(|n| *n == name) {
-            Some(i) => i,
-            None => {
-                names.push(name);
-                names.len() - 1
-            }
-        };
-        replica_drive.push(idx);
-    }
-    DriveMap {
-        drives: names.len(),
-        replica_drive,
-    }
 }
 
 /// Serves one chunk, preferring replicas on the worker's home drive (§5.2
@@ -500,17 +669,17 @@ fn drive_map(sources: &dyn ShardSources, shard: usize, replica_count: usize) -> 
 /// worker whose home drive is degraded falls back to any eligible replica).
 /// On failure degrades the replica, requeues onto the same drain-local list
 /// with the replica's bit set, and lets a healthy drive retry.
-#[allow(clippy::too_many_arguments)]
 fn run_chunk<'a>(
     shared: &(Mutex<Shared<'a>>, Condvar),
-    read: &ReadState,
-    sources: &dyn ShardSources,
-    slots: &Arc<[Arc<dyn ChunkSource>]>,
-    replica_drive: &[usize],
+    ctx: &ShardCtx<'_>,
     home: usize,
     mut job: DrainJob<'a>,
 ) {
-    let shard = read.shard_index;
+    let read = &*job.job.read;
+    let shard = ctx.shard;
+    let slots = &ctx.slots;
+    let sources = ctx.sources;
+    let replica_drive = &ctx.replica_drive;
     let replica_count = slots.len();
     let (offset, _) = read.chunks[job.job.chunk_index];
     let mut mask = job.job.exclude_mask;
@@ -795,6 +964,93 @@ mod tests {
             sources,
             dst,
         })
+    }
+
+    /// One batch, two reads (§5.2): both land in one wait, each into its own
+    /// destination, each CRC-verified.
+    #[test]
+    fn batch_drains_two_reads_in_one_wait() {
+        let (_paths, reg) = fixture(2, "batch");
+        let sources = TestSources {
+            reg,
+            fail: vec![],
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            drives: Vec::new(),
+            delay_ms: 0,
+            conc: None,
+            wait_for_pair: None,
+        };
+        let queue = Arc::new(ChunkQueue::new(0));
+        // Aligned covering regions (§5.4): both spans cover 0..4096; the
+        // logical windows sit at the head-scratch offsets (0 and 1024).
+        let mut d0 = vec![0u8; 4096];
+        let mut d1 = vec![0u8; 4096];
+        let mut batch = queue.batch();
+        batch.push(ReadJob {
+            shard_index: 0,
+            offset: 0,
+            len: 512,
+            expected_crc: crc32c::crc32c(&pattern(0, 512)),
+            verify_crc: true,
+            prefetch: false,
+            sources: &sources,
+            dst: &mut d0,
+        });
+        batch.push(ReadJob {
+            shard_index: 0,
+            offset: 1024,
+            len: 3072,
+            expected_crc: crc32c::crc32c(&pattern(1024, 3072)),
+            verify_crc: true,
+            prefetch: false,
+            sources: &sources,
+            dst: &mut d1,
+        });
+        batch.wait().unwrap();
+        assert_eq!(d0, pattern(0, 4096));
+        assert_eq!(&d1[1024..], pattern(1024, 3072));
+    }
+
+    /// One batched read's terminal failure fails the whole batch.
+    #[test]
+    fn batched_read_failure_fails_the_whole_batch() {
+        let (_paths, reg) = fixture(2, "batch-fail");
+        let sources = TestSources {
+            reg,
+            fail: vec![],
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            drives: Vec::new(),
+            delay_ms: 0,
+            conc: None,
+            wait_for_pair: None,
+        };
+        let queue = Arc::new(ChunkQueue::new(0));
+        let mut good = vec![0u8; 4096];
+        let mut bad = vec![0u8; 4096];
+        let mut batch = queue.batch();
+        batch.push(ReadJob {
+            shard_index: 0,
+            offset: 0,
+            len: 512,
+            expected_crc: crc32c::crc32c(&pattern(0, 512)),
+            verify_crc: true,
+            prefetch: false,
+            sources: &sources,
+            dst: &mut good,
+        });
+        // Wrong digest: lands, then fails CRC verification.
+        batch.push(ReadJob {
+            shard_index: 0,
+            offset: 512,
+            len: 512,
+            expected_crc: 0xdead_beef,
+            verify_crc: true,
+            prefetch: false,
+            sources: &sources,
+            dst: &mut bad,
+        });
+        assert!(matches!(batch.wait(), Err(StoreError::Crc { .. })));
+        assert_eq!(good, pattern(0, 4096));
     }
 
     #[test]

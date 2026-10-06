@@ -33,7 +33,7 @@ pub mod sys;
 
 pub use engine::{ChunkSource, DEFAULT_IO_THREADS, IoEngine, PageRead, ShardSources};
 pub use manifest::{ExpertIndexEntry, ModelManifest, ShardEntry, load_manifest};
-pub use queue::{ChunkQueue, ReadHandle, ReadJob};
+pub use queue::{ChunkQueue, ReadBatch, ReadHandle, ReadJob};
 pub use replica::{
     ReplicaHealth, ReplicaRegistry, ReplicaSlot, ShardReplicas, parent_device_name,
     physical_device_name,

@@ -472,6 +472,175 @@ impl ExpertSource for StoreExpertSource {
         })
     }
 
+    /// One queued drain for the whole unit (§5.2): every plane is resolved
+    /// and validated up front, all covering reads are enqueued as one batch,
+    /// and a single [`ReadBatch::wait`] drains them — per-drive striping,
+    /// replica failover, and per-plane CRC verification happen inside that
+    /// one drain. Planes that cannot host their aligned covering read in
+    /// place (misaligned tensor base or undersized region) share the
+    /// thread-local page-aligned scratch, split into per-plane windows; the
+    /// in-place rule is unchanged from [`Self::read_expert`].
+    fn read_expert_batched(
+        &self,
+        layer: u32,
+        batch: &[(ExpertKind, u32)],
+        targets: &mut [(&mut [u8], usize)],
+    ) -> io::Result<()> {
+        if batch.len() != targets.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("batch {} != targets {}", batch.len(), targets.len()),
+            ));
+        }
+        // Resolve + validate every plane before enqueueing anything: a bad
+        // plane must fail the unit before any bytes move (§3.4).
+        let page = DIRECT_ALIGN as usize;
+        struct Planned {
+            plane_index: usize,
+            offset: u64,
+            stride: usize,
+            covering: usize,
+            expected: Option<u32>,
+            /// `Some(i)`: plane i reads in place; `None`: scratch window.
+            in_place: Option<usize>,
+            logical_at: usize,
+        }
+        let mut plans: Vec<Planned> = Vec::with_capacity(batch.len());
+        let mut scratch_planes: Vec<usize> = Vec::new();
+        for (i, &(kind, expert)) in batch.iter().enumerate() {
+            let Some(p) = self
+                .planes
+                .get(plane_index(layer, kind))
+                .and_then(Option::as_ref)
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no expert plane layer {layer} kind {kind:?}"),
+                ));
+            };
+            if expert >= p.n_experts {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("expert {expert} out of range (n={})", p.n_experts),
+                ));
+            }
+            let stride = usize::try_from(p.stride).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "plane stride exceeds usize")
+            })?;
+            let (into, head) = &targets[i];
+            if into.len() < head.saturating_add(stride) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "buffer {} < head {head} + plane stride {stride}",
+                        into.len()
+                    ),
+                ));
+            }
+            let offset = p.offsets[expert as usize];
+            let covering = p.covering[expert as usize] as usize;
+            let logical_at = (offset % DIRECT_ALIGN) as usize;
+            let in_place = (*head == logical_at
+                && into.len() >= covering
+                && into.as_ptr() as usize % page == 0)
+                .then_some(i);
+            if in_place.is_none() {
+                scratch_planes.push(i);
+            }
+            plans.push(Planned {
+                plane_index: plane_index(layer, kind),
+                offset,
+                stride,
+                covering,
+                expected: p.crc.as_ref().map(|c| c[expert as usize]),
+                in_place,
+                logical_at,
+            });
+        }
+
+        // Shared scratch for planes that cannot host their covering read:
+        // one resize, then consecutive page-aligned windows (each window is
+        // rounded to a page multiple so the next stays aligned).
+        fn scratch_windows<'a>(scratch: &'a mut [u8], covs: &[usize]) -> Vec<Option<&'a mut [u8]>> {
+            let page = DIRECT_ALIGN as usize;
+            let mut out = Vec::with_capacity(covs.len());
+            let mut rest: &mut [u8] = scratch;
+            for &cov in covs {
+                let rounded = cov.div_ceil(page) * page;
+                let skip = (page - rest.as_ptr() as usize % page) % page;
+                let (head, tail) = rest.split_at_mut(skip + rounded);
+                out.push(Some(&mut head[skip..skip + cov]));
+                rest = tail;
+            }
+            out
+        }
+        let scratch_covs: Vec<usize> = scratch_planes.iter().map(|&i| plans[i].covering).collect();
+        SCRATCH.with(|s| -> io::Result<()> {
+            let mut scratch = s.borrow_mut();
+            if !scratch_planes.is_empty() {
+                let need: usize = scratch_covs.iter().map(|c| c.div_ceil(page) * page).sum();
+                let raw = need + page - 1;
+                if scratch.len() < raw {
+                    scratch.resize(raw, 0);
+                }
+            }
+
+            // Enqueue all planes first, drain once (§5.2).
+            let mut rb = self.queue.batch();
+            let mut windows = scratch_windows(&mut scratch, &scratch_covs);
+            let mut wi = 0usize;
+            for ((into, _), plan) in targets.iter_mut().zip(plans.iter()) {
+                let dst: &mut [u8] = match plan.in_place {
+                    Some(_) => &mut into[..plan.covering],
+                    None => windows[wi]
+                        .take()
+                        .unwrap_or_else(|| unreachable!("more scratch planes than windows")),
+                };
+                let p = self.planes[plan.plane_index].as_ref().unwrap();
+                rb.push(ReadJob {
+                    shard_index: p.shard,
+                    offset: plan.offset,
+                    len: plan.stride,
+                    expected_crc: plan.expected.unwrap_or(0),
+                    verify_crc: plan.expected.is_some(),
+                    prefetch: false,
+                    sources: &self.registry,
+                    dst,
+                });
+                if plan.in_place.is_none() {
+                    wi += 1;
+                }
+            }
+            rb.wait().map_err(|e| match e {
+                StoreError::Io { source, .. } => source,
+                other @ StoreError::Unavailable { .. } => {
+                    io::Error::new(io::ErrorKind::NotFound, other.to_string())
+                }
+                other @ StoreError::Crc { .. } => {
+                    io::Error::new(io::ErrorKind::InvalidData, other.to_string())
+                }
+                other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
+            })?;
+
+            // Scratch-served planes land in their window: copy the logical
+            // row out (the only second copy, same rule as read_expert). The
+            // windows were consumed by the drain; re-derive them from the
+            // same scratch buffer.
+            let windows = scratch_windows(&mut scratch, &scratch_covs);
+            let mut wi = 0usize;
+            for ((into, head), plan) in targets.iter_mut().zip(plans.iter()) {
+                if plan.in_place.is_some() {
+                    continue;
+                }
+                let w = windows[wi].as_ref().unwrap();
+                wi += 1;
+                into[*head..*head + plan.stride]
+                    .copy_from_slice(&w[plan.logical_at..plan.logical_at + plan.stride]);
+            }
+            Ok(())
+        })
+    }
+
     fn plane(&self, layer: u32, kind: ExpertKind, expert: u32) -> Option<(u64, u64)> {
         let p = self.planes.get(plane_index(layer, kind))?.as_ref()?;
         Some((*p.offsets.get(expert as usize)?, p.stride))
@@ -708,6 +877,62 @@ mod tests {
         std::fs::write(&p, json).unwrap();
         let err = StoreExpertSource::open(&p, Arc::new(ChunkQueue::new(1))).unwrap_err();
         assert!(err.to_string().contains("expert_index"), "{err}");
+    }
+
+    #[test]
+    fn read_expert_batched_drains_planes_in_one_batch() {
+        let (mpath, _, _) = fixture("batched", Some(true));
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let batch = [(ExpertKind::Gate, 1u32), (ExpertKind::Up, 0u32)];
+        let shard_of = |k: ExpertKind| if k == ExpertKind::Gate { 0 } else { 1 };
+
+        // Page-aligned covering region for one plane (§5.4): the raw buffer,
+        // the aligned-window skip, the covering length, the head.
+        fn aligned_target(
+            src: &StoreExpertSource,
+            kind: ExpertKind,
+            expert: u32,
+        ) -> (Vec<u8>, usize, usize, usize) {
+            let (off, stride) = src.plane(0, kind, expert).unwrap();
+            let start = off - off % DIRECT_ALIGN;
+            let end = (off + stride).div_ceil(DIRECT_ALIGN) * DIRECT_ALIGN;
+            let covering = (end - start) as usize;
+            let head = (off % DIRECT_ALIGN) as usize;
+            let raw = vec![0u8; covering + DIRECT_ALIGN as usize];
+            let skip = DIRECT_ALIGN as usize - raw.as_ptr() as usize % DIRECT_ALIGN as usize;
+            (raw, skip, covering, head)
+        }
+
+        // Fast path: both planes land in place, one batched drain.
+        let (mut raw0, skip0, cov0, head0) = aligned_target(&src, ExpertKind::Gate, 1);
+        let (mut raw1, skip1, cov1, head1) = aligned_target(&src, ExpertKind::Up, 0);
+        {
+            let mut targets = [
+                (&mut raw0[skip0..skip0 + cov0], head0),
+                (&mut raw1[skip1..skip1 + cov1], head1),
+            ];
+            src.read_expert_batched(0, &batch, &mut targets).unwrap();
+        }
+        assert_eq!(
+            &raw0[skip0 + head0..skip0 + head0 + STRIDE as usize],
+            &row_bytes(shard_of(ExpertKind::Gate), 1)[..]
+        );
+        assert_eq!(
+            &raw1[skip1 + head1..skip1 + head1 + STRIDE as usize],
+            &row_bytes(shard_of(ExpertKind::Up), 0)[..]
+        );
+
+        // Scratch path: head 0 differs from the planes' logical offsets and
+        // the buffers are undersized — bytes still land at head after the
+        // shared-scratch copy (§5.4).
+        let mut g = vec![0u8; STRIDE as usize];
+        let mut u = vec![0u8; STRIDE as usize];
+        {
+            let mut targets = [(&mut g[..], 0usize), (&mut u[..], 0)];
+            src.read_expert_batched(0, &batch, &mut targets).unwrap();
+        }
+        assert_eq!(g, row_bytes(shard_of(ExpertKind::Gate), 1));
+        assert_eq!(u, row_bytes(shard_of(ExpertKind::Up), 0));
     }
 
     #[test]

@@ -162,6 +162,31 @@ pub trait ExpertSource: Send + Sync {
     /// Absolute file offset + stride of one plane, for construction-time
     /// cross-checks against live tensors.
     fn plane(&self, layer: u32, kind: ExpertKind, expert: u32) -> Option<(u64, u64)>;
+
+    /// Reads one expert unit's planes in one call: `batch[i]` is the
+    /// `(kind, expert)` of plane i and `targets[i]` its `(region, head)`
+    /// destination — the same contract as [`ExpertSource::read_expert`] per
+    /// plane (§5.2: one queued drain per unit instead of N blocking reads).
+    /// `batch` and `targets` have equal length.
+    ///
+    /// The default loops [`ExpertSource::read_expert`] so sources without a
+    /// queued drain keep working; queue-backed sources override this to
+    /// enqueue every plane before waiting once.
+    ///
+    /// # Errors
+    /// Any plane's failure fails the whole batch; earlier planes' bytes are
+    /// scratch (the caller discards the unit on error).
+    fn read_expert_batched(
+        &self,
+        layer: u32,
+        batch: &[(ExpertKind, u32)],
+        targets: &mut [(&mut [u8], usize)],
+    ) -> io::Result<()> {
+        for (&(kind, expert), (into, head)) in batch.iter().zip(targets.iter_mut()) {
+            self.read_expert(layer, kind, expert, into, *head)?;
+        }
+        Ok(())
+    }
 }
 
 /// Source failures that are not plain I/O.
