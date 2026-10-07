@@ -1,32 +1,84 @@
-//! §6.5 prefetch: background page-ins fed by an injected access-set source,
+//! §6.5 prefetch: background page-ins fed by an injected access source,
 //! demand-priority gated (rounds skip while demand page-ins are in flight).
 //! One prefetch thread, so at most one prefetch page-in is ever in flight.
-//! The engine's feed is P4's `notify_access` recency (golem-engine
-//! `PolicyFeed`); tests prove the mechanism against injected feeds.
+//! The engine's feed is the P5 next-layer prediction queue
+//! ([`PredictionQueue`], `--prefetch read`); tests also inject their own.
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
 #![allow(unexpected_cfgs)]
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
-use super::pager::ExpertPool;
-use super::primitives::{Arc, AtomicBool, JoinHandle, Ordering, spawn};
+use super::pager::{ExpertPool, PoolError};
+use super::primitives::{Arc, AtomicBool, Condvar, JoinHandle, Mutex, Ordering, spawn};
 
-/// Access-set union depth (§6.5: union of the last k steps).
-pub const PREFETCH_K: usize = 3;
-
-/// Recent-access source: the engine backs it with P4's `notify_access`
-/// recency; tests inject their own.
+/// Units to page in: the engine backs it with P5 predictions; tests inject
+/// their own.
 pub trait AccessFeed: Send + Sync {
-    /// The union of the last `k` steps' accessed `(layer, expert)` units.
-    /// The pool filters already-resident units itself; returned units may
-    /// repeat across calls.
-    fn take_union(&self, k: usize) -> Vec<(u32, u32)>;
+    /// Takes every pending `(layer, expert)` unit. The pool filters
+    /// already-resident units itself; units may repeat across calls.
+    fn take(&self) -> Vec<(u32, u32)>;
+
+    /// Waits up to `timeout` for new units (default: a plain park, so the
+    /// stop latency stays bounded).
+    fn idle(&self, timeout: Duration) {
+        std::thread::park_timeout(timeout);
+    }
+}
+
+/// Bounded FIFO of predicted units (§6.5 `read`): the decode thread pushes
+/// each prediction (one lock, no allocation once warm: capacity is
+/// reserved up front), the prefetch thread drains it. Past `cap` the
+/// oldest units drop — a prediction for a layer already computed is
+/// worthless. A push wakes the prefetch thread at once: one layer of
+/// compute is the whole lead time, a 25 ms poll would miss it.
+pub struct PredictionQueue {
+    keys: Mutex<VecDeque<(u32, u32)>>,
+    cv: Condvar,
+    cap: usize,
+}
+
+impl PredictionQueue {
+    /// Empty queue holding at most `cap` units.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            keys: Mutex::new(VecDeque::with_capacity(cap.max(1))),
+            cv: Condvar::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Appends one layer's predicted experts, dropping the oldest past `cap`.
+    pub fn push(&self, layer: u32, experts: impl IntoIterator<Item = u32>) {
+        let mut q = self.keys.lock().unwrap();
+        for e in experts {
+            if q.len() == self.cap {
+                q.pop_front();
+            }
+            q.push_back((layer, e));
+        }
+        drop(q);
+        self.cv.notify_one();
+    }
+}
+
+impl AccessFeed for PredictionQueue {
+    fn take(&self) -> Vec<(u32, u32)> {
+        self.keys.lock().unwrap().drain(..).collect()
+    }
+
+    fn idle(&self, timeout: Duration) {
+        let q = self.keys.lock().unwrap();
+        if q.is_empty() {
+            let _ = self.cv.wait_timeout(q, timeout).unwrap();
+        }
+    }
 }
 
 /// Handle to the spawned prefetch thread. `stop()` signals; `Drop` signals
-/// and joins. The loop parks between empty rounds (25 ms bound) so stop
-/// latency is bounded by one park.
+/// and joins. The loop idles between empty rounds (25 ms bound) so stop
+/// latency is bounded by one idle.
 pub struct PrefetchHandle {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -48,16 +100,15 @@ impl Drop for PrefetchHandle {
     }
 }
 
-/// Spawns the §6.5 prefetch loop over `pool`: each round takes
-/// `access.take_union(k)`, filters residents, and pages the rest in with
-/// `demand = false` — but only while no demand page-in is in flight
-/// ([`ExpertPool::demand_inflight`]), the demand-priority rule. Source
-/// errors warn and continue; they never kill the thread.
-pub fn spawn_prefetch(
-    pool: Arc<ExpertPool>,
-    access: Arc<dyn AccessFeed>,
-    k: usize,
-) -> PrefetchHandle {
+/// Spawns the §6.5 prefetch loop over `pool`: each round takes the feed's
+/// pending units, filters residents, and pages the rest in with `demand =
+/// false` — but only while no demand page-in is in flight
+/// ([`ExpertPool::demand_inflight`]), the demand-priority rule. A prefetch
+/// that finds no cold victim skips the unit (P17: it never evicts a
+/// demand-hot key). Source errors warn and continue; they never kill the
+/// thread.
+pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> PrefetchHandle {
+    const IDLE: Duration = Duration::from_millis(25);
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let stop = stop.clone();
@@ -67,28 +118,31 @@ pub fn spawn_prefetch(
                     return;
                 }
                 // Demand priority: a demand page-in in flight wins the I/O;
-                // skip the whole round and re-check after one park.
+                // skip the whole round and re-check after one idle.
                 if pool.demand_inflight() > 0 {
-                    park();
+                    access.idle(IDLE);
                     continue;
                 }
                 let batch: Vec<_> = access
-                    .take_union(k)
+                    .take()
                     .into_iter()
                     .filter(|&(layer, expert)| !pool.residency.is_resident(layer, expert))
                     .collect();
                 if batch.is_empty() {
-                    park();
+                    access.idle(IDLE);
                     continue;
                 }
                 for (layer, expert) in batch {
                     if stop.load(Ordering::Relaxed) || pool.demand_inflight() > 0 {
                         break;
                     }
-                    if let Err(e) = pool.ensure_unit(false, layer, expert) {
+                    match pool.ensure_unit(false, layer, expert) {
+                        Ok(()) | Err(PoolError::Busy) => {}
                         // Transient source trouble must not kill prefetching;
                         // `source_errors` already counted the failure.
-                        tracing::warn!(layer, expert, error = %e, "prefetch page-in failed; continuing");
+                        Err(e) => {
+                            tracing::warn!(layer, expert, error = %e, "prefetch page-in failed; continuing")
+                        }
                     }
                 }
             }
@@ -98,11 +152,6 @@ pub fn spawn_prefetch(
         stop,
         thread: Some(thread),
     }
-}
-
-/// Bounded wait between rounds: stop latency ≤ one park, idle CPU ≈ 0.
-fn park() {
-    std::thread::park_timeout(Duration::from_millis(25));
 }
 
 #[cfg(test)]
@@ -141,10 +190,8 @@ mod tests {
     }
 
     impl AccessFeed for QueueFeed {
-        fn take_union(&self, k: usize) -> Vec<(u32, u32)> {
-            let mut keys = self.keys.lock().unwrap();
-            let n = k.min(keys.len());
-            keys.drain(..n).collect()
+        fn take(&self) -> Vec<(u32, u32)> {
+            self.keys.lock().unwrap().drain(..).collect()
         }
     }
 
@@ -243,11 +290,31 @@ mod tests {
         let source = StdArc::new(GateSource::new((u32::MAX, u32::MAX)));
         let pool = test_pool(8, arc_dyn(source.clone()));
         let feed = StdArc::new(QueueFeed::new(vec![(0, 0), (0, 1)]));
-        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed), 3);
+        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed));
         until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 2);
         assert!(pool.residency.is_resident(0, 0));
         assert!(pool.residency.is_resident(0, 1));
         drop(handle); // stop + join — returns promptly (bounded park)
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn prediction_queue_drops_the_oldest_past_its_cap_and_wakes_the_idler() {
+        let q = StdArc::new(PredictionQueue::new(3));
+        q.push(0, [1, 2]);
+        q.push(1, [3, 4]);
+        assert_eq!(q.take(), [(0, 2), (1, 3), (1, 4)]);
+        assert!(q.take().is_empty());
+        let q2 = q.clone();
+        let t0 = Instant::now();
+        let idler = std::thread::spawn(move || q2.idle(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(20));
+        q.push(2, [5]);
+        idler.join().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "push wakes the idle wait"
+        );
     }
 
     // Sequential unit test over loom-primitive pool types: needs no exploration
@@ -262,7 +329,7 @@ mod tests {
         let source = StdArc::new(GateSource::new((0, 7)));
         let pool = test_pool(8, arc_dyn(source.clone()));
         let feed = StdArc::new(QueueFeed::new(vec![(0, 0)]));
-        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()), 3);
+        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()));
 
         // Round 1: prefetch pages expert 0.
         until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 1);

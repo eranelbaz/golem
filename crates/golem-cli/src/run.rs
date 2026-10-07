@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use golem_engine::ParityStep;
 use golem_engine::atomic::write_atomic;
-use golem_engine::config::{EngineConfig, VramOrder};
+use golem_engine::config::{EngineConfig, PrefetchMode, VramOrder};
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::timing::TimingRecorder;
@@ -104,6 +104,23 @@ pub struct RunArgs {
     /// `score` (§6.2 decayed score, the default) or `recency`.
     #[arg(long, value_name = "ORDER", default_value = "score", value_parser = parse_vram_order)]
     pub vram_order: VramOrder,
+    /// §6.5 next-layer routing prediction (P5): `off` (default), `protect`
+    /// (shield predicted experts from RAM eviction) or `read` (page predicted
+    /// experts in at prefetch priority). Needs the RAM expert pool.
+    #[arg(long, value_name = "MODE", default_value = "off", value_parser = parse_prefetch)]
+    pub prefetch: PrefetchMode,
+    /// Layers ahead each MoE layer predicts for `--prefetch`.
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub prefetch_lookahead: u32,
+}
+
+fn parse_prefetch(s: &str) -> Result<PrefetchMode, String> {
+    match s {
+        "off" => Ok(PrefetchMode::Off),
+        "protect" => Ok(PrefetchMode::Protect),
+        "read" => Ok(PrefetchMode::Read),
+        _ => Err(format!("want off, protect or read, got {s:?}")),
+    }
 }
 
 fn parse_vram_order(s: &str) -> Result<VramOrder, String> {
@@ -139,6 +156,8 @@ impl RunArgs {
             timing_csv: self.timing_csv.clone(),
             routing_trace: self.routing_trace.clone(),
             vram_order: self.vram_order,
+            prefetch: self.prefetch,
+            prefetch_lookahead: self.prefetch_lookahead,
             ..default
         }
     }
@@ -174,6 +193,11 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     // §3.4 P3: the store path only exists behind the RAM expert pool; a
     // --manifest without the pool would silently decode off the plain GGUF
     // path while the user believes replicas are serving experts.
+    if config.prefetch != PrefetchMode::Off && config.ram_experts_gib == 0 {
+        return Err(
+            "--prefetch requires --ram-experts-gib > 0: predictions steer the expert pool".into(),
+        );
+    }
     if args.manifest.is_some() && config.ram_experts_gib == 0 {
         return Err(
             "--manifest requires --ram-experts-gib > 0: the expert pool \
@@ -193,7 +217,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         eprintln!("golem: device cache {k} expert slots per layer");
     }
 
-    match (&args.prompt, &args.parity_dump) {
+    let result = match (&args.prompt, &args.parity_dump) {
         (Some(prompt), Some(dump)) => {
             one_shot_parity(&mut session, &args.model, prompt, dump, args.n_predict)
         }
@@ -202,7 +226,18 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         // multi-turn REPL dump would be ill-defined — refuse it up front.
         (None, Some(_)) => Err("--parity-dump requires --prompt".into()),
         (None, None) => repl(&mut session, &mut timing_out, &mut trace_out),
+    };
+    // §6.5 metrics for the whole run: stderr, and the timing CSV's trailer.
+    if let Some(stats) = session
+        .prefetch_stats()
+        .filter(|s| s.mode != PrefetchMode::Off)
+    {
+        eprintln!("golem: {stats}");
+        if let Some(f) = timing_out.as_mut() {
+            writeln!(f, "# {stats}")?;
+        }
     }
+    result
 }
 
 /// `RLIMIT_MEMLOCK` bytes, `None` = unlimited.
@@ -368,7 +403,7 @@ fn resolved_config_line(config: &EngineConfig) -> String {
     format!(
         "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} cpu_moe={:?} \
          ram_experts_gib={} device_cache_experts={} io_threads={:?} manifest={:?} \
-         vram_order={:?} model_size={}",
+         vram_order={:?} prefetch={:?} prefetch_lookahead={} model_size={}",
         config.n_ctx,
         config.batch_tokens,
         config.n_predict,
@@ -381,6 +416,8 @@ fn resolved_config_line(config: &EngineConfig) -> String {
         config.io_threads,
         config.manifest_path,
         config.vram_order,
+        config.prefetch,
+        config.prefetch_lookahead,
         std::fs::metadata(&config.model_path)
             .map(|m| m.len())
             .unwrap_or(0),
@@ -787,6 +824,33 @@ mod tests {
             "lfu",
         ]);
         assert!(bad.is_err(), "unknown order is a parse error");
+    }
+
+    #[test]
+    fn run_args_map_prefetch_flags_into_config() {
+        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        assert_eq!(
+            (config.prefetch, config.prefetch_lookahead),
+            (PrefetchMode::Off, 1)
+        );
+        let config = parse_run_args(&[
+            "run",
+            "m.gguf",
+            "--prefetch",
+            "read",
+            "--prefetch-lookahead",
+            "2",
+        ])
+        .to_config();
+        assert_eq!(
+            (config.prefetch, config.prefetch_lookahead),
+            (PrefetchMode::Read, 2)
+        );
+        for bad in [["--prefetch", "on"], ["--prefetch-lookahead", "0"]] {
+            let argv = ["run", "m.gguf", bad[0], bad[1]];
+            let r = RunArgs::augment_args(clap::Command::new("run")).try_get_matches_from(argv);
+            assert!(r.is_err(), "{bad:?} must not parse");
+        }
     }
 
     #[test]

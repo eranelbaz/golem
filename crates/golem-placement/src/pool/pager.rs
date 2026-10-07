@@ -559,6 +559,12 @@ impl ExpertPool {
         Ok(())
     }
 
+    /// Shields `layer`'s predicted experts from eviction (§6.5 `protect`),
+    /// replacing the layer's previous prediction.
+    pub fn protect(&self, layer: u32, experts: impl IntoIterator<Item = u32>) {
+        self.residency.protect(layer, experts);
+    }
+
     /// Claims one expert's slot, paging it in if needed, and returns the
     /// UNDROPPED lease (the caller keeps the lease until the host→device DMA
     /// is known complete, then drops it).

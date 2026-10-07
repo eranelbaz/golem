@@ -25,7 +25,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 5
+#define GOLEM_HOOKS_ABI_VERSION 6
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -62,6 +62,16 @@ typedef void (*golem_copy_done_fn)(void *payload);
 typedef void (*golem_routing_fn)(void *payload, int32_t blk, const void *tensor,
                                  const int32_t *ids_dense, int64_t n_ids,
                                  int32_t n_experts);
+
+/* Hook (P5, design §6.5): next-layer routing prediction. When
+ * golem_set_predict enabled it, the model graph builds, from layer `src_blk`'s
+ * FFN input, the top (n_expert_used + margin) experts layer `target_blk`'s
+ * router would pick (target = src + 1 .. src + lookahead). The scheduler
+ * reads them right after src_blk's routing readback (the device is already
+ * synchronized there) and passes them here, decode ubatches (1 token) only.
+ * Real routing is untouched (I1): predictions only steer staging. */
+typedef void (*golem_predict_fn)(void *payload, int32_t src_blk, int32_t target_blk,
+                                 const int32_t *ids, int32_t n_ids);
 
 /* --- Context lifecycle. --- */
 
@@ -142,6 +152,16 @@ void golem_policy_order_epoch_advance(golem_ctx_t ctx);
  * (device allocations are budget-bounded, never proportional to the expert
  * count). Set once by the engine at pool enable. */
 void golem_set_device_cache_experts(golem_ctx_t ctx, int32_t k);
+
+/* P5: enable next-layer prediction nodes (lookahead layers ahead, top
+ * n_expert_used + margin each) delivered to `predict` with the registered
+ * payload. lookahead <= 0 or predict == NULL disables (no graph nodes). Set
+ * before the first graph build. */
+void golem_set_predict(golem_ctx_t ctx, int32_t lookahead, int32_t margin, golem_predict_fn predict);
+/* Graph-build query: prediction lookahead (0 = off, also for a NULL ctx). */
+int32_t golem_predict_lookahead(golem_ctx_t ctx);
+/* Graph-build query: prediction margin beyond n_expert_used. */
+int32_t golem_predict_margin(golem_ctx_t ctx);
 /* Current budget (<= 0 = unset). */
 int32_t golem_device_cache_experts(golem_ctx_t ctx);
 

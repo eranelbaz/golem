@@ -82,6 +82,9 @@ struct Shard {
     /// first demand claim counts a prefetch hit, an eviction while set
     /// counts wasted prefetch bytes (§6.5).
     prefetched: Vec<u64>,
+    /// Keys a next-layer prediction shields from eviction (`--prefetch
+    /// protect`, §6.5), replaced per prediction of the layer.
+    protected: Vec<u64>,
 }
 
 /// A shard's lock paired with the condvar its fill gate waits on. The lock is
@@ -304,6 +307,7 @@ impl ResidencyMap {
                     slot_of: vec![-1; keys_per_layer],
                     filling: vec![0; filling_words],
                     prefetched: vec![0; filling_words],
+                    protected: vec![0; filling_words],
                 }),
                 fill_cv: Condvar::new(),
             })
@@ -342,6 +346,22 @@ impl ResidencyMap {
 
     fn bit_clear(bits: &mut [u64], i: usize) {
         bits[i / 64] &= !(1 << (i % 64));
+    }
+
+    /// Replaces `layer`'s prediction-protected set with `experts` (§6.5
+    /// `protect`): CLOCK skips them like snapshot-excluded keys. One shard
+    /// lock per call; out-of-range ids are ignored.
+    pub fn protect(&self, layer: u32, experts: impl IntoIterator<Item = u32>) {
+        let Some(shard) = self.shards.get(layer as usize) else {
+            return;
+        };
+        let mut sh = shard.shard.lock().unwrap();
+        sh.protected.fill(0);
+        for e in experts {
+            if e < self.n_experts {
+                Self::bit_set(&mut sh.protected, self.local(e));
+            }
+        }
     }
 
     /// Residency of one unit (shard lock, flip-length hold).
@@ -570,7 +590,7 @@ impl ResidencyMap {
             // second chance and stays demoted forever (it can't be picked
             // to earn the bit back).
             let expert = c as u32;
-            if snapshot.excludes(li as u32, expert) {
+            if snapshot.excludes(li as u32, expert) || Self::bit_test(&sh.protected, c) {
                 drop(sh);
                 continue;
             }
@@ -857,6 +877,26 @@ mod tests {
             panic!("demand evicts the prefetched fill")
         };
         assert_eq!((v.expert, v.prefetched), (2, true));
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn protected_keys_are_never_victims_until_replaced() {
+        let m = map(1, 8, vec![0..2]);
+        let snap = PolicySnapshot::empty();
+        warm(&m, &snap, 0, 0);
+        warm(&m, &snap, 0, 1);
+        m.protect(0, [0, 99]);
+        let Got::Evicted(v, _) = take(&m, &snap, 0, 2) else {
+            panic!("evicts the unprotected key")
+        };
+        assert_eq!(v.expert, 1);
+        m.release_lease(0, 2);
+        m.protect(0, [2]);
+        let Got::Evicted(v, _) = take(&m, &snap, 0, 3) else {
+            panic!("the replaced set frees expert 0")
+        };
+        assert_eq!(v.expert, 0);
     }
 
     #[test]

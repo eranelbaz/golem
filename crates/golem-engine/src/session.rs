@@ -666,6 +666,11 @@ impl Session {
         self.config.n_gpu_layers > 0
     }
 
+    /// §6.5 prefetch/prediction counters; `None` without the RAM expert pool.
+    pub fn prefetch_stats(&self) -> Option<crate::p3_glue::PrefetchStats> {
+        self.p3.as_ref().map(|p| p.prefetch_stats())
+    }
+
     /// Resolved P2 slot count per layer (explicit or derived from free VRAM);
     /// `None` without the RAM expert pool.
     pub fn device_cache_experts(&self) -> Option<u32> {
