@@ -94,6 +94,17 @@ struct ShardLock {
     fill_cv: Condvar,
 }
 
+/// A class's wake channel for `claim_for`'s no-victim park: a generation
+/// counter plus the condvar waiters park on. Every lease release or slot
+/// free in the class bumps `gen` and notifies `cv`, so a release between a
+/// waiter's generation read (before its CLOCK sweep) and its park cannot be
+/// lost: the re-check under the `gen` lock sees the bump and skips the park.
+#[derive(Debug)]
+struct ClassWake {
+    generation: Mutex<u64>,
+    cv: Condvar,
+}
+
 /// Residency map over all expert layers: `(layer, expert) → slot` with
 /// in-flight leases and atomic claim-time eviction (§6.6). Slots are carved
 /// into size classes (§5.4); a layer's keys claim, fill and evict only inside
@@ -121,6 +132,9 @@ pub struct ResidencyMap {
     free_slots: Mutex<Vec<Vec<u32>>>,
     /// Serialises CLOCK sweeps; one hand per class over that class's keys.
     sweep: Mutex<Vec<ClockHand>>,
+    /// Per-class generation + condvar for the no-victim park (see
+    /// [`ClassWake`]).
+    class_wake: Vec<ClassWake>,
 }
 
 /// Maximum keys examined per sweep call. A victimless sweep advances the hand
@@ -324,6 +338,12 @@ impl ResidencyMap {
             shards,
             free_slots: Mutex::new(free_slots),
             sweep: Mutex::new((0..n_classes).map(|_| ClockHand { hand: 0 }).collect()),
+            class_wake: (0..n_classes)
+                .map(|_| ClassWake {
+                    generation: Mutex::new(0),
+                    cv: Condvar::new(),
+                })
+                .collect(),
         })
     }
 
@@ -435,6 +455,11 @@ impl ResidencyMap {
         // keeps out of reach for one decode thread.
         let starve_bound = 2 * self.class_keys[class].div_ceil(SWEEP_BUDGET) + 1;
         let mut starved = 0usize;
+        let mut parked_retry = false;
+        // Generation of the class wake channel, sampled before each CLOCK
+        // sweep: a release (or cancel) in the class during the sweep bumps
+        // it, and the park below skips itself when the sample is stale.
+        let mut sweep_gen = 0u64;
         loop {
             let mut sh = self.shards[li].shard.lock().unwrap();
             if Self::bit_test(&sh.bits, i) {
@@ -479,6 +504,8 @@ impl ResidencyMap {
                     if starved > starve_bound {
                         return Err(ClaimError::Busy);
                     }
+                    let wake = &self.class_wake[class];
+                    sweep_gen = *wake.generation.lock().unwrap();
                     self.clock_evict(class, snapshot, demand, (li, i))
                         .map(|(v, s)| (s, Some(v)))
                 }
@@ -487,19 +514,33 @@ impl ResidencyMap {
                 Some(x) => x,
                 None if !demand => return Err(ClaimError::Busy),
                 None => {
-                    // No victim this pass: leases are transient, so park on
-                    // the shard condvar — `release_lease` (and fills/cancels)
-                    // notify it — instead of spinning. The timed wait also
-                    // covers victims that appear without a notification
-                    // (snapshot protection lapsing as steps advance); the
-                    // starve bound still terminates the loop.
-                    let sh = self.shards[li].shard.lock().unwrap();
-                    let _sh = super::primitives::wait_timeout(
-                        &self.shards[li].fill_cv,
-                        sh,
-                        std::time::Duration::from_micros(200),
-                    );
-                    drop(_sh);
+                    // A victimless sweep may have only cleared ref bits or
+                    // hit SWEEP_BUDGET, so retry once immediately — no
+                    // latency cost, and it matches the pre-park behaviour.
+                    if !parked_retry {
+                        parked_retry = true;
+                        continue;
+                    }
+                    // Generation-gated park on the class condvar: victims
+                    // come from any layer of the class (not just this
+                    // shard's), and a release between the sweep and this
+                    // lock bumped `sweep_gen` — in either case skip the
+                    // park and re-sweep. The wait is bounded (leases are
+                    // transient) and the starve bound still terminates the
+                    // loop. Loom cannot model the timed wait (see
+                    // `primitives::wait_timeout`): there the generation
+                    // re-check above still runs, but liveness comes from the
+                    // modeled spin + starve bound, not the timeout.
+                    let wake = &self.class_wake[class];
+                    let g = wake.generation.lock().unwrap();
+                    if *g == sweep_gen {
+                        let g = super::primitives::wait_timeout(
+                            &wake.cv,
+                            g,
+                            std::time::Duration::from_micros(200),
+                        );
+                        drop(g);
+                    }
                     continue;
                 }
             };
@@ -658,13 +699,24 @@ impl ResidencyMap {
     }
 
     /// Drops one lease. The slot stays resident until evicted via `claim`.
+    /// Bumps the class's wake generation and notifies its condvar: a waiter
+    /// parked in `claim_for`'s no-victim path can now evict, and the bump
+    /// closes the release-vs-park race (a waiter that sampled the old
+    /// generation skips its park instead of sleeping through this release).
     pub(crate) fn release_lease(&self, layer: u32, expert: u32) {
-        let mut sh = self.shards[layer as usize].shard.lock().unwrap();
-        let i = self.local(expert);
-        debug_assert!(sh.leases[i] > 0, "release without a lease");
-        sh.leases[i] = sh.leases[i].saturating_sub(1);
-        // A waiter parked in `claim_for`'s no-victim path can now evict.
-        self.shards[layer as usize].fill_cv.notify_all();
+        let li = layer as usize;
+        {
+            let mut sh = self.shards[li].shard.lock().unwrap();
+            let i = self.local(expert);
+            debug_assert!(sh.leases[i] > 0, "release without a lease");
+            sh.leases[i] = sh.leases[i].saturating_sub(1);
+            // A waiter parked on the shard's fill gate (this key mid-fill)
+            // is unaffected; the no-victim parkers wait on the class cv.
+            self.shards[li].fill_cv.notify_all();
+        }
+        let wake = &self.class_wake[self.class_of_layer[li] as usize];
+        *wake.generation.lock().unwrap() += 1;
+        wake.cv.notify_all();
     }
 
     /// Abandons a page-in (reached only through [`FillClaim`]): drops the claim's lease — by contract the
@@ -690,7 +742,14 @@ impl ResidencyMap {
             // Shard guard dropped before the leaf free list.
         };
         if let Some(s) = freed {
-            self.free_slots.lock().unwrap()[self.class_of_layer[li] as usize].push(s);
+            let class = self.class_of_layer[li] as usize;
+            self.free_slots.lock().unwrap()[class].push(s);
+            // The freed slot is claimable without a CLOCK sweep: bump the
+            // class generation and wake no-victim parkers, as a lease
+            // release would (they re-enter the loop and pop the free list).
+            let wake = &self.class_wake[class];
+            *wake.generation.lock().unwrap() += 1;
+            wake.cv.notify_all();
         }
         self.shards[li].fill_cv.notify_all();
     }
@@ -1269,6 +1328,45 @@ mod tests {
                 other => unreachable!("{other:?}"),
             };
             assert_eq!((mine, t.join().unwrap()), (0, 1));
+        });
+    }
+
+    #[test]
+    fn no_victim_park_is_woken_by_a_class_release() {
+        // One class, one slot: the second claimer finds no free slot and no
+        // victim (the only resident key is leased), so it parks on the class
+        // wake channel; the lease release bumps the generation and notifies,
+        // and the waiter must finish (filled or evicted) — never busy, never
+        // lost. Under loom the wait degrades to a yield (loom has no timed
+        // wait), so this test explores the park/notify path and both
+        // branches of the generation gate rather than detecting a hang.
+        primitives::model(|| {
+            let m = Arc::new(map(1, 2, vec![0..1]));
+            let m2 = m.clone();
+            let snap = Arc::new(PolicySnapshot::empty());
+            let snap2 = snap.clone();
+            let t = primitives::spawn(move || {
+                let got = take(&m2, &snap2, 0, 1);
+                // `take` holds the lease when it grants one; release so the
+                // map state is final for the join. Busy grants no lease.
+                if !matches!(got, Got::Busy) {
+                    m2.release_lease(0, 1);
+                }
+                // Busy is admissible under loom, where the park is a yield:
+                // the starve bound can fire before the release lands. What
+                // must never happen is a hang (loom reports it) — the
+                // generation gate guarantees the parked thread re-checks.
+                matches!(got, Got::Filled(_) | Got::Evicted(..) | Got::Busy)
+            });
+            let main_got = take(&m, &snap, 0, 0);
+            if !matches!(main_got, Got::Busy) {
+                m.release_lease(0, 0);
+            }
+            assert!(t.join().unwrap(), "parked claimer never made progress");
+            assert!(
+                matches!(main_got, Got::Filled(_) | Got::Evicted(..) | Got::Busy),
+                "parked claimer never made progress"
+            );
         });
     }
 

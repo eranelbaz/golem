@@ -214,16 +214,10 @@ impl Policy {
         self.states.is_empty()
     }
 
-    fn decay_factor(&self, from: u64, to: u64) -> f64 {
-        // Magnitude-based by design: callers may legitimately decay
-        // backwards in virtual time (`pass` sweeps every key to one step;
-        // the journal sweep decays to a horizon below a replayed access),
-        // so the delta is the absolute difference built from saturating
-        // subs — no wrap on either ordering.
-        let fwd = to.saturating_sub(from);
-        let back = from.saturating_sub(to);
-        debug_assert!(fwd == 0 || back == 0, "from and to cannot both lead");
-        decay_factor(fwd + back, self.cfg.half_life_steps)
+    /// Class-scope helper so callers mutating `self.scratch_rank` (e.g.
+    /// `pass`) can use it without a `&self` borrow conflict.
+    fn decay_factor(from: u64, to: u64, half_life: f64) -> f64 {
+        decay_factor(from.abs_diff(to), half_life)
     }
 
     /// Record an access at `step` (§6.2): lazy decay since the expert's last
@@ -236,7 +230,11 @@ impl Policy {
             step >= self.states[key].last_score_step,
             "steps must be monotonic"
         );
-        let df = self.decay_factor(self.states[key].last_score_step, step);
+        let df = Self::decay_factor(
+            self.states[key].last_score_step,
+            step,
+            self.cfg.half_life_steps,
+        );
         let st = &mut self.states[key];
         st.score = st.score * df + 1.0;
         st.last_score_step = step;
@@ -326,7 +324,11 @@ impl Policy {
             step >= self.states[key].last_score_step,
             "steps must be monotonic"
         );
-        let df = self.decay_factor(self.states[key].last_score_step, step);
+        let df = Self::decay_factor(
+            self.states[key].last_score_step,
+            step,
+            self.cfg.half_life_steps,
+        );
         let st = &mut self.states[key];
         st.score *= df;
         st.last_score_step = step;
@@ -380,12 +382,13 @@ impl Policy {
     pub fn pass(&mut self, step: u64) -> PolicyOutput {
         let vram_cap = self.cfg.vram_experts_max;
         let min_dwell = self.cfg.min_dwell_steps;
+        let half_life = self.cfg.half_life_steps;
         let n = self.states.len();
         self.scratch_rank.clear();
         let rank = &mut self.scratch_rank;
         for k in 0..n {
             let last = self.states[k].last_score_step;
-            let d = decay_factor(last.max(step) - last.min(step), self.cfg.half_life_steps);
+            let d = Self::decay_factor(last, step, half_life);
             let st = &mut self.states[k];
             st.score *= d;
             st.last_score_step = step;
@@ -569,7 +572,11 @@ impl Policy {
         for r in journal.iter() {
             let vstep = r.step;
             for &k in &r.accesses {
-                let df = self.decay_factor(self.states[k].last_score_step, vstep);
+                let df = Self::decay_factor(
+                    self.states[k].last_score_step,
+                    vstep,
+                    self.cfg.half_life_steps,
+                );
                 let st = &mut self.states[k];
                 st.score = st.score * df + 1.0;
                 st.last_score_step = vstep;
@@ -581,7 +588,11 @@ impl Policy {
         // would trip), then stamp `last_score_step = 0`. Keys never
         // replayed have score 0, so the sweep is a no-op for them.
         for k in 0..self.states.len() {
-            let df = self.decay_factor(self.states[k].last_score_step, horizon);
+            let df = Self::decay_factor(
+                self.states[k].last_score_step,
+                horizon,
+                self.cfg.half_life_steps,
+            );
             let st = &mut self.states[k];
             st.score *= df;
             st.last_score_step = 0;

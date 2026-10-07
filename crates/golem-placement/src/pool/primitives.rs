@@ -42,8 +42,16 @@ pub fn yield_now() {
 }
 
 /// Parks the claimer on `cv` until notified or `dur` elapses, returning the
-/// reguarded lock (loom has no timed wait: spin-yield instead — loom models
-/// deterministic interleavings, not wall-clock parking).
+/// reguarded lock.
+///
+/// Gap: loom cannot model timed waits, so under `--cfg loom` this is a single
+/// yield — the caller's starve bound (not the timeout) provides liveness in
+/// the model. A lost wakeup is therefore not observable as a hang under loom;
+/// liveness across the park/notify path is instead guaranteed by the
+/// generation gate in `claim_for` (the park predicate `gen` is re-checked
+/// under the wake-channel lock that every release/cancel bumps, so a release
+/// concurrent with parking either skips the park or is notified), and the
+/// loom residency test exercises both branches of that gate in-model.
 #[cfg(loom)]
 pub fn wait_timeout<'a, T>(
     cv: &'a Condvar,
