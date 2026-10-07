@@ -487,7 +487,19 @@ impl ResidencyMap {
                 Some(x) => x,
                 None if !demand => return Err(ClaimError::Busy),
                 None => {
-                    super::primitives::yield_now();
+                    // No victim this pass: leases are transient, so park on
+                    // the shard condvar — `release_lease` (and fills/cancels)
+                    // notify it — instead of spinning. The timed wait also
+                    // covers victims that appear without a notification
+                    // (snapshot protection lapsing as steps advance); the
+                    // starve bound still terminates the loop.
+                    let sh = self.shards[li].shard.lock().unwrap();
+                    let _sh = super::primitives::wait_timeout(
+                        &self.shards[li].fill_cv,
+                        sh,
+                        std::time::Duration::from_micros(200),
+                    );
+                    drop(_sh);
                     continue;
                 }
             };
@@ -651,6 +663,8 @@ impl ResidencyMap {
         let i = self.local(expert);
         debug_assert!(sh.leases[i] > 0, "release without a lease");
         sh.leases[i] = sh.leases[i].saturating_sub(1);
+        // A waiter parked in `claim_for`'s no-victim path can now evict.
+        self.shards[layer as usize].fill_cv.notify_all();
     }
 
     /// Abandons a page-in (reached only through [`FillClaim`]): drops the claim's lease — by contract the

@@ -41,6 +41,30 @@ pub fn yield_now() {
     loom::thread::yield_now();
 }
 
+/// Parks the claimer on `cv` until notified or `dur` elapses, returning the
+/// reguarded lock (loom has no timed wait: spin-yield instead — loom models
+/// deterministic interleavings, not wall-clock parking).
+#[cfg(loom)]
+pub fn wait_timeout<'a, T>(
+    cv: &'a Condvar,
+    guard: loom::sync::MutexGuard<'a, T>,
+    _dur: std::time::Duration,
+) -> loom::sync::MutexGuard<'a, T> {
+    loom::thread::yield_now();
+    guard
+}
+
+/// Parks the claimer on `cv` until notified or `dur` elapses.
+#[cfg(not(loom))]
+pub fn wait_timeout<'a, T>(
+    cv: &'a Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+    dur: std::time::Duration,
+) -> std::sync::MutexGuard<'a, T> {
+    let (guard, _t) = cv.wait_timeout(guard, dur).unwrap();
+    guard
+}
+
 #[cfg(not(loom))]
 pub use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
