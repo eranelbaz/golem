@@ -197,7 +197,7 @@ fn register_p2_hooks() {
     // the Session built on it by `new_with_test_ctx`.
     let hooked = ctx.register(
         golem_llama_sys::HookFns {
-            evict_dest: None,
+            evict_batch: None,
             ensure: Some(on_ensure),
             routing: Some(on_routing),
             copy_done: None,

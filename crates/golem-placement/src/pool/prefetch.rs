@@ -145,7 +145,15 @@ pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> Pre
                         break;
                     }
                     match pool.ensure_unit(false, layer, expert) {
-                        Ok(()) | Err(PoolError::Busy) => {}
+                        Ok(()) => {
+                            // The promotion bit may have landed while this
+                            // page-in ran (concurrent end_batch_step_exclusive):
+                            // drop the just-refilled RAM copy, the VRAM one is
+                            // authoritative (exactly-one-tier, O10). No-op
+                            // unless `is_vram`.
+                            pool.release_if_vram(layer, expert);
+                        }
+                        Err(PoolError::Busy) => {}
                         // Transient source trouble must not kill prefetching;
                         // `source_errors` already counted the failure.
                         Err(e) => {

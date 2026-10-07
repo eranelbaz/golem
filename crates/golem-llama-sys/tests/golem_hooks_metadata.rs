@@ -114,7 +114,7 @@ fn hooked_guard_unregisters_and_recovers_payload() {
             ensure: Some(nop),
             routing: Some(nop2),
             copy_done: Some(nop3),
-            evict_dest: None,
+            evict_batch: None,
         },
         std::sync::Arc::new([0u64; 4]),
     );

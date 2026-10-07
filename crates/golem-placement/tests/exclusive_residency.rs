@@ -119,6 +119,58 @@ fn d2h_restores_exactly_one_ram_copy() {
 
 #[test]
 #[cfg(not(loom))]
+fn d2h_resident_arm_releases_the_probe_lease() {
+    let pool = pool(2);
+    let mut buf = vec![0u8; plane_len() as usize];
+    // Expert 2 becomes pool-resident and stays (never promoted).
+    pool.ensure_batch(
+        0,
+        &[(ExpertKind::Gate, 2)],
+        &mut [buf.as_mut_ptr() as *const u8],
+    )
+    .unwrap();
+    pool.end_batch_step();
+    assert!(pool.is_resident(0, 2));
+    // A D2H for a key whose RAM copy is current must report Resident AND
+    // leave zero outstanding leases (the probe lease is released, not leaked
+    // — a leaked lease would pin the slot against release_resident forever).
+    assert!(matches!(
+        pool.claim_d2h(0, 2, 0.0),
+        golem_placement::pool::D2hIncoming::Resident
+    ));
+    assert_eq!(
+        pool.outstanding_leases(0, 2),
+        0,
+        "claim_d2h Resident leaked the probe's lease"
+    );
+}
+
+#[test]
+#[cfg(not(loom))]
+fn device_cache_reset_drops_the_staged_batch_without_releasing_slots() {
+    let pool = pool(2);
+    let mut buf = vec![0u8; plane_len() as usize];
+    // Stage a batch whose copy_done has NOT run yet (leases still held).
+    pool.ensure_batch(
+        0,
+        &[(ExpertKind::Gate, 3)],
+        &mut [buf.as_mut_ptr() as *const u8],
+    )
+    .unwrap();
+    assert!(pool.is_resident(0, 3) && !pool.is_vram(0, 3));
+    // Between-turns device cache reset: the staged VRAM copies are gone.
+    pool.reset_exclusive_batch();
+    pool.clear_all_vram();
+    // The next compute's copy_done must release nothing and set no VRAM bit:
+    // the unit stays exactly once in the pool tier (its RAM copy is current).
+    pool.end_batch_step_exclusive();
+    assert!(pool.is_resident(0, 3), "RAM copy must survive the reset");
+    assert!(!pool.is_vram(0, 3), "no stale VRAM bit after reset");
+    assert!(pool.is_resident(0, 3) ^ pool.is_vram(0, 3));
+}
+
+#[test]
+#[cfg(not(loom))]
 fn score_floor_drops_into_a_full_hot_pool() {
     let pool = pool(1); // one slot: the resident victim must score colder
     let scores = vec![5.0f32, 0.0, 0.0, 0.0];

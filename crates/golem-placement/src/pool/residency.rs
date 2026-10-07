@@ -786,6 +786,27 @@ impl ResidencyMap {
         wake.cv.notify_all();
     }
 
+    /// The slot a resident key currently occupies, if any (diag/prefetch seam:
+    /// pairs with [`Self::release_resident`] for callers that hold no claim
+    /// token). `None` while mid-fill — the slot is not readable yet.
+    pub(crate) fn resident_slot(&self, layer: u32, expert: u32) -> Option<u32> {
+        let li = layer as usize;
+        let sh = self.shards[li].shard.lock().unwrap();
+        let i = self.local(expert);
+        if Self::bit_test(&sh.bits, i) && !Self::bit_test(&sh.filling, i) {
+            Some(sh.slot_of[i] as u32)
+        } else {
+            None
+        }
+    }
+
+    /// The key's outstanding lease count (test/diagnostic seam: the D2H
+    /// `Resident` path must not leak the probe's lease).
+    pub(crate) fn lease_count(&self, layer: u32, expert: u32) -> u16 {
+        let sh = self.shards[layer as usize].shard.lock().unwrap();
+        sh.leases[self.local(expert)]
+    }
+
     /// Abandons a page-in (reached only through [`FillClaim`]): drops the claim's lease — by contract the
     /// only one on the key (concurrent claimers park on the fill gate until
     /// this cancel or the fill completes) — clears the key's residency and
@@ -872,7 +893,13 @@ impl ResidencyMap {
         floor: f32,
     ) -> D2hClaim<'_> {
         match self.claim_for(layer, expert, snapshot, true, floor) {
-            Ok(Claim::Resident { .. }) => D2hClaim::Resident,
+            Ok(Claim::Resident { .. }) => {
+                // claim_for granted this probe a lease on the resident key;
+                // the D2H outcome hands no token out, so release it here —
+                // the caller copies nothing and the slot stays resident.
+                self.release_lease(layer, expert);
+                D2hClaim::Resident
+            }
             Ok(Claim::Filled { slot, claim }) => D2hClaim::Claimed { slot, claim },
             Err(ClaimError::Evicted(evicted)) => D2hClaim::Claimed {
                 slot: evicted.slot,

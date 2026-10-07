@@ -367,7 +367,7 @@ This is exponential-decay frequency: a blend of LRU (recency dominates for small
   - Promotion to VRAM releases the expert's pool slot once its H2D copy lands.
   - VRAM eviction copies the slot D2H into a free pool slot, or drops it when the pool's victim scores higher. It is never re-read from disk while a VRAM copy exists.
   - The disk → RAM → VRAM staging order is kept (spec §Expert placement).
-  - Cost: one D2H per VRAM eviction (15.2 MB at ≈25 GB/s ≈ 0.6 ms, off the critical path on the promotion stream), plus a pool-slot claim on the eviction path.
+  - Cost: one D2H per VRAM eviction (15.2 MB at ≈25 GB/s ≈ 0.6 ms) on the split backend's stream — the SAME stream the H2D refills of the stolen slots use, issued first so stream order lands the D2H before the refill (not a separate promotion stream); measured decode impact pending A/B. Plus a pool-slot claim on the eviction path.
   - Sized by the M3.7 replay: build it if the extra ≈10.6 GiB of unique capacity moves the replayed RAM hit rate. Built behind `--residency inclusive|exclusive` (ABI v7 `evict_dest` hook); **inclusive stays the default** until the decode tok/s A/B (cold + warm, both orders) proves exclusive on this machine.
 - *Amended 2026-10-06: routing profile for first start.* M2.5's journal seeds a warm start. A first start has no journal, so ship or record an offline **routing profile**: per-(layer, expert) access counts from M3.8 traces over real prompts. Seed scores from it and pre-fill the pool and the VRAM slots before the first request. The hit-rate curve comes from the M3.7 replay.
 - *Amended 2026-10-07 (M3.7 replay, `docs/baselines/m3.7-policy-replay.md`).* Four real 512-token traces replayed at production geometry (K = 18). Findings:

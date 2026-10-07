@@ -1,5 +1,7 @@
-// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v5:
-// per-model hook context; v7 adds the exclusive-residency evict_dest hook). Part of the vendored ggml include tree; the ABI is
+// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v8:
+// per-model hook context; v7 added the exclusive-residency eviction hook,
+// v8 batches it per (layer, compute) — one call for all of a layer's
+// evictions in one shot). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
@@ -25,7 +27,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 7
+#define GOLEM_HOOKS_ABI_VERSION 8
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -44,21 +46,27 @@ typedef void (*golem_ensure_host_resident_fn)(void *payload, const void *tensor,
                                               int32_t n_miss,
                                               const void **out_ptrs);
 
-/* Hook (exclusive residency, design §6.3 O10): a device-slab slot was
- * evicted; decide where its bytes go. Fills out_ptrs[0..3] (indexed
- * kind-1: gate/up/down) with the pool-side host destination of that
- * expert's three planes and returns 1 → the substrate issues ONE D2H copy
- * per plane on the split (promotion) stream before any H2D re-fill of the
- * slot (stream order makes the copy safe). Returns 0 to drop the bytes
+/* Hook (exclusive residency, design §6.3 O10): device-slab slots were
+ * evicted; decide where their bytes go. ONE call per (layer, compute) with
+ * the layer's whole eviction list. For expert i, fills out_ptrs[3i..3i+3]
+ * (indexed kind-1: gate/up/down) with the pool-side host destinations of
+ * that expert's three planes and sets keep[i] != 0 → the substrate issues
+ * ONE D2H copy per plane for that expert; keep[i] == 0 drops the bytes
  * (pool copy already current, or the pool's eviction victim scores
  * higher); the substrate then simply invalidates the slot. The pool keeps
  * the returned slots gated until the matching copy_done, which runs only
  * after the substrate synchronized its backends, so the D2H has landed
  * before any pool reader is admitted. Called on the decode thread, once
- * per evicted (layer, expert) per compute. */
-typedef int (*golem_evict_dest_fn)(void *payload, const void *tensor,
-                                   int32_t expert,
-                                   const void **out_ptrs);
+ * per layer per compute.
+ *
+ * Stream/cost note: the D2H copies run on the SPLIT BACKEND's stream — the
+ * same stream the H2D refills of the stolen slots use — and are issued
+ * BEFORE those refills, so stream order lands the eviction D2H first (it
+ * is NOT on a separate promotion stream). Cost ≈ 15.2 MB / 25 GB/s ≈
+ * 0.6 ms per evicted expert; measured decode impact pending A/B. */
+typedef void (*golem_evict_batch_fn)(void *payload, const void *tensor,
+                                     const int32_t *experts, int32_t n_evicts,
+                                     void *const *out_ptrs, int32_t *keep);
 
 /* Hook: releases the host-pool leases taken by ensure_host_resident since
  * the previous copy_done. Called at the start of each scheduler compute,
@@ -117,7 +125,7 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
                                          golem_ensure_host_resident_fn ensure,
                                          golem_routing_fn routing,
                                          golem_copy_done_fn copy_done,
-                                         golem_evict_dest_fn evict_dest,
+                                         golem_evict_batch_fn evict_batch,
                                          void *payload);
 
 /* Marks the ctx unhooked, then JOINS: waits until the ctx's in-flight step

@@ -557,60 +557,100 @@ impl ExpertPool {
         }));
         // Leases dropped with the drained vector: the slots are un-leased, so
         // the release succeeds unless an in-flight prefetch claim re-leased
-        // the key in between — that unit stays inclusive by design.
+        // the key in between — that unit stays inclusive by design. The VRAM
+        // bit is set BEFORE the release: a prefetcher that filtered on
+        // `is_vram` earlier then re-checks after its claim (see
+        // `release_if_vram`) and sees the bit, so it cannot re-page a key
+        // whose VRAM copy exists (the exclusive invariant, O10).
         for &(layer, expert, slot) in triples.iter() {
-            self.residency.release_resident(layer, expert, slot);
             self.vram.set(layer, expert);
+            self.residency.release_resident(layer, expert, slot);
         }
         triples.clear();
         batch.snapshot = self.snapshot();
     }
 
-    /// Claims a slot for an incoming VRAM eviction D2H (O10). `floor` is the
-    /// incoming expert's published score: a CLOCK victim scoring strictly
-    /// above it is kept and the copy dropped. On `Dest` the three plane
-    /// destinations are handed out raw (the fill gate stays closed until
-    /// [`Self::commit_d2h`], parking every pool reader of the key, so no
-    /// reader can observe the copy in flight); the pending claim is recorded
-    /// and its lease held until commit, so CLOCK cannot recycle the slot
-    /// mid-copy.
-    pub fn claim_d2h(&self, layer: u32, expert: u32, floor: f32) -> D2hIncoming {
-        // VRAM presence bit cleared by the caller before this call (the C
-        // side reports the eviction once, before any later ensure).
-        let snapshot = self.snapshot();
-        match self.residency.claim_d2h(layer, expert, &snapshot, floor) {
-            super::residency::D2hClaim::Resident => D2hIncoming::Resident,
-            super::residency::D2hClaim::Dropped => D2hIncoming::Dropped,
-            super::residency::D2hClaim::Claimed { slot, claim } => {
-                let unit = &self.geometry.layers[layer as usize];
-                // SAFETY: the claim holds the key's only lease and the fill
-                // gate is closed (no pool reader exists); the view ends here,
-                // the raw plane pointers stay covered by the pending lease +
-                // closed gate until commit_d2h.
-                let mut dst = [std::ptr::null_mut::<u8>(); 3];
-                for (k, d) in dst.iter_mut().enumerate() {
-                    let (off, _) = unit.plane(ExpertKind::ALL[k]);
-                    *d = self.arena.slot_ptr_at(claim.slot(), off);
-                }
-                claim.defer();
-                let lease = Lease {
-                    map: self.residency.clone(),
-                    _arena: self.arena.clone(),
-                    layer,
-                    expert,
-                    slot,
-                };
-                self.d2h_pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(PendingD2h {
+    /// Claims slots for a whole layer's incoming VRAM evictions (O10): one
+    /// call per (layer, compute) — the policy snapshot is taken ONCE for the
+    /// batch (cached from this compute's `batch_claims`, as the H2D path
+    /// does) and the pending-D2H table is locked once, instead of per
+    /// evicted expert. Per-expert `floor` is the expert's published score: a
+    /// CLOCK victim scoring strictly above it is kept and the copy dropped.
+    /// Outcomes align with `experts`/`floors`. The caller must have cleared
+    /// each key's VRAM presence bit before this call (the C side reports
+    /// the eviction once, before any later ensure).
+    pub fn claim_d2h_batch(
+        &self,
+        layer: u32,
+        experts: &[u32],
+        floors: &[f32],
+        out: &mut [D2hIncoming],
+    ) {
+        assert_eq!(
+            experts.len(),
+            floors.len(),
+            "claim_d2h_batch: floors/experts length mismatch"
+        );
+        assert_eq!(
+            experts.len(),
+            out.len(),
+            "claim_d2h_batch: out length mismatch"
+        );
+        if experts.is_empty() {
+            return;
+        }
+        // One snapshot for the whole batch: the floor decisions within one
+        // compute share the snapshot the H2D ensure path used (refreshed at
+        // end_batch_step), so victims rank consistently across the step.
+        let snapshot = self
+            .batch_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot
+            .clone();
+        // One pending-table lock per batch: every claim pushed under it, so
+        // CLOCK cannot recycle a claimed slot mid-batch either.
+        let mut pending = self.d2h_pending.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, (&expert, &floor)) in experts.iter().zip(floors).enumerate() {
+            out[i] = match self.residency.claim_d2h(layer, expert, &snapshot, floor) {
+                super::residency::D2hClaim::Resident => D2hIncoming::Resident,
+                super::residency::D2hClaim::Dropped => D2hIncoming::Dropped,
+                super::residency::D2hClaim::Claimed { slot, claim } => {
+                    let unit = &self.geometry.layers[layer as usize];
+                    // SAFETY: the claim holds the key's only lease and the fill
+                    // gate is closed (no pool reader exists); the view ends here,
+                    // the raw plane pointers stay covered by the pending lease +
+                    // closed gate until commit_d2h.
+                    let mut dst = [std::ptr::null_mut::<u8>(); 3];
+                    for (k, d) in dst.iter_mut().enumerate() {
+                        let (off, _) = unit.plane(ExpertKind::ALL[k]);
+                        *d = self.arena.slot_ptr_at(claim.slot(), off);
+                    }
+                    claim.defer();
+                    let lease = Lease {
+                        map: self.residency.clone(),
+                        _arena: self.arena.clone(),
+                        layer,
+                        expert,
+                        slot,
+                    };
+                    pending.push(PendingD2h {
                         layer,
                         expert,
                         lease,
                     });
-                D2hIncoming::Dest(dst)
-            }
+                    D2hIncoming::Dest(dst)
+                }
+            };
         }
+    }
+
+    /// Single-expert form of [`Self::claim_d2h_batch`] (tests and the
+    /// inclusive ABI path).
+    pub fn claim_d2h(&self, layer: u32, expert: u32, floor: f32) -> D2hIncoming {
+        let mut out = [D2hIncoming::Dropped];
+        self.claim_d2h_batch(layer, &[expert], &[floor], &mut out);
+        std::mem::replace(&mut out[0], D2hIncoming::Dropped)
     }
 
     /// Completes every pending VRAM-eviction D2H: opens the fill gates (the
@@ -641,6 +681,49 @@ impl ExpertPool {
     /// reset between turns).
     pub fn clear_all_vram(&self) {
         self.vram.clear_all();
+    }
+
+    /// Drops every lease of the staged (not yet `copy_done`'d) exclusive
+    /// batch WITHOUT releasing its pool slots: the device-cache reset between
+    /// turns destroyed the staged VRAM copies, so the units must stay
+    /// pool-resident (their RAM copies are current) and no later
+    /// [`Self::end_batch_step_exclusive`] may release those slots or set
+    /// VRAM bits for them. Decode is idle between turns (the caller's
+    /// invariant), so no lease is in flight on the device.
+    pub fn reset_exclusive_batch(&self) {
+        let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scratch = self
+            .exclusive_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::swap(&mut *scratch, &mut batch.leases);
+        let n = self.geometry.n_experts as usize;
+        for l in scratch.drain(..) {
+            batch.lease_of[l.layer as usize * n + l.expert as usize] = UNCLAIMED;
+        }
+        // Leases dropped with the drained vector: un-leased, slots stay
+        // resident. `lease_of` fully cleared — the next step re-claims fresh.
+    }
+
+    /// Prefetcher seam (exclusive residency, O10): if the unit gained a VRAM
+    /// copy while this prefetch page-in was in flight (a concurrent
+    /// `end_batch_step_exclusive` promotion), release the just-refilled RAM
+    /// copy — the VRAM one is authoritative, and keeping both breaks the
+    /// exactly-one-tier invariant. The narrow check-vs-release race with a
+    /// fresh VRAM eviction is benign: `claim_d2h` re-fills a pool slot from
+    /// the slab behind a closed gate before any reader is admitted.
+    pub fn release_if_vram(&self, layer: u32, expert: u32) {
+        if !self.vram.test(layer, expert) {
+            return;
+        }
+        if let Some(slot) = self.residency.resident_slot(layer, expert) {
+            self.residency.release_resident(layer, expert, slot);
+        }
+    }
+
+    /// The key's outstanding pool lease count (test/observability seam).
+    pub fn outstanding_leases(&self, layer: u32, expert: u32) -> u16 {
+        self.residency.lease_count(layer, expert)
     }
 
     /// Publishes a rebuilt policy snapshot (the engine's per-step scored

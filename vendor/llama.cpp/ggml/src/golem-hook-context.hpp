@@ -49,7 +49,7 @@ struct golem_ctx {
     golem_ensure_host_resident_fn ensure = nullptr;
     golem_routing_fn routing = nullptr;
     golem_copy_done_fn copy_done = nullptr;
-    golem_evict_dest_fn evict_dest = nullptr; // exclusive residency (ABI v7)
+    golem_evict_batch_fn evict_batch = nullptr; // exclusive residency (ABI v8)
     void *payload = nullptr;
     // P5 next-layer prediction (golem_set_predict; 0 = off)
     golem_predict_fn predict = nullptr;
