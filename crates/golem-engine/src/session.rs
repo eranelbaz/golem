@@ -1154,7 +1154,7 @@ unsafe fn apply_template(
             content: m.content.as_ptr(),
         })
         .collect();
-    let n_msg = chat.len() as raw::size_t;
+    let n_msg = chat.len();
     // SAFETY: tmpl and chat point to live NUL-terminated data; null/0 buffer is
     // the documented sizing call (returns the total number of bytes needed,
     // negative on detection/apply failure).
