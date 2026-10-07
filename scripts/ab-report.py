@@ -9,14 +9,17 @@ from pathlib import Path
 
 
 def leg_row(d: Path) -> str:
-    if "rc=0" not in (d / "meta.txt").read_text().split():
+    if not (d / "meta.txt").is_file() or "rc=0" not in (d / "meta.txt").read_text().split():
         sys.exit(f"{d.name}: run did not finish with rc=0")
     lines = (d / "timing.csv").read_text().splitlines()
     rows = list(csv.DictReader(l for l in lines if not l.startswith("#")))
     if not rows:
         sys.exit(f"{d.name}: no decode rows")
-    wall = sum(float(r["wall_ms"]) for r in rows)
-    disk = sum(float(r["disk_bytes"]) for r in rows)
+    try:
+        wall = sum(float(r["wall_ms"]) for r in rows)
+        disk = sum(float(r["disk_bytes"]) for r in rows)
+    except (KeyError, ValueError) as e:
+        sys.exit(f"{d.name}: unusable timing.csv ({e})")
     trailer = next((l[2:] for l in lines if l.startswith("# prefetch")), "")
     stats = dict(re.findall(r"(\w+)=(\S+)", trailer))
     return "| {} | {} | {:.3f} | {:.2f} | {} | {} | {} |".format(

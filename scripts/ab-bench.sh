@@ -20,6 +20,8 @@ GIB="${GOLEM_AB_GIB:-59}"
 TOKENS="${GOLEM_AB_TOKENS:-128}"
 OUT="${GOLEM_AB_WORK:-$REPO/.ab-work}/$LEG"
 mkdir -p "$OUT"
+rm -f "$OUT"/{timing.csv,meta.txt,stdout.txt,stderr.txt}
+[[ -x $BIN && -f $MODEL ]] || { echo "FATAL: missing $BIN or $MODEL" >&2; exit 2; }
 
 [[ "$(ulimit -l)" == unlimited ]] || { echo "FATAL: RLIMIT_MEMLOCK=$(ulimit -l), need unlimited" >&2; exit 2; }
 if [[ "$TEMP" == cold ]]; then
@@ -36,7 +38,6 @@ flags=(--n-gpu-layers 99 --cpu-moe-layers 99 --greedy --ram-experts-gib "$GIB" -
   echo "git=$(git -C "$REPO" rev-parse HEAD) bin_sha256=$(sha256sum "$BIN" | cut -c1-16)"
   echo "avail_kib_before=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
 } > "$OUT/meta.txt"
-rm -f "$OUT/timing.csv"
 rc=0
 "$BIN" run "$MODEL" "${flags[@]}" --prompt "$PROMPT" > "$OUT/stdout.txt" 2> "$OUT/stderr.txt" || rc=$?
 echo "rc=$rc" >> "$OUT/meta.txt"
