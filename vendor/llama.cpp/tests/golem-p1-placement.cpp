@@ -267,6 +267,7 @@ int main() {
 
     {   // --- leg 3: unregister-join ---
         HState s;
+        g_cb_entered.store(false); // leg 2's h_ensure runs left it true
         g_join_sleep_ms.store(200);
         golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
         golem_set_device_cache_experts(c, 2);
@@ -284,10 +285,10 @@ int main() {
         golem_unregister_hooks(h);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
+        worker.join(); // join before REQUIRE so a failure cannot terminate on a live thread
         REQUIRE(ms >= 100, "unregister must join the in-flight callback (%lld ms)", (long long) ms);
         REQUIRE(s.ensure_calls.load() == 1, "callback ran once");
         REQUIRE(s.cb_returned.load(), "callback completed before unregister returned");
-        worker.join();
         g_cb_entered.store(false);
         g_join_sleep_ms.store(0);
         golem_sched_detach_ctx(es.sched);
