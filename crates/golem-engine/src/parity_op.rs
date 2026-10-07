@@ -41,7 +41,7 @@ const N_THREADS: i32 = 2;
 /// lives in the device buffer (`no_alloc = true`). 1 MiB is orders of
 /// magnitude above the metadata this leg needs (ggml aborts rather than
 /// returning garbage when a pool is exhausted, so headroom is cheap).
-const MEM_SIZE: u64 = 1024 * 1024;
+const MEM_SIZE: usize = 1024 * 1024;
 
 /// Weight encoding of the expert tensors for one op-parity leg. The fp32 leg
 /// computes the synthetic weights as-is; the q8_0 leg quantizes the *same*

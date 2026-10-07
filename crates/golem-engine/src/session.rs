@@ -370,9 +370,9 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
     // are n_vocab valid floats (llama.h contract).
     let logits_ptr = unsafe { raw::llama_get_logits_ith(ctx.as_ptr(), 0) };
     if logits_ptr.is_null() {
-        // No EngineError code can represent this without lying about a decode return
-        // code; it is a broken FFI invariant, not a model rejection.
-        panic!("llama_get_logits_ith returned null after a successful decode");
+        // No decode return code can represent this without lying; it is a
+        // broken FFI invariant, not a model rejection — surface it as a value.
+        return Err(EngineError::LogitsUnavailable);
     }
     // SAFETY: logits_ptr is non-null and valid for n floats per llama.h.
     let logits = unsafe { std::slice::from_raw_parts(logits_ptr, n) };
@@ -406,7 +406,7 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         // SAFETY: successful decode with one output token; n floats valid.
         let logits_ptr = unsafe { raw::llama_get_logits_ith(ctx.as_ptr(), 0) };
         if logits_ptr.is_null() {
-            panic!("llama_get_logits_ith returned null after a successful re-decode");
+            return Err(EngineError::LogitsUnavailable);
         }
         // SAFETY: logits_ptr is non-null and valid for n floats per llama.h.
         let logits = unsafe { std::slice::from_raw_parts(logits_ptr, n) };
@@ -1154,7 +1154,7 @@ unsafe fn apply_template(
             content: m.content.as_ptr(),
         })
         .collect();
-    let n_msg = chat.len() as raw::size_t;
+    let n_msg = chat.len();
     // SAFETY: tmpl and chat point to live NUL-terminated data; null/0 buffer is
     // the documented sizing call (returns the total number of bytes needed,
     // negative on detection/apply failure).

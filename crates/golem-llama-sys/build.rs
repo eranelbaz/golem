@@ -325,7 +325,6 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: true,
         })
-        .size_t_is_usize(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("bindgen failed on llama.h + golem-hooks.h");

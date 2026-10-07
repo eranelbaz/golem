@@ -8,9 +8,6 @@
 //! another claimer.
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
-#![allow(unexpected_cfgs)]
-
-use std::fmt;
 
 use super::arena::Arena;
 use super::primitives::{Arc, AtomicUsize, Ordering};
@@ -55,9 +52,10 @@ impl SnapshotHandle {
 /// (the key's claim is cancelled — no ghost residency, slot recycled; the
 /// FFI layer aborts loudly on this), an over-subscribed pool, or a caller
 /// contract violation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     /// Source read failed after bounded retries.
+    #[error("expert page-in failed: {source}")]
     Source {
         /// The failing source error.
         source: std::io::Error,
@@ -65,30 +63,17 @@ pub enum PoolError {
     /// Every slot is leased or snapshot-protected after bounded CLOCK walks
     /// — the pool is over-subscribed; leases are transient, so this is a
     /// loud contract violation, not a wait.
+    #[error("expert pool busy: no evictable slot — pool over-subscribed")]
     Busy,
     /// Caller passed a length-mismatched `ptrs` or an out-of-range
     /// `(layer, expert)` range — a programming error, reported as a value
     /// so no `pub fn` panics (library rule: errors are `Result`).
+    #[error("pool contract violated: {reason}")]
     Contract {
         /// What the caller violated.
         reason: String,
     },
 }
-
-impl fmt::Display for PoolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PoolError::Source { source } => write!(f, "expert page-in failed: {source}"),
-            PoolError::Busy => write!(
-                f,
-                "expert pool busy: no evictable slot — pool over-subscribed"
-            ),
-            PoolError::Contract { reason } => write!(f, "pool contract violated: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for PoolError {}
 
 /// In-flight lease for one (layer, expert) unit; `Drop` releases it. Held
 /// across the copy-under-lease; the slot cannot be refilled or evicted while
@@ -323,8 +308,8 @@ pub struct ExpertPool {
     batch_claims: super::primitives::Mutex<BatchClaims>,
 }
 
-impl fmt::Debug for ExpertPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for ExpertPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExpertPool")
             .field("arena", &self.arena)
             .field("residency", &self.residency)

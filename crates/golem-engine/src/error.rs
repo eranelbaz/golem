@@ -33,6 +33,10 @@ pub enum EngineError {
     /// llama_decode returned nonzero (positive: no KV slot / aborted; negative: fatal).
     #[error("llama_decode failed with code {0}")]
     Decode(i32),
+    /// llama_get_logits_ith returned null after a successful decode — the
+    /// substrate broke the logits-output FFI contract.
+    #[error("llama_get_logits_ith returned null after a successful decode")]
+    LogitsUnavailable,
     /// T1 op-parity leg: raw ggml failure — `ggml_init` returned null,
     /// a tensor allocation failed, or the graph compute reported a
     /// non-success [`ggml_status`].

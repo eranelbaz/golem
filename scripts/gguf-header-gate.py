@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Gate: read GGUF headers via the vendored fork's gguf-py.
 
-Asserts arch == glm5next (M0.1 pin) across every shard that carries the
+Asserts arch == glm5next (arch pin) across every shard that carries the
 field, and prints the layer/expert counts needed for the manifest's
 expert_index.
 
@@ -58,7 +58,7 @@ def main():
         fatal("no shard carries general.architecture")
     print("arch:", arch)
     if arch != "glm5next":
-        fatal(f"GATE FAILED: arch is {arch!r}, expected 'glm5next' — M0.1 pin mismatch, stop")
+        fatal(f"GATE FAILED: arch is {arch!r}, expected 'glm5next' — arch pin mismatch, stop")
 
     for k in sorted(reader.fields):
         if any(s in k for s in ("expert_count", "expert_used", "block_count",

@@ -5,7 +5,6 @@
 //! ([`PredictionQueue`], `--prefetch read`); tests also inject their own.
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
-#![allow(unexpected_cfgs)]
 
 use std::collections::VecDeque;
 use std::time::Duration;

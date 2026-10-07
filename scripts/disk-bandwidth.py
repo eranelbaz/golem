@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""O_DIRECT disk bandwidth benchmark (M0.4).
+"""O_DIRECT disk bandwidth benchmark .
 
 O_DIRECT bypasses the page cache, so no root drop_caches is needed.
 Legs: per-file and striped-across-files x {seq, rand} x {N threads}.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Parity-suite driver: M1.4 T1 (op parity) + T2 (end-to-end greedy token
-parity over the 8 M0.5 prompts) between two golem-cli substrate builds.
+"""Parity-suite driver: T1 (op parity) + T2 (end-to-end greedy token
+parity over the 8 frozen benchmark prompts) between two golem-cli substrate builds.
 
 Thin shim — implementation lives in the scripts/parity_suite/ package.
 Commands:

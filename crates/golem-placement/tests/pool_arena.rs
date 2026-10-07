@@ -5,7 +5,6 @@
 //! [`ExpertPool`].
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
-#![allow(unexpected_cfgs)]
 
 use golem_gguf::ExpertKind;
 use golem_placement::pool::primitives::{Arc, arc_dyn};

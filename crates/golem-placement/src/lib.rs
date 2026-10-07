@@ -146,6 +146,10 @@ pub struct Policy {
     /// Record for the current step; pushed to the journal when a later step's
     /// record is created or on [`Policy::detach_journal`].
     pending: Option<JournalRecord>,
+    /// Per-pass scratch reused across [`Policy::pass`] calls: the decode
+    /// hot path must not allocate the rank/flag buffers per pass.
+    scratch_rank: Vec<(f64, usize)>,
+    scratch_flags: Vec<bool>, // [0..n) = in_order, [n..2n) = promoted
 }
 
 impl Policy {
@@ -190,6 +194,8 @@ impl Policy {
             journal: None,
             journal_step: None,
             pending: None,
+            scratch_rank: Vec::with_capacity(n),
+            scratch_flags: vec![false; 2 * n],
         })
     }
 
@@ -208,8 +214,10 @@ impl Policy {
         self.states.is_empty()
     }
 
-    fn decay_factor(&self, from: u64, to: u64) -> f64 {
-        decay_factor(from.max(to) - from.min(to), self.cfg.half_life_steps)
+    /// Class-scope helper so callers mutating `self.scratch_rank` (e.g.
+    /// `pass`) can use it without a `&self` borrow conflict.
+    fn decay_factor(from: u64, to: u64, half_life: f64) -> f64 {
+        decay_factor(from.abs_diff(to), half_life)
     }
 
     /// Record an access at `step` (§6.2): lazy decay since the expert's last
@@ -222,7 +230,11 @@ impl Policy {
             step >= self.states[key].last_score_step,
             "steps must be monotonic"
         );
-        let df = self.decay_factor(self.states[key].last_score_step, step);
+        let df = Self::decay_factor(
+            self.states[key].last_score_step,
+            step,
+            self.cfg.half_life_steps,
+        );
         let st = &mut self.states[key];
         st.score = st.score * df + 1.0;
         st.last_score_step = step;
@@ -312,7 +324,11 @@ impl Policy {
             step >= self.states[key].last_score_step,
             "steps must be monotonic"
         );
-        let df = self.decay_factor(self.states[key].last_score_step, step);
+        let df = Self::decay_factor(
+            self.states[key].last_score_step,
+            step,
+            self.cfg.half_life_steps,
+        );
         let st = &mut self.states[key];
         st.score *= df;
         st.last_score_step = step;
@@ -364,22 +380,25 @@ impl Policy {
     /// Policy pass (§6.3): refresh scores, order experts, produce the
     /// promotion/pinning order for P2 and the eviction candidate lists.
     pub fn pass(&mut self, step: u64) -> PolicyOutput {
-        let cfg = self.cfg.clone();
+        let vram_cap = self.cfg.vram_experts_max;
+        let min_dwell = self.cfg.min_dwell_steps;
+        let half_life = self.cfg.half_life_steps;
         let n = self.states.len();
-        let mut rank: Vec<(f64, usize)> = Vec::with_capacity(n);
+        self.scratch_rank.clear();
+        let rank = &mut self.scratch_rank;
         for k in 0..n {
-            let df = self.decay_factor(self.states[k].last_score_step, step);
+            let last = self.states[k].last_score_step;
+            let d = Self::decay_factor(last, step, half_life);
             let st = &mut self.states[k];
-            st.score *= df;
+            st.score *= d;
             st.last_score_step = step;
             rank.push((st.score, k));
         }
         rank.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
 
         let resident = |k: usize, bit: u8| self.states[k].tiers & bit != 0;
-        let dwell_ok = |k: usize| {
-            step.saturating_sub(self.states[k].last_transition_step) > cfg.min_dwell_steps
-        };
+        let dwell_ok =
+            |k: usize| step.saturating_sub(self.states[k].last_transition_step) > min_dwell;
 
         // Promotion is a two-phase relative-swap rule (§6.3 as amended):
         // the order is seeded with current VRAM residents first (best-first,
@@ -394,11 +413,13 @@ impl Policy {
         // here: the steady-state score of an average expert is p·H ≈ 14 at
         // H = 512, an order of magnitude above any fixed θ.
         const SWAP_MARGIN: f64 = 1.2;
-        let mut vram_order: Vec<PolicyEntry> = Vec::with_capacity(cfg.vram_experts_max);
-        let mut in_order = vec![false; n];
+        let mut vram_order: Vec<PolicyEntry> = Vec::with_capacity(vram_cap);
+        let (in_order, promoted) = self.scratch_flags.split_at_mut(n);
+        in_order.fill(false);
+        promoted.fill(false);
         // Phase 1: incumbents keep their seats.
-        for &(score, k) in &rank {
-            if vram_order.len() == cfg.vram_experts_max {
+        for &(score, k) in rank.iter() {
+            if vram_order.len() == vram_cap {
                 break;
             }
             if resident(k, TIER_VRAM) {
@@ -413,11 +434,11 @@ impl Policy {
         // transiently leaves a displaced resident in VRAM past the cap
         // until its eviction lands — bounded by D_min, and the real P2
         // slab (K slots) enforces the hard budget at promotion time.
-        for &(score, k) in &rank {
-            if cfg.vram_experts_max == 0 || in_order[k] || !resident(k, TIER_RAM) || !dwell_ok(k) {
+        for &(score, k) in rank.iter() {
+            if vram_cap == 0 || in_order[k] || !resident(k, TIER_RAM) || !dwell_ok(k) {
                 continue;
             }
-            if vram_order.len() < cfg.vram_experts_max {
+            if vram_order.len() < vram_cap {
                 in_order[k] = true;
                 vram_order.push(PolicyEntry { key: k, score });
                 continue;
@@ -444,7 +465,7 @@ impl Policy {
             }
         }
         vram_order.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.key.cmp(&b.key)));
-        let mut promoted = vec![false; n];
+        // in_order's pass is done; the same scratch buffer serves `promoted`.
         for e in &vram_order {
             if !resident(e.key, TIER_VRAM) {
                 promoted[e.key] = true;
@@ -464,7 +485,7 @@ impl Policy {
         vram_evict_order.reverse();
 
         let mut ram_evict_order: Vec<PolicyEntry> = Vec::new();
-        for &(_, k) in &rank {
+        for &(_, k) in rank.iter() {
             if !resident(k, TIER_RAM) || resident(k, TIER_VRAM) {
                 continue;
             }
@@ -551,7 +572,11 @@ impl Policy {
         for r in journal.iter() {
             let vstep = r.step;
             for &k in &r.accesses {
-                let df = self.decay_factor(self.states[k].last_score_step, vstep);
+                let df = Self::decay_factor(
+                    self.states[k].last_score_step,
+                    vstep,
+                    self.cfg.half_life_steps,
+                );
                 let st = &mut self.states[k];
                 st.score = st.score * df + 1.0;
                 st.last_score_step = vstep;
@@ -563,7 +588,11 @@ impl Policy {
         // would trip), then stamp `last_score_step = 0`. Keys never
         // replayed have score 0, so the sweep is a no-op for them.
         for k in 0..self.states.len() {
-            let df = self.decay_factor(self.states[k].last_score_step, horizon);
+            let df = Self::decay_factor(
+                self.states[k].last_score_step,
+                horizon,
+                self.cfg.half_life_steps,
+            );
             let st = &mut self.states[k];
             st.score *= df;
             st.last_score_step = 0;
