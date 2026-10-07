@@ -5,7 +5,6 @@
 
 // `cfg(loom)` is swapped via RUSTFLAGS by the T6 loom leg (declared in
 // primitives.rs); register it as known for this module's cfg uses too.
-#![allow(unexpected_cfgs)]
 // Tests build one-class slot tables as `vec![0..slots]`; the lint's
 // alternatives are no clearer.
 #![allow(clippy::single_range_in_vec_init)]

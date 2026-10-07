@@ -5,7 +5,6 @@
 //
 // `cfg(loom)` is set via RUSTFLAGS by the T6 loom leg (the `loom` feature only
 // links the crate), so declare the cfg name known here.
-#![allow(unexpected_cfgs)]
 
 #[cfg(loom)]
 pub use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

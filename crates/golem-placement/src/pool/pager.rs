@@ -8,7 +8,6 @@
 //! another claimer.
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
-#![allow(unexpected_cfgs)]
 
 use std::fmt;
 

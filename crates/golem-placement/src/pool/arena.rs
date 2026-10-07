@@ -1,5 +1,3 @@
-#![allow(unexpected_cfgs)]
-
 //! mlock'd RAM expert slot arena (§5.4): `mmap(MAP_ANONYMOUS|MAP_NORESERVE)`
 //! locked into physical memory, carved into per-class slot regions — one run
 //! of equal slots per distinct slot size (§5.4). Slots are handed out

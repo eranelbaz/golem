@@ -6,7 +6,6 @@
 //! golem-store.
 
 // `cfg(loom)` is set via RUSTFLAGS by the loom leg; declare it known here.
-#![allow(unexpected_cfgs)]
 
 use std::collections::BTreeMap;
 use std::fmt;
