@@ -6,6 +6,9 @@ use std::path::PathBuf;
 /// Errors raised by the engine across model loading, session setup, and decode.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    /// `EngineConfig` value out of its documented range.
+    #[error("invalid engine config: {0}")]
+    InvalidConfig(String),
     /// GGUF file malformed at the byte level (magic, header, tensor table).
     #[error("invalid GGUF model: {0}")]
     InvalidModel(String),

@@ -79,13 +79,15 @@ struct TraceRing {
     dropped: usize,
 }
 
-/// Routing-trace ring capacities for one turn: every prompt and generated
-/// token routes `top_k` ids on each of the `n_layers` MoE layers, one record
-/// per (chunk or step, layer); a turn's tokens are bounded by `n_ctx +
-/// n_predict`. GLM at ctx 4096 + 512: 193k records, 1.5M ids ≈ 6 MiB.
-fn trace_caps(n_ctx: u32, n_predict: u32, n_layers: u32, top_k: u32) -> (usize, usize) {
-    let recs = (n_ctx as usize + n_predict as usize) * n_layers as usize;
-    (recs, recs * top_k as usize)
+/// Routing-trace ring capacities for one turn: one record per (prefill
+/// chunk or decode step, layer), `top_k` ids per token per layer; a turn's
+/// tokens are bounded by `n_ctx + n_predict`. GLM at ctx 4096 + 512, batch
+/// 512: 21.8k records, 1.5M ids ≈ 6 MiB; at ctx 131072: 33k records, 44M
+/// ids ≈ 177 MB (opt-in `--routing-trace` only).
+fn trace_caps(n_ctx: u32, n_predict: u32, batch: u32, n_layers: u32, top_k: u32) -> (usize, usize) {
+    let (ctx, pred, layers) = (n_ctx as usize, n_predict as usize, n_layers as usize);
+    let recs = (ctx.div_ceil(batch.max(1) as usize) + pred) * layers;
+    (recs, (ctx + pred) * layers * top_k as usize)
 }
 
 impl TraceRing {
@@ -627,6 +629,13 @@ pub(crate) fn session_closed() {
 pub(crate) fn advance_decode_step() {
     for h in current_states() {
         h.policy.step.fetch_add(1, Ordering::Relaxed);
+        // A prediction whose layer never reported routing this step is
+        // spent: drop it and its protect shield before the next step.
+        for (layer, p) in h.pred.pending.iter().enumerate() {
+            if p.swap(false, Ordering::Relaxed) && h.pred.mode == PrefetchMode::Protect {
+                h.pool.protect(layer as u32, std::iter::empty());
+            }
+        }
     }
 }
 
@@ -1055,6 +1064,12 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // were generated from — checked before any source open or allocation, so a
     // stale build fails fast instead of silently decoding with a drifted ABI.
     check_abi(abi_header_for_check(), golem_llama_sys::hooks_abi_version())?;
+    if config.prefetch != PrefetchMode::Off && !(1..=4).contains(&config.prefetch_lookahead) {
+        return Err(EngineError::InvalidConfig(format!(
+            "prefetch_lookahead {} outside 1..=4",
+            config.prefetch_lookahead
+        )));
+    }
 
     // Pool geometry from the GGUF file itself (header + tensor table only).
     let metadata = crate::gguf::read_metadata(&config.model_path)?;
@@ -1200,7 +1215,13 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // Routing-trace ring (§11 pattern), preallocated at enable — overflow
     // drops and counts instead of reallocating on the hot path.
     let trace = config.routing_trace.as_ref().map(|_| {
-        let (rec_cap, id_cap) = trace_caps(config.n_ctx, config.n_predict, n_layers, n_expert_used);
+        let (rec_cap, id_cap) = trace_caps(
+            config.n_ctx,
+            config.n_predict,
+            config.batch_tokens,
+            n_layers,
+            n_expert_used,
+        );
         // Model file (hashed into the header), not the trace output path.
         Mutex::new(TraceRing::new(config.model_path.clone(), rec_cap, id_cap))
     });
@@ -1233,7 +1254,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             n_layers,
             geo.n_experts,
             // Two steps of every layer's predictions; older ones are stale.
-            2 * (config.prefetch_lookahead.max(1) * (n_expert_used + PREDICT_MARGIN)) as usize
+            2 * (config.prefetch_lookahead * (n_expert_used + PREDICT_MARGIN)) as usize
                 * n_layers as usize,
         ),
     });
@@ -1805,10 +1826,9 @@ mod tests {
 
     #[test]
     fn trace_caps_cover_every_layer_of_every_token() {
-        // GLM: 32 generated tokens + a 1024-token ctx × 42 layers. The old
-        // `n_predict + 256` record cap held 288 records = 6.9 decode steps.
-        let (recs, ids) = trace_caps(1024, 32, 42, 8);
-        assert_eq!(recs, 1056 * 42);
+        // GLM: 1024-token ctx in 512-token chunks + 32 decode steps × 42 layers.
+        let (recs, ids) = trace_caps(1024, 32, 512, 42, 8);
+        assert_eq!(recs, (2 + 32) * 42);
         assert_eq!(ids, 1056 * 42 * 8);
     }
 

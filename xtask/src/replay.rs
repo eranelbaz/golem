@@ -93,6 +93,10 @@ impl Trace {
         let mut computes: Vec<Compute> = Vec::new();
         let mut prev_blk = u32::MAX;
         for (n, line) in lines.enumerate() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
             let bad = |why: &str| format!("{name}:{}: {why}: {line}", n + 2);
             let cols: Vec<&str> = line.split('\t').collect();
             let [step, phase, blk, ids] = cols[..] else {
@@ -909,6 +913,9 @@ pub fn run(args: Vec<String>) {
     // The trace run's resolved K (`golem run` prints it): a smaller K cannot
     // hold that run's prefill chunks, a larger one overstates VRAM hits.
     let k = k.unwrap_or_else(|| die("--k <slots per layer> is required".into()));
+    if !(1..=1024).contains(&k) {
+        die(format!("--k {k} outside 1..=1024"));
+    }
     if paths.is_empty() {
         die("no trace files".into());
     }
