@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::sync::{Mutex, Once};
+use std::sync::Once;
 
 use golem_llama_sys::raw;
 use golem_llama_sys::{Backend, substrate_backend};
@@ -129,23 +129,31 @@ impl LoadedModel {
     }
 }
 
-/// Loads the model at `config.model_path`, creates a context with `config`-derived
-/// params, and runs the decode self-check probe before handing the handle back.
-///
-/// Refused once the process-global expert hooks are registered: the hooks are
-/// never unregistered, so the self-check decode (and any later decode) of
-/// another model would run through the first model's pool, keyed by recycled
-/// host tensor addresses. One hook-owning model per process; a second model
-/// needs a second process.
+/// Serializes session construction so the pooled-concurrent refusal cannot
+/// race a concurrent `new` that has not yet counted (shared by [`Session::new`]
+/// and [`Session::new_with_test_ctx`]).
+fn construction_lock() -> std::sync::MutexGuard<'static, ()> {
+    static CONSTRUCT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CONSTRUCT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Loads the model at `config.model_path`, creates a context with
+/// `config`-derived params, and runs the decode self-check probe before
+/// handing the handle back. No per-process hook state remains: each model
+/// carries its own `golem_ctx` (ABI v5), so sequential models in one process
+/// are legal — a pooled session attaches its ctx via [`load_with_hooks`].
 pub fn load(config: &EngineConfig) -> Result<LoadedModel, EngineError> {
-    if p3_glue::hooks_registered() {
-        return Err(EngineError::PoolInit(
-            "a pool-enabled session owns this process's expert hooks; \
-             another model in the same process would be served the old \
-             model's bytes — use a second process"
-                .into(),
-        ));
-    }
+    load_with_hooks(config, None)
+}
+
+/// [`load`] with a pooled session's `golem_ctx` attached to the model
+/// immediately after load and BEFORE `llama_init_from_model` — so the
+/// context's first `sched_reserve` sees the hooks (`routing_fn != NULL`)
+/// and sizes no full-size expert-plane `input_cpy` (cpy shrink).
+pub(crate) fn load_with_hooks(
+    config: &EngineConfig,
+    attach: Option<raw::golem_ctx_t>,
+) -> Result<LoadedModel, EngineError> {
     init_backend(forces_expert_offload(config));
 
     // Fail fast, fail loud: refuse-to-start on a §4.3 violation before weights touch memory.
@@ -201,6 +209,15 @@ pub fn load(config: &EngineConfig) -> Result<LoadedModel, EngineError> {
         }
         Model { ptr }
     };
+    // Per-model hook attach (ABI v5 §3.4): the ctx rides the llama_model so
+    // every sched `sched_reserve` creates (including re-reserves) re-applies
+    // it. Must precede `llama_init_from_model` — its self-check decode is
+    // already a hooked decode.
+    if let Some(ctx) = attach {
+        // SAFETY: model is live and has no ctx yet; ctx is a live golem_ctx
+        // owned by the caller's SessionHooks (outlives this model).
+        unsafe { raw::llama_golem_model_attach(model.as_ptr(), ctx) };
+    }
 
     let n_batch = config.batch_tokens.min(config.n_ctx);
     // SAFETY: returns llama.cpp's default context params by value.
@@ -451,6 +468,9 @@ fn ffi_messages(messages: &[ChatTurn<'_>]) -> Result<Vec<ChatMessageFFI>, Engine
 
 /// A loaded model bound to its resolved chat template, driving one decode slot
 /// (stateless per turn — every `chat_turn` re-prefills the full transcript).
+/// Field order is load-bearing: `loaded` (llama_free) drops BEFORE `p3`
+/// (unregister already done in `Drop`; ctx free + pool drop here) — the
+/// §3.4 teardown order.
 pub struct Session {
     loaded: LoadedModel,
     config: EngineConfig,
@@ -458,10 +478,11 @@ pub struct Session {
     last_prompt_tokens: Vec<raw::llama_token>,
     /// P3 pool state when the RAM expert pool is enabled (nonzero
     /// `ram_experts_gib`); `None` keeps flagless runs pristine (hooks unset,
-    /// T4). The pool itself lives in the process-lifetime leaked hook handle;
-    /// this is only the stats/geometry view, so no drop-order coupling with
-    /// the substrate.
-    p3: Option<p3_glue::PoolEnable>,
+    /// T4). The session owns its hooks: dropping the session unregisters
+    /// (C joins in-flight steps) and frees the per-model ctx — so the field
+    /// must drop AFTER `loaded` (declaration order below) keeps the model
+    /// alive while the hooks still reference it.
+    p3: Option<p3_glue::SessionHooks>,
     /// §11 per-step recorder when `config.timing_csv` is set; flushed by the
     /// caller (`write_timing`) at turn end and reused across turns.
     /// Fixed-capacity, preallocated.
@@ -474,29 +495,71 @@ pub struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Pairs with session_opened in `new`; keeps the p3_glue live-session
-        // guard exact (enable refuses only while a session is actually live).
+        // §3.4 teardown order: detach the model's ctx → unregister-join →
+        // `llama_free` (field drop below: the sched destructor decrements the
+        // ctx attach refcount) → `golem_ctx_free` (inside SessionHooks::drop,
+        // aborts while the refcount ≠ 0) → pool/prefetch drop. `p3` is
+        // declared after `loaded`, so its drop runs after `llama_free`.
+        if let Some(_p3) = self.p3.as_ref() {
+            // SAFETY: the model is live until `loaded` drops below; NULL
+            // detaches so no later context can reach the freed ctx.
+            unsafe {
+                raw::llama_golem_model_attach(self.loaded.model().as_ptr(), std::ptr::null_mut())
+            };
+        }
+        if let Some(p3) = self.p3.as_mut() {
+            // Reclaim the device slab set while the substrate backend is
+            // still alive — freeing those buffers after `llama_free` would be
+            // a use-after-free (the ctx_free dc-empty assert enforces it).
+            // Decode is idle between turns, so no slab entry is in flight.
+            let ctx = p3.live_ctx_ptr();
+            if !ctx.is_null() {
+                // SAFETY: FFI on the session's live ctx; clears + frees the
+                // device-cache entries only.
+                unsafe { raw::golem_reset_device_cache(ctx) };
+            }
+            // Unregister + join BEFORE `llama_free`: no in-flight C callback
+            // may touch the pool while the context tears down.
+            p3.unregister();
+        }
+        // Pairs with session_opened in `new`; keeps the live-session counter
+        // exact.
         p3_glue::session_closed();
     }
 }
 
 impl Session {
     /// Loads per `config`, resolves the chat template (model-embedded, else
-    /// [`FALLBACK_CHAT_TEMPLATE`]), and validates it with a 1-message probe apply:
-    /// apply failure → `TemplateApply(code)`; empty/unusable → `TemplateUnavailable`.
+    /// [`FALLBACK_CHAT_TEMPLATE`]), and validates it with a 1-message probe
+    /// apply: apply failure → `TemplateApply(code)`; empty/unusable →
+    /// `TemplateUnavailable`. A pooled config's hooks are created BEFORE the
+    /// model loads and attach to the model inside `load_with_hooks`.
     pub fn new(config: &EngineConfig) -> Result<Self, EngineError> {
-        // Serializes construction so `p3_glue::enable`'s live-session check
-        // cannot race a concurrent pool-off `new` that has not yet counted.
-        static CONSTRUCT: Mutex<()> = Mutex::new(());
-        let _construct = CONSTRUCT.lock().unwrap_or_else(|e| e.into_inner());
-        // Both refusals precede `load` so they cost no model load: a pool
-        // enabled under a live session would re-route its decodes, and `load`
-        // itself refuses a second model once the (never-unregistered) hooks
-        // exist.
+        // Serializes construction so the pooled-concurrent refusal cannot
+        // race a concurrent `new` that has not yet counted.
+        let _construct = construction_lock();
+        // A second CONCURRENT pool-enabled session is refused before any
+        // model load (VRAM arithmetic in the refusal). Sequential sessions —
+        // pooled or not — are legal: the hooks are per-model (ABI v5).
         if config.ram_experts_gib > 0 {
-            p3_glue::refuse_if_session_live()?;
+            p3_glue::refuse_if_pool_session_live()?;
         }
-        let loaded = load(config)?;
+        // P3 (§3.4): build the RAM expert pool + create the per-model ctx
+        // BEFORE the model loads — the ctx must attach to the llama_model
+        // before `llama_init_from_model` so its first `sched_reserve` sees
+        // the hooks (cpy shrink). If the load fails, the guards drop cleanly.
+        let p3 = if config.ram_experts_gib > 0 {
+            Some(p3_glue::enable(config)?)
+        } else {
+            None
+        };
+        let loaded = match load_with_hooks(config, p3.as_ref().map(|p| p.ctx_ptr())) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                drop(p3);
+                return Err(e);
+            }
+        };
         let template_src = loaded
             .model()
             .chat_template()
@@ -513,15 +576,7 @@ impl Session {
             return Err(EngineError::TemplateUnavailable);
         }
 
-        // P3 (§3.4): build the RAM expert pool + register hooks once, when the
-        // config asks for it. Registration happens for the process lifetime
-        // (leaked handle); a second pool-enabled session in one process is a
-        // loud error (see p3_glue::enable).
-        let p3 = if config.ram_experts_gib > 0 {
-            Some(p3_glue::enable(config)?)
-        } else {
-            None
-        };
+        // P3 guards came from `enable` above; nothing to build here.
 
         Ok({
             p3_glue::session_opened();
@@ -540,11 +595,60 @@ impl Session {
         })
     }
 
+    /// Test seam (hip-tests): [`Session::new`] with a caller-owned
+    /// `golem_ctx` attached to the model BEFORE `llama_init_from_model` —
+    /// the caller registers its own hook set on that ctx (ABI v5) and keeps
+    /// the registration alive for the session's lifetime. Pool stays off.
+    #[cfg(feature = "hip-tests")]
+    pub fn new_with_test_ctx(
+        config: &EngineConfig,
+        ctx: raw::golem_ctx_t,
+    ) -> Result<Self, EngineError> {
+        let _guard = construction_lock();
+        let loaded = load_with_hooks(config, Some(ctx))?;
+        let template_src = loaded
+            .model()
+            .chat_template()
+            .unwrap_or_else(|| FALLBACK_CHAT_TEMPLATE.to_owned());
+        let template = CString::new(template_src).map_err(|_| EngineError::TemplateUnavailable)?;
+        let probe = ffi_messages(&[ChatTurn {
+            role: "user",
+            content: "ping",
+        }])?;
+        // SAFETY: template is a live CString; probe CStrings outlive the call.
+        if unsafe { apply_template(&template, &probe, true) }?.is_empty() {
+            return Err(EngineError::TemplateUnavailable);
+        }
+        Ok({
+            p3_glue::session_opened();
+            Session {
+                loaded,
+                config: config.clone(),
+                template,
+                last_prompt_tokens: Vec::new(),
+                p3: None,
+                timing: config
+                    .timing_csv
+                    .as_ref()
+                    .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
+                pool_verified: false,
+            }
+        })
+    }
+
     /// The P3 slow-path counters when the RAM expert pool is enabled for this
     /// session; `None` when the pool is off (the default). Demand and prefetch
     /// page-ins are counted separately (design §6.6).
     pub fn p3_stats(&self) -> Option<&P3Stats> {
         self.p3.as_ref().map(|p| p.stats.as_ref())
+    }
+
+    /// The session's per-model hook context pointer (ABI v5), for test seams
+    /// that address per-ctx substrate state (the P4 budget setter/reset).
+    /// `None` when the pool is off.
+    #[cfg_attr(not(feature = "hip-tests"), allow(dead_code))]
+    pub fn p3_ctx_ptr(&self) -> Option<raw::golem_ctx_t> {
+        self.p3.as_ref().map(|p| p.ctx_ptr())
     }
 
     /// The tokenized prompt of the most recent `chat_turn` (post-render,
@@ -570,9 +674,11 @@ impl Session {
         if !self.offloaded() || self.p3.is_none() {
             return None;
         }
-        // SAFETY: FFI getter; the returned pointer is a process-lifetime
-        // static (never null, never freed).
-        let block = unsafe { raw::golem_get_device_cache_stats() };
+        // SAFETY: FFI getter with this session's live ctx; the returned
+        // pointer is ctx-owned (alive while the hooks are registered).
+        let block = unsafe {
+            raw::golem_get_device_cache_stats(self.p3.as_ref().expect("p3 present").ctx_ptr())
+        };
         assert!(
             !block.is_null(),
             "golem_get_device_cache_stats returned null"
@@ -591,6 +697,18 @@ impl Session {
     pub fn write_timing(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         match self.timing.as_mut() {
             Some(t) => t.flush(w),
+            None => Ok(()),
+        }
+    }
+
+    /// Flushes this turn's routing-trace records (§11 pattern) into `w`:
+    /// the `# golem-routing-trace v1` header on first call, then one
+    /// `step\tphase\tlayer\tid,id,...` line per routing readback since the
+    /// last flush; the ring clears for the next turn. No-op when the routing
+    /// trace is disabled (config) or the pool is off (no routing readbacks).
+    pub fn write_routing_trace(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        match self.p3.as_ref() {
+            Some(p3) => p3.write_routing_trace(w),
             None => Ok(()),
         }
     }
@@ -793,6 +911,10 @@ impl Session {
         let mut scratch = String::new();
         if let Some(t) = self.timing.as_mut() {
             t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
+        }
+        if let Some(p3) = self.p3.as_ref() {
+            // Same stale-record guard for the routing trace.
+            p3.write_routing_trace(&mut std::io::sink())?;
         }
         // Prefill activity must not bleed into step 0's row: take-and-discard
         // the P3/store accumulators right before the decode loop (also
@@ -1404,49 +1526,60 @@ mod tests {
         assert_eq!(prefill_chunk_cap(8, 4096, Some((8, 8))), 1);
     }
 
-    /// Off-then-on guard: `enable` must refuse while ANY session is
-    /// live, and must succeed once the last one dropped (counter back to 0).
+    /// Concurrent-only guard: a pool-off session no longer blocks a pooled
+    /// one (per-model ctx, ABI v5 — hooks only route THEIR model's decodes),
+    /// but a second CONCURRENT pool-enabled session is refused with the slab
+    /// VRAM arithmetic, and enable succeeds again once it drops.
     /// CPU-testable: a pool-off tiny-moe session loads without hooks, and a
     /// pooled enable with an explicit K works on CPU (see
     /// `multi_chunk_prefill_advances_the_policy_step_zero_times`). Success
-    /// after drop registers the hooks for the process lifetime — nextest runs
-    /// each test in its own process, so no other test observes that state.
+    /// after drop leaves no live hooks (nextest runs each test in its own
+    /// process, so no other test observes residual state).
     #[test]
-    fn enable_refused_while_any_session_is_live_and_allowed_once_all_dropped() {
+    fn pooled_enable_concurrent_only_refusal_with_vram_arithmetic() {
         let model = xtask::tiny_moe::cached_fixture();
         let pooled = EngineConfig {
-            model_path: model,
+            model_path: model.clone(),
             ram_experts_gib: 1,
             device_cache_experts: 8, // tiny-moe: K=8 ≥ top_k=2
             ..EngineConfig::default()
         };
         let plain = EngineConfig {
-            model_path: xtask::tiny_moe::cached_fixture(),
+            model_path: model,
             ..EngineConfig::default()
         };
-        let s = Session::new(&plain).expect("pool-off session loads");
+        // A live POOL-OFF session no longer refuses a pooled enable: the
+        // hooks attach to the pooled model only.
+        let plain_session = Session::new(&plain).expect("pool-off session loads");
+        let hooks = p3_glue::enable(&pooled).expect("pooled enable alongside a pool-off session");
+        drop(plain_session);
+
+        // Concurrent second POOL-ON enable: refused, naming the slab VRAM.
         let err = match p3_glue::enable(&pooled) {
             Err(e) => e,
-            Ok(_) => panic!("enable must refuse while a session is live"),
+            Ok(_) => panic!("concurrent second pool enable must be refused"),
         };
         assert!(
-            err.to_string().contains("session already exists"),
-            "refusal must name the live-session guard: {err}"
+            err.to_string().contains("7.3 GB") && err.to_string().contains("24 GiB"),
+            "refusal must carry the slab VRAM arithmetic: {err}"
         );
-        drop(s);
-        p3_glue::enable(&pooled).expect("enable succeeds once no session is live");
+        drop(hooks);
+        let _again = p3_glue::enable(&pooled).expect("enable succeeds once the pool dropped");
     }
 
-    /// Pool-on construction must be refused while another session is live
-    /// BEFORE any model load: the model path here does not exist, so a load
-    /// attempt would surface a GGUF error instead of the live-session refusal.
+    /// Pool-on construction must be refused while another POOL-ON session is
+    /// live BEFORE any model load: the model path here does not exist, so a
+    /// load attempt would surface a GGUF error instead of the concurrent-pool
+    /// refusal. A pool-off live session no longer refuses (per-model hooks).
     #[test]
-    fn pooled_new_is_refused_before_load_while_a_session_is_live() {
-        let plain = EngineConfig {
+    fn pooled_new_is_refused_before_load_while_a_pooled_session_is_live() {
+        let pooled = EngineConfig {
             model_path: xtask::tiny_moe::cached_fixture(),
+            ram_experts_gib: 1,
+            device_cache_experts: 8,
             ..EngineConfig::default()
         };
-        let _live = Session::new(&plain).expect("pool-off session loads");
+        let _live = Session::new(&pooled).expect("pooled session loads");
         let pooled_missing_model = EngineConfig {
             model_path: "/nonexistent/never-loaded.gguf".into(),
             ram_experts_gib: 1,
@@ -1455,36 +1588,11 @@ mod tests {
         };
         let err = match Session::new(&pooled_missing_model) {
             Err(e) => e,
-            Ok(_) => panic!("pool-on while a session is live must be refused"),
+            Ok(_) => panic!("concurrent pool-on session must be refused"),
         };
         assert!(
-            matches!(&err, EngineError::PoolInit(m) if m.contains("session already exists")),
-            "must be the live-session refusal, not a load error: {err}"
-        );
-    }
-
-    /// `load` is public: once the process-global hooks are registered it must
-    /// refuse a further model itself, not rely on `Session::new`.
-    #[test]
-    fn load_is_refused_once_the_expert_hooks_are_registered() {
-        let pooled = EngineConfig {
-            model_path: xtask::tiny_moe::cached_fixture(),
-            ram_experts_gib: 1,
-            device_cache_experts: 8,
-            ..EngineConfig::default()
-        };
-        p3_glue::enable(&pooled).expect("enable registers the hooks");
-        let plain = EngineConfig {
-            model_path: xtask::tiny_moe::cached_fixture(),
-            ..EngineConfig::default()
-        };
-        let err = match load(&plain) {
-            Err(e) => e,
-            Ok(_) => panic!("load must refuse while the hooks are registered"),
-        };
-        assert!(
-            matches!(&err, EngineError::PoolInit(m) if m.contains("expert hooks")),
-            "{err}"
+            matches!(&err, EngineError::PoolInit(m) if m.contains("two device slab sets")),
+            "must be the concurrent-pool refusal, not a load error: {err}"
         );
     }
 

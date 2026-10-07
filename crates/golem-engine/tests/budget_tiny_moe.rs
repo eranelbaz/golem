@@ -68,8 +68,13 @@ fn budget_k4_evicts_and_stays_on_gpu() {
     // Measured window: clear the cached entries (counters stay cumulative —
     // all assertions are on deltas; see t3_cache_invariance for the seam).
     //
-    // SAFETY: FFI, no invariants (clears device-cache entries only).
-    unsafe { golem_llama_sys::raw::golem_reset_device_cache() };
+    // SAFETY: FFI with the session's live ctx (ABI v5: the device cache is
+    // per-ctx); clears device-cache entries only.
+    unsafe {
+        golem_llama_sys::raw::golem_reset_device_cache(
+            session.p3_ctx_ptr().expect("pooled session ⇒ live ctx"),
+        )
+    };
     let before = session
         .device_cache_stats()
         .expect("pooled split ⇒ P4 stats");

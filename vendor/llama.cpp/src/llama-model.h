@@ -616,6 +616,11 @@ struct llama_model {
 
     std::string name = "n/a";
 
+    // Golem per-model hook context (ABI v5): set by the engine via
+    // llama_golem_model_attach before llama_init_from_model; llama_context
+    // re-applies it to every scheduler created in sched_reserve.
+    struct golem_ctx * golem_ctx = nullptr;
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 

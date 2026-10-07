@@ -16,20 +16,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 fn golem_p2_device_cache_stats_roundtrip() {
     // Opaque to bindgen (zero-sized marker struct), not a laid-out record.
     assert_eq!(std::mem::size_of::<raw::golem_device_cache_stats>(), 0);
-
-    // SAFETY: FFI call, no invariants (<= 0 = unset budget).
-    unsafe { raw::golem_set_device_cache_experts(0) };
-    let p = unsafe { raw::golem_get_device_cache_stats() };
+    // ABI v5: the device cache lives on the per-model ctx.
+    let ctx = golem_llama_sys::GolemCtx::create(1, 8).expect("ctx create");
+    // SAFETY: FFI setter, no invariants (<= 0 = unset budget).
+    unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), 0) };
+    // SAFETY: FFI getter with a live ctx; returns the ctx-owned stats block.
+    let p = unsafe { raw::golem_get_device_cache_stats(ctx.as_ptr()) };
     assert!(!p.is_null());
 
     // Layout contract guaranteed by the C++ definition: 3 contiguous
     // lock-free u64 counters (bytes_copied, bytes_skipped, evictions).
     let stats = unsafe { &*(p.cast::<[AtomicU64; 3]>()) };
-    // Fresh process: counters at zero (nextest isolates per-test processes;
+    // Fresh ctx: counters at zero (nextest isolates per-test processes;
     // no decode ran in this one).
     assert_eq!(stats[0].load(Ordering::Relaxed), 0); // bytes_copied
     assert_eq!(stats[1].load(Ordering::Relaxed), 0); // bytes_skipped
     assert_eq!(stats[2].load(Ordering::Relaxed), 0); // evictions
+    // Null ctx is guarded, not crash: stats query returns null.
+    // SAFETY: FFI getter, null-guarded by the C side.
+    assert!(unsafe { raw::golem_get_device_cache_stats(std::ptr::null_mut()) }.is_null());
 }
 
 #[test]

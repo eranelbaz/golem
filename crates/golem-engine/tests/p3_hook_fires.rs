@@ -1,83 +1,187 @@
-//! P3 acceptance seam: ensure_host_resident is invoked by the split scheduler
-//! before expert host bytes are read, with the weights tensor + routed range.
-//! Runs only where a GPU split exists
-//! (feature `hip-tests`, HIP CI job);
-//! CPU builds never enter the split-scheduler expert-copy path.
-#![cfg(feature = "hip-tests")]
+//! P3 acceptance, ABI v5: the batched `ensure_host_resident` trampoline
+//! claims each routed unit once per step, hands out per-plane pool pointers
+//! and holds the leases until `copy_done`; the merged routing readback books
+//! recency lock-free; `SessionHooks` is fully owned per session (two
+//! sequential enable/drop cycles each decode; two cycles run concurrently on
+//! separate threads). Drives the engine-registered trampolines directly over
+//! the tiny-MoE fixture on the CPU backend — no GPU split needed.
 #![allow(unsafe_code)]
 mod common;
 
-use golem_engine::session::{ChatTurn, Session};
+use common::expert_tensor as xt;
+use common::tiny_moe_path;
+use golem_engine::config::EngineConfig;
+use golem_engine::p3_glue;
+use golem_llama_sys::raw;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Pooled config for tiny-moe on the CPU backend: explicit K (no VRAM query
+/// exists off HIP), 1 GiB pool. A failed precondition (RLIMIT_MEMLOCK below
+/// the pool) FAILS — an early return reads as a pass (AGENTS.md Evidence).
+fn pooled_config() -> EngineConfig {
+    EngineConfig {
+        model_path: tiny_moe_path(),
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        ..EngineConfig::default()
+    }
+}
+
+/// One simulated decode step through the engine-registered trampolines:
+/// routing readback for blk.1 with routed ids [3, 5], then the batched
+/// ensure for the three planes of expert 3, then copy_done. `payload` is
+/// [`SessionHooks::payload_ptr`]; `gate` the synthetic gate tensor.
+fn drive_step(payload: *mut libc::c_void, gate: *mut raw::ggml_tensor) -> [*const u8; 3] {
+    let ids: [i32; 2] = [3, 5];
+    p3_glue::routing(
+        payload,
+        xt::BLK,
+        std::ptr::null(),
+        ids.as_ptr(),
+        2,
+        xt::N_EXPERTS,
+    );
+    let mut out: [*const u8; 3] = [std::ptr::null(); 3];
+    let kinds = [1, 2, 3]; // gate, up, down
+    let miss_ids = [3, 3, 3];
+    p3_glue::ensure_host_resident(
+        payload,
+        gate.cast(),
+        kinds.as_ptr(),
+        miss_ids.as_ptr(),
+        3,
+        out.as_mut_ptr().cast(),
+    );
+    p3_glue::copy_done(payload);
+    out
+}
 
 #[test]
-fn ensure_host_resident_fires_on_offload_decode() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+fn ensure_pages_once_claims_once_and_counts_calls() {
+    let hooks = p3_glue::enable(&pooled_config()).expect("enable");
+    let payload = hooks.payload_ptr();
+    let (_ctx, gate) = xt::gate_tensor();
 
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    static LAST_RANGE: AtomicUsize = AtomicUsize::new(0); // (first<<16)|last
-
-    extern "C" fn on_ensure(
-        _ctx: *mut libc::c_void,
-        _tensor: *const libc::c_void,
-        first: i32,
-        last: i32,
-        _ptrs: *mut *const libc::c_void,
-    ) {
-        // ABI v2: the substrate copies from the returned pointers; these
-        // hook-level tests don't page from a pool, so serve one static buffer.
-        static SRC: [u8; 65536] = [0u8; 65536];
-        // SAFETY: `_tensor` is the substrate's expert tensor, valid for the call.
-        let stride =
-            unsafe { golem_llama_sys::raw::golem_tensor_expert_stride_bytes(_tensor) } as usize;
-        assert!(
-            stride <= SRC.len(),
-            "expert plane stride {stride} exceeds the static source ({} B)",
-            SRC.len()
-        );
-        let src = SRC.as_ptr() as *const libc::c_void;
-        for i in 0..((last - first + 1) as usize) {
-            // SAFETY: C passes `last - first + 1` writable out-pointer slots.
-            unsafe { *_ptrs.add(i) = src };
-        }
-
-        CALLS.fetch_add(1, Ordering::SeqCst);
-        LAST_RANGE.store(((first as usize) << 16) | last as usize, Ordering::SeqCst);
-    }
-    // SAFETY: valid fn pointer; process-lifetime registration (no unregister
-    // exists in this test binary — hooks staying set for the process is fine,
-    // the callback only touches its own atomics).
-    unsafe {
-        golem_llama_sys::raw::golem_register_hooks(
-            Some(on_ensure),
-            None,
-            None,
-            None,
-            std::ptr::null_mut(),
-        );
-    }
-
-    let cfg = common::offload::offload_config();
-    let mut session = Session::new(&cfg).unwrap();
-    let turns = [ChatTurn {
-        role: "user",
-        content: "Hello",
-    }];
-    let mut out = String::new();
-    session
-        .chat_turn(&turns, &mut |piece| out.push_str(piece))
-        .unwrap(); // helper spelling per chat_tiny_moe.rs
-    assert!(!out.is_empty());
-
-    let calls = CALLS.load(Ordering::SeqCst);
+    let out = drive_step(payload, gate);
     assert!(
-        calls > 0,
-        "ensure_host_resident never fired during offload decode"
+        out.iter().all(|p| !p.is_null()),
+        "all three plane pointers must be filled: {out:?}"
     );
-    let packed = LAST_RANGE.load(Ordering::SeqCst);
-    let (first, last) = ((packed >> 16) as i32, (packed & 0xffff) as i32);
-    assert!(first <= last, "inverted range ({first}, {last})");
-    assert!(
-        last < 8,
-        "range exceeds tiny-moe expert count 8: ({first}, {last})"
+    assert_ne!(out[0], out[1], "distinct planes live at distinct offsets");
+
+    // Claim-once: three plane misses of ONE unit → one demand claim, one
+    // unit page-in; the routing readback and copy_done each fired once.
+    let stats = hooks.state_stats();
+    assert_eq!(stats.demand_claims.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.demand_slow_pageins.load(Ordering::Relaxed), 1);
+    assert_eq!(hooks.routing_calls(), 1);
+    assert_eq!(hooks.ensure_calls(), 1);
+    assert_eq!(hooks.copy_done_calls(), 1);
+
+    // A second identical step: units resident → fast hits, no new page-ins;
+    // the copy_done above released the leases so the re-claim succeeds.
+    // SAFETY: as above.
+    let _ = drive_step(payload, gate);
+    assert_eq!(stats.demand_slow_pageins.load(Ordering::Relaxed), 1);
+    assert_eq!(hooks.ensure_calls(), 2);
+}
+
+#[test]
+fn two_sequential_enable_drop_cycles_each_decode() {
+    for cycle in 0..2 {
+        let hooks = p3_glue::enable(&pooled_config())
+            .unwrap_or_else(|e| panic!("cycle {cycle}: enable must succeed, got {e}"));
+        let payload = hooks.payload_ptr();
+        let (_ctx, gate) = xt::gate_tensor();
+        let out = drive_step(payload, gate);
+        assert!(
+            out.iter().all(|p| !p.is_null()),
+            "cycle {cycle}: pooled decode through the fresh ctx"
+        );
+        drop(hooks);
+        // The drop must fully unwind (unregister-join → ctx free): the next
+        // cycle's enable + ctx create prove it — golem_ctx_free aborts if
+        // hooks were still registered.
+    }
+    assert!(!p3_glue::hooks_registered(), "no hooks outlive the cycles");
+}
+
+#[test]
+fn two_sessionhooks_run_their_hook_paths_concurrently() {
+    // Two direct enables on separate threads, each driving its own ctx +
+    // pool state concurrently: the payload state is per-session (no
+    // process-global hook state exists), so both full hook paths pass.
+    let failures = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for t in 0..2 {
+            let failures = &failures;
+            s.spawn(move || {
+                let hooks = match p3_glue::enable(&pooled_config()) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("thread {t}: enable failed: {e}");
+                        failures.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                let payload = hooks.payload_ptr();
+                let (_ctx, gate) = xt::gate_tensor();
+                for _ in 0..8 {
+                    let out = drive_step(payload, gate);
+                    if out.iter().any(|p| p.is_null()) {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                drop(hooks);
+            });
+        }
+    });
+    assert_eq!(failures.load(Ordering::SeqCst), 0);
+}
+
+/// A counting allocator that only counts while the current thread opts in,
+/// so background threads (order publisher, prefetcher) don't pollute the
+/// steady-state zero-allocation assertion.
+static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct CountingAlloc;
+// SAFETY: forwards to System; the counter is only an observation.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if COUNTING.load(Ordering::Relaxed) {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: delegated to the system allocator with the same layout.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: delegated with the layout the allocation came in with.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+#[test]
+fn trampolines_allocate_nothing_in_steady_state() {
+    let hooks = p3_glue::enable(&pooled_config()).expect("enable");
+    let payload = hooks.payload_ptr();
+    let (_ctx, gate) = xt::gate_tensor();
+    // Warm: first sight registers (allocates), first page-ins fill slots.
+    let _ = drive_step(payload, gate);
+
+    COUNT.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::Relaxed);
+    for _ in 0..200 {
+        let _ = drive_step(payload, gate);
+    }
+    COUNTING.store(false, Ordering::Relaxed);
+    let allocs = COUNT.load(Ordering::Relaxed);
+    assert_eq!(
+        allocs, 0,
+        "batched ensure + routing + copy_done must not allocate in steady state"
     );
 }

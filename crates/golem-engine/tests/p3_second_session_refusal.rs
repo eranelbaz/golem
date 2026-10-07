@@ -1,22 +1,25 @@
-//! The second-session refusal must run BEFORE `load()` —
-//! a different model's load decodes its self-check through the stale hook
-//! set (tensor table keyed by recycled host addresses, host bytes diverging
-//! from the old pool) and dies in `p3_fatal` instead of returning `Err`.
-//! Runs only where a GPU split exists (feature `hip-tests`, HIP CI job); CPU
-//! builds never enter the split-scheduler expert-copy path, so the pool would
-//! idle.
-#![cfg(feature = "hip-tests")]
+//! Per-model hook lifecycle (ABI v5, H-10 session level): sequential pooled
+//! sessions in one process are LEGAL — each model carries its own `golem_ctx`,
+//! and a dropped session's teardown (unregister-join → ctx free) leaves no
+//! live hook state for the next one. Only a second CONCURRENT pool-enabled
+//! session is refused, before any model load, with the slab VRAM arithmetic
+//! (two K=10 slab sets ≈ 2 × 7.3 GB on a 24 GiB card). CPU-testable: a pooled
+//! session with an explicit K loads and decodes its self-check without a GPU
+//! split (the trampolines are registered either way); the full two-model
+//! *bytes* proof is `h10_two_models.rs` (HIP-gated — the split-scheduler
+//! expert-copy path only runs where a GPU split exists).
 mod common;
 
 use std::path::PathBuf;
 
+use common::tiny_moe_path;
 use golem_engine::config::EngineConfig;
 use golem_engine::error::EngineError;
 use golem_engine::session::Session;
 
-/// Second model: same real tiny-moe shape, different weights (another seed) —
-/// exactly the "second model in one process" shape the refusal exists for.
-/// Cached in `.test-cache/` next to the primary fixture (never in git).
+/// Second fixture: same real tiny-moe shape, different weights (another
+/// seed) — exactly the "two sequential models in one process" shape H-10
+/// asks for. Cached in `.test-cache/` next to the primary fixture.
 fn second_fixture() -> PathBuf {
     const SECOND_SEED: u64 = 0x6d_6f_6c_65_67; // "golem" reversed
     let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -36,56 +39,58 @@ fn second_fixture() -> PathBuf {
     p
 }
 
-#[test]
-fn second_session_with_a_different_model_returns_err_before_load() {
-    // Pool ON: registers the process-global hooks (leaked, never unregistered).
-    let mut cfg = common::offload::offload_config();
-    cfg.ram_experts_gib = 1;
-    // Precondition fails loudly — no skip (AGENTS.md Evidence; memlock is
-    // unlimited on the HIP CI machine).
-    let _owner = Session::new(&cfg)
-        .expect("pooled session must load (RLIMIT_MEMLOCK must allow the 1 GiB pool)");
-
-    // A DIFFERENT fixture, pool ON: refused with Err(PoolInit) before the
-    // model loads (a live session already exists).
-    let other = EngineConfig {
-        model_path: second_fixture(),
+fn pooled(path: &std::path::Path) -> EngineConfig {
+    EngineConfig {
+        model_path: path.into(),
         ram_experts_gib: 1,
+        device_cache_experts: 8, // tiny-moe: K=8 ≥ top_k=2
+        ..EngineConfig::default()
+    }
+}
+
+/// H-10 (session level): two sequential pooled sessions, different models,
+/// one process. The second must load and decode — a stale hook set would
+/// abort in `p3_fatal` instead of returning `Ok`.
+#[test]
+fn two_sequential_pooled_sessions_load_and_decode() {
+    let a = Session::new(&pooled(&tiny_moe_path()))
+        .expect("first pooled session must load (RLIMIT_MEMLOCK must allow the 1 GiB pool)");
+    drop(a);
+    let b = Session::new(&pooled(&second_fixture()))
+        .expect("second sequential pooled session must load: hooks are per-model");
+    drop(b);
+}
+
+/// Concurrent-only refusal: while a pooled session is LIVE, a second pooled
+/// `Session::new` is refused BEFORE any model load (the model path here does
+/// not exist, so a load attempt would surface a GGUF error instead) and the
+/// message carries the slab VRAM arithmetic.
+#[test]
+fn concurrent_second_pooled_session_refused_with_vram_arithmetic() {
+    let _live = Session::new(&pooled(&tiny_moe_path()))
+        .expect("pooled session must load (RLIMIT_MEMLOCK must allow the 1 GiB pool)");
+    let other = EngineConfig {
+        model_path: "/nonexistent/never-loaded.gguf".into(),
+        ram_experts_gib: 1,
+        device_cache_experts: 8,
         ..EngineConfig::default()
     };
     match Session::new(&other) {
         Err(EngineError::PoolInit(msg)) => {
             assert!(
-                msg.contains("session already exists"),
-                "refusal must name the live session: {msg}"
+                msg.contains("7.3 GB") && msg.contains("24 GiB"),
+                "refusal must carry the slab VRAM arithmetic: {msg}"
             );
         }
         Err(e) => panic!("second session must be refused as PoolInit, got: {e}"),
-        Ok(_) => panic!("second session in a hook-owning process must be refused"),
+        Ok(_) => panic!("concurrent second pooled session must be refused"),
     }
+}
 
-    // Pool OFF with a different model: `load` itself refuses once the hooks
-    // are registered — a load would decode through the stale hooks and abort
-    // the process (p3_fatal) instead of returning.
-    let other_off = EngineConfig {
-        model_path: second_fixture(),
-        ..EngineConfig::default()
-    };
-    match Session::new(&other_off) {
-        Err(EngineError::PoolInit(msg)) => {
-            assert!(
-                msg.contains("expert hooks"),
-                "refusal must name the hook ownership: {msg}"
-            );
-        }
-        Err(e) => panic!("second session must be refused as PoolInit, got: {e}"),
-        Ok(_) => panic!("second session in a hook-owning process must be refused"),
-    }
-
-    // Same-shape sanity: the second fixture really loads (in a fresh process
-    // the hooks would be unset), so the refusal is about process state, not a
-    // broken fixture. Probed via the GGUF metadata walk only — loading here is
-    // impossible by construction (hooks are registered).
+/// Same-shape sanity: the second fixture really is tiny-moe shape, so the
+/// sequential test above proves lifecycle, not a broken fixture.
+#[test]
+fn second_fixture_is_real_tiny_moe_shape() {
     let metadata = golem_engine::gguf::read_metadata(&second_fixture()).unwrap();
     assert_eq!(
         metadata.kv_u64("glm4moe.expert_count"),

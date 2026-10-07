@@ -229,3 +229,38 @@ fn t6_step_claim_pins_the_unit_across_planes() {
         evictor.join().unwrap();
     });
 }
+
+/// The ABI v5 batched miss-list path (`ensure_batch` + `end_batch_step`)
+/// interleaved with a thread-local `StepClaims` claimer: the pool-owned
+/// batch table must ride the same shard discipline (one fill per unit,
+/// provenance-correct plane pointers), and `end_batch_step` must release
+/// its leases so the other thread's claims never deadlock on the 1-slot
+/// pool. `Busy` stays the only legal failure for the concurrent claimer.
+#[test]
+fn t6_ensure_batch_interleaves_with_range_claims() {
+    primitives::model(|| {
+        let pool = loom_pool();
+        let p2 = pool.clone();
+        let batch = primitives::spawn(move || {
+            let mut out = [std::ptr::null(); 2];
+            let misses = [(ExpertKind::Gate, 1u32), (ExpertKind::Down, 1u32)];
+            let r = p2.ensure_batch(0, &misses, &mut out);
+            if r.is_ok() {
+                p2.end_batch_step();
+            }
+            r
+        });
+        let mut step = StepClaims::new(pool.clone());
+        let mut ptr = [std::ptr::null()];
+        match step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut ptr) {
+            Ok(()) | Err(PoolError::Busy) => {}
+            Err(e) => panic!("unexpected pool error: {e}"),
+        }
+        let batched = batch.join().unwrap();
+        match batched {
+            Ok(()) | Err(PoolError::Busy) => {}
+            Err(e) => panic!("unexpected pool error: {e}"),
+        }
+        step.next_step();
+    });
+}

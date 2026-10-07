@@ -391,6 +391,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     # backend device type at graph split (golem_get_expert_placement_stats).
     llama_build_and_test(golem-p1-placement.cpp)
     target_link_libraries(golem-p1-placement PRIVATE ggml)
+    target_include_directories(golem-p1-placement PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

@@ -1,161 +1,154 @@
-//! P2/P4 acceptance: policy_query is consulted per routed expert tensor with
-//! a valid permutation, notify_access fires per routed expert, and the
-//! persistent device cache skips re-routed experts on an identical second
-//! turn (P4 counters expose the traffic through `Session::device_cache_stats`).
-//! The permutation seam test registers its own recording hooks over the
-//! pool-off offload config (C engages P2 on hook presence alone — the
-//! call-site); the counters test drives the engine-registered hooks (pool
-//! on). Runs only where a GPU split exists (feature `hip-tests`, HIP CI
-//! job); CPU builds never enter the split-scheduler expert-copy path.
-#![cfg(feature = "hip-tests")]
+//! P2 acceptance, reworked to the ABI v5 routing semantics: the merged
+//! routing readback books recency lock-free, the eviction order reaches C
+//! through the per-ctx triple buffers (`golem_policy_order`), the
+//! `copy_done` flush publishes synchronously, the background publisher
+//! catches dirty layers, and the epoch gate makes pushes skip (never block)
+//! when no buffer is free. Drives the engine-registered trampolines over the
+//! tiny-MoE fixture on the CPU backend.
 #![allow(unsafe_code)]
 mod common;
 
-use golem_engine::session::{ChatTurn, Session};
+use common::expert_tensor as xt;
+use common::tiny_moe_path;
+use golem_engine::config::EngineConfig;
+use golem_engine::p3_glue::{self, SessionHooks};
+use golem_llama_sys::raw;
+use std::time::{Duration, Instant};
 
-fn chat(session: &mut Session, prompt: &str) -> String {
-    let mut out = String::new();
-    session
-        .chat_turn(
-            &[ChatTurn {
-                role: "user",
-                content: prompt,
-            }],
-            &mut |piece| out.push_str(piece),
-        )
-        .unwrap();
-    out
+fn pooled_config() -> EngineConfig {
+    EngineConfig {
+        model_path: tiny_moe_path(),
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        ..EngineConfig::default()
+    }
 }
 
-/// FFI seam: C consults policy_query per routed expert tensor and consumes a
-/// valid permutation (invariant 4: any permutation is legal — identity is
-/// the cheapest legal answer); notify_access reports each routed expert.
+/// One routing readback for blk.1 with `ids` at the current step.
+fn route(hooks: &SessionHooks, ids: &[i32]) {
+    p3_glue::routing(
+        hooks.payload_ptr(),
+        xt::BLK,
+        std::ptr::null(),
+        ids.as_ptr(),
+        ids.len() as i64,
+        xt::N_EXPERTS,
+    );
+}
+
+/// `copy_done` with the ctx attached so the flush can push orders.
+fn copy_done(hooks: &SessionHooks) {
+    p3_glue::copy_done(hooks.payload_ptr())
+}
+
+/// The current evict-first order C would consume for the gate tensor.
+///
+/// # Safety
+/// `gate` must be a live ggml tensor with an expert name.
+unsafe fn policy_order(hooks: &SessionHooks, gate: *mut raw::ggml_tensor) -> Option<Vec<i32>> {
+    // SAFETY: live ctx + live tensor with a golem-recognized expert name.
+    let p = unsafe { raw::golem_policy_order(hooks.ctx_ptr(), gate.cast(), xt::N_EXPERTS) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: the acquired triple-buffer slot holds n_experts entries and is
+    // stable until this layer's next publish (same contract C relies on).
+    Some(unsafe { std::slice::from_raw_parts(p, xt::N_EXPERTS as usize) }.to_vec())
+}
+
 #[test]
-fn policy_query_is_consulted_with_valid_permutations() {
-    use std::sync::Mutex;
+fn routing_semantics_flush_publisher_and_epoch_gate() {
+    let hooks = p3_glue::enable(&pooled_config()).expect("enable");
+    let (_ctx, gate) = xt::gate_tensor();
 
-    static QUERIES: Mutex<Vec<Vec<i32>>> = Mutex::new(Vec::new());
-    static NOTIFIES: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+    // Nothing pushed yet → C consumes the identity order fallback (NULL).
+    // SAFETY: live tensor.
+    assert!(
+        unsafe { policy_order(&hooks, gate) }.is_none(),
+        "order must be NULL before the first push (identity fallback in C)"
+    );
 
-    extern "C" fn on_query(
-        _ctx: *mut libc::c_void,
-        _tensor: *const libc::c_void,
-        n: i32,
-    ) -> *const i32 {
-        let v: Vec<i32> = (0..n).collect(); // any permutation is legal (invariant 4)
-        QUERIES.lock().unwrap().push(v.clone());
-        // contract: valid until next call — leak-per-test is fine (test process)
-        Box::into_raw(v.into_boxed_slice()) as *const i32
-    }
-    extern "C" fn on_notify(_ctx: *mut libc::c_void, expert_id: i64) {
-        NOTIFIES.lock().unwrap().push(expert_id);
-    }
-    extern "C" fn on_ensure(
-        _ctx: *mut libc::c_void,
-        tensor: *const libc::c_void,
-        first: i32,
-        last: i32,
-        ptrs: *mut *const libc::c_void,
-    ) {
-        // ABI v2: the substrate copies from the returned pointers, so serve
-        // the tensor's REAL per-expert planes — the same bytes the unpooled
-        // upstream path reads (`input->data + id·nb[2]`). One shared static
-        // would hand every expert zero bytes, making misplaced planes
-        // undetectable by any output assertion.
-        // SAFETY: `tensor` is the substrate's expert tensor, valid for the
-        // call; only `data` is read, and the per-expert stride comes from
-        // the substrate's own metadata query (nb[2], see golem-hooks.h).
-        let base = unsafe { (*tensor.cast::<golem_llama_sys::raw::ggml_tensor>()).data };
-        let stride =
-            unsafe { golem_llama_sys::raw::golem_tensor_expert_stride_bytes(tensor) } as usize;
-        for e in first..=last {
-            unsafe {
-                *ptrs.add((e - first) as usize) = base.byte_add(e as usize * stride).cast();
-            }
+    // Step 1 routes expert 2, step 2 routes expert 4: recency puts 4 after 2.
+    route(&hooks, &[2]);
+    hooks.advance_decode_step();
+    route(&hooks, &[4]);
+    copy_done(&hooks); // bounded flush; the publisher may also win the claim
+
+    // SAFETY: live tensor.
+    let order = wait_order(&hooks, gate);
+    assert_eq!(order.len(), 8);
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..8).collect::<Vec<i32>>(), "permutation");
+    assert_eq!(order[7], 4, "most recent expert evicted last: {order:?}");
+    assert_eq!(order[6], 2, "earlier-step expert next-to-last: {order:?}");
+
+    // Publisher catches a later dirty layer without any flush. Each probe
+    // advances the epoch (the sched does this per step entry): reader pins
+    // from an older epoch must never block a publisher slot.
+    hooks.advance_decode_step();
+    route(&hooks, &[6]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: FFI on a live ctx.
+        unsafe { raw::golem_policy_order_epoch_advance(hooks.ctx_ptr()) };
+        // SAFETY: live tensor (publishes the reader epoch on acquire).
+        let order = unsafe { policy_order(&hooks, gate) }.expect("order already published");
+        if order[7] == 6 {
+            break;
         }
-    }
-
-    // SAFETY: valid fn pointers; process-lifetime registration (no unregis-
-    // ter exists) is fine for a test process — nextest isolates per-test
-    // processes, so these hooks only ever see this test's decode.
-    unsafe {
-        golem_llama_sys::raw::golem_register_hooks(
-            Some(on_ensure),
-            Some(on_query),
-            Some(on_notify),
-            None,
-            std::ptr::null_mut(),
+        assert!(
+            Instant::now() < deadline,
+            "background publisher never published the new recency: {order:?}"
         );
+        std::thread::sleep(Duration::from_micros(200));
     }
 
-    // Pool OFF (engine registers nothing): these hooks stand in for the
-    // engine's, isolating the C call-site seam. P2 engages because BOTH
-    // policy_query and ensure_host_resident are non-null (call-site contract).
-    // The pooled path aborts on an unset (K = 0) budget, and the session's
-    // load-time self-check already decodes through these hooks.
-    // SAFETY: FFI setter, no invariants; K = n_expert of tiny-moe.
-    unsafe { golem_llama_sys::raw::golem_set_device_cache_experts(8) };
-    let cfg = common::offload::offload_config();
-    let mut session = Session::new(&cfg).unwrap();
-    let out = chat(&mut session, "Hello");
-    assert!(!out.is_empty());
-
-    let queries = QUERIES.lock().unwrap().clone();
+    // Epoch gate: acquire (pin the current slot at a FIXED epoch), publish,
+    // acquire again... after three pins no slot is free and the push SKIPS
+    // (returns 0) instead of blocking or clobbering a reader-held buffer.
+    for _ in 0..6 {
+        hooks.advance_decode_step();
+        route(&hooks, &[7]);
+        copy_done(&hooks);
+        // SAFETY: live tensor (pins the current slot at the fixed epoch).
+        let _ = unsafe { policy_order(&hooks, gate) };
+    }
     assert!(
-        !queries.is_empty(),
-        "policy_query never fired during offload decode"
+        hooks.order_pushes_failed() > 0,
+        "exhausted triple buffers must skip, not clobber a reader-held slot"
     );
-    for order in &queries {
-        assert_eq!(order.len(), 8, "tiny-moe expert count");
-        let mut sorted = order.clone();
-        sorted.sort_unstable();
-        assert_eq!(
-            sorted,
-            (0..order.len() as i32).collect::<Vec<i32>>(),
-            "returned order must be a permutation of 0..n"
-        );
-    }
 
-    let notifies = NOTIFIES.lock().unwrap().clone();
-    assert!(!notifies.is_empty(), "notify_access never fired");
-    assert!(
-        notifies.iter().all(|&id| (0..8).contains(&id)),
-        "routed expert ids must be within 0..8"
+    // The gate clears once the reader epoch advances (C bumps it per step
+    // entry; the seam exists for non-sched drivers).
+    // SAFETY: FFI on a live ctx.
+    unsafe { raw::golem_policy_order_epoch_advance(hooks.ctx_ptr()) };
+    hooks.advance_decode_step();
+    route(&hooks, &[1]);
+    copy_done(&hooks);
+    let order = wait_order(&hooks, gate);
+    assert_eq!(order[7], 1, "recency updated: {order:?}");
+    assert_eq!(
+        hooks.routing_calls(),
+        10,
+        "one routing call per ids tensor per step"
     );
 }
 
-/// Engine-registered hooks (pool on): the persistent device cache skips the
-/// identical re-route of a second turn, and P4 counters surface the traffic.
-/// A failed precondition (RLIMIT_MEMLOCK below the 1 GiB pool) FAILS — an
-/// early return reads as a pass to the harness (AGENTS.md Evidence).
-#[test]
-fn device_cache_skips_on_second_identical_turn() {
-    let mut cfg = common::offload::offload_config();
-    cfg.ram_experts_gib = 1; // pool on ⇒ engine registers all three hooks
-    let mut session = Session::new(&cfg).expect("session with pooled offload");
-
-    let out1 = chat(&mut session, "Hello");
-    assert!(!out1.is_empty());
-    let first = session
-        .device_cache_stats()
-        .expect("pooled GPU split ⇒ device-cache stats present");
-    assert!(
-        first.bytes_copied > 0,
-        "cold turn copies routed experts into the device cache: {first:?}"
-    );
-
-    let out2 = chat(&mut session, "Hello");
-    assert_eq!(
-        out1, out2,
-        "device cache must not change decode output (§7.4)"
-    );
-    let second = session.device_cache_stats().unwrap();
-    assert!(
-        second.bytes_skipped > 0,
-        "identical re-route must hit the device cache"
-    );
-    assert!(
-        second.skip_ratio > first.skip_ratio,
-        "skip ratio must climb on an all-hit turn (first {first:?}, second {second:?})"
-    );
+/// Waits (bounded) for the layer's order to be published and returns it:
+/// the dirty claim may be won by the publisher thread microseconds before
+/// the `copy_done` flush, so publication can land one poll later.
+fn wait_order(hooks: &SessionHooks, gate: *mut raw::ggml_tensor) -> Vec<i32> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: live ctx + live tensor.
+        if let Some(order) = unsafe { policy_order(hooks, gate) } {
+            return order;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "order never published after the flush"
+        );
+        std::thread::sleep(Duration::from_micros(100));
+    }
 }

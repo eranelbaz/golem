@@ -93,6 +93,13 @@ pub struct RunArgs {
     /// `unmeasured` (no fork event pair on the copy stream yet).
     #[arg(long, value_name = "FILE")]
     pub timing_csv: Option<PathBuf>,
+    /// Per-step routing-trace destination (design §2.3 step 4): a
+    /// `# golem-routing-trace v1` header, then one `step\tphase\tlayer\tid,...`
+    /// record per MoE layer per decode step, flushed at each turn end.
+    /// Requires the RAM expert pool (`--ram-experts-gib`); consumes no
+    /// per-step heap when unset.
+    #[arg(long, value_name = "FILE")]
+    pub routing_trace: Option<PathBuf>,
 }
 
 impl RunArgs {
@@ -118,6 +125,7 @@ impl RunArgs {
             io_threads: self.io_threads,
             manifest_path: self.manifest.clone(),
             timing_csv: self.timing_csv.clone(),
+            routing_trace: self.routing_trace.clone(),
             ..default
         }
     }
@@ -145,6 +153,11 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    // Routing trace (§2.3 step 4): same turn-end flush lifecycle as the CSV.
+    let mut trace_out = match &config.routing_trace {
+        Some(path) => Some(std::fs::File::create(path)?),
+        None => None,
+    };
     // §3.4 P3: the store path only exists behind the RAM expert pool; a
     // --manifest without the pool would silently decode off the plain GGUF
     // path while the user believes replicas are serving experts.
@@ -168,11 +181,11 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         (Some(prompt), Some(dump)) => {
             one_shot_parity(&mut session, &args.model, prompt, dump, args.n_predict)
         }
-        (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out),
+        (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out, &mut trace_out),
         // The dump records exactly one prompt (header `prompt_tokens`), so a
         // multi-turn REPL dump would be ill-defined — refuse it up front.
         (None, Some(_)) => Err("--parity-dump requires --prompt".into()),
-        (None, None) => repl(&mut session, &mut timing_out),
+        (None, None) => repl(&mut session, &mut timing_out, &mut trace_out),
     }
 }
 
@@ -287,6 +300,7 @@ fn one_shot(
     session: &mut Session,
     prompt: &str,
     timing_out: &mut Option<std::fs::File>,
+    trace_out: &mut Option<std::fs::File>,
 ) -> Result<(), Box<dyn Error>> {
     session.chat_turn(
         &[ChatTurn {
@@ -300,6 +314,9 @@ fn one_shot(
     if let Err(e) = flush_timing(session, timing_out) {
         eprintln!("error: timing csv: {e}");
     }
+    if let Err(e) = flush_trace(session, trace_out) {
+        eprintln!("error: routing trace: {e}");
+    }
     println!();
     Ok(())
 }
@@ -312,6 +329,19 @@ fn flush_timing(
 ) -> Result<(), Box<dyn Error>> {
     if let Some(f) = timing_out.as_mut() {
         session.write_timing(f)?;
+        f.flush()?;
+    }
+    Ok(())
+}
+
+/// Flushes the turn's buffered routing-trace records (ring resets for the
+/// next turn). Best-effort like the CSV.
+fn flush_trace(
+    session: &mut Session,
+    trace_out: &mut Option<std::fs::File>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(f) = trace_out.as_mut() {
+        session.write_routing_trace(f)?;
         f.flush()?;
     }
     Ok(())
@@ -444,6 +474,7 @@ fn model_identity(path: &Path) -> std::io::Result<(String, u64)> {
 fn repl(
     session: &mut Session,
     timing_out: &mut Option<std::fs::File>,
+    trace_out: &mut Option<std::fs::File>,
 ) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
@@ -463,6 +494,9 @@ fn repl(
             Ok(_) => {
                 if let Err(e) = flush_timing(session, timing_out) {
                     eprintln!("error: timing csv: {e}");
+                }
+                if let Err(e) = flush_trace(session, trace_out) {
+                    eprintln!("error: routing trace: {e}");
                 }
                 println!()
             }

@@ -265,6 +265,37 @@ impl StepClaims {
     }
 }
 
+/// Pool-owned claim table for the batched P3 miss-list path (ABI v5): the
+/// same lease-until-copy_done contract as [`StepClaims`], but reachable
+/// through `&ExpertPool` so the FFI trampoline needs no thread-local state.
+/// Decode-thread-only access — one [`ExpertPool::ensure_batch`] per
+/// (layer, step, split-segment) and one [`ExpertPool::end_batch_step`] per
+/// compute, both from the single decode thread (stated invariant; the mutex
+/// exists for `&self` legality, never contended).
+struct BatchClaims {
+    lease_of: Vec<u32>,
+    leases: Vec<Lease>,
+    snapshot: Arc<PolicySnapshot>,
+}
+
+impl BatchClaims {
+    fn new(n_experts: u32, n_layers: usize) -> Self {
+        Self {
+            lease_of: vec![UNCLAIMED; n_layers * n_experts as usize],
+            leases: Vec::new(),
+            snapshot: Arc::new(PolicySnapshot::empty()),
+        }
+    }
+
+    fn next_step(&mut self, pool: &ExpertPool) {
+        let n = pool.geometry.n_experts as usize;
+        for lease in self.leases.drain(..) {
+            self.lease_of[lease.layer as usize * n + lease.expert as usize] = UNCLAIMED;
+        }
+        self.snapshot = pool.snapshot();
+    }
+}
+
 struct DemandGuard<'a>(&'a AtomicUsize);
 
 impl Drop for DemandGuard<'_> {
@@ -288,6 +319,8 @@ pub struct ExpertPool {
     demand_inflight: AtomicUsize,
     source: Arc<dyn ExpertSource>,
     snapshots: Arc<SnapshotHandle>,
+    /// Batched miss-list claim state (ABI v5); see [`BatchClaims`].
+    batch_claims: super::primitives::Mutex<BatchClaims>,
 }
 
 impl fmt::Debug for ExpertPool {
@@ -337,6 +370,7 @@ impl ExpertPool {
             .map(|c| arena.class_range(c))
             .collect();
         let residency = ResidencyMap::new(class_of_layer, geometry.n_experts, class_slots)?;
+        let batch_claims = BatchClaims::new(geometry.n_experts, geometry.layers.len());
         Ok(Arc::new(Self {
             arena: Arc::new(arena),
             geometry,
@@ -345,7 +379,79 @@ impl ExpertPool {
             demand_inflight: super::primitives::AtomicUsize::new(0),
             source,
             snapshots,
+            batch_claims: super::primitives::Mutex::new(batch_claims),
         }))
+    }
+
+    /// Claims and page-ins the whole `(kind, expert)` miss list of ONE layer
+    /// in a single call (ABI v5 batched P3: one shared-queue submission for
+    /// all planes), writing each miss's pool-side plane pointer into `out`.
+    /// Each `(layer, expert)` unit is claimed and leased exactly once per
+    /// step regardless of how many of its planes miss; the leases are held
+    /// until [`Self::end_batch_step`] so eviction cannot recycle a slot
+    /// mid-DMA. Steady state allocates nothing (preallocated table + lease
+    /// list). Caller-preallocated `out` (`misses.len()` entries).
+    ///
+    /// # Errors
+    /// Length-mismatched `out`, a layer or expert out of range, a source
+    /// failure after bounded retries, or an over-subscribed pool
+    /// ([`PoolError::Contract`] for the first three shapes' contract
+    /// violations). On error the units claimed so far stay leased until the
+    /// next `end_batch_step`.
+    pub fn ensure_batch(
+        &self,
+        layer: u32,
+        misses: &[(ExpertKind, u32)],
+        out: &mut [*const u8],
+    ) -> Result<(), PoolError> {
+        if out.len() != misses.len() {
+            return Err(PoolError::Contract {
+                reason: format!(
+                    "out length {}: expected misses.len() = {}",
+                    out.len(),
+                    misses.len()
+                ),
+            });
+        }
+        if (layer as usize) >= self.geometry.layers.len() {
+            return Err(PoolError::Contract {
+                reason: format!("layer {layer} out of range"),
+            });
+        }
+        let n = self.geometry.n_experts;
+        let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        let _inflight = self.demand_guard(true);
+        for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
+            if expert >= n {
+                return Err(PoolError::Contract {
+                    reason: format!("expert {expert} out of range (n_experts {n})"),
+                });
+            }
+            let base = layer as usize * n as usize + expert as usize;
+            if batch.lease_of[base] == UNCLAIMED {
+                let lease = self.claim_leased(true, layer, expert, &batch.snapshot)?;
+                // Count successes only, as in ensure_range_leased.
+                self.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
+                batch.lease_of[base] = batch.leases.len() as u32;
+                batch.leases.push(lease);
+            }
+            let lease_at = batch.lease_of[base] as usize;
+            *dst = self
+                .plane_bytes(layer, &batch.leases[lease_at], kind)
+                .as_ptr();
+        }
+        Ok(())
+    }
+
+    /// Ends the batched step: releases every lease taken by
+    /// [`Self::ensure_batch`] since the previous call and refreshes the
+    /// policy snapshot. The caller guarantees the device has consumed every
+    /// pointer handed out (the glue's `copy_done`).
+    pub fn end_batch_step(&self) {
+        self.batch_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_step(self);
     }
 
     /// [`Self::try_new`] for callers that treat bad input as a bug.

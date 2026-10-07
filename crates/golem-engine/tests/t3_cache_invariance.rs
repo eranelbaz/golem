@@ -74,7 +74,7 @@ fn raw_counters() -> [u64; 3] {
     // SAFETY: FFI getter; the returned pointer is a process-lifetime static
     // (never null, never freed), and the layout contract is the one
     // documented on `Session::device_cache_stats`.
-    let block = unsafe { golem_llama_sys::raw::golem_get_device_cache_stats() };
+    let block = unsafe { golem_llama_sys::raw::golem_get_device_cache_stats(test_ctx()) };
     assert!(
         !block.is_null(),
         "golem_get_device_cache_stats returned null"
@@ -121,7 +121,12 @@ impl Snapshot {
     }
 }
 
-/// Whether the registered `policy_query` hook returns a shuffled order.
+/// Whether the routing order would be shuffled. ABI v5 note: the per-tensor
+/// `policy_query` callback is GONE — the eviction order is consumed from the
+/// ctx's triple buffers via `golem_policy_order`, and this test never pushes
+/// (C falls back to the identity order + a one-time warning). The toggle is
+/// kept so the state-(c)/(d) legs both run; the shuffle-permutation seam now
+/// lives in the vendor ctest (`golem-p2-cache.cpp` order push cases).
 static SHUFFLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn set_shuffle(on: bool) {
@@ -138,10 +143,11 @@ fn register_p2_hooks() {
     static CALL: AtomicUsize = AtomicUsize::new(0);
 
     extern "C" fn on_ensure(
-        _ctx: *mut libc::c_void,
+        _payload: *mut libc::c_void,
         tensor: *const libc::c_void,
-        first: i32,
-        last: i32,
+        _miss_kinds: *const i32,
+        miss_ids: *const i32,
+        n_miss: i32,
         ptrs: *mut *const libc::c_void,
     ) {
         // ABI v2: the substrate copies from the returned pointers, so serve
@@ -155,61 +161,83 @@ fn register_p2_hooks() {
         let base = unsafe { (*tensor.cast::<golem_llama_sys::raw::ggml_tensor>()).data };
         let stride =
             unsafe { golem_llama_sys::raw::golem_tensor_expert_stride_bytes(tensor) } as usize;
-        for e in first..=last {
-            unsafe {
-                *ptrs.add((e - first) as usize) = base.byte_add(e as usize * stride).cast();
-            }
+        // ABI v5: the miss list is flat across all planes (kind, id) pairs;
+        // every miss of this test reads the tensor's REAL per-expert plane.
+        for i in 0..n_miss as usize {
+            // SAFETY: C passes `n_miss` entries in each list and `n_miss`
+            // writable out slots (ggml-backend.cpp miss hoisting).
+            let id = unsafe { *miss_ids.add(i) };
+            unsafe { *ptrs.add(i) = base.byte_add(id as usize * stride).cast() };
         }
     }
-    unsafe extern "C" fn on_query(
-        _ctx: *mut libc::c_void,
+    extern "C" fn on_routing(
+        _payload: *mut libc::c_void,
+        _blk: i32,
         _tensor: *const libc::c_void,
-        n: i32,
-    ) -> *const i32 {
-        let n = n as usize;
-        let mut order: Vec<i32> = (0..n as i32).collect();
-        if SHUFFLE.load(Ordering::Relaxed) {
-            // rand-free LCG over the call counter: a fresh permutation per
-            // query, so the C eviction walk hits varying victims.
-            let mut lcg = (CALL.fetch_add(1, Ordering::Relaxed) as u64)
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            for i in (1..n).rev() {
-                lcg = lcg
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let j = (lcg >> 33) as usize % (i + 1);
-                order.swap(i, j);
-            }
-        }
-        // contract: valid until the next call — leak-per-test is fine.
-        Box::into_raw(order.into_boxed_slice()) as *const i32
+        _ids: *const i32,
+        _n: i64,
+        _n_experts: i32,
+    ) {
     }
-    extern "C" fn on_notify(_ctx: *mut libc::c_void, _expert_id: i64) {}
 
-    // SAFETY: valid fn pointers; process-lifetime registration (no
-    // unregister exists) is fine for a test process.
-    unsafe {
-        golem_llama_sys::raw::golem_register_hooks(
-            Some(on_ensure),
-            Some(on_query),
-            Some(on_notify),
-            None,
-            std::ptr::null_mut(),
-        );
+    // ABI v5: hooks register on a per-model ctx. This test drives the
+    // substrate through a session whose engine hooks would normally own the
+    // ctx; the test-owned ctx here keeps the seam working until session
+    // lifecycle wiring attaches the model (routing presence is what turns
+    // the C slab path on). The guards leak for the process lifetime:
+    // nextest isolates per-test processes.
+    use std::sync::OnceLock;
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    if REGISTERED.set(()).is_err() {
+        return; // one registration per process
     }
+    let ctx = golem_llama_sys::GolemCtx::create(4, 8).expect("test ctx");
+    TEST_CTX
+        .set(ctx.as_ptr() as usize)
+        .ok()
+        .expect("one test ctx per process");
+    // The guard is intentionally leaked (process lifetime; nextest isolates
+    // per-test processes): the substrate keeps calling the registered hooks
+    // for every decode after this function returns, and the ctx must outlive
+    // the Session built on it by `new_with_test_ctx`.
+    let hooked = ctx.register(
+        golem_llama_sys::HookFns {
+            ensure: Some(on_ensure),
+            routing: Some(on_routing),
+            copy_done: None,
+        },
+        std::sync::Arc::new(()),
+    );
+    std::mem::forget(hooked);
 }
 
+/// A Session carrying the test-owned ctx on its model: `new_with_test_ctx`
+/// attaches BEFORE `llama_init_from_model`, so every `sched_reserve`
+/// (including re-reserves) sees the hooks and the slab path engages.
+fn session_with_test_hooks() -> Session {
+    Session::new_with_test_ctx(&config(), test_ctx()).expect("session with test-owned ctx")
+}
+
+/// The test-owned ctx pointer (set by `register_p2_hooks`). Held as `usize`:
+/// the C-side ctx is internally synchronized (ABI v5 atomics + dc mutex) and
+/// outlives the leak-for-process-lifetime guard.
+static TEST_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 fn set_budget(experts: i32) {
-    // SAFETY: FFI setter, no invariants (0 = unlimited; the
-    // budget is a per-tensor expert COUNT — the slab is sized from it).
-    unsafe { golem_llama_sys::raw::golem_set_device_cache_experts(experts) };
+    // SAFETY: FFI setter on the test ctx (ABI v5: per-ctx budget; 0 =
+    // unlimited). The budget is a per-tensor expert COUNT — the slab is
+    // sized from it.
+    unsafe { golem_llama_sys::raw::golem_set_device_cache_experts(test_ctx(), experts) };
 }
 
 fn reset_cache() {
-    // SAFETY: FFI, no invariants (clears cache entries; counters stay
+    // SAFETY: FFI on the test ctx (clears cache entries; counters stay
     // cumulative, so all assertions are on counter deltas).
-    unsafe { golem_llama_sys::raw::golem_reset_device_cache() };
+    unsafe { golem_llama_sys::raw::golem_reset_device_cache(test_ctx()) };
+}
+
+fn test_ctx() -> golem_llama_sys::raw::golem_ctx_t {
+    *TEST_CTX.get().expect("register_p2_hooks ran first") as golem_llama_sys::raw::golem_ctx_t
 }
 
 /// One greedy turn, decoded through the parity recorder; returns the
@@ -252,7 +280,7 @@ fn t3_four_cache_states_decode_identically() {
     set_budget(8);
 
     // Pool is off ⇒ no mlock failure path (that guard lives in the pooled tests).
-    let mut session = Session::new(&config()).unwrap();
+    let mut session = session_with_test_hooks();
 
     // --- (b) cold start — runs FIRST (self-check warmup must not count).
     set_budget(8); // K = n_expert: every routed pair fits
