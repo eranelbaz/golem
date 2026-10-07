@@ -2079,6 +2079,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         GGML_ASSERT(ggml_nbytes(p.t) == (size_t) p.t->ne[0] * sizeof(int32_t));
                         golem_pred_ids.resize(p.t->ne[0]);
+                        // Usually computed on the ids backend (already
+                        // synchronized); otherwise drain its own backend.
+                        ggml_backend_t pb = ggml_backend_sched_get_tensor_backend(sched, p.t);
+                        if (pb != NULL && pb != ids_backend) {
+                            ggml_backend_synchronize(pb);
+                        }
                         ggml_backend_tensor_get(p.t, golem_pred_ids.data(), 0, ggml_nbytes(p.t));
                         golem_cb_guard cb;
                         gctx->predict(gctx->payload, src_blk, p.target, golem_pred_ids.data(),

@@ -136,6 +136,8 @@ pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> Pre
                     continue;
                 }
                 for (layer, expert) in batch {
+                    // Dropping the rest is deliberate: by the time demand
+                    // drains, those layers have run and the units are waste.
                     if stop.load(Ordering::Relaxed) || pool.demand_inflight() > 0 {
                         break;
                     }

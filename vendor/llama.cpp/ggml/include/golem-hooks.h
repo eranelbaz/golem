@@ -63,7 +63,7 @@ typedef void (*golem_routing_fn)(void *payload, int32_t blk, const void *tensor,
                                  const int32_t *ids_dense, int64_t n_ids,
                                  int32_t n_experts);
 
-/* Hook (P5, design §6.5): next-layer routing prediction. When
+/* Hook (P5, design 6.5): next-layer routing prediction. When
  * golem_set_predict enabled it, the model graph builds, from layer `src_blk`'s
  * FFN input, the top (n_expert_used + margin) experts layer `target_blk`'s
  * router would pick (target = src + 1 .. src + lookahead). The scheduler

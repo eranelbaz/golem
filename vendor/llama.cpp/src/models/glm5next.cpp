@@ -649,7 +649,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_build_forward_expand(gf, post);
         ggml_build_forward_expand(gf, comb);
 
-        // Golem P5 (§6.5): predict layer il+d's routed experts from this
+        // Golem P5 (design 6.5): predict layer il+d's routed experts from this
         // layer's FFN input, normed with layer il+d's ffn_norm, through the
         // same gating as build_moe_ffn. Staging only; routing is untouched.
         // Decode graphs only: the scheduler delivers single-token rows.
