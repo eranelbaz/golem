@@ -8,7 +8,6 @@
 // `cfg(loom)` is set via RUSTFLAGS by the loom leg; declare it known here.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -251,8 +250,8 @@ pub enum SourceError {
     Store(golem_store::StoreError),
 }
 
-impl fmt::Display for SourceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "expert source I/O: {e}"),
             Self::Gguf(e) => write!(f, "expert source GGUF: {e}"),

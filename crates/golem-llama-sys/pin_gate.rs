@@ -239,46 +239,18 @@ pub fn content_hash(root: &Path) -> io::Result<String> {
     Ok(hex_of(&h.finish()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PinError {
+    #[error("I/O error: {0}")]
     Io(io::Error),
-    MissingKey {
-        pin_file: String,
-    },
+    #[error("content_sha256 key missing/empty/malformed in {pin_file}")]
+    MissingKey { pin_file: String },
+    #[error("vendor tree drifted (actual {actual} != expected {expected}, pin {pin_file})")]
     Mismatch {
         expected: String,
         actual: String,
         pin_file: String,
     },
-}
-
-impl std::fmt::Display for PinError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PinError::Io(e) => write!(f, "I/O error: {e}"),
-            PinError::MissingKey { pin_file } => write!(
-                f,
-                "content_sha256 key missing/empty/malformed in {pin_file}"
-            ),
-            PinError::Mismatch {
-                expected,
-                actual,
-                pin_file,
-            } => write!(
-                f,
-                "vendor tree drifted (actual {actual} != expected {expected}, pin {pin_file})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PinError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            PinError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
 }
 
 impl From<io::Error> for PinError {

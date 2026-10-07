@@ -14,9 +14,13 @@ links = "llama-cpp"
 [features]
 default = []
 
+[dependencies]
+thiserror = { workspace = true }
+
 [build-dependencies]
 cmake = "0.1"
 bindgen = "0.72"
+thiserror = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }

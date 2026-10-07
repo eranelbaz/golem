@@ -7,7 +7,6 @@
 //! All `unsafe` in the pool module lives here (mmap/mlock/munlock/munmap and
 //! raw slot access), each item with its invariant named.
 
-use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 
@@ -21,10 +20,11 @@ pub struct SlotClass {
 }
 
 /// Arena construction/mapping failures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ArenaError {
     /// Empty class list, a zero slot size or slot count, total slot count
     /// above `u32::MAX`, or total byte size overflow.
+    #[error("invalid arena layout: pool_bytes={pool_bytes} slot_size={slot_size}")]
     InvalidLayout {
         /// Rejected pool size.
         pool_bytes: usize,
@@ -32,6 +32,7 @@ pub enum ArenaError {
         slot_size: usize,
     },
     /// `mmap` failed.
+    #[error("arena mmap failed, errno={errno}")]
     MapFailed {
         /// `errno` from the syscall.
         errno: i32,
@@ -39,32 +40,12 @@ pub enum ArenaError {
     /// `mlock` failed (typically `ENOMEM` on low `RLIMIT_MEMLOCK` — see the
     /// CLI preflight). NEVER mapped unlocked as a fallback: mlock is a
     /// correctness feature (§5.4).
+    #[error("arena mlock failed, errno={errno} (check RLIMIT_MEMLOCK / LimitMEMLOCK)")]
     LockFailed {
         /// `errno` from the syscall.
         errno: i32,
     },
 }
-
-impl fmt::Display for ArenaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidLayout {
-                pool_bytes,
-                slot_size,
-            } => write!(
-                f,
-                "invalid arena layout: pool_bytes={pool_bytes} slot_size={slot_size}"
-            ),
-            Self::MapFailed { errno } => write!(f, "arena mmap failed, errno={errno}"),
-            Self::LockFailed { errno } => write!(
-                f,
-                "arena mlock failed, errno={errno} (check RLIMIT_MEMLOCK / LimitMEMLOCK)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ArenaError {}
 
 /// Marks `file` random-access so buffered expert reads do no readahead (it
 /// would only populate the cache with neighbouring expert bytes). The flag
@@ -118,8 +99,8 @@ struct ClassRegion {
     offset: usize,
 }
 
-impl fmt::Debug for Arena {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for Arena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Arena")
             .field("len", &self.len)
             .field("slots", &self.slots)
