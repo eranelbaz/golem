@@ -16,7 +16,6 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::tiny_moe_path;
 use golem_engine::config::EngineConfig;
 
 fn second_fixture() -> PathBuf {

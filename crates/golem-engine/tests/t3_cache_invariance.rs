@@ -138,10 +138,6 @@ fn set_shuffle(on: bool) {
 /// pager seams. Process-lifetime registration is fine: nextest isolates
 /// per-test processes, so these hooks only ever see this test's decode.
 fn register_p2_hooks() {
-    use std::sync::atomic::AtomicUsize;
-
-    static CALL: AtomicUsize = AtomicUsize::new(0);
-
     extern "C" fn on_ensure(
         _payload: *mut libc::c_void,
         tensor: *const libc::c_void,
@@ -194,7 +190,6 @@ fn register_p2_hooks() {
     let ctx = golem_llama_sys::GolemCtx::create(4, 8).expect("test ctx");
     TEST_CTX
         .set(ctx.as_ptr() as usize)
-        .ok()
         .expect("one test ctx per process");
     // The guard is intentionally leaked (process lifetime; nextest isolates
     // per-test processes): the substrate keeps calling the registered hooks
