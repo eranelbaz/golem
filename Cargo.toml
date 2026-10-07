@@ -17,18 +17,14 @@ all = "warn"
 
 # Predeclared for upcoming tasks; unused entries cost nothing until referenced.
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
-axum = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 libc = "0.2"
-uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 crc32c = "0.6"
 sysinfo = "0.33"
