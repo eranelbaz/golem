@@ -243,6 +243,28 @@ impl Arena {
         unsafe { std::slice::from_raw_parts_mut(self.ptr().add(self.offset_of(i)), n) }
     }
 
+    /// Raw pointer `slot_bytes + offset` into one slot. The exclusive-D2H
+    /// path (§6.3 O10) hands these to the substrate: the residency claim's
+    /// fill gate for the slot's key is closed from claim to commit, which
+    /// parks every pool reader of the key, and the pending lease keeps the
+    /// slot from being recycled — so no safe alias can observe or overlap the
+    /// write while the raw pointer is live.
+    ///
+    /// # Panics
+    /// Panics when `slot >= slot_count` or `offset` leaves the slot.
+    pub(crate) fn slot_ptr_at(&self, slot: u32, offset: u64) -> *mut u8 {
+        assert!(slot < self.slots, "slot {slot} out of range");
+        let n = self.slot_size_of(slot);
+        assert!(
+            (offset as usize) < n,
+            "plane offset {offset} leaves slot {slot}"
+        );
+        // SAFETY: `slot < slots` keeps the address inside the mapping; the
+        // offset is bounds-checked against the slot's size above; exclusivity
+        // is enforced by the closed fill gate + pending lease named above.
+        unsafe { self.ptr().add(self.offset_of(slot)).add(offset as usize) }
+    }
+
     /// Number of slot classes.
     pub fn class_count(&self) -> usize {
         self.classes.len()

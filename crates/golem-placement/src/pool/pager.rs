@@ -10,7 +10,7 @@
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
 
 use super::arena::Arena;
-use super::primitives::{Arc, AtomicUsize, Ordering};
+use super::primitives::{Arc, AtomicU64, AtomicUsize, Mutex, Ordering};
 use super::residency::{
     Claim, ClaimError, ExpertKind, FillClaim, P3Stats, PolicySnapshot, PoolConfigError,
     ResidencyMap,
@@ -306,6 +306,88 @@ pub struct ExpertPool {
     snapshots: Arc<SnapshotHandle>,
     /// Batched miss-list claim state (ABI v5); see [`BatchClaims`].
     batch_claims: super::primitives::Mutex<BatchClaims>,
+    /// Pending VRAM-eviction D2H claims (O10): fill gate closed, lease held,
+    /// until [`ExpertPool::commit_d2h`]. Bounded by the routed set of one
+    /// compute (≤ K per layer); capacity is reserved at construction.
+    d2h_pending: Mutex<Vec<PendingD2h>>,
+    /// Reused lease scratch for [`ExpertPool::end_batch_step_exclusive`]
+    /// (decode-thread-only; capacity stabilizes after the first step).
+    exclusive_scratch: Mutex<Vec<Lease>>,
+    /// Reused (layer, expert, slot) scratch beside [`ExpertPool::exclusive_scratch`].
+    exclusive_triples: Mutex<Vec<(u32, u32, u32)>>,
+    /// Units whose only current copy is the VRAM slab (O10 bookkeeping):
+    /// steers the prefetcher off VRAM-resident experts (no disk read while a
+    /// VRAM copy exists). Best-effort; a stale bit only skips a prefetch.
+    vram: VramBits,
+}
+
+/// One claimed-but-not-yet-committed VRAM-eviction D2H.
+struct PendingD2h {
+    layer: u32,
+    expert: u32,
+    /// The claimed slot: keeps it resident and un-evictable until commit.
+    lease: Lease,
+}
+
+/// Outcome of [`ExpertPool::claim_d2h`]. `Dest` carries the three plane
+/// pointers (gate/up/down ordinal order) of the claimed slot.
+pub enum D2hIncoming {
+    /// The pool copy is current: the VRAM bytes are droppable.
+    Resident,
+    /// No acceptable pool slot (score floor kept every victim): droppable.
+    Dropped,
+    /// Copy the three planes into these destinations.
+    Dest([*mut u8; 3]),
+}
+
+/// Flat VRAM-presence bitset over `layers × n_experts` keys.
+#[derive(Debug)]
+struct VramBits {
+    bits: Vec<AtomicU64>,
+    words_per_layer: usize,
+}
+
+impl VramBits {
+    fn new(layers: usize, n_experts: usize) -> Self {
+        let words_per_layer = n_experts.div_ceil(64);
+        Self {
+            bits: (0..layers * words_per_layer)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            words_per_layer,
+        }
+    }
+
+    fn test(&self, layer: u32, expert: u32) -> bool {
+        let w = layer as usize * self.words_per_layer + expert as usize / 64;
+        self.bits
+            .get(w)
+            .is_some_and(|w| w.load(Ordering::Relaxed) & (1 << (expert % 64)) != 0)
+    }
+
+    fn set(&self, layer: u32, expert: u32) {
+        if let Some(w) = self
+            .bits
+            .get(layer as usize * self.words_per_layer + expert as usize / 64)
+        {
+            w.fetch_or(1 << (expert % 64), Ordering::Relaxed);
+        }
+    }
+
+    fn clear(&self, layer: u32, expert: u32) {
+        if let Some(w) = self
+            .bits
+            .get(layer as usize * self.words_per_layer + expert as usize / 64)
+        {
+            w.fetch_and(!(1 << (expert % 64)), Ordering::Relaxed);
+        }
+    }
+
+    fn clear_all(&self) {
+        for w in &self.bits {
+            w.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 impl std::fmt::Debug for ExpertPool {
@@ -356,6 +438,10 @@ impl ExpertPool {
             .collect();
         let residency = ResidencyMap::new(class_of_layer, geometry.n_experts, class_slots)?;
         let batch_claims = BatchClaims::new(geometry.n_experts, geometry.layers.len());
+        let vram = VramBits::new(geometry.layers.len(), geometry.n_experts as usize);
+        // One compute stages at most K units per layer into the slab; evicted
+        // units per compute are bounded by the same number.
+        let d2h_pending = Vec::with_capacity(geometry.layers.len() * 64);
         Ok(Arc::new(Self {
             arena: Arc::new(arena),
             geometry,
@@ -365,6 +451,10 @@ impl ExpertPool {
             source,
             snapshots,
             batch_claims: super::primitives::Mutex::new(batch_claims),
+            d2h_pending: super::primitives::Mutex::new(d2h_pending),
+            exclusive_scratch: super::primitives::Mutex::new(Vec::new()),
+            exclusive_triples: super::primitives::Mutex::new(Vec::new()),
+            vram,
         }))
     }
 
@@ -437,6 +527,126 @@ impl ExpertPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .next_step(self);
+    }
+
+    /// [`Self::end_batch_step`] under EXCLUSIVE residency (O10): after the
+    /// leases drop, every unit the step staged H2D is VRAM-resident, so its
+    /// pool slot is released (each release re-checks zero leases — a
+    /// concurrent prefetch claim keeps the unit inclusive) and the unit is
+    /// marked VRAM-present, which steers the prefetcher off it (no disk read
+    /// while the VRAM copy exists). No allocation: the release list is the
+    /// drained lease vector's contents, moved into a reused scratch.
+    pub fn end_batch_step_exclusive(&self) {
+        let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        // Swap the step's leases into a reused scratch (no per-step
+        // allocation — decode hot path) so `lease_of` is writable while we
+        // walk them.
+        let mut scratch = self
+            .exclusive_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut triples = self
+            .exclusive_triples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::swap(&mut *scratch, &mut batch.leases);
+        let n = self.geometry.n_experts as usize;
+        triples.extend(scratch.drain(..).map(|l| {
+            batch.lease_of[l.layer as usize * n + l.expert as usize] = UNCLAIMED;
+            (l.layer, l.expert, l.slot())
+        }));
+        // Leases dropped with the drained vector: the slots are un-leased, so
+        // the release succeeds unless an in-flight prefetch claim re-leased
+        // the key in between — that unit stays inclusive by design.
+        for &(layer, expert, slot) in triples.iter() {
+            self.residency.release_resident(layer, expert, slot);
+            self.vram.set(layer, expert);
+        }
+        triples.clear();
+        batch.snapshot = self.snapshot();
+    }
+
+    /// Claims a slot for an incoming VRAM eviction D2H (O10). `floor` is the
+    /// incoming expert's published score: a CLOCK victim scoring strictly
+    /// above it is kept and the copy dropped. On `Dest` the three plane
+    /// destinations are handed out raw (the fill gate stays closed until
+    /// [`Self::commit_d2h`], parking every pool reader of the key, so no
+    /// reader can observe the copy in flight); the pending claim is recorded
+    /// and its lease held until commit, so CLOCK cannot recycle the slot
+    /// mid-copy.
+    pub fn claim_d2h(&self, layer: u32, expert: u32, floor: f32) -> D2hIncoming {
+        // VRAM presence bit cleared by the caller before this call (the C
+        // side reports the eviction once, before any later ensure).
+        let snapshot = self.snapshot();
+        match self.residency.claim_d2h(layer, expert, &snapshot, floor) {
+            super::residency::D2hClaim::Resident => D2hIncoming::Resident,
+            super::residency::D2hClaim::Dropped => D2hIncoming::Dropped,
+            super::residency::D2hClaim::Claimed { slot, claim } => {
+                let unit = &self.geometry.layers[layer as usize];
+                // SAFETY: the claim holds the key's only lease and the fill
+                // gate is closed (no pool reader exists); the view ends here,
+                // the raw plane pointers stay covered by the pending lease +
+                // closed gate until commit_d2h.
+                let mut dst = [std::ptr::null_mut::<u8>(); 3];
+                for (k, d) in dst.iter_mut().enumerate() {
+                    let (off, _) = unit.plane(ExpertKind::ALL[k]);
+                    *d = self.arena.slot_ptr_at(claim.slot(), off);
+                }
+                claim.defer();
+                let lease = Lease {
+                    map: self.residency.clone(),
+                    _arena: self.arena.clone(),
+                    layer,
+                    expert,
+                    slot,
+                };
+                self.d2h_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(PendingD2h {
+                        layer,
+                        expert,
+                        lease,
+                    });
+                D2hIncoming::Dest(dst)
+            }
+        }
+    }
+
+    /// Completes every pending VRAM-eviction D2H: opens the fill gates (the
+    /// caller guarantees the copies landed — the substrate drains its
+    /// backends before `copy_done`) and drops the pending leases.
+    pub fn commit_d2h(&self) {
+        let mut pending = self.d2h_pending.lock().unwrap_or_else(|e| e.into_inner());
+        for p in pending.drain(..) {
+            self.residency.finish_d2h(p.layer, p.expert);
+            drop(p.lease);
+        }
+    }
+
+    /// Whether `(layer, expert)`'s only current copy is known to be the VRAM
+    /// slab (exclusive residency bookkeeping; best-effort — a stale bit only
+    /// makes the prefetcher skip a unit that is also RAM-resident).
+    pub fn is_vram(&self, layer: u32, expert: u32) -> bool {
+        self.vram.test(layer, expert)
+    }
+
+    /// Clears the VRAM-presence bit of one unit (the substrate reported the
+    /// slab slot evicted).
+    pub fn clear_vram(&self, layer: u32, expert: u32) {
+        self.vram.clear(layer, expert);
+    }
+
+    /// Clears every VRAM-presence bit (the substrate's device cache was
+    /// reset between turns).
+    pub fn clear_all_vram(&self) {
+        self.vram.clear_all();
+    }
+
+    /// Publishes a rebuilt policy snapshot (the engine's per-step scored
+    /// table) for the next compute's victim picks.
+    pub fn publish_snapshot(&self, snapshot: Arc<PolicySnapshot>) {
+        self.snapshots.update(snapshot);
     }
 
     /// [`Self::try_new`] for callers that treat bad input as a bug.
@@ -560,35 +770,39 @@ impl ExpertPool {
         expert: u32,
         snapshot: &PolicySnapshot,
     ) -> Result<Lease, PoolError> {
-        let slot = match self.residency.claim_for(layer, expert, snapshot, demand) {
-            Ok(Claim::Resident { slot, prefetch_hit }) => {
-                if demand {
-                    self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+        let slot =
+            match self
+                .residency
+                .claim_for(layer, expert, snapshot, demand, f32::NEG_INFINITY)
+            {
+                Ok(Claim::Resident { slot, prefetch_hit }) => {
+                    if demand {
+                        self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if prefetch_hit {
+                        self.stats.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    slot
                 }
-                if prefetch_hit {
-                    self.stats.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(Claim::Filled { slot, claim }) => {
+                    self.page_in(demand, layer, expert, claim)?;
+                    slot
                 }
-                slot
-            }
-            Ok(Claim::Filled { slot, claim }) => {
-                self.page_in(demand, layer, expert, claim)?;
-                slot
-            }
-            Err(ClaimError::Evicted(evicted)) => {
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                let slot = evicted.slot;
-                debug_assert_eq!(slot, evicted.victim.slot);
-                if evicted.victim.prefetched {
-                    let unit = &self.geometry.layers[evicted.victim.layer as usize];
-                    self.stats
-                        .prefetch_wasted_bytes
-                        .fetch_add(unit.bytes(), Ordering::Relaxed);
+                Err(ClaimError::Evicted(evicted)) => {
+                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                    let slot = evicted.slot;
+                    debug_assert_eq!(slot, evicted.victim.slot);
+                    if evicted.victim.prefetched {
+                        let unit = &self.geometry.layers[evicted.victim.layer as usize];
+                        self.stats
+                            .prefetch_wasted_bytes
+                            .fetch_add(unit.bytes(), Ordering::Relaxed);
+                    }
+                    self.page_in(demand, layer, expert, evicted.claim)?;
+                    slot
                 }
-                self.page_in(demand, layer, expert, evicted.claim)?;
-                slot
-            }
-            Err(ClaimError::Busy) => return Err(PoolError::Busy),
-        };
+                Err(ClaimError::Busy) => return Err(PoolError::Busy),
+            };
         Ok(Lease {
             map: self.residency.clone(),
             _arena: self.arena.clone(),

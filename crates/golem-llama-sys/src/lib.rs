@@ -45,7 +45,7 @@ pub fn hooks_abi_version() -> i32 {
 // handle-returning register, batched ensure, triple-buffered order push).
 // A header drift past v6 must fail this build, not silently re-shape the
 // guards.
-const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 6);
+const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 7);
 
 /// Per-model hook context (ABI v5): owns a `golem_ctx_t` from
 /// `golem_ctx_create` and frees it on drop. `golem_ctx_free` aborts while
@@ -119,6 +119,7 @@ impl GolemCtx {
                 hooks.ensure,
                 hooks.routing,
                 hooks.copy_done,
+                hooks.evict_dest,
                 payload_ptr as *mut T as *mut std::ffi::c_void,
             )
         };
@@ -136,6 +137,9 @@ pub struct HookFns {
     pub ensure: raw::golem_ensure_host_resident_fn,
     pub routing: raw::golem_routing_fn,
     pub copy_done: raw::golem_copy_done_fn,
+    /// Exclusive-residency eviction hook (ABI v7, §6.3 O10); `None` keeps
+    /// inclusive residency.
+    pub evict_dest: raw::golem_evict_dest_fn,
 }
 
 /// A live hook registration: `Drop` unregisters (C joins in-flight

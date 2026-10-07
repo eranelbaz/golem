@@ -55,9 +55,16 @@ fn two_dim_tensor_with_exps_suffix_is_not_expert() {
 #[test]
 fn register_null_ctx_smoke() {
     unsafe {
-        // ABI v5: register takes the ctx first; a NULL ctx is null-guarded
+        // ABI v7: register takes the ctx first; a NULL ctx is null-guarded
         // and returns a NULL handle, whose unregister is a no-op.
-        let h = golem_register_hooks(std::ptr::null_mut(), None, None, None, std::ptr::null_mut());
+        let h = golem_register_hooks(
+            std::ptr::null_mut(),
+            None,
+            None,
+            None,
+            None,
+            std::ptr::null_mut(),
+        );
         assert!(h.is_null(), "NULL ctx must not produce a handle");
         golem_unregister_hooks(h);
         // No assertion beyond "does not crash + links": the unset state is
@@ -107,6 +114,7 @@ fn hooked_guard_unregisters_and_recovers_payload() {
             ensure: Some(nop),
             routing: Some(nop2),
             copy_done: Some(nop3),
+            evict_dest: None,
         },
         std::sync::Arc::new([0u64; 4]),
     );

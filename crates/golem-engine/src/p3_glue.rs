@@ -42,12 +42,13 @@ use golem_gguf::blk_of;
 use golem_llama_sys::raw;
 use golem_llama_sys::{CtxRaw, GolemCtx, HookFns, Hooked};
 use golem_placement::pool::{
-    AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PolicySnapshot,
-    PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource, spawn_prefetch,
+    AccessFeed, D2hIncoming, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats,
+    PolicySnapshot, PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource,
+    spawn_prefetch,
 };
 use golem_store::ChunkQueue;
 
-use crate::config::{EngineConfig, PrefetchMode, VramOrder};
+use crate::config::{EngineConfig, PrefetchMode, Residency, VramOrder};
 use crate::error::EngineError;
 
 /// One traced routing readback: fixed fields plus a range into the ring's
@@ -270,6 +271,12 @@ struct HookState {
     /// routing readback appends (preallocated, no per-id heap), turn end
     /// flushes. `None` costs the trampoline one `Option` check.
     trace: Option<Mutex<TraceRing>>,
+    /// Exclusive residency (§6.3 O10): registers `evict_dest`, releases
+    /// promoted pool slots and commits D2H fills at `copy_done`.
+    exclusive: bool,
+    /// Per-key score scratch the `copy_done` flush refills for the scored
+    /// snapshot (one reuse, never a per-step allocation of the table).
+    scores_scratch: Mutex<Vec<f32>>,
     /// §6.5 P5 prediction state (mode `Off`: never touched).
     pred: PredState,
 }
@@ -807,6 +814,13 @@ impl SessionHooks {
         set_scoring(on);
     }
 
+    /// The substrate's device cache was reset between turns (session.rs
+    /// calls `golem_reset_device_cache`): the VRAM copies are gone, so the
+    /// exclusive-residency presence bits must go too.
+    pub fn device_cache_reset(&self) {
+        self.state.pool.clear_all_vram();
+    }
+
     /// Stage 1 of the teardown order: unregister + join (drops `Hooked`,
     /// recovering the payload Arc). `Session` calls this explicitly BEFORE
     /// `llama_free`; the remaining teardown (publisher/prefetch stop, then
@@ -1241,6 +1255,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         },
         miss_scratch: Mutex::new(Vec::with_capacity(3 * k.min(geo.n_experts) as usize)),
         flush_scratch: Mutex::new(OrderScratch::new(geo.n_experts as usize)),
+        exclusive: config.residency == Residency::Exclusive,
+        scores_scratch: Mutex::new(Vec::with_capacity((n_layers * geo.n_experts) as usize)),
         policy,
         n_layers,
         dense_lead,
@@ -1286,11 +1302,13 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // engine config cannot express pipeline parallelism or multi-GPU to
     // pre-reject here). The ctx is consumed into the guard: the registration
     // borrow is encoded by moving, so the ctx always outlives the hooks.
+    let exclusive = state.exclusive;
     let hooked = ctx.register(
         HookFns {
             ensure: Some(ensure_host_resident),
             routing: Some(routing),
             copy_done: Some(copy_done),
+            evict_dest: exclusive.then_some(evict_dest),
         },
         state.clone(),
     );
@@ -1578,9 +1596,19 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         h.copy_done_calls.fetch_add(1, Ordering::Relaxed);
-        // The device consumed the step's pointers (C synchronized its
-        // backends before this hook): the slots are safe to recycle.
-        h.pool.end_batch_step();
+        if h.exclusive {
+            // Exclusive residency (O10): the eviction D2Hs issued last
+            // compute landed (C drained its backends above) — open their
+            // fill gates; then release the pool slots of everything staged
+            // H2D last compute and mark those units VRAM-present.
+            h.pool.commit_d2h();
+            h.pool.end_batch_step_exclusive();
+            h.publish_scored_snapshot();
+        } else {
+            // The device consumed the step's pointers (C synchronized its
+            // backends before this hook): the slots are safe to recycle.
+            h.pool.end_batch_step();
+        }
         // Bounded flush-if-dirty: if the publisher has not caught up (it
         // polls at 250 µs), publish up to 8 dirty layers here. push never
         // blocks — a full triple-buffer set leaves the layer dirty for the
@@ -1590,6 +1618,68 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
             publish_dirty(h, 8, &mut scratch);
         }
     });
+}
+
+/// The exclusive-residency eviction hook (ABI v7, §6.3 O10): the substrate
+/// evicted a fully-valid slab slot; decide whether its bytes move into the
+/// pool (D2H on the promotion stream) or drop. Runs on the decode thread,
+/// once per evicted (layer, expert) per compute, BEFORE that compute's
+/// `ensure` — so a unit evicted and copied back is already pool-resident
+/// when its next slab miss is served (it is never re-read from disk while a
+/// VRAM copy could exist).
+///
+/// Returns 1 with `out_ptrs[0..3]` (kind-1 order: gate/up/down) filled → the
+/// substrate issues three D2H copies; 0 → drop. The pool keeps the claimed
+/// slot gated (fill bit) until the matching `copy_done`, which the substrate
+/// fires only after it synchronized its backends — the D2H has landed before
+/// any pool reader is admitted.
+// The C ABI fixes the signature; the pointer contract is enforced by the
+// guarded body.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn evict_dest(
+    payload: *mut c_void,
+    tensor: *const c_void,
+    expert: i32,
+    out_ptrs: *mut *const c_void,
+) -> i32 {
+    guarded("evict_dest", || {
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        let Some(entry) = h.entry_for(tensor) else {
+            return 0; // non-expert tensor: nothing to place
+        };
+        if expert < 0 || expert as u32 >= h.n_experts {
+            p3_fatal(format!(
+                "P3 evict_dest contract violation: id {expert} vs n_experts {}",
+                h.n_experts
+            ));
+        }
+        if out_ptrs.is_null() {
+            p3_fatal("P3: evict_dest called with null out_ptrs".into());
+        }
+        // The incoming copy's score floor: displace only strictly colder RAM
+        // keys (relative swap margin's exclusive counterpart, O10).
+        let step = h.policy.step.load(Ordering::Relaxed);
+        let floor = h.policy.decayed(
+            entry.layer as usize * h.n_experts as usize + expert as u32 as usize,
+            step,
+        ) as f32;
+        // The VRAM copy is gone the moment the substrate reports the slot
+        // evicted — clear the presence bit before any later ensure.
+        h.pool.clear_vram(entry.layer, expert as u32);
+        match h.pool.claim_d2h(entry.layer, expert as u32, floor) {
+            D2hIncoming::Dest(dst) => {
+                // SAFETY: C allocates 3 writable out-pointer slots
+                // (golem-backend.cpp evict loop).
+                let out = unsafe { std::slice::from_raw_parts_mut(out_ptrs, 3) };
+                for (o, d) in out.iter_mut().zip(dst.iter()) {
+                    *o = *d as *const c_void;
+                }
+                1
+            }
+            D2hIncoming::Resident | D2hIncoming::Dropped => 0,
+        }
+    })
 }
 
 /// The P5 next-layer prediction trampoline (ABI v6, §6.5): fired after
@@ -1692,6 +1782,28 @@ pub extern "C" fn routing(
 }
 
 impl HookState {
+    /// Publishes the scored policy snapshot for the next compute's D2H floor
+    /// decisions (exclusive residency, O10): every key's §6.2 decayed score
+    /// at the current step, written into a reused scratch and wrapped in one
+    /// snapshot. Once per decode step (in `copy_done`), never per expert.
+    fn publish_scored_snapshot(&self) {
+        let step = self.policy.step.load(Ordering::Relaxed);
+        let n = self.n_experts as usize;
+        let keys = self.n_layers as usize * n;
+        let mut scratch = self
+            .scores_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        scratch.clear();
+        scratch.reserve(keys);
+        for i in 0..keys {
+            scratch.push(self.policy.decayed(i, step) as f32);
+        }
+        let mut snap = PolicySnapshot::empty();
+        snap.replace_scores(scratch.clone());
+        self.pool.publish_snapshot(Arc::new(snap));
+    }
+
     /// Registered entry for `tensor`, registering it on first sight.
     ///
     /// First sight = the first ensure callback for this tensor, which runs

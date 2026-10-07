@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use golem_engine::ParityStep;
 use golem_engine::atomic::write_atomic;
-use golem_engine::config::{EngineConfig, PrefetchMode, VramOrder};
+use golem_engine::config::{EngineConfig, PrefetchMode, Residency, VramOrder};
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::timing::TimingRecorder;
@@ -112,6 +112,22 @@ pub struct RunArgs {
     /// Layers ahead each MoE layer predicts for `--prefetch`.
     #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4))]
     pub prefetch_lookahead: u32,
+    /// RAM/VRAM expert residency (design §6.3 O10): `inclusive` (default)
+    /// keeps an expert's pool slot while its VRAM copy exists; `exclusive`
+    /// releases the pool slot once the H2D lands and copies evictions back
+    /// into the pool (or drops them when a RAM victim scores higher). Needs
+    /// the RAM expert pool. Exclusive is opt-in until the inclusive-vs-
+    /// exclusive A/B proves it on decode tok/s.
+    #[arg(long, value_name = "MODE", default_value = "inclusive", value_parser = parse_residency)]
+    pub residency: Residency,
+}
+
+fn parse_residency(s: &str) -> Result<Residency, String> {
+    match s {
+        "inclusive" => Ok(Residency::Inclusive),
+        "exclusive" => Ok(Residency::Exclusive),
+        _ => Err(format!("want inclusive or exclusive, got {s:?}")),
+    }
 }
 
 fn parse_prefetch(s: &str) -> Result<PrefetchMode, String> {
@@ -158,6 +174,7 @@ impl RunArgs {
             vram_order: self.vram_order,
             prefetch: self.prefetch,
             prefetch_lookahead: self.prefetch_lookahead,
+            residency: self.residency,
             ..default
         }
     }

@@ -517,6 +517,10 @@ impl Drop for Session {
                 // SAFETY: FFI on the session's live ctx; clears + frees the
                 // device-cache entries only.
                 unsafe { raw::golem_reset_device_cache(ctx) };
+                // The slab bytes are gone: drop the exclusive-residency
+                // VRAM-presence bits so the prefetcher serves those units
+                // from disk again.
+                p3.device_cache_reset();
             }
             // Unregister + join BEFORE `llama_free`: no in-flight C callback
             // may touch the pool while the context tears down.

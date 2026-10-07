@@ -44,11 +44,12 @@ fn hook_abi_types_generated() {
     assert_thin_fn_ptr::<raw::golem_routing_fn>();
     assert_thin_fn_ptr::<raw::golem_copy_done_fn>();
     assert_thin_fn_ptr::<raw::golem_predict_fn>();
-    // ABI v6: the per-model ctx surface plus the P5 predict seam is
-    // generated, and the header constant the bindings came from matches the
-    // compiled substrate.
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 6);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 6);
+    assert_thin_fn_ptr::<raw::golem_evict_dest_fn>();
+    // ABI v7: the per-model ctx surface, the P5 predict seam and the
+    // exclusive-residency evict_dest hook are generated, and the header
+    // constant the bindings came from matches the compiled substrate.
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 7);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 7);
     let fns: &[(&str, *const ())] = &[
         ("golem_set_predict", raw::golem_set_predict as *const ()),
         (

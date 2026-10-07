@@ -1887,6 +1887,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static thread_local std::vector<golem_plane_plan> golem_planes;
     static thread_local std::vector<int32_t> golem_dense;    // dense ids (routing readback + remap)
     static thread_local std::vector<int32_t> golem_identity; // NULL-order fallback (identity permutation)
+    // Exclusive residency (ABI v7, design §6.3 O10): this layer's fully-valid
+    // slab evictions of the current pre-pass, as (slot, owner id); drained per
+    // layer into one evict_dest call + per-plane D2H copies.
+    static thread_local std::vector<std::pair<int32_t, int32_t>> golem_evicts;
     // P5: prediction nodes named golem_pred-<target blk>-<source blk>, indexed
     // once per compute (one strncmp per node) and delivered in the source
     // layer's pre-pass, right after its ids readback synchronized the device.
@@ -2102,6 +2106,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 golem_miss_kinds.clear();
                 golem_miss_ids.clear();
+                golem_evicts.clear();
                 for (int j = input_id; j < split->n_inputs; ++j) {
                     struct ggml_tensor * inp = split->inputs[j];
                     const int kind = golem_expert_stem_kind(inp->name);
@@ -2242,8 +2247,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 golem_ids_pin_alloc(st, split_backend, node2->src[2]->ne[0], node2->src[2]->ne[1]);
                             }
                             // Slab step: decide skips/copies/evictions + remap.
-                            plan.dc = golem::golem_slab_step(L, kind - 1, plan.routed, golem_dense.data(),
+                            plan.dc = golem::golem_slab_step_ev(L, kind - 1, plan.routed, golem_dense.data(),
                                 (int64_t) golem_dense.size(), order, K, (int32_t) n_expert_j, st.remap,
+                                gctx->evict_dest != NULL ? &golem_evicts : nullptr,
                                 [&](int32_t slot, int32_t id5) { plan.pending.emplace_back(slot, id5); });
                             GGML_ASSERT((int64_t) st.remap.size() == ggml_nelements(st.ids_dev));
                             GGML_ASSERT(ggml_backend_buffer_is_host(st.ids_pin_buf));
@@ -2272,6 +2278,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int32_t id3 : plan.routed) {
                             golem_miss_kinds.push_back(kind);
                             golem_miss_ids.push_back(id3);
+                        }
+                    }
+                }
+                // Exclusive residency (O10): hand each fully-valid eviction
+                // to the pool first — it either returns D2H destinations for
+                // the three planes (copied here, before any H2D re-fill of
+                // the stolen slots; both run on the split stream, so the
+                // D2H lands first) or scores the bytes droppable. Runs only
+                // when the evict_dest hook is registered; NULL-hooked runs
+                // keep inclusive residency verbatim. Post-drain, so the
+                // previous compute has finished reading these slots.
+                if (gctx->evict_dest != NULL && !golem_evicts.empty()) {
+                    for (const auto & ev : golem_evicts) {
+                        const void * ev_dst[3] = { NULL, NULL, NULL };
+                        int keep;
+                        {
+                            golem_cb_guard cb;
+                            keep = gctx->evict_dest(gctx->payload, input, ev.second, ev_dst);
+                        }
+                        if (!keep) {
+                            continue;
+                        }
+                        for (int j = input_id; j < split->n_inputs; ++j) {
+                            const golem_plane_plan & plan = golem_planes[j];
+                            const int kind = golem_expert_stem_kind(split->inputs[j]->name);
+                            if (plan.mode != 2 || plan.st == nullptr || kind == 0 ||
+                                golem_tensor_blk(split->inputs[j]->name) != blk) {
+                                continue;
+                            }
+                            GGML_ASSERT(ev_dst[kind - 1] != NULL);
+                            ggml_backend_tensor_get_async(split_backend, plan.st->slab,
+                                const_cast<void *>(ev_dst[kind - 1]),
+                                (size_t) ev.first * plan.st->expert_size, plan.st->expert_size);
                         }
                     }
                 }
@@ -3337,6 +3376,7 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
                                          golem_ensure_host_resident_fn ensure,
                                          golem_routing_fn routing,
                                          golem_copy_done_fn copy_done,
+                                         golem_evict_dest_fn evict_dest,
                                          void *payload) {
     if (ctx == NULL) {
         return NULL;
@@ -3351,6 +3391,7 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
     ctx->ensure = ensure;
     ctx->routing = routing;
     ctx->copy_done = copy_done;
+    ctx->evict_dest = evict_dest;
     ctx->payload = payload;
     ctx->generation.fetch_add(1, std::memory_order_relaxed);
     return new golem_hook_handle{ctx};
@@ -3376,6 +3417,7 @@ void golem_unregister_hooks(golem_hook_handle_t handle) {
     ctx->ensure = NULL;
     ctx->routing = NULL;
     ctx->copy_done = NULL;
+    ctx->evict_dest = NULL;
     ctx->payload = NULL;
 }
 

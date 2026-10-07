@@ -128,7 +128,11 @@ pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> Pre
                 let batch: Vec<_> = access
                     .take()
                     .into_iter()
-                    .filter(|&(layer, expert)| !pool.residency.is_resident(layer, expert))
+                    // Exclusive residency (O10): skip VRAM-resident units —
+                    // never re-read from disk while a VRAM copy exists.
+                    .filter(|&(layer, expert)| {
+                        !pool.residency.is_resident(layer, expert) && !pool.is_vram(layer, expert)
+                    })
                     .collect();
                 if batch.is_empty() {
                     access.idle(IDLE);
