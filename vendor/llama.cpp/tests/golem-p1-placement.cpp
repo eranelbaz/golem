@@ -139,6 +139,7 @@ struct HState {
 
 static std::vector<char> g_pool; // host expert pool stand-in
 static std::atomic<int> g_join_sleep_ms{0};
+static std::atomic<bool> g_cb_entered{false}; // leg 3: observed in-flight entry
 golem_hook_handle_t g_h_abort = nullptr; // leg 5: unregistered from inside the callback
 static void pool_init() {
     const size_t plane = (size_t) NE0 * NE1 * sizeof(float);
@@ -158,6 +159,7 @@ static void h_ensure(void * p, const void * tensor, const int32_t * mk, const in
         out[i] = g_pool.data() + plane * ((size_t) (kind - 1) * N_EXP + mi[i]);
     }
     (void) tensor;
+    g_cb_entered.store(true);
     std::this_thread::sleep_for(std::chrono::milliseconds(g_join_sleep_ms.load()));
     s->cb_returned.store(true);
 }
@@ -265,7 +267,7 @@ int main() {
 
     {   // --- leg 3: unregister-join ---
         HState s;
-        g_join_sleep_ms.store(50);
+        g_join_sleep_ms.store(200);
         golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
         golem_set_device_cache_experts(c, 2);
         auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, &s);
@@ -273,15 +275,20 @@ int main() {
         es.build();
         golem_sched_set_ctx(es.sched, c);
         std::thread worker([&] { ggml_backend_sched_graph_compute(es.sched, es.gf); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // callback in flight
+        // deterministic in-flight detection: wait for the callback's own entry signal
+        for (int i = 0; i < 5000 && !g_cb_entered.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        REQUIRE(g_cb_entered.load(), "callback must start before unregister");
         const auto t0 = std::chrono::steady_clock::now();
         golem_unregister_hooks(h);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        REQUIRE(ms >= 40, "unregister must join the in-flight callback (%lld ms)", (long long) ms);
+        REQUIRE(ms >= 100, "unregister must join the in-flight callback (%lld ms)", (long long) ms);
         REQUIRE(s.ensure_calls.load() == 1, "callback ran once");
         REQUIRE(s.cb_returned.load(), "callback completed before unregister returned");
         worker.join();
+        g_cb_entered.store(false);
         g_join_sleep_ms.store(0);
         golem_sched_detach_ctx(es.sched);
         golem_reset_device_cache(c);
