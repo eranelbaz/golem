@@ -85,10 +85,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
     { LLM_ARCH_GLM_DSA,          "glm-dsa"          },
-    // "glm5-next": the spelling the released GGUFs use for their KV keys —
-    // LLM_ARCH_NAMES doubles as the metadata-key prefix (llama-arch.cpp
-    // LLM_KV_NAMES), so this must match the files, not the upstream enum tag.
-    { LLM_ARCH_GLM5NEXT,         "glm5-next"        },
+    { LLM_ARCH_GLM5NEXT,         "glm5next"         },
     { LLM_ARCH_BITNET,           "bitnet"           },
     { LLM_ARCH_T5,               "t5"               },
     { LLM_ARCH_T5ENCODER,        "t5encoder"        },
@@ -995,10 +992,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 };
 
-LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
+LLM_KV::LLM_KV(llm_arch arch, const char * suffix, std::string prefix)
+    : arch(arch), suffix(suffix), prefix(std::move(prefix)) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    std::string name = ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+    std::string name = ::format(LLM_KV_NAMES.at(kv), prefix.empty() ? LLM_ARCH_NAMES.at(arch) : prefix.c_str());
 
     if (suffix != nullptr) {
         name += ".";
@@ -1048,17 +1046,22 @@ llm_arch llm_arch_from_string(const std::string & name) {
             return kv.first;
         }
     }
-    // Hyphenated GGUF spellings of known arches (e.g. unsloth ships
-    // "glm5-next" for "glm5next"): fold '-' out and retry.
-    std::string folded;
-    folded.reserve(name.size());
-    for (char c : name) {
-        if (c != '-') {
-            folded += c;
+    // Hyphenated GGUF spellings of known arches (unsloth ships both
+    // "glm5next" and "glm5-next"): compare with '-' folded out of both sides.
+    // The loader keeps the file's spelling as the KV prefix (LLM_KV::prefix).
+    const auto fold = [](const std::string & s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if (c != '-') {
+                out += c;
+            }
         }
-    }
+        return out;
+    };
+    const std::string folded = fold(name);
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
-        if (kv.second == folded) {
+        if (fold(kv.second) == folded) {
             return kv.first;
         }
     }

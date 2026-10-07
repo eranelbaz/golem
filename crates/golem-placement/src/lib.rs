@@ -62,6 +62,14 @@ impl fmt::Display for Infeasible {
 
 impl std::error::Error for Infeasible {}
 
+/// §6.2 default score half-life H, in steps.
+pub const HALF_LIFE_STEPS: f64 = 512.0;
+
+/// §6.2 decay of a score over `dt` steps: e^(−dt/H).
+pub fn decay_factor(dt: u64, half_life: f64) -> f64 {
+    (-(dt as f64) / half_life).exp()
+}
+
 /// Policy configuration (§6.1–6.4). Defaults are the design numbers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacementConfig {
@@ -84,7 +92,7 @@ impl Default for PlacementConfig {
         Self {
             layers: 0,
             experts_per_layer: 0,
-            half_life_steps: 512.0,
+            half_life_steps: HALF_LIFE_STEPS,
             min_dwell_steps: 256,
             vram_experts_max: 0,
             ram_slots: 0,
@@ -201,8 +209,7 @@ impl Policy {
     }
 
     fn decay_factor(&self, from: u64, to: u64) -> f64 {
-        let dt = from.max(to) - from.min(to);
-        (-(dt as f64) / self.cfg.half_life_steps).exp()
+        decay_factor(from.max(to) - from.min(to), self.cfg.half_life_steps)
     }
 
     /// Record an access at `step` (§6.2): lazy decay since the expert's last

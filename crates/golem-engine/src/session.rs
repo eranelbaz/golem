@@ -666,6 +666,12 @@ impl Session {
         self.config.n_gpu_layers > 0
     }
 
+    /// Resolved P2 slot count per layer (explicit or derived from free VRAM);
+    /// `None` without the RAM expert pool.
+    pub fn device_cache_experts(&self) -> Option<u32> {
+        self.p3.as_ref().map(|p| p.device_cache_experts)
+    }
+
     /// P4 device expert-copy cache counters (§3.4): bytes copied into / skipped
     /// by the persistent device cache, evictions, and the derived skip ratio.
     /// `None` unless this session drives the pooled GPU split — the only P2
@@ -815,6 +821,12 @@ impl Session {
             && substrate_backend() == Backend::Hip;
         let placement_before = expert_placement();
         let traffic_before = self.p3.as_ref().map_or(0, |p| pool_traffic(&p.stats));
+        if let Some(p3) = self.p3.as_ref() {
+            // Stale-record guard: a failed prior turn's routing records are
+            // dropped (the header survives for the real file flush) before
+            // this turn's prefill records (phase `pf`) start.
+            p3.drain_routing_trace();
+        }
         let prefill = p3_glue::PrefillScope::enter();
         for chunk in prompt.chunks(chunk_cap) {
             let len = chunk.len();
@@ -911,11 +923,6 @@ impl Session {
         let mut scratch = String::new();
         if let Some(t) = self.timing.as_mut() {
             t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
-        }
-        if let Some(p3) = self.p3.as_ref() {
-            // Same stale-record guard for the routing trace (records dropped;
-            // the header must survive for the real file flush).
-            p3.drain_routing_trace();
         }
         // Prefill activity must not bleed into step 0's row: take-and-discard
         // the P3/store accumulators right before the decode loop (also

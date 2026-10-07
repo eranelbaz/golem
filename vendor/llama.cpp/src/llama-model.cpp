@@ -1402,9 +1402,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 }
 
 void llama_model_base::load_vocab(llama_model_loader & ml) {
-    const auto kv = LLM_KV(arch);
-
-    vocab.load(ml, kv);
+    vocab.load(ml, ml.llm_kv);
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {

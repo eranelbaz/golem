@@ -29,6 +29,7 @@
 #![allow(unsafe_code)]
 
 use golem_placement::pool::SlotClass;
+use golem_placement::{HALF_LIFE_STEPS, decay_factor};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 #[cfg(test)]
@@ -46,7 +47,7 @@ use golem_placement::pool::{
 };
 use golem_store::ChunkQueue;
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, VramOrder};
 use crate::error::EngineError;
 
 /// One traced routing readback: fixed fields plus a range into the ring's
@@ -76,6 +77,15 @@ struct TraceRing {
     rec_cap: usize,
     id_cap: usize,
     dropped: usize,
+}
+
+/// Routing-trace ring capacities for one turn: every prompt and generated
+/// token routes `top_k` ids on each of the `n_layers` MoE layers, one record
+/// per (chunk or step, layer); a turn's tokens are bounded by `n_ctx +
+/// n_predict`. GLM at ctx 4096 + 512: 193k records, 1.5M ids ≈ 6 MiB.
+fn trace_caps(n_ctx: u32, n_predict: u32, n_layers: u32, top_k: u32) -> (usize, usize) {
+    let recs = (n_ctx as usize + n_predict as usize) * n_layers as usize;
+    (recs, recs * top_k as usize)
 }
 
 impl TraceRing {
@@ -260,14 +270,20 @@ struct HookState {
     trace: Option<Mutex<TraceRing>>,
 }
 
-/// §6.2 policy state: per-expert last-access steps feeding the evict-first
-/// order, the decode-step counter, and the per-layer dirty flags consumed by
-/// the order publisher.
+/// §6.2 policy state: per-expert last-access steps and decayed scores
+/// feeding the evict-first order, the decode-step counter, and the per-layer
+/// dirty flags consumed by the order publisher.
 struct PolicyState {
     /// Flat `layer × n_experts` last-access step + 1; 0 = never accessed.
     /// Atomics: the routing readback books one routed id per element on the
     /// decode hot path, which takes no lock.
     last_access: Vec<AtomicU64>,
+    /// Flat §6.2 score as of the key's last booking, packed with that step
+    /// in one word (`f32 bits << 32 | step + 1`, 0 = never) so the
+    /// publisher never pairs a score with another step's age. The decode
+    /// thread is the only writer. GLM: 12,096 keys × 8 B ≈ 97 KB.
+    score: Vec<AtomicU64>,
+    vram_order: VramOrder,
     /// Decode-step counter: one post-prefill trunk `llama_decode` = one step
     /// (§6.2: prefill chunks are excluded from scoring), bumped by
     /// [`advance_decode_step`] from `Session`'s generation decode.
@@ -286,11 +302,12 @@ struct PolicyState {
 }
 
 impl PolicyState {
-    fn new(n_layers: u32, n_experts: u32) -> Self {
+    fn new(n_layers: u32, n_experts: u32, vram_order: VramOrder) -> Self {
+        let keys = n_layers as usize * n_experts as usize;
         Self {
-            last_access: (0..n_layers as usize * n_experts as usize)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            last_access: (0..keys).map(|_| AtomicU64::new(0)).collect(),
+            score: (0..keys).map(|_| AtomicU64::new(0)).collect(),
+            vram_order,
             step: AtomicU64::new(0),
             scoring: AtomicBool::new(true),
             dirty: (0..n_layers as usize)
@@ -303,21 +320,40 @@ impl PolicyState {
     }
 
     /// Books one step's routed ids of `layer` (the dense ids readback):
-    /// every routed expert's recency moves to `step + 1`. Out-of-range and
-    /// negative ids are rejected (never wrapped into the next layer's row).
-    /// Lock-free: one relaxed store per routed id.
+    /// every routed expert's recency moves to `step + 1` and its score to
+    /// `decayed + 1`. Out-of-range and negative ids are rejected (never
+    /// wrapped into the next layer's row). Lock-free: relaxed loads/stores
+    /// per routed id; repeated ids in one readback book once per step.
     fn book_routed(&self, layer: usize, ids: &[i32]) {
         if !self.scoring.load(Ordering::Relaxed) {
             return;
         }
         let step = self.step.load(Ordering::Relaxed);
         let n = self.n_experts;
-        let row = &self.last_access[layer * n..][..n];
+        let base = layer * n;
         for &id in ids {
-            if id >= 0 && (id as usize) < n {
-                row[id as usize].store(step + 1, Ordering::Relaxed);
+            if id < 0 || id as usize >= n {
+                continue;
             }
+            let i = base + id as usize;
+            if self.last_access[i].load(Ordering::Relaxed) == step + 1 {
+                continue;
+            }
+            let s = (self.decayed(i, step) + 1.0) as f32;
+            let word = u64::from(s.to_bits()) << 32 | (step + 1) & u64::from(u32::MAX);
+            self.score[i].store(word, Ordering::Relaxed);
+            self.last_access[i].store(step + 1, Ordering::Relaxed);
         }
+    }
+
+    /// §6.2 score of flat key `i` decayed to `step` (0 when never booked).
+    fn decayed(&self, i: usize, step: u64) -> f64 {
+        let word = self.score[i].load(Ordering::Relaxed);
+        let Some(last) = (word & u64::from(u32::MAX)).checked_sub(1) else {
+            return 0.0;
+        };
+        let age = (step & u64::from(u32::MAX)).saturating_sub(last);
+        f64::from(f32::from_bits((word >> 32) as u32)) * decay_factor(age, HALF_LIFE_STEPS)
     }
 
     /// Marks `layer`'s order dirty for the publisher.
@@ -350,15 +386,32 @@ impl PolicyState {
         out
     }
 
-    /// Builds the evict-first order for `layer` into `order` (recency sort:
-    /// never-accessed first, then ascending last-access step; ties by
-    /// ascending index). Preallocated `order`; no allocation.
+    /// Builds the evict-first order for `layer` into `order`: never-accessed
+    /// first, then ascending last-access step ([`VramOrder::Recency`]) or
+    /// ascending decayed score ([`VramOrder::Score`]); ties by ascending
+    /// index. Preallocated `order`; no allocation (runs on the publisher).
     fn build_order(&self, layer: usize, order: &mut [i32]) {
         let n = self.n_experts;
         debug_assert_eq!(order.len(), n);
         order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
-        let row = &self.last_access[layer * n..][..n];
-        order.sort_unstable_by_key(|&i| (row[i as usize].load(Ordering::Relaxed), i));
+        let base = layer * n;
+        let row = &self.last_access[base..][..n];
+        match self.vram_order {
+            VramOrder::Recency => {
+                order.sort_unstable_by_key(|&i| (row[i as usize].load(Ordering::Relaxed), i));
+            }
+            VramOrder::Score => {
+                let step = self.step.load(Ordering::Relaxed);
+                let key = |i: i32| {
+                    let never = row[i as usize].load(Ordering::Relaxed) == 0;
+                    (!never, self.decayed(base + i as usize, step))
+                };
+                order.sort_unstable_by(|&a, &b| {
+                    let (ka, kb) = (key(a), key(b));
+                    ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1)).then(a.cmp(&b))
+                });
+            }
+        }
     }
 }
 
@@ -984,21 +1037,15 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // unlimited, never proportional to total experts — AGENTS.md).
     unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k as i32) };
 
-    // P2 state: per-expert recency (never-accessed first, then ascending
-    // last-access step) — pure recency order.
-    let policy = PolicyState::new(n_layers, geo.n_experts);
-    // Routing-trace ring (§11 pattern), preallocated at enable: decode steps
-    // are bounded by n_predict, prefill ids by chunk_tokens × top_k —
-    // overflow drops and counts instead of reallocating on the hot path.
+    // P2 state: per-expert recency and §6.2 decayed score; the evict-first
+    // order sorts by `config.vram_order`.
+    let policy = PolicyState::new(n_layers, geo.n_experts, config.vram_order);
+    // Routing-trace ring (§11 pattern), preallocated at enable — overflow
+    // drops and counts instead of reallocating on the hot path.
     let trace = config.routing_trace.as_ref().map(|_| {
-        let rec_cap = config.n_predict as usize + 256; // + prefill-chunk headroom
-        let prefill_ids = (config.batch_tokens as usize).max(1) * n_expert_used as usize;
-        Mutex::new(TraceRing::new(
-            // Model file (hashed into the header), not the trace output path.
-            config.model_path.clone(),
-            rec_cap,
-            rec_cap.saturating_mul(prefill_ids),
-        ))
+        let (rec_cap, id_cap) = trace_caps(config.n_ctx, config.n_predict, n_layers, n_expert_used);
+        // Model file (hashed into the header), not the trace output path.
+        Mutex::new(TraceRing::new(config.model_path.clone(), rec_cap, id_cap))
     });
     let state = Arc::new(HookState {
         p3_wait_ns: AtomicU64::new(0),
@@ -1128,16 +1175,11 @@ fn class_layout(
     pool_bytes: u64,
     k: u32,
 ) -> Result<Vec<SlotClass>, EngineError> {
-    let total_unit_bytes: u64 = classes
-        .iter()
-        .map(|&(unit, ref ls)| unit.saturating_mul(ls.len() as u64))
-        .sum();
     let mut out = Vec::with_capacity(classes.len());
-    for &(unit, ref layers) in classes {
-        // slots = ⌊pool_bytes × share / unit⌋ = ⌊pool_bytes × layers / Σ unit⌋
-        // (the unit cancels); u128 because pool_bytes × layers can exceed u64.
-        let slots =
-            u128::from(pool_bytes) * u128::from(layers.len() as u64) / u128::from(total_unit_bytes);
+    for (&(unit, ref layers), slots) in classes
+        .iter()
+        .zip(golem_placement::pool::class_slots(classes, pool_bytes))
+    {
         let slots = u32::try_from(slots)
             .map_err(|_| EngineError::PoolInit("slot count exceeds u32::MAX".into()))?;
         let floor = layers.len() as u64 * u64::from(k) + 1;
@@ -1549,6 +1591,15 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn trace_caps_cover_every_layer_of_every_token() {
+        // GLM: 32 generated tokens + a 1024-token ctx × 42 layers. The old
+        // `n_predict + 256` record cap held 288 records = 6.9 decode steps.
+        let (recs, ids) = trace_caps(1024, 32, 42, 8);
+        assert_eq!(recs, 1056 * 42);
+        assert_eq!(ids, 1056 * 42 * 8);
+    }
+
+    #[test]
     fn abi_mismatch_is_poolinit_with_both_versions() {
         let e = check_abi(1, 2).unwrap_err();
         let msg = match e {
@@ -1701,7 +1752,7 @@ mod tests {
 
     #[test]
     fn routing_books_recency_for_whole_layer_and_marks_dirty() {
-        let p = PolicyState::new(2, 4);
+        let p = PolicyState::new(2, 4, VramOrder::Recency);
         p.step.store(5, Ordering::Relaxed); // recent_union keeps steps > step − k
         p.book_routed(1, &[2, 2, 7, -1]); // duplicates idempotent; out-of-range rejected
         p.mark_dirty(1); // the trampoline does this right after booking
@@ -1727,7 +1778,7 @@ mod tests {
     fn out_of_range_id_never_spills_into_the_next_layer() {
         // id == n_experts would have passed a loose bounds guard and booked
         // layer 1's row 0.
-        let p = PolicyState::new(2, 4);
+        let p = PolicyState::new(2, 4, VramOrder::Recency);
         p.step.store(3, Ordering::Relaxed);
         p.book_routed(0, &[4, -1, 100]);
         assert!(
@@ -1740,7 +1791,7 @@ mod tests {
 
     #[test]
     fn order_built_once_per_call_and_content_is_correct() {
-        let p = PolicyState::new(2, 6);
+        let p = PolicyState::new(2, 6, VramOrder::Recency);
         p.step.store(7, Ordering::Relaxed);
         p.book_routed(0, &[3]);
         p.step.store(9, Ordering::Relaxed);
@@ -1758,6 +1809,27 @@ mod tests {
     }
 
     #[test]
+    fn score_order_evicts_the_once_used_before_the_frequent_older_expert() {
+        // Expert 1 routed at steps 0..4, expert 2 once at step 5; 0 and 3
+        // never. Recency evicts the older 1 first; the §6.2 decayed score
+        // (≈ 4 vs ≈ 1) evicts 2 first. Never-accessed lead both orders.
+        let book = |order| {
+            let p = PolicyState::new(1, 4, order);
+            for s in 0..4 {
+                p.step.store(s, Ordering::Relaxed);
+                p.book_routed(0, &[1]);
+            }
+            p.step.store(5, Ordering::Relaxed);
+            p.book_routed(0, &[2]);
+            let mut out = vec![0i32; 4];
+            p.build_order(0, &mut out);
+            out
+        };
+        assert_eq!(book(VramOrder::Recency), [0, 3, 1, 2]);
+        assert_eq!(book(VramOrder::Score), [0, 3, 2, 1]);
+    }
+
+    #[test]
     fn order_builder_recency_sorts_never_accessed_first() {
         // Raw last_access words: 0 = never, else step + 1.
         let hist = [6, 0, 3, 0, 3];
@@ -1770,7 +1842,7 @@ mod tests {
 
     #[test]
     fn published_order_is_identity_for_fresh_experts_and_a_permutation_otherwise() {
-        let p = PolicyState::new(1, 6);
+        let p = PolicyState::new(1, 6, VramOrder::Recency);
         let mut order = vec![0i32; 6];
         p.build_order(0, &mut order);
         assert_eq!(order, vec![0, 1, 2, 3, 4, 5], "no accesses → identity");
@@ -1792,7 +1864,7 @@ mod tests {
 
     #[test]
     fn recent_union_bounds_and_cutoff() {
-        let p = PolicyState::new(1, 4);
+        let p = PolicyState::new(1, 4, VramOrder::Recency);
         p.step.store(9, Ordering::Relaxed);
         p.book_routed(0, &[2]);
         assert_eq!(p.recent_union(1), vec![(0, 2)]);

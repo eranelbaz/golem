@@ -10,7 +10,7 @@ mod common;
 
 use common::expert_tensor as xt;
 use common::tiny_moe_path;
-use golem_engine::config::EngineConfig;
+use golem_engine::config::{EngineConfig, VramOrder};
 use golem_engine::p3_glue::{self, SessionHooks};
 use golem_llama_sys::raw;
 use std::time::{Duration, Instant};
@@ -20,6 +20,8 @@ fn pooled_config() -> EngineConfig {
         model_path: tiny_moe_path(),
         ram_experts_gib: 1,
         device_cache_experts: 4,
+        // These legs assert publisher mechanics with recency expectations.
+        vram_order: VramOrder::Recency,
         ..EngineConfig::default()
     }
 }

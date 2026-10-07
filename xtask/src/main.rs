@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 use std::io::Write;
 
-use xtask::{parity, parity_compare, shape_moe, tiny_moe};
+use xtask::{parity, parity_compare, replay, shape_moe, tiny_moe};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -17,6 +17,7 @@ fn main() {
         }
         Some("parity") => parity::run(args.collect()),
         Some("parity-compare") => parity_compare::run(args.collect()),
+        Some("replay") => replay::run(args.collect()),
         Some(other) => {
             eprintln!("unknown xtask command: {other}");
             std::process::exit(2);

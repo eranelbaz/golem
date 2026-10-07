@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use golem_engine::ParityStep;
 use golem_engine::atomic::write_atomic;
-use golem_engine::config::EngineConfig;
+use golem_engine::config::{EngineConfig, VramOrder};
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::timing::TimingRecorder;
@@ -100,6 +100,18 @@ pub struct RunArgs {
     /// per-step heap when unset.
     #[arg(long, value_name = "FILE")]
     pub routing_trace: Option<PathBuf>,
+    /// P2 evict-first order among a layer's non-routed VRAM slots:
+    /// `score` (§6.2 decayed score, the default) or `recency`.
+    #[arg(long, value_name = "ORDER", default_value = "score", value_parser = parse_vram_order)]
+    pub vram_order: VramOrder,
+}
+
+fn parse_vram_order(s: &str) -> Result<VramOrder, String> {
+    match s {
+        "score" => Ok(VramOrder::Score),
+        "recency" => Ok(VramOrder::Recency),
+        _ => Err(format!("want score or recency, got {s:?}")),
+    }
 }
 
 impl RunArgs {
@@ -126,6 +138,7 @@ impl RunArgs {
             manifest_path: self.manifest.clone(),
             timing_csv: self.timing_csv.clone(),
             routing_trace: self.routing_trace.clone(),
+            vram_order: self.vram_order,
             ..default
         }
     }
@@ -176,6 +189,9 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         )?;
     }
     let mut session = Session::new(&config)?;
+    if let Some(k) = session.device_cache_experts() {
+        eprintln!("golem: device cache {k} expert slots per layer");
+    }
 
     match (&args.prompt, &args.parity_dump) {
         (Some(prompt), Some(dump)) => {
@@ -352,7 +368,7 @@ fn resolved_config_line(config: &EngineConfig) -> String {
     format!(
         "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} cpu_moe={:?} \
          ram_experts_gib={} device_cache_experts={} io_threads={:?} manifest={:?} \
-         model_size={}",
+         vram_order={:?} model_size={}",
         config.n_ctx,
         config.batch_tokens,
         config.n_predict,
@@ -364,6 +380,7 @@ fn resolved_config_line(config: &EngineConfig) -> String {
         config.device_cache_experts,
         config.io_threads,
         config.manifest_path,
+        config.vram_order,
         std::fs::metadata(&config.model_path)
             .map(|m| m.len())
             .unwrap_or(0),
@@ -755,6 +772,21 @@ mod tests {
         assert_eq!(config.device_cache_experts, 0, "unset = derive from VRAM");
         let config = parse_run_args(&["run", "m.gguf", "--device-cache-experts", "9"]).to_config();
         assert_eq!(config.device_cache_experts, 9);
+    }
+
+    #[test]
+    fn run_args_map_vram_order_flag_into_config() {
+        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        assert_eq!(config.vram_order, VramOrder::Score);
+        let config = parse_run_args(&["run", "m.gguf", "--vram-order", "recency"]).to_config();
+        assert_eq!(config.vram_order, VramOrder::Recency);
+        let bad = RunArgs::augment_args(clap::Command::new("run")).try_get_matches_from([
+            "run",
+            "m.gguf",
+            "--vram-order",
+            "lfu",
+        ]);
+        assert!(bad.is_err(), "unknown order is a parse error");
     }
 
     #[test]
