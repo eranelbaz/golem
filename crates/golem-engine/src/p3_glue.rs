@@ -109,6 +109,13 @@ impl TraceRing {
         });
     }
 
+    /// Record drop without a header write (pre-turn stale-record guard).
+    fn clear_records(&mut self) {
+        self.records.clear();
+        self.ids.clear();
+        self.dropped = 0;
+    }
+
     /// Writes the `# golem-routing-trace v1` header once (hashing the model
     /// file on first use — the only expensive part, paid once per file), then
     /// one `step\tphase\tlayer\tid,id,...` line per record, then clears the
@@ -616,6 +623,17 @@ impl SessionHooks {
         let mut t = trace.lock().unwrap_or_else(|e| e.into_inner());
         t.flush(w, self.state.n_layers, self.top_k)
     }
+
+    /// Drops buffered records without touching the header (the pre-turn
+    /// stale-record guard — a sink flush would swallow the header write).
+    pub fn drain_routing_trace(&self) {
+        if let Some(trace) = &self.state.trace {
+            trace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear_records();
+        }
+    }
 }
 
 impl Drop for SessionHooks {
@@ -972,11 +990,12 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // Routing-trace ring (§11 pattern), preallocated at enable: decode steps
     // are bounded by n_predict, prefill ids by chunk_tokens × top_k —
     // overflow drops and counts instead of reallocating on the hot path.
-    let trace = config.routing_trace.as_ref().map(|p| {
+    let trace = config.routing_trace.as_ref().map(|_| {
         let rec_cap = config.n_predict as usize + 256; // + prefill-chunk headroom
         let prefill_ids = (config.batch_tokens as usize).max(1) * n_expert_used as usize;
         Mutex::new(TraceRing::new(
-            p.clone(),
+            // Model file (hashed into the header), not the trace output path.
+            config.model_path.clone(),
             rec_cap,
             rec_cap.saturating_mul(prefill_ids),
         ))

@@ -85,7 +85,10 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
     { LLM_ARCH_GLM_DSA,          "glm-dsa"          },
-    { LLM_ARCH_GLM5NEXT,         "glm5next"         },
+    // "glm5-next": the spelling the released GGUFs use for their KV keys —
+    // LLM_ARCH_NAMES doubles as the metadata-key prefix (llama-arch.cpp
+    // LLM_KV_NAMES), so this must match the files, not the upstream enum tag.
+    { LLM_ARCH_GLM5NEXT,         "glm5-next"        },
     { LLM_ARCH_BITNET,           "bitnet"           },
     { LLM_ARCH_T5,               "t5"               },
     { LLM_ARCH_T5ENCODER,        "t5encoder"        },
@@ -1045,7 +1048,20 @@ llm_arch llm_arch_from_string(const std::string & name) {
             return kv.first;
         }
     }
-
+    // Hyphenated GGUF spellings of known arches (e.g. unsloth ships
+    // "glm5-next" for "glm5next"): fold '-' out and retry.
+    std::string folded;
+    folded.reserve(name.size());
+    for (char c : name) {
+        if (c != '-') {
+            folded += c;
+        }
+    }
+    for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
+        if (kv.second == folded) {
+            return kv.first;
+        }
+    }
     return LLM_ARCH_UNKNOWN;
 }
 

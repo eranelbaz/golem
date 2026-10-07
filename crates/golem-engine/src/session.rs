@@ -913,8 +913,9 @@ impl Session {
             t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
         }
         if let Some(p3) = self.p3.as_ref() {
-            // Same stale-record guard for the routing trace.
-            p3.write_routing_trace(&mut std::io::sink())?;
+            // Same stale-record guard for the routing trace (records dropped;
+            // the header must survive for the real file flush).
+            p3.drain_routing_trace();
         }
         // Prefill activity must not bleed into step 0's row: take-and-discard
         // the P3/store accumulators right before the decode loop (also
