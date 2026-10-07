@@ -57,6 +57,10 @@ struct llama_context {
 
     void synchronize();
 
+    // Golem ABI v5 seam: explicit detach of this context's scheduler
+    // attachment (decrements the ctx's attach refcount).
+    void golem_detach();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 

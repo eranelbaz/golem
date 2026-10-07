@@ -13,6 +13,8 @@
 //
 // Aborts are asserted in fork()ed children (GGML_ABORT raises SIGABRT).
 #include "golem-device-cache.hpp"
+#include "golem-hook-context.hpp"
+#include "golem-test-sched.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -242,6 +244,94 @@ int main() {
         int status = 0;
         wait(&status);
         REQUIRE(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT, "duplicate order must abort");
+    }
+
+    // --- golem_ctx eviction-order API (plan Task 3): NULL before first push,
+    // push → acquire returns the published permutation without re-entry, and
+    // the epoch gate never hands a reader a torn buffer. ---
+    {
+        using namespace golem_test;
+        golem_ctx_t c = golem_ctx_create(2, N_EXP);
+        // order keys off the tensor name (blk × kind); use a named stand-in
+        ggml_tensor t {};
+        ggml_set_name(&t, "blk.0.ffn_up_exps.weight");
+        T_REQUIRE(golem_policy_order(c, &t, N_EXP) == nullptr,
+                  "order must be NULL before the first push");
+        const int32_t perm[4] = {2, 0, 3, 1};
+        T_REQUIRE(golem_policy_order_push(c, 0, 2, perm, N_EXP) == 1, "push must publish");
+        const int32_t * got = golem_policy_order(c, &t, N_EXP);
+        T_REQUIRE(got != nullptr && std::equal(got, got + N_EXP, perm),
+                  "acquire must return the pushed permutation");
+        // invalid (blk, kind) and over-long pushes are rejected, ctx untouched
+        T_REQUIRE(golem_policy_order_push(c, 9, 1, perm, N_EXP) == 0, "blk out of range");
+        T_REQUIRE(golem_policy_order_push(c, 0, 4, perm, N_EXP) == 0, "kind out of range");
+
+        // Epoch gate: readers of the CURRENT epoch pin their slot; the
+        // publisher skips (returns 0) instead of overwriting, and never
+        // blocks. Fill all three slots with current-epoch readers, then the
+        // next push must skip; advancing the epoch frees the gate.
+        golem_policy_order_epoch_advance(c); // fixed epoch N for the readers below
+        (void) golem_policy_order(c, &t, N_EXP);          // pins slot 0 @N
+        T_REQUIRE(golem_policy_order_push(c, 0, 2, perm, N_EXP) == 1, "push 2");
+        (void) golem_policy_order(c, &t, N_EXP);          // pins slot 1 @N
+        T_REQUIRE(golem_policy_order_push(c, 0, 2, perm, N_EXP) == 1, "push 3");
+        (void) golem_policy_order(c, &t, N_EXP);          // pins slot 2 @N
+        T_REQUIRE(golem_policy_order_push(c, 0, 2, perm, N_EXP) == 0,
+                  "publisher must skip when every slot may hold a current reader");
+        // readers always see a valid permutation while the publisher spins
+        std::atomic<bool> stop{false};
+        std::thread reader([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                const int32_t * o = golem_policy_order(c, &t, N_EXP);
+                if (o != nullptr) {
+                    int32_t seen = 0;
+                    for (int i = 0; i < N_EXP; ++i) {
+                        seen |= 1 << o[i];
+                    }
+                    T_REQUIRE(seen == 0xf, "reader saw a torn order (0x%x)", seen);
+                }
+            }
+        });
+        for (int i = 0; i < 64; ++i) {
+            golem_policy_order_push(c, 0, 2, perm, N_EXP); // skips freely under the gate
+            golem_policy_order_epoch_advance(c);
+        }
+        stop.store(true);
+        reader.join();
+        golem_reset_device_cache(c);
+        golem_ctx_free(c);
+    }
+
+    // --- one decode step over one layer: routing fires exactly once, with a
+    // dense ids vector of ne0*ne1 entries (plan Task 3). ---
+    {
+        using namespace golem_test;
+        pool_init();
+        HState s;
+        golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
+        golem_set_device_cache_experts(c, 2);
+        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, &s);
+        (void) h;
+        {
+            ExpertSched es;
+            es.build(1);
+            golem_sched_set_ctx(es.sched, c);
+            ggml_backend_sched_graph_compute(es.sched, es.gf);
+            T_REQUIRE(s.routing_calls.load() == 1, "routing must fire once per step, got %d",
+                      s.routing_calls.load());
+            T_REQUIRE(s.last_n_ids == 2, "dense ids size %lld != 2", (long long) s.last_n_ids);
+            T_REQUIRE(s.last_ids.size() == 2 && s.last_ids[0] == 0 && s.last_ids[1] == 1,
+                      "dense ids content wrong");
+            T_REQUIRE(s.last_blk == 0, "blk %d != 0", s.last_blk);
+            T_REQUIRE(s.ensure_calls.load() == 1, "one ensure per (layer, step), got %d",
+                      s.ensure_calls.load());
+            // first step: nothing bit-valid yet, both routed experts are misses
+            T_REQUIRE(s.miss_ids.size() == 2 && s.miss_ids[0] == 0 && s.miss_ids[1] == 1,
+                      "first step must miss both routed experts");
+        } // sched detached and freed before the ctx
+        golem_unregister_hooks(h);
+        golem_reset_device_cache(c);
+        golem_ctx_free(c);
     }
 
     if (g_failures != 0) {

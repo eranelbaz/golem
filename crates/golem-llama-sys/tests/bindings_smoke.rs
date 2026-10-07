@@ -41,6 +41,60 @@ fn assert_thin_fn_ptr<T>() {
 #[test]
 fn hook_abi_types_generated() {
     assert_thin_fn_ptr::<raw::golem_ensure_host_resident_fn>();
-    assert_thin_fn_ptr::<raw::golem_policy_query_fn>();
-    assert_thin_fn_ptr::<raw::golem_notify_access_fn>();
+    assert_thin_fn_ptr::<raw::golem_routing_fn>();
+    assert_thin_fn_ptr::<raw::golem_copy_done_fn>();
+    // ABI v5: the per-model ctx surface is generated, and the header constant
+    // the bindings came from matches the compiled substrate.
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 5);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 5);
+    let fns: &[(&str, *const ())] = &[
+        ("golem_ctx_create", raw::golem_ctx_create as *const ()),
+        ("golem_ctx_free", raw::golem_ctx_free as *const ()),
+        (
+            "golem_register_hooks",
+            raw::golem_register_hooks as *const (),
+        ),
+        (
+            "golem_unregister_hooks",
+            raw::golem_unregister_hooks as *const (),
+        ),
+        ("golem_policy_order", raw::golem_policy_order as *const ()),
+        (
+            "golem_policy_order_push",
+            raw::golem_policy_order_push as *const (),
+        ),
+        (
+            "golem_ctx_generation",
+            raw::golem_ctx_generation as *const (),
+        ),
+        (
+            "llama_golem_model_attach",
+            raw::llama_golem_model_attach as *const (),
+        ),
+        (
+            "llama_golem_context_detach",
+            raw::llama_golem_context_detach as *const (),
+        ),
+    ];
+    for (name, f) in fns {
+        assert!(!f.is_null(), "hook surface symbol {name} unresolved");
+    }
+}
+
+#[test]
+fn batched_ensure_signature() {
+    // The batched ensure carries the miss list (kinds + ids) and writes the
+    // pool pointers — the exact v5 shape.
+    extern "C" fn f(
+        _payload: *mut std::ffi::c_void,
+        _tensor: *const std::ffi::c_void,
+        _kinds: *const i32,
+        _ids: *const i32,
+        _n: i32,
+        _out: *mut *const std::ffi::c_void,
+    ) {
+    }
+    let g: raw::golem_ensure_host_resident_fn = Some(f);
+    assert_eq!(std::mem::size_of::<raw::golem_ensure_host_resident_fn>(), 8);
+    let _ = g;
 }

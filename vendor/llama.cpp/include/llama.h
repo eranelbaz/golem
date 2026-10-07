@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "ggml-opt.h"
 #include "gguf.h"
+#include "golem-hooks.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -537,6 +538,14 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
+
+    // Golem per-model hook context seam (ABI v5): store `ctx` on the model
+    // BEFORE llama_init_from_model; the context re-applies it to every
+    // scheduler it creates. Null-guarded: NULL ctx clears the attachment.
+    LLAMA_API void llama_golem_model_attach(struct llama_model * model, golem_ctx_t ctx);
+    // Explicit detach of a live context's scheduler attachment (decrements
+    // the ctx's attach refcount). Null-guarded.
+    LLAMA_API void llama_golem_context_detach(struct llama_context * ctx);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

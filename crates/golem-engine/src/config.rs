@@ -51,6 +51,12 @@ pub struct EngineConfig {
     /// timings are recorded and flushed at turn end; `None` (the default)
     /// records nothing.
     pub timing_csv: Option<PathBuf>,
+    /// Routing-trace destination (§11 timing-CSV pattern): when set, every
+    /// routing readback is appended to a preallocated per-step ring and
+    /// flushed at turn end as `step\tphase\tlayer\tid,id,...` under a
+    /// `# golem-routing-trace v1` header; `None` (the default) traces
+    /// nothing — the trampoline's only cost is one `Option` check.
+    pub routing_trace: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -71,6 +77,7 @@ impl Default for EngineConfig {
             io_threads: None,
             manifest_path: None,
             timing_csv: None,
+            routing_trace: None,
         }
     }
 }

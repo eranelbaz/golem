@@ -612,6 +612,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // Golem: re-apply the model's hook ctx to EVERY scheduler created here —
+    // a recreated sched silently losing hooks would disable expert offload.
+    golem_sched_set_ctx(sched.get(), model.golem_ctx);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -647,6 +650,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                golem_sched_set_ctx(sched.get(), model.golem_ctx);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -4342,4 +4346,18 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+// --- Golem seam (ABI v5): explicit detach of a live context's scheduler
+// attachment (decrements the ctx's attach refcount; the sched destructor
+// does the same). Null-guarded. ---
+void llama_context::golem_detach() {
+    golem_sched_detach_ctx(sched.get());
+}
+
+void llama_golem_context_detach(struct llama_context * ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->golem_detach();
 }

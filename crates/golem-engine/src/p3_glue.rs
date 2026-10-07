@@ -1,31 +1,31 @@
-//! P3 FFI glue (§3.4): process-lifetime hook registration, the
-//! `ensure_host_resident` trampoline, and the per-tensor registration table.
+//! P3 FFI glue (§3.4, ABI v5): per-session hook context, the batched
+//! `ensure_host_resident` trampoline, the merged routing readback, and the
+//! off-decode-thread eviction-order publisher.
 //!
-//! Hook lifecycle: registered exactly ONCE per process
-//! via [`HANDLE`]; the pool handle is `Box::leak`ed and hooks are never
-//! unregistered — the C side stores the fn pointers in plain non-atomic
-//! statics, so any teardown could race a mid-flight callback (UB). The
-//! registration table fills lazily on the first callback per expert tensor
-//! (the P1 ABI exposes expert metadata per tensor but no model-tensor
-//! enumeration, so data pointers are only knowable when the substrate hands
-//! the tensor to the callback). `enable` runs after `load()` returns, so the
-//! first callbacks fire on the first decode — a GPU split registers every
-//! expert tensor on that step, and any cross-check mismatch aborts loudly
-//! there (the void FFI ABI has no error return).
+//! Hook lifecycle (per [`SessionHooks`], one per pooled session): `enable`
+//! builds the RAM expert pool, creates a `golem_ctx` (owned by the sys-crate
+//! RAII guards), registers the three hooks with an `Arc<HookState>` payload
+//! and returns the guards. Dropping [`SessionHooks`] unregisters (the C side
+//! joins in-flight steps) and frees the ctx — two sequential pooled sessions
+//! in one process are legal; a concurrent second `enable` is refused (the
+//! live-session guard plus the [`CURRENT`] reservation). The old
+//! leaked-handle architecture is gone: no process-global hook state exists.
 //!
-//! Registration shape:
-//! - *Lazy registration:* a load-time tensor walk is not expressible
-//!   through the P1 ABI (no enumeration API); the table is built at first
-//!   callback per tensor instead. The load-time cross-checks (source plane
-//!   stride == substrate stride per expert tensor; one pread byte-compared
-//!   against the loader-populated host bytes) run at that registration, where
-//!   the host buffer is guaranteed untouched by the pool — mismatch is a loud
-//!   abort (the void FFI ABI has no error return).
-//! - *Pool pointers, not host bytes:* `ensure_host_resident` claims each
-//!   `(layer, expert)` unit of `first..=last` once per compute through the
-//!   thread-local `StepClaims` (the unit's other planes reuse that lease),
-//!   writes the slot's plane pointer into `out_ptrs`, and C copies H2D from
-//!   there. The leases are released by the next compute's `copy_done`.
+//! Decode hot path (per AGENTS.md): the trampolines allocate nothing in
+//! steady state — the miss list is staged into a preallocated `HookState`
+//! scratch, the claim table lives in the pool (`ExpertPool::ensure_batch`),
+//! and the routing readback touches only atomics. The eviction order is
+//! rebuilt OFF the decode thread (one publisher thread) into the ctx's
+//! triple-buffered `(blk, kind)` buffers via `golem_policy_order_push`;
+//! `copy_done` runs a bounded non-blocking flush-if-dirty as the lag
+//! fallback. C never blocks: when no triple-buffer slot is free the push is
+//! skipped and the layer stays dirty for the next pass.
+//!
+//! Decode-thread-only fields: `HookState` is shared with the publisher
+//! thread, so everything is atomic/mutex-protected; the decode thread is the
+//! only writer of the step counter and the only caller of the trampolines
+//! while hooks are registered (C invokes them from the single scheduler
+//! compute path).
 #![allow(unsafe_code)]
 
 use golem_placement::pool::SlotClass;
@@ -33,264 +33,297 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 #[cfg(test)]
 use std::sync::atomic::AtomicI32;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+use std::sync::{Arc, Mutex};
 
 use golem_gguf::blk_of;
 use golem_llama_sys::raw;
+use golem_llama_sys::{CtxRaw, GolemCtx, HookFns, Hooked};
 use golem_placement::pool::{
     AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PREFETCH_K,
-    PolicySnapshot, PrefetchHandle, SnapshotHandle, StepClaims, StoreExpertSource, spawn_prefetch,
+    PolicySnapshot, PrefetchHandle, SnapshotHandle, StoreExpertSource, spawn_prefetch,
 };
 use golem_store::ChunkQueue;
 
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 
-/// One registered expert tensor: everything the trampoline needs to translate
-/// a `(tensor, first_id, last_id)` callback into pool work.
+/// One traced routing readback: fixed fields plus a range into the ring's
+/// preallocated flat id buffer (§11 pattern — no per-id heap write).
+struct TraceRec {
+    step: u64,
+    prefill: bool,
+    layer: i32,
+    start: usize,
+    len: usize,
+}
+
+/// Preallocated per-step routing-trace ring (§11 timing-CSV pattern): the
+/// routing readback appends fixed-size records into `records` and their ids
+/// into the flat `ids` buffer, both sized at enable — capacity overflow
+/// drops and counts, never reallocates. Flushed (and cleared) at turn end by
+/// [`SessionHooks::write_routing_trace`]. With `trace: None` in
+/// [`HookState`], the trampoline's only cost is one `Option` check.
+struct TraceRing {
+    /// Model path — the header's `model=<sha8>` is streamed lazily at first
+    /// flush (multi-GiB hashing must not run at enable).
+    model_path: std::path::PathBuf,
+    header_written: bool,
+    records: Vec<TraceRec>,
+    ids: Vec<i32>,
+    /// Fixed capacities (sized at enable); overflow drops and counts.
+    rec_cap: usize,
+    id_cap: usize,
+    dropped: usize,
+}
+
+impl TraceRing {
+    fn new(model_path: std::path::PathBuf, rec_cap: usize, id_cap: usize) -> Self {
+        Self {
+            model_path,
+            header_written: false,
+            records: Vec::with_capacity(rec_cap),
+            ids: Vec::with_capacity(id_cap),
+            rec_cap,
+            id_cap,
+            dropped: 0,
+        }
+    }
+
+    /// Appends one routing readback. Pure push-into-capacity: no allocation
+    /// on the decode hot path.
+    fn record(&mut self, step: u64, prefill: bool, layer: i32, ids: &[i32]) {
+        if self.records.len() >= self.rec_cap || self.ids.len() + ids.len() > self.id_cap {
+            self.dropped += 1;
+            return;
+        }
+        let start = self.ids.len();
+        self.ids.extend_from_slice(ids);
+        self.records.push(TraceRec {
+            step,
+            prefill,
+            layer,
+            start,
+            len: ids.len(),
+        });
+    }
+
+    /// Record drop without a header write (pre-turn stale-record guard).
+    fn clear_records(&mut self) {
+        self.records.clear();
+        self.ids.clear();
+        self.dropped = 0;
+    }
+
+    /// Writes the `# golem-routing-trace v1` header once (hashing the model
+    /// file on first use — the only expensive part, paid once per file), then
+    /// one `step\tphase\tlayer\tid,id,...` line per record, then clears the
+    /// ring for the next turn.
+    fn flush(
+        &mut self,
+        w: &mut impl std::io::Write,
+        n_layers: u32,
+        top_k: u32,
+    ) -> std::io::Result<()> {
+        if !self.header_written {
+            self.header_written = true;
+            writeln!(
+                w,
+                "# golem-routing-trace v1 model={} layers={n_layers} top_k={top_k}",
+                model_sha8(&self.model_path)
+            )?;
+        }
+        for r in &self.records {
+            write!(
+                w,
+                "{}\t{}\t{}\t",
+                r.step,
+                if r.prefill { "pf" } else { "dc" },
+                r.layer
+            )?;
+            let ids = &self.ids[r.start..r.start + r.len];
+            for (i, id) in ids.iter().enumerate() {
+                if i > 0 {
+                    write!(w, ",")?;
+                }
+                write!(w, "{id}")?;
+            }
+            writeln!(w)?;
+        }
+        if self.dropped > 0 {
+            tracing::warn!(dropped = self.dropped, "routing trace ring overflow");
+            self.dropped = 0;
+        }
+        self.records.clear();
+        self.ids.clear();
+        Ok(())
+    }
+}
+
+/// First 8 hex chars of the model file's sha256, streamed (models are
+/// multi-GiB; never held in memory).
+fn model_sha8(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return format!("open-error-{e}"),
+    };
+    use std::io::Read;
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// One registered expert tensor: everything the ensure trampoline needs to
+/// translate a `(tensor, miss list)` callback into pool work.
 #[derive(Clone, Copy)]
 struct TensorEntry {
     /// Dense-lead-adjusted expert layer index (pool key space).
     layer: u32,
-    /// Which of the layer's three planes.
-    kind: ExpertKind,
-    /// Expert count (`ne[2]` via `golem_tensor_expert_count`).
-    n_experts: u32,
 }
 
-thread_local! {
-    /// Last `entry_for` hit on this thread. C stages a layer's experts back
-    /// to back on one tensor, so this answers nearly every per-expert call
-    /// without the table lock. Keyed by raw tensor address: it stays valid
-    /// only while one model owns the process's hooks — `session::load`
-    /// refuses a second model once the hooks are registered (a recycled
-    /// address would hit a stale entry).
-    static LAST_ENTRY: std::cell::Cell<Option<(usize, TensorEntry)>> =
-        const { std::cell::Cell::new(None) };
-
-    /// The decode thread's claim table: `ensure_host_resident` claims each
-    /// unit once per compute here (other planes reuse the lease) and
-    /// `copy_done` ends the step at the start of the NEXT compute on this
-    /// same thread (both fire from `ggml_backend_sched_compute_splits`).
-    /// Thread-local: no lock per routed expert beyond one shard lock per
-    /// unit, none held across page-in I/O; allocated on first use, reused
-    /// across steps. The engine synchronizes after every decode and
-    /// `copy_done` drains the backends, so the prior step's DMAs are complete.
-    static STEP_CLAIMS: std::cell::RefCell<Option<StepClaims>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// The leaked process-lifetime P3 state. See [`HANDLE`].
-struct PoolHandle {
-    /// Dense-lead-adjusted expert layer count (from the GGUF walk at `enable`).
-    n_layers: u32,
-    /// Dense lead: expert tensors exist only from blk.<dense_lead> on; pool
-    /// layers are renumbered to exclude it.
-    dense_lead: u32,
-    /// §6.5 prefetch thread. Declaration order is the drop contract: the
-    /// handle is stopped and joined BEFORE the pool `Arc` drops. (The engine leaks
-    /// the whole handle — process lifetime, hooks never unregistered — so
-    /// neither field actually drops; the order keeps the invariant structural.)
-    // Never read directly: its whole job is Drop (stop + join).
-    #[allow(dead_code)]
-    prefetch: PrefetchHandle,
+/// The per-session hook payload (the C `void *payload`). Contains claims,
+/// scores and stats — no owned ctx pointers except the registration-keyed
+/// `ctx_ptr` window below.
+struct HookState {
+    /// The demand pager (arena + residency + stats + batch claim table).
+    pool: Arc<ExpertPool>,
     /// Expert byte source: the GGUF pread path or the store-backed reader
     /// (`--manifest`); the [`ExpertSource`] seam is what the registration
     /// cross-checks and the pool page-in both drive.
     source: Arc<dyn ExpertSource>,
     /// Concrete store-backed source when `config.manifest_path` was set:
-    /// its `Arc<ChunkQueue>` owns the shared queue's lifetime inside the
-    /// leaked handle (never read directly).
-    #[allow(dead_code)]
+    /// owns the shared queue's lifetime (§11 disk timing reads it).
     store: Option<Arc<StoreExpertSource>>,
-    /// The demand pager (arena + residency + stats).
-    pool: Arc<ExpertPool>,
-    /// Aggregate expert geometry from the GGUF walk.
+    /// Dense-lead-adjusted expert layer count (from the GGUF walk at enable).
+    n_layers: u32,
+    /// Dense lead: expert tensors exist only from blk.<dense_lead> on; pool
+    /// layers are renumbered to exclude it.
+    dense_lead: u32,
     n_experts: u32,
+    /// `golem_ctx_generation` at registration: every `last_entry` hit is
+    /// tagged with it, so an address recycled across sessions can never hit
+    /// a stale entry.
+    generation: u64,
+    /// The live ctx pointer while hooks are registered, else null. Set at
+    /// enable; cleared in `SessionHooks::drop` AFTER the unregister-join (so
+    /// no callback can read it) and BEFORE the ctx is freed. Read by the
+    /// decode thread (copy_done flush) and the publisher thread.
+    ctx_ptr: AtomicPtr<raw::golem_ctx>,
     /// tensor pointer → entry; filled on first callback per tensor (guarded
-    /// by its own mutex, never held across `ensure_range` — the residency
+    /// by its own mutex, never held across `ensure_batch` — the residency
     /// shard lock stays leaf-most, §6.6).
     tensors: Mutex<HashMap<usize, TensorEntry>>,
+    /// Last `entry_for` hit on the decode thread, tagged with the ctx
+    /// generation. C stages a layer's experts back to back on one tensor, so
+    /// this answers nearly every call without the table lock; the tag
+    /// rejects a recycled address left over from a previous session's
+    /// registration. Decode-thread-only writer; mutex for `&self`.
+    last_entry: Mutex<Option<(usize, u64, TensorEntry)>>,
     /// `ensure_host_resident` invocations, for the per-1000 slow-path line.
     slow_calls: AtomicUsize,
-    /// Cumulative ns spent inside the P1 trampoline's page-in section
+    /// Cumulative ns spent inside the ensure trampoline's page-in section
     /// (§11 per-step timing; taken (swap-to-zero) per decode step).
     p3_wait_ns: AtomicU64,
-    /// P2/P4 policy state (order building + access bookkeeping), leaked
-    /// alongside the handle and shared with the prefetch feed by reference.
-    policy: &'static PolicyQueryState,
+    /// Test/counters observability: trampoline call counts (the ABI v5 call
+    /// arithmetic: routing == n_offloaded_expert_layers, ensure ≤ that).
+    routing_calls: AtomicUsize,
+    ensure_calls: AtomicUsize,
+    copy_done_calls: AtomicUsize,
+    /// Order pushes skipped because no triple-buffer slot was free under the
+    /// epoch gate (the publisher retries; `copy_done`'s flush too).
+    order_pushes_failed: AtomicUsize,
+    /// Per-call miss list scratch, preallocated (`3 × K` capacity): the
+    /// trampoline stages the FFI arrays here — no per-step heap. Mutex for
+    /// `&self`; decode-thread-only in practice.
+    miss_scratch: Mutex<Vec<(ExpertKind, u32)>>,
+    /// Scratch the `copy_done` flush sorts into, preallocated at enable
+    /// (decode-thread-only writer; mutex for `&self`).
+    flush_scratch: Mutex<Vec<i32>>,
+    /// §6.2 recency + §6.6 dirty tracking (shared with the publisher).
+    policy: PolicyState,
+    /// §11-style routing-trace ring when `config.routing_trace` is set; the
+    /// routing readback appends (preallocated, no per-id heap), turn end
+    /// flushes. `None` costs the trampoline one `Option` check.
+    trace: Option<Mutex<TraceRing>>,
 }
 
-/// Process-lifetime registration: set once, read forever, never torn down.
-static HANDLE: OnceLock<&'static PoolHandle> = OnceLock::new();
-
-/// Build-in-progress reservation: set by the first `enable` BEFORE any
-/// resource is allocated, so a concurrent second `enable` fails fast instead
-/// of racing [`HANDLE`] and leaking a built arena + prefetch thread.
-static ENABLING: AtomicBool = AtomicBool::new(false);
-
-/// Process-wide count of live [`crate::session::Session`]s. Off-then-on
-/// guard: once ANY session exists, [`enable`] refuses — a pool registered
-/// under a live session would retroactively route that session's decodes
-/// through the new hooks (the first session's next decode would page from a
-/// pool built for a different model).
-static LIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
-
-/// Err while any session is live: a pool enabled under a live session would
-/// retroactively route that session's decodes through the new hooks. Checked
-/// by `Session::new` BEFORE `load` (so a refusal costs no model load) and
-/// again by [`enable`].
-pub(crate) fn refuse_if_session_live() -> Result<(), EngineError> {
-    if LIVE_SESSIONS.load(Ordering::SeqCst) > 0 {
-        return Err(EngineError::PoolInit(
-            "a session already exists in this process; enabling the expert pool \
-             now would re-route its decodes through the new hooks — enable the \
-             pool at construction of the FIRST session"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Marks a successfully constructed session (called by `Session::new`).
-pub(crate) fn session_opened() {
-    LIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Marks a dropped session (called by `Session::drop`).
-pub(crate) fn session_closed() {
-    let prev = LIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst);
-    debug_assert!(prev > 0, "session_closed without a matching session_opened");
-}
-
-/// `last_queried` sentinel: no policy_query yet.
-const NO_LAYER: u32 = u32::MAX;
-
-/// P2 policy state (§3.4): per-expert last-access steps feeding the
-/// evict-first order, plus the double-buffered order slices returned to C.
-///
-/// Attribution: `notify_access` carries only the expert id, so accesses are
-/// booked under the layer of the most recent `policy_query`. Exact for the
-/// current C call-site shape — C emits notify per routed expert inside the
-/// same policy_query-guarded block, single decode thread; multiple contexts
-/// would need tensor identity passed explicitly.
-struct PolicyQueryState {
+/// §6.2 policy state: per-expert last-access steps feeding the evict-first
+/// order, the decode-step counter, and the per-layer dirty flags consumed by
+/// the order publisher.
+struct PolicyState {
     /// Flat `layer × n_experts` last-access step + 1; 0 = never accessed.
-    /// Atomics: `notify_access` fires per routed expert on the decode hot
-    /// path, which takes no lock. One row per layer, shared by all three of
-    /// its tensors — the same order is returned for gate/up/down, which the
-    /// shared per-layer slot table requires (§3.4).
+    /// Atomics: the routing readback books one routed id per element on the
+    /// decode hot path, which takes no lock.
     last_access: Vec<AtomicU64>,
     /// Decode-step counter: one post-prefill trunk `llama_decode` = one step
     /// (§6.2: prefill chunks are excluded from scoring), bumped by
-    /// [`advance_decode_step`] from `Session`'s generation decode. Rust drives
-    /// decode, so Rust owns the step.
+    /// [`advance_decode_step`] from `Session`'s generation decode.
     step: AtomicU64,
-    /// Per-layer order slots (index `n_layers` holds the identity order for
-    /// non-expert tensors, in its own slot so it can never poison a layer
-    /// entry). Pointer lifetime: a published pointer is stable until the
-    /// SAME layer's order is rebuilt at the next step — interleaved
-    /// publishes of other layers (or the identity) never clobber it. C
-    /// consumes the order within one copy step: the callback calls
-    /// policy_query and feeds the pointer to golem_slab_step before any
-    /// further publish (ggml-backend.cpp compute_splits, single decode
-    /// thread, n_copies == 1 enforced at callback entry), so the next-step
-    /// rebuild never races a live consumer.
-    order_bufs: Vec<Mutex<OrderBuf>>,
-    /// Pointer table into `order_bufs`, read without a lock on cache hits;
-    /// written under the slot mutex at build.
-    order_ptrs: Vec<AtomicPtr<i32>>,
-    /// Per-layer decode step of the last build: a rebuild happens only when
-    /// the step advanced since that layer's last publish. Plain atomics,
-    /// single decode thread; per-layer so interleaved publishes of other
-    /// layers within one step stay cache hits.
-    cached_step: Vec<AtomicU64>,
-    /// Rebuild counter (test observability: one build per (layer, step)).
-    order_builds: AtomicUsize,
-    /// Last layer passed to policy_query; notify attribution key.
-    /// [`NO_LAYER`] until the first query.
-    last_queried: AtomicU32,
-    /// Whether `notify_access` books recency: false during prefill (§6.2: a
-    /// prefill ubatch routes nearly every expert and would flatten the
-    /// scores), true during generation decodes. Driven by `Session` through
-    /// [`set_scoring`].
+    /// Whether the routing readback books recency: false during prefill
+    /// (§6.2: a prefill ubatch routes nearly every expert and would flatten
+    /// the scores), true during generation decodes. Driven by `Session`
+    /// through [`set_scoring`].
     scoring: AtomicBool,
-    n_layers: u32,
-    n_experts: u32,
+    /// Per-layer dirty flags: the routing readback marks; the publisher and
+    /// the `copy_done` flush swap-to-claim and publish.
+    dirty: Vec<AtomicBool>,
+    dirty_any: AtomicBool,
+    n_layers: usize,
+    n_experts: usize,
 }
 
-impl PolicyQueryState {
+impl PolicyState {
     fn new(n_layers: u32, n_experts: u32) -> Self {
         Self {
             last_access: (0..n_layers as usize * n_experts as usize)
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             step: AtomicU64::new(0),
-            order_bufs: (0..=n_layers)
-                .map(|_| Mutex::new(OrderBuf::new(n_experts)))
-                .collect(),
-            order_ptrs: (0..=n_layers)
-                .map(|_| AtomicPtr::new(std::ptr::null_mut()))
-                .collect(),
-            cached_step: (0..=n_layers).map(|_| AtomicU64::new(u64::MAX)).collect(),
-            order_builds: AtomicUsize::new(0),
-            last_queried: AtomicU32::new(NO_LAYER),
             scoring: AtomicBool::new(true),
-            n_layers,
-            n_experts,
+            dirty: (0..n_layers as usize)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            dirty_any: AtomicBool::new(false),
+            n_layers: n_layers as usize,
+            n_experts: n_experts as usize,
         }
     }
 
-    /// Returns the evict-first order for `layer` (shared by all three of its
-    /// tensors), rebuilt at most once per (layer, decode step) and cached in
-    /// the layer's slot; `None` = identity order for non-expert tensors,
-    /// built into its own slot and never cached under the layer key. Hot
-    /// path: cache hits are two relaxed atomic loads + a pointer load — no
-    /// lock, no allocation (slots sized at enable). Accepted staleness:
-    /// accesses recorded by `note_access` between a step's plane queries are
-    /// not reflected until the next step's rebuild (LRU heuristic quality,
-    /// not correctness).
-    fn publish_order(&self, layer: Option<u32>) -> *const i32 {
-        let slot = match layer {
-            Some(layer) => {
-                debug_assert!(
-                    layer < self.n_layers,
-                    "order requested outside the registered geometry"
-                );
-                let step = self.step.load(Ordering::Relaxed);
-                let last = self.cached_step[layer as usize].load(Ordering::Relaxed);
-                if last == step {
-                    return self.order_ptrs[layer as usize]
-                        .load(Ordering::Relaxed)
-                        .cast_const();
-                }
-                let mut buf = self.order_bufs[layer as usize].lock().unwrap();
-                let OrderBuf { keys, order } = &mut *buf;
-                let lo = layer as usize * self.n_experts as usize;
-                for (k, a) in keys.iter_mut().zip(&self.last_access[lo..]) {
-                    *k = a.load(Ordering::Relaxed);
-                }
-                build_order(keys, order);
-                self.order_builds.fetch_add(1, Ordering::Relaxed);
-                self.order_ptrs[layer as usize]
-                    .store(order.as_ptr() as *mut i32, Ordering::Relaxed);
-                self.cached_step[layer as usize].store(step, Ordering::Relaxed);
-                return order.as_ptr();
+    /// Books one step's routed ids of `layer` (the dense ids readback):
+    /// every routed expert's recency moves to `step + 1`. Out-of-range and
+    /// negative ids are rejected (never wrapped into the next layer's row).
+    /// Lock-free: one relaxed store per routed id.
+    fn book_routed(&self, layer: usize, ids: &[i32]) {
+        if !self.scoring.load(Ordering::Relaxed) {
+            return;
+        }
+        let step = self.step.load(Ordering::Relaxed);
+        let n = self.n_experts;
+        let row = &self.last_access[layer * n..][..n];
+        for &id in ids {
+            if id >= 0 && (id as usize) < n {
+                row[id as usize].store(step + 1, Ordering::Relaxed);
             }
-            None => self.n_layers as usize,
-        };
-        let mut buf = self.order_bufs[slot].lock().unwrap();
-        let order = &mut buf.order;
-        order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
-        self.order_ptrs[slot].store(order.as_ptr() as *mut i32, Ordering::Relaxed);
-        order.as_ptr()
+        }
     }
 
-    /// Test observability: total order rebuilds so far.
-    #[cfg(test)]
-    fn order_builds(&self) -> usize {
-        self.order_builds.load(Ordering::Relaxed)
+    /// Marks `layer`'s order dirty for the publisher.
+    fn mark_dirty(&self, layer: usize) {
+        self.dirty[layer].store(true, Ordering::Relaxed);
+        self.dirty_any.store(true, Ordering::Relaxed);
     }
 
     /// Last-access step of flat index `idx`; `None` = never accessed.
@@ -298,36 +331,13 @@ impl PolicyQueryState {
         self.last_access[idx].load(Ordering::Relaxed).checked_sub(1)
     }
 
-    /// Record one routed-expert access under the last queried (layer, kind)
-    /// at the current decode step.
-    fn note_access(&self, expert_id: i64) {
-        if !self.scoring.load(Ordering::Relaxed) {
-            return;
-        }
-        let step = self.step.load(Ordering::Relaxed);
-        let layer = self.last_queried.load(Ordering::Relaxed);
-        if layer == NO_LAYER {
-            return; // defensive: notify before any query — nothing to attribute
-        }
-        // Out-of-range ids are never routed by C (compute_splits masks ids to
-        // [0, n_expert) before notify_access); reject before the usize cast
-        // would wrap negatives and before id == n_experts could spill into the
-        // next layer's row.
-        if expert_id < 0 || expert_id as u64 >= self.n_experts as u64 {
-            return;
-        }
-        let e = expert_id as usize;
-        let idx = layer as usize * self.n_experts as usize + e;
-        self.last_access[idx].store(step + 1, Ordering::Relaxed);
-    }
-
     /// §6.5 prefetch feed: union of accessed `(layer, expert)` units from
     /// the last `k` steps. Layer-major, expert-ascending order.
     fn recent_union(&self, k: usize) -> Vec<(u32, u32)> {
         let cutoff = self.step.load(Ordering::Relaxed).saturating_sub(k as u64);
-        let n = self.n_experts as usize;
+        let n = self.n_experts;
         let mut out = Vec::new();
-        for layer in 0..self.n_layers as usize {
+        for layer in 0..self.n_layers {
             for e in 0..n {
                 if self
                     .access_step(layer * n + e)
@@ -339,29 +349,23 @@ impl PolicyQueryState {
         }
         out
     }
-}
 
-/// One order slot handed to C plus its sort-key scratch, both
-/// `n_experts` long for the process lifetime.
-struct OrderBuf {
-    keys: Vec<u64>,
-    order: Vec<i32>,
-}
-
-impl OrderBuf {
-    fn new(n_experts: u32) -> Self {
-        Self {
-            keys: vec![0; n_experts as usize],
-            order: vec![0; n_experts as usize],
-        }
+    /// Builds the evict-first order for `layer` into `order` (recency sort:
+    /// never-accessed first, then ascending last-access step; ties by
+    /// ascending index). Preallocated `order`; no allocation.
+    fn build_order(&self, layer: usize, order: &mut [i32]) {
+        let n = self.n_experts;
+        debug_assert_eq!(order.len(), n);
+        order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
+        let row = &self.last_access[layer * n..][..n];
+        order.sort_unstable_by_key(|&i| (row[i as usize].load(Ordering::Relaxed), i));
     }
 }
 
-/// Recency order builder (pure; unit-tested): `keys` are the raw
-/// `last_access` words (0 = never, else step + 1), so ascending key puts
-/// never-accessed experts first, then ascending last-access step; ties break
-/// by ascending index. Writes a permutation of `0..keys.len()` into `order`
-/// by construction; no allocation (unstable sort, unique keys).
+/// Recency order builder over raw keys (pure; unit-tested): `keys` are the
+/// raw `last_access` words (0 = never, else step + 1). Writes a permutation
+/// of `0..keys.len()` by construction.
+#[cfg(test)]
 fn build_order(keys: &[u64], order: &mut [i32]) {
     debug_assert_eq!(keys.len(), order.len());
     order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
@@ -380,12 +384,54 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
     }
 }
 
+/// The one pool-enabled session's payload state, process-wide. Set by a
+/// successful [`enable`], cleared by `SessionHooks::drop` — the sequential
+/// enable/drop cycle is legal, a concurrent second enable is refused.
+static CURRENT: Mutex<Vec<Arc<HookState>>> = Mutex::new(Vec::new());
+
+/// Process-wide count of live [`crate::session::Session`]s. Off-then-on
+/// guard: once ANY session exists, [`enable`] refuses — a pool registered
+/// under a live session would retroactively route that session's decodes
+/// through the new hooks (the first session's next decode would page from a
+/// pool built for a different model).
+static LIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Err while a pool-enabled session's hooks are live: a second concurrent
+/// pool would build a second slab set — at the real target (K = 10) each is
+/// 10 slots × 42 layers × 3 planes × ≈5.8 MB ≈ 7.3 GB, twice on a 24 GiB
+/// card. Sequential pooled sessions are legal (per-model ctx, ABI v5).
+/// Checked by `Session::new` BEFORE `load` (so a refusal costs no model
+/// load) and again by [`enable`].
+pub(crate) fn refuse_if_pool_session_live() -> Result<(), EngineError> {
+    if hooks_registered() {
+        return Err(EngineError::PoolInit(
+            "a pool-enabled session already exists in this process; a concurrent second \
+             pool would hold two device slab sets (at the target: K=10 × 42 layers × \
+             3 planes × ≈5.8 MB ≈ 7.3 GB each — 14.6 GB on a 24 GiB card) — drop \
+             the first session before opening another pooled one"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Marks a successfully constructed session (called by `Session::new`).
+pub(crate) fn session_opened() {
+    LIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Marks a dropped session (called by `Session::drop`).
+pub(crate) fn session_closed() {
+    let prev = LIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(prev > 0, "session_closed without a matching session_opened");
+}
+
 /// Bumps the policy decode step: `Session` calls this after every successful
 /// trunk decode (§6.2: prefill chunks are excluded from scoring — a prefill
 /// ubatch routes nearly every expert and would flatten the scores). No-op
 /// while hooks are unregistered.
 pub(crate) fn advance_decode_step() {
-    if let Some(h) = HANDLE.get() {
+    for h in current_states() {
         h.policy.step.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -398,33 +444,41 @@ pub(crate) struct StepIoStats {
     pub disk_bytes: Option<u64>,
 }
 
+fn current_states() -> Vec<Arc<HookState>> {
+    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Takes (swap-to-zero) the timing accumulators at a decode step boundary.
 /// No-op while hooks are unregistered: unmeasured fields come back `None`.
 pub(crate) fn take_step_io_stats() -> StepIoStats {
-    match HANDLE.get() {
-        None => StepIoStats {
+    let states = current_states();
+    if states.is_empty() {
+        return StepIoStats {
             p3_wait_ns: 0,
             disk_ns: None,
             disk_bytes: None,
-        },
-        Some(h) => {
-            let (disk_ns, disk_bytes) = h.store.as_ref().map_or((None, None), |s| {
-                let (ns, bytes) = s.take_disk_stats();
-                (Some(ns), Some(bytes))
-            });
-            StepIoStats {
-                p3_wait_ns: h.p3_wait_ns.swap(0, Ordering::Relaxed),
-                disk_ns,
-                disk_bytes,
-            }
+        };
+    }
+    let mut out = StepIoStats {
+        p3_wait_ns: 0,
+        disk_ns: None,
+        disk_bytes: None,
+    };
+    for h in states {
+        out.p3_wait_ns += h.p3_wait_ns.swap(0, Ordering::Relaxed);
+        if let Some(s) = &h.store {
+            let (ns, bytes) = s.take_disk_stats();
+            out.disk_ns = Some(out.disk_ns.unwrap_or(0) + ns);
+            out.disk_bytes = Some(out.disk_bytes.unwrap_or(0) + bytes);
         }
     }
+    out
 }
 
 /// Switches recency booking on for generation decodes and off for prefill
 /// (§6.2). No-op while hooks are unregistered.
 pub(crate) fn set_scoring(on: bool) {
-    if let Some(h) = HANDLE.get() {
+    for h in current_states() {
         h.policy.scoring.store(on, Ordering::Relaxed);
     }
 }
@@ -449,58 +503,306 @@ impl Drop for PrefillScope {
 /// Test seam: the live policy decode step (0 while hooks are unregistered).
 #[cfg(test)]
 pub(crate) fn decode_step_for_test() -> u64 {
-    HANDLE
-        .get()
+    current_states()
+        .first()
         .map_or(0, |h| h.policy.step.load(Ordering::Relaxed))
 }
 
-/// Whether the process-global hooks are registered (a second model in the
-/// process is refused: the hooks are never unregistered).
-pub(crate) fn hooks_registered() -> bool {
-    HANDLE.get().is_some()
+/// Whether a pooled session's hooks are registered (a second pooled session
+/// in the process is refused while one is live).
+pub fn hooks_registered() -> bool {
+    !CURRENT.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
-/// P3 pool facts the session needs past enable (§2.4): a prefill chunk's
-/// routed set is at most `chunk_tokens × top_k` distinct experts per layer
-/// and must fit the `device_cache_experts`-slot slab, so the chunk is capped
-/// at `max(1, device_cache_experts / top_k)` tokens.
-pub(crate) struct PoolEnable {
-    /// Pool counters for [`crate::session::Session::p3_stats`].
-    pub stats: Arc<P3Stats>,
+/// The per-session hook guards: owns the registration (unregister-join on
+/// drop), the order publisher, the prefetch thread and the pool. Drop order
+/// (the ABI v5 contract): unregister-join → clear the ctx window + stop the
+/// publisher → ctx free (inside the sys RAII guard).
+pub struct SessionHooks {
+    /// §6.5 prefetch thread. Stopped before the hooks are torn down so its
+    /// pool feed cannot outlive the pool state.
+    prefetch: PrefetchHandle,
+    /// The eviction-order publisher (background thread).
+    publisher: PublisherHandle,
+    /// The live hook registration; also owns the ctx (`Arc` inside the
+    /// guard). Taken first in `drop`.
+    hooked: Option<Hooked<HookState>>,
+    /// The payload state (same Arc the C callbacks receive).
+    state: Arc<HookState>,
+    /// Pool counters for [`crate::session::Session::p3_stats`] (the same Arc
+    /// the pool holds).
+    pub(crate) stats: Arc<P3Stats>,
+    /// `golem_ctx` keep-alive: a clone of the ctx Arc that outlives the
+    /// registration. Declared LAST so it drops after publisher/prefetch/state
+    /// — the §3.4 drop order ends with `golem_ctx_free` (which aborts while
+    /// any sched attach refcount remains) and then the pool.
+    ctx_keep: Arc<CtxRaw>,
     /// Device slab slots per layer, as priced at enable (§3.4).
     pub device_cache_experts: u32,
     /// Model routed top-k (`expert_used_count`).
     pub top_k: u32,
 }
 
+impl SessionHooks {
+    /// The raw ctx pointer while hooks are registered (the per-ctx P4 stats
+    /// getter). Panics after drop — callers hold the session.
+    pub fn ctx_ptr(&self) -> raw::golem_ctx_t {
+        self.hooked.as_ref().expect("hooks dropped").ctx_ptr()
+    }
+
+    /// The payload pointer C receives: drive the trampolines directly with
+    /// it (test and measurement harnesses; the C scheduler does the same).
+    pub fn payload_ptr(&self) -> *mut c_void {
+        Arc::as_ptr(&self.state) as *mut c_void
+    }
+
+    /// Bumps this session's policy decode step (the `Session` decode path
+    /// calls the free function; direct-`enable` harnesses call this).
+    pub fn advance_decode_step(&self) {
+        self.state.policy.step.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test/counters observability: trampoline call counts.
+    pub fn routing_calls(&self) -> usize {
+        self.state.routing_calls.load(Ordering::Relaxed)
+    }
+    /// Batched ensure calls so far.
+    pub fn ensure_calls(&self) -> usize {
+        self.state.ensure_calls.load(Ordering::Relaxed)
+    }
+    /// copy_done calls so far.
+    pub fn copy_done_calls(&self) -> usize {
+        self.state.copy_done_calls.load(Ordering::Relaxed)
+    }
+    /// Order pushes skipped because no triple-buffer slot was free under the
+    /// epoch gate (retried by publisher/flush).
+    pub fn order_pushes_failed(&self) -> usize {
+        self.state.order_pushes_failed.load(Ordering::Relaxed)
+    }
+    /// The pool's counters (test/observability seam).
+    pub fn state_stats(&self) -> Arc<P3Stats> {
+        self.stats.clone()
+    }
+
+    /// Switches recency booking (§6.2) — harness seam mirroring the free
+    /// [`set_scoring`] used by `Session`.
+    pub fn set_scoring(&self, on: bool) {
+        set_scoring(on);
+    }
+
+    /// Stage 1 of the teardown order: unregister + join (drops `Hooked`,
+    /// recovering the payload Arc). `Session` calls this explicitly BEFORE
+    /// `llama_free`; the remaining teardown (publisher/prefetch stop, then
+    /// `golem_ctx_free`, then the pool) rides [`Drop for SessionHooks`].
+    /// The live ctx pointer while hooks are registered (or before the Drop
+    /// clears it): the Session teardown's slab-reclamation seam —
+    /// `golem_reset_device_cache` must run while the substrate backend is
+    /// still alive, i.e. before `llama_free`.
+    pub(crate) fn live_ctx_ptr(&self) -> raw::golem_ctx_t {
+        self.state.ctx_ptr.load(Ordering::SeqCst)
+    }
+
+    /// Unregisters the hooks and joins in-flight callbacks (idempotent; the
+    /// §3.4 Session teardown calls this before `llama_free`, the Drop runs it
+    /// as a backstop).
+    pub fn unregister(&mut self) {
+        self.hooked = None;
+        CURRENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !Arc::ptr_eq(s, &self.state));
+    }
+
+    /// Flushes this turn's routing-trace records into `w` (header on first
+    /// call, then one line per record; the ring clears for the next turn).
+    /// No-op when the routing trace is disabled.
+    pub fn write_routing_trace(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let Some(trace) = &self.state.trace else {
+            return Ok(());
+        };
+        let mut t = trace.lock().unwrap_or_else(|e| e.into_inner());
+        t.flush(w, self.state.n_layers, self.top_k)
+    }
+
+    /// Drops buffered records without touching the header (the pre-turn
+    /// stale-record guard — a sink flush would swallow the header write).
+    pub fn drain_routing_trace(&self) {
+        if let Some(trace) = &self.state.trace {
+            trace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear_records();
+        }
+    }
+}
+
+impl Drop for SessionHooks {
+    fn drop(&mut self) {
+        // 1. Unregister + join (skipped if `unregister` already ran — the
+        //    §3.4 Session order calls it before `llama_free`): no C callback
+        //    can touch the payload after this returns (and the payload Arc
+        //    is recovered by the guard). The CURRENT window goes with it:
+        //    clearing before the ctx free makes a subsequent enable() see a
+        //    clean slate.
+        self.unregister();
+        // 2. Stop the publisher thread FIRST (it reads the ctx pointer
+        //    window), then clear the pointer (post-join: no reader left).
+        self.publisher.stop_and_join();
+        self.state
+            .ctx_ptr
+            .store(std::ptr::null_mut(), Ordering::SeqCst);
+        self.prefetch.stop();
+        // 3. `ctx_keep` (last field) drops now — golem_ctx_free aborts while
+        //    a sched attach refcount remains, and `llama_free` (which ran
+        //    earlier in the Session order) has already run the sched
+        //    destructors. The pool/prefetch state drops with `state`.
+        debug_assert_eq!(
+            Arc::strong_count(&self.ctx_keep),
+            1,
+            "the ctx Arc must be exclusive before golem_ctx_free"
+        );
+    }
+}
+
+/// Handle to the order publisher thread. `stop_and_join` is explicit (drop
+/// order inside [`SessionHooks`]); `Drop` also signals + joins as backstop.
+struct PublisherHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PublisherHandle {
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PublisherHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Spawns the order publisher: wakes on a bounded poll, sorts every dirty
+/// layer's recency row into preallocated scratch and pushes all three kinds
+/// into the ctx's triple buffers. Never blocks the decode thread: when no
+/// buffer slot is free under the epoch gate the push is skipped and the
+/// layer stays dirty (retried next pass).
+fn spawn_order_publisher(state: Arc<HookState>, interval: std::time::Duration) -> PublisherHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name("golem-order-publisher".into())
+            .spawn(move || {
+                // Off-hot-path scratch: allocated once per thread, never in
+                // the publish loop.
+                let mut order: Vec<i32> = vec![0; state.n_experts as usize];
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if state.policy.dirty_any.load(Ordering::Relaxed) {
+                        publish_dirty(&state, usize::MAX, &mut order);
+                    }
+                    std::thread::park_timeout(interval);
+                }
+            })
+            .expect("spawn order publisher")
+    };
+    PublisherHandle {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// Publishes up to `limit` dirty layers into the ctx's triple buffers.
+/// Returns how many layers were published. Each layer is claimed with a
+/// swap-to-false (the publisher and the `copy_done` flush are the two
+/// competitors; exactly one wins a given dirty bit). A failed push (no free
+/// slot under the epoch gate) re-marks the layer dirty and counts a skip —
+/// never blocks, never overwrites a buffer a reader may still hold.
+fn publish_dirty(state: &HookState, limit: usize, order_scratch: &mut [i32]) -> usize {
+    // SAFETY: the ctx pointer is non-null only while hooks are registered;
+    // it is cleared after the unregister-join, and this runs either on the
+    // decode thread inside a registered hook (copy_done flush) or on the
+    // publisher thread, which is stopped before the pointer is cleared.
+    let ctx = state.ctx_ptr.load(Ordering::SeqCst);
+    if ctx.is_null() {
+        return 0;
+    }
+    let ctx: raw::golem_ctx_t = ctx;
+    let n = state.n_experts as usize;
+    let mut published = 0;
+    for layer in 0..state.policy.n_layers {
+        if published >= limit {
+            break;
+        }
+        if !state.policy.dirty[layer].swap(false, Ordering::Relaxed) {
+            continue;
+        }
+        state.policy.build_order(layer, order_scratch);
+        let blk = layer as i32 + state.dense_lead as i32;
+        let mut all_pushed = true;
+        for kind in 1..=3 {
+            // SAFETY: `ctx` is live (see above); `order_scratch` holds n
+            // initialized i32s.
+            let ok = unsafe {
+                raw::golem_policy_order_push(ctx, blk, kind, order_scratch.as_ptr(), n as i32)
+            };
+            if ok == 0 {
+                all_pushed = false;
+                state.order_pushes_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if all_pushed {
+            published += 1;
+        } else {
+            state.policy.mark_dirty(layer);
+        }
+    }
+    if published > 0 {
+        state.policy.dirty_any.store(
+            state.policy.dirty.iter().any(|d| d.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+    }
+    published
+}
+
 /// Builds the RAM expert pool for `config` (which must set
-/// `ram_experts_gib > 0`) and registers the P3 hooks for the process
-/// lifetime. Returns the pool's counters plus the slab/routing geometry the
-/// session needs to bound a prefill chunk (§2.4).
+/// `ram_experts_gib > 0`), creates the per-model `golem_ctx` (ABI v5) and
+/// registers the session's hooks. Returns the guards: dropping them
+/// unregisters (join) and frees the ctx.
 ///
 /// # Errors
 /// GGUF/geometry failures, arena mmap/mlock failures (no silent unlocked
-/// fallback, §5.4), or a second pool-enabled session in one process (one
-/// pool-enabled session per process: the hooks are process-global).
-pub(crate) fn enable(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
+/// fallback, §5.4), or a concurrent second pool-enabled construction (one
+/// pool-enabled session at a time: two slab sets at K=10 ≈ 10 × 42 × 3 ×
+/// 5.8 MB ≈ 7.3 GB each on a 24 GiB card).
+pub fn enable(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     debug_assert!(config.ram_experts_gib > 0, "enable() with pool disabled");
     // Refuse BEFORE allocating anything: a pool enabled while any session is
     // live would silently re-route that session's subsequent decodes through
-    // the new hooks (process-global, never unregistered).
-    refuse_if_session_live()?;
-    if ENABLING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err(EngineError::PoolInit(
-            "concurrent pool-enabled session construction".into(),
-        ));
-    }
+    // the new hooks (they fire per step regardless of which session owns
+    // them).
+    refuse_if_pool_session_live()?;
+    // CURRENT's lock held across construction: concurrent enables serialize
+    // (each on its own ctx; the multi-ctx capability the ABI v5 surface is
+    // built for) and never race a half-built state into the registry.
     let result = enable_inner(config);
-    // Reservation released either way: on success HANDLE now refuses a
-    // second enable with the accurate one-pool-per-process error; on failure
-    // a later enable() may retry from scratch.
-    ENABLING.store(false, Ordering::SeqCst);
+    if let Ok(hooks) = &result {
+        CURRENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(hooks.state.clone());
+    }
     result
 }
 
@@ -538,19 +840,11 @@ const _: () = assert!(
         && (raw::GOLEM_HOOKS_ABI_VERSION as i64) <= i32::MAX as i64
 );
 
-fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
+fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // The compiled substrate's hook surface must match the header the bindings
     // were generated from — checked before any source open or allocation, so a
     // stale build fails fast instead of silently decoding with a drifted ABI.
-    // Deliberately before the HANDLE short-circuit: a stale substrate reports
-    // the ABI error even on a second enable.
     check_abi(abi_header_for_check(), golem_llama_sys::hooks_abi_version())?;
-    if HANDLE.get().is_some() {
-        return Err(EngineError::PoolInit(
-            "a pool-enabled session already exists (one per process: hooks are process-global)"
-                .into(),
-        ));
-    }
 
     // Pool geometry from the GGUF file itself (header + tensor table only).
     let metadata = crate::gguf::read_metadata(&config.model_path)?;
@@ -580,9 +874,8 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
 
     // Expert byte source: the store-backed reader when a manifest is
     // configured (§5.2 — the shared queue drives the P3 slow path; the
-    // queue lives in the leaked handle via the store source's Arc), else
-    // the single-replica GGUF pread path (byte-identical to pre-manifest
-    // behavior).
+    // queue lives in the session's source Arc), else the single-replica GGUF
+    // pread path.
     let (source, store): (Arc<dyn ExpertSource>, Option<Arc<StoreExpertSource>>) =
         match &config.manifest_path {
             Some(manifest_path) => {
@@ -624,14 +917,8 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
     // budget, never proportional to expert count (unbounded slabs are ≈184 GB
     // on GLM-5.3-Flash — 126 live tensors × 288 experts × ≈5 MB — against a
     // 24 GiB card). An explicit config value wins; otherwise K derives from
-    // the free VRAM at enable time (the model's non-expert weights are
-    // already resident, so what is free is what the slabs + KV + compute
-    // buffers must share), with half held back as growth headroom:
-    // K = free/2 / Σ_layers unit bytes − 1 = 9 on the target
-    // (Σ unit bytes = 644,022,272 across 3 stride classes; ≈6.657 GB usable
-    // / 644 MB ≈ 10.34, minus the − 1 headroom). Pricing by 42 × 3 × max
-    // stride instead gave K = 6 < top-k, refusing the real model at enable.
-    // K is rejected below the model's top-k (expert_used_count): a routed
+    // the free VRAM at enable time, with half held back as growth headroom
+    // (K = 9 on the target). K is rejected below the model's top-k: a routed
     // set larger than K aborts mid-decode, so a smaller K must fail at enable.
     let k = derive_device_cache_experts(config, slab, n_expert_used)?;
     // Per-class RAM layout (§5.4): each unit-size class gets slots
@@ -661,8 +948,9 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
         let (ptr, len) = arena.as_ptr_range();
         // SAFETY: the arena is a live, page-aligned, solely-owned mapping of
         // exactly `len` bytes (mmap + mlock above); registration happens
-        // before any slot is handed out and unregister rides the process
-        // teardown (the pool is leaked by design, hooks never unregistered).
+        // before any slot is handed out and unregister rides the pool's drop
+        // (the session teardown unregisters the hooks first, so no callback
+        // can touch a deregistered arena).
         if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
             return Err(EngineError::PoolInit(format!(
                 "hipHostRegister failed on the {len}-byte expert pool (HIP result {r})"
@@ -687,65 +975,99 @@ fn enable_inner(config: &EngineConfig) -> Result<PoolEnable, EngineError> {
     )
     .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
-    // P2 state: per-expert recency (never-accessed first, then
-    // ascending last-access step) — pure recency order.
-    let policy: &'static PolicyQueryState =
-        Box::leak(Box::new(PolicyQueryState::new(n_layers, geo.n_experts)));
-    let prefetch = spawn_prefetch(pool.clone(), Arc::new(PolicyFeed(policy)), PREFETCH_K);
+    // Per-model hook context (ABI v5). n_layers covers the full blk range —
+    // C indexes its order buffers by the raw blk number, and the dense lead
+    // has no expert tensors but does not shift blk numbering.
+    let ctx = GolemCtx::create((dense_lead + n_layers) as i32, geo.n_experts as i32)
+        .ok_or_else(|| EngineError::PoolInit("golem_ctx_create failed".into()))?;
+    // SAFETY: FFI setter on a live ctx; bounded per-layer slab (never
+    // unlimited, never proportional to total experts — AGENTS.md).
+    unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k as i32) };
 
-    let handle: &'static PoolHandle = Box::leak(Box::new(PoolHandle {
-        n_layers: geo.n_layers(),
+    // P2 state: per-expert recency (never-accessed first, then ascending
+    // last-access step) — pure recency order.
+    let policy = PolicyState::new(n_layers, geo.n_experts);
+    // Routing-trace ring (§11 pattern), preallocated at enable: decode steps
+    // are bounded by n_predict, prefill ids by chunk_tokens × top_k —
+    // overflow drops and counts instead of reallocating on the hot path.
+    let trace = config.routing_trace.as_ref().map(|_| {
+        let rec_cap = config.n_predict as usize + 256; // + prefill-chunk headroom
+        let prefill_ids = (config.batch_tokens as usize).max(1) * n_expert_used as usize;
+        Mutex::new(TraceRing::new(
+            // Model file (hashed into the header), not the trace output path.
+            config.model_path.clone(),
+            rec_cap,
+            rec_cap.saturating_mul(prefill_ids),
+        ))
+    });
+    let state = Arc::new(HookState {
+        p3_wait_ns: AtomicU64::new(0),
+        slow_calls: AtomicUsize::new(0),
+        routing_calls: AtomicUsize::new(0),
+        ensure_calls: AtomicUsize::new(0),
+        copy_done_calls: AtomicUsize::new(0),
+        order_pushes_failed: AtomicUsize::new(0),
+        tensors: Mutex::new(HashMap::new()),
+        last_entry: Mutex::new(None),
+        ctx_ptr: AtomicPtr::new(ctx.as_ptr()),
+        generation: {
+            // SAFETY: FFI query on a live ctx.
+            unsafe { raw::golem_ctx_generation(ctx.as_ptr()) }
+        },
+        miss_scratch: Mutex::new(Vec::with_capacity(3 * k.min(geo.n_experts) as usize)),
+        flush_scratch: Mutex::new(vec![0; geo.n_experts as usize]),
+        policy,
+        n_layers,
         dense_lead,
-        prefetch,
+        n_experts: geo.n_experts,
+        pool,
         source,
         store,
-        pool: pool.clone(),
-        n_experts: geo.n_experts,
-        tensors: Mutex::new(HashMap::new()),
-        slow_calls: AtomicUsize::new(0),
-        p3_wait_ns: AtomicU64::new(0),
-        policy,
-    }));
-    // CAS reservation above ⇒ no concurrent setter and `get()` was None.
-    assert!(
-        HANDLE.set(handle).is_ok(),
-        "HANDLE must be unset after winning the enable reservation"
+        trace,
+    });
+
+    let prefetch = spawn_prefetch(
+        state.pool.clone(),
+        Arc::new(PolicyFeed(state.clone())),
+        PREFETCH_K,
     );
+    // Order publisher: 250 µs poll — the order may lag ≥ 1 step by design;
+    // the copy_done flush bounds the worst case without blocking.
+    let publisher = spawn_order_publisher(state.clone(), std::time::Duration::from_micros(250));
 
-    // Fresh device-cache state before the hooks engage it (the map may hold
-    // entries from an earlier in-process model — the invalidation seam).
-    // SAFETY: FFI call, no invariants.
-    unsafe { raw::golem_reset_device_cache() };
-    // SAFETY: FFI setter, no invariants.
-    unsafe {
-        raw::golem_set_device_cache_experts(k as i32);
-    }
-
-    // SAFETY: `handle` is leaked ('static) and never mutated after this, so
-    // the context pointer outlives every callback; all four are valid fn
-    // pointers (P3 ensure_host_resident / P2 policy_query / P4 notify_access /
-    // copy_done; the C side's n_copies == 1 abort is the defense-in-depth —
-    // the engine config cannot express pipeline parallelism or multi-GPU to
-    // pre-reject here).
-    unsafe {
-        raw::golem_register_hooks(
-            Some(ensure_host_resident),
-            Some(policy_query),
-            Some(notify_access),
-            Some(copy_done),
-            handle as *const PoolHandle as *mut c_void,
-        );
-    }
+    // SAFETY: `state` is shared with C as `Arc::into_raw` and recovered by
+    // the guard's drop after the C unregister-join returns — no in-flight
+    // callback can race the recovery. All three fn pointers are valid C
+    // ABIs; the C side's n_copies == 1 abort is the defense-in-depth (the
+    // engine config cannot express pipeline parallelism or multi-GPU to
+    // pre-reject here). The ctx is consumed into the guard: the registration
+    // borrow is encoded by moving, so the ctx always outlives the hooks.
+    let hooked = ctx.register(
+        HookFns {
+            ensure: Some(ensure_host_resident),
+            routing: Some(routing),
+            copy_done: Some(copy_done),
+        },
+        state.clone(),
+    );
+    // The ctx keep-alive: the registration owns one Arc; this clone orders
+    // the free AFTER `llama_free` in the §3.4 Session teardown.
+    let hooked_ctx_keep = hooked.ctx_arc();
 
     tracing::info!(
         layers = n_layers,
         experts = geo.n_experts,
         classes = ?layout,
         gib = config.ram_experts_gib,
-        "P3 RAM expert pool registered (hooks set for process lifetime)"
+        "P3 RAM expert pool registered (per-model ctx, hooks set)"
     );
-    Ok(PoolEnable {
-        stats: pool.stats.clone(),
+    Ok(SessionHooks {
+        prefetch,
+        publisher,
+        hooked: Some(hooked),
+        stats: state.pool.stats.clone(),
+        state,
+        ctx_keep: hooked_ctx_keep,
         device_cache_experts: k,
         top_k: n_expert_used,
     })
@@ -860,6 +1182,16 @@ fn k_from_free_vram(
     Ok(k as u32)
 }
 
+/// Miss-list kind code from the ABI (1=gate 2=up 3=down) → plane.
+fn kind_from_code(code: i32) -> Option<ExpertKind> {
+    match code {
+        1 => Some(ExpertKind::Gate),
+        2 => Some(ExpertKind::Up),
+        3 => Some(ExpertKind::Down),
+        _ => None,
+    }
+}
+
 /// Loud terminal state for FFI-adjacent contract violations (the void ABI
 /// leaves no non-silent failure path; corrupt-weight
 /// decode is worse than a dead process — documented, deliberate).
@@ -888,174 +1220,231 @@ fn guarded<R>(what: &str, body: impl FnOnce() -> R) -> R {
     }
 }
 
-/// The P1 `ensure_host_resident` trampoline. Runs on the substrate decode
-/// thread; touches only the pool's own synchronization — no substrate state,
-/// no locks ordered with C code (the concurrency test model covers it).
+/// Recovers the payload reference from the C `void *`.
+///
+/// # Safety
+/// `payload` was installed by [`enable`] as `Arc::into_raw(HookState)` and
+/// the callback runs strictly inside the registration's lifetime (the C
+/// unregister-join precedes the recovery).
+unsafe fn state_of<'a>(payload: *mut c_void) -> &'a HookState {
+    unsafe { &*(payload as *const HookState) }
+}
+
+/// The P1 `ensure_host_resident` trampoline, ABI v5 batched form: ONE call
+/// per (layer, step, split-segment) with the whole miss list across ALL
+/// planes; the pool holds a lease on each returned slot until `copy_done`.
+/// Runs on the substrate decode thread; touches only the pool's own
+/// synchronization — no substrate state, no locks ordered with C code.
 ///
 /// # Contract
-/// No input clamping: an out-of-range or inverted `[first_id, last_id]` is a
-/// contract violation → logged + `abort()`. Non-expert
-/// tensors return immediately (null-guard semantics upstream of the pool).
-pub(crate) extern "C" fn ensure_host_resident(
-    ctx: *mut c_void,
+/// A null tensor, a negative `n_miss`, or an out-of-range
+/// `(kind, id)` is a contract violation → logged + `abort()`.
+// The C ABI fixes the signature; the pointer contract is documented above
+// and enforced by the guarded body.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ensure_host_resident(
+    payload: *mut c_void,
     tensor: *const c_void,
-    first_id: i32,
-    last_id: i32,
+    miss_kinds: *const i32,
+    miss_ids: *const i32,
+    n_miss: i32,
     out_ptrs: *mut *const c_void,
 ) {
     guarded("ensure_host_resident", || {
-        ensure_host_resident_inner(ctx, tensor, first_id, last_id, out_ptrs)
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        let Some(entry) = h.entry_for(tensor) else {
+            return; // non-expert tensor: upstream behavior
+        };
+        if n_miss <= 0 {
+            return; // nothing missed this segment
+        }
+        if miss_kinds.is_null() || miss_ids.is_null() {
+            p3_fatal("P3: ensure_host_resident called with null miss list".into());
+        }
+        if out_ptrs.is_null() {
+            p3_fatal("P3: ensure_host_resident called with null out_ptrs".into());
+        }
+        let n = n_miss as usize;
+        // SAFETY: C allocates `n` entries in each array and passes them here
+        // (ggml-backend.cpp golem miss hoisting pre-pass).
+        let (kinds, ids) = unsafe {
+            (
+                std::slice::from_raw_parts(miss_kinds, n),
+                std::slice::from_raw_parts(miss_ids, n),
+            )
+        };
+        // SAFETY: C allocates `n` writable out-pointer slots (copy_experts_to
+        // plan distribution); `*const c_void` and `*const u8` share layout.
+        let out: &mut [*const u8] = unsafe { std::slice::from_raw_parts_mut(out_ptrs.cast(), n) };
+
+        let mut scratch = h.miss_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        scratch.clear();
+        for (&kind, &id) in kinds.iter().zip(ids) {
+            let Some(kind) = kind_from_code(kind) else {
+                p3_fatal(format!(
+                    "P3 miss-list contract violation: kind {kind} not in 1..=3"
+                ));
+            };
+            if id < 0 || id as u32 >= h.n_experts {
+                p3_fatal(format!(
+                    "P3 miss-list contract violation: id {id} vs n_experts {}",
+                    h.n_experts
+                ));
+            }
+            scratch.push((kind, id as u32));
+        }
+
+        // The pool IS the H2D source. Claim + page-in each unit once per
+        // compute and hand the slot's plane pointer to C; the lease stays
+        // held until `copy_done`, so eviction cannot recycle a slot mid-DMA.
+        // §11: a few `Instant::now()` per layer is the sanctioned hot-path cost.
+        // The scratch mutex stays held across the call: the decode thread is
+        // its only contender (stated invariant), so this serializes nothing.
+        let t0 = std::time::Instant::now();
+        let paged = h.pool.ensure_batch(entry.layer, &scratch, out);
+        drop(scratch);
+        h.p3_wait_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        h.ensure_calls.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = paged {
+            p3_fatal(format!(
+                "P3 page-in failed (layer {}, n_miss {n}): {e}; \
+                 aborting rather than decoding on garbage",
+                entry.layer
+            ));
+        }
+
+        // Counters visibility: one info line per 1000 slow paths (real metrics
+        // are P4's).
+        if (h.slow_calls.fetch_add(1, Ordering::Relaxed) + 1) % 1000 == 0 {
+            tracing::info!(
+                calls = h.slow_calls.load(Ordering::Relaxed),
+                demand_pageins = h.pool.stats.demand_slow_pageins.load(Ordering::Relaxed),
+                fast_hits = h.pool.stats.fast_hits.load(Ordering::Relaxed),
+                evictions = h.pool.stats.evictions.load(Ordering::Relaxed),
+                "P3 slow-path progress"
+            );
+        }
     })
 }
 
-fn ensure_host_resident_inner(
-    ctx: *mut c_void,
-    tensor: *const c_void,
-    first_id: i32,
-    last_id: i32,
-    out_ptrs: *mut *const c_void,
-) {
-    // SAFETY: ctx was installed by `enable` as a leaked `&'static PoolHandle`
-    // and is never mutated afterwards; it outlives every callback.
-    let h = unsafe { &*(ctx as *const PoolHandle) };
-    let Some(entry) = h.entry_for(tensor) else {
-        return; // non-expert tensor: upstream behavior
-    };
-    if first_id < 0 || first_id > last_id || last_id >= entry.n_experts as i32 {
-        p3_fatal(format!(
-            "P3 range contract violation: [{first_id}, {last_id}] vs n_experts {}",
-            entry.n_experts
-        ));
-    }
-    let first = first_id as u32;
-    let last = last_id as u32;
-    let n = (last - first + 1) as usize;
-    if out_ptrs.is_null() {
-        p3_fatal("P3: ensure_host_resident called with null out_ptrs".into());
-    }
-    // SAFETY: C allocates `n` entries and passes the array here
-    // (copy_experts_to); `*const c_void` and `*const u8` share layout.
-    let out: &mut [*const u8] = unsafe { std::slice::from_raw_parts_mut(out_ptrs.cast(), n) };
-
-    // The pool IS the H2D source. Claim + page-in each unit once per compute
-    // and hand the slot's plane pointer to C; the lease stays held until
-    // `copy_done`, so eviction cannot recycle a slot mid-DMA.
-    // §11: a few `Instant::now()` per layer is the sanctioned hot-path cost.
-    let t0 = std::time::Instant::now();
-    let paged = STEP_CLAIMS.with_borrow_mut(|step| {
-        step.get_or_insert_with(|| StepClaims::new(h.pool.clone()))
-            .ensure_range_leased(entry.layer, entry.kind, first, last, out)
-    });
-    h.p3_wait_ns
-        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    if let Err(e) = paged {
-        p3_fatal(format!(
-            "P3 page-in failed (layer {}, {kind:?}, experts [{first}, {last}]): {e}; \
-             aborting rather than decoding on garbage",
-            entry.layer,
-            kind = entry.kind
-        ));
-    }
-
-    // Counters visibility: one info line per 1000 slow paths (real metrics
-    // are P4's).
-    if (h.slow_calls.fetch_add(1, Ordering::Relaxed) + 1) % 1000 == 0 {
-        tracing::info!(
-            calls = h.slow_calls.load(Ordering::Relaxed),
-            demand_pageins = h.pool.stats.demand_slow_pageins.load(Ordering::Relaxed),
-            fast_hits = h.pool.stats.fast_hits.load(Ordering::Relaxed),
-            evictions = h.pool.stats.evictions.load(Ordering::Relaxed),
-            "P3 slow-path progress"
-        );
-    }
-}
-
-/// Ends the previous compute's step: releases its host-pool leases and
-/// refreshes the policy snapshot. Runs at the START of a scheduler compute,
-/// after C drained the backends, so the previous compute's DMAs are complete.
-extern "C" fn copy_done(_ctx: *mut c_void) {
+/// Ends the previous compute's step: releases the batched leases and runs
+/// the bounded non-blocking order flush. Runs at the START of a scheduler
+/// compute, after C drained the backends, so the previous compute's DMAs are
+/// complete. One call per compute — never per expert.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn copy_done(payload: *mut c_void) {
     guarded("copy_done", || {
-        STEP_CLAIMS.with_borrow_mut(|step| {
-            if let Some(step) = step {
-                step.next_step();
-            }
-        });
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        h.copy_done_calls.fetch_add(1, Ordering::Relaxed);
+        // The device consumed the step's pointers (C synchronized its
+        // backends before this hook): the slots are safe to recycle.
+        h.pool.end_batch_step();
+        // Bounded flush-if-dirty: if the publisher has not caught up (it
+        // polls at 250 µs), publish up to 8 dirty layers here. push never
+        // blocks — a full triple-buffer set leaves the layer dirty for the
+        // publisher's next pass.
+        if h.policy.dirty_any.load(Ordering::Relaxed) {
+            let mut scratch = h.flush_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            publish_dirty(h, 8, &mut scratch);
+        }
     });
 }
 
-/// §6.5 prefetch feed backed by the P2 access map: `notify_access` (P4)
-/// records per-expert recency; the prefetcher unions the last `k` steps.
-struct PolicyFeed(&'static PolicyQueryState);
+/// §6.5 prefetch feed backed by the P2 access map: the routing readback
+/// books per-expert recency; the prefetcher unions the last `k` steps.
+struct PolicyFeed(Arc<HookState>);
 
 impl AccessFeed for PolicyFeed {
     fn take_union(&self, k: usize) -> Vec<(u32, u32)> {
-        self.0.recent_union(k)
+        self.0.policy.recent_union(k)
     }
 }
 
-/// The P2 `policy_query` trampoline: returns the evict-first expert order
-/// for `tensor` as a permutation of `0..n_experts`, valid until the next
-/// call (frozen-buffer contract). First expert-tensor sight flows through
-/// the full `entry_for` validate-and-cross-check path — per copy step
-/// (verified: `ggml_backend_sched_compute_splits`, slab branch) C calls
-/// policy_query, then per-slot ensure_host_resident, then notify_access —
-/// so the first expert tensor ever seen arrives HERE, already registered
-/// before any ensure_host_resident cross-check can abort on first sight.
-extern "C" fn policy_query(ctx: *mut c_void, tensor: *const c_void, n_experts: i32) -> *const i32 {
-    guarded("policy_query", || {
-        policy_query_inner(ctx, tensor, n_experts)
+/// The v5 merged routing readback trampoline: fired ONCE per changed ids
+/// tensor per step with the densely gathered ids. Replaces the per-tensor
+/// `policy_query` + per-expert `notify_access` fan-out: score booking,
+/// access atomics and dirty-order marking happen in this single lock-free
+/// call. Keyed by `blk` (the layer number — fused gate_up layouts have no
+/// separate gate tensor; gate/up/down share ids).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn routing(
+    payload: *mut c_void,
+    blk: i32,
+    _tensor: *const c_void,
+    ids_dense: *const i32,
+    n_ids: i64,
+    n_experts: i32,
+) {
+    guarded("routing", || {
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        h.routing_calls.fetch_add(1, Ordering::Relaxed);
+        if n_experts != h.n_experts as i32 {
+            p3_fatal(format!(
+                "P2: routing n_experts {n_experts} vs pool geometry {}",
+                h.n_experts
+            ));
+        }
+        if blk < h.dense_lead as i32 || blk >= (h.dense_lead + h.n_layers) as i32 {
+            p3_fatal(format!(
+                "P2: routing blk {blk} outside the expert blk range [{}, {})",
+                h.dense_lead,
+                h.dense_lead + h.n_layers
+            ));
+        }
+        if ids_dense.is_null() || n_ids <= 0 {
+            return; // nothing routed (defensive; C reads the ids first)
+        }
+        let layer = (blk - h.dense_lead as i32) as usize;
+        // SAFETY: C passes `n_ids` gathered ids it read this step.
+        let ids = unsafe { std::slice::from_raw_parts(ids_dense, n_ids as usize) };
+        h.policy.book_routed(layer, ids);
+        h.policy.mark_dirty(layer);
+        if let Some(trace) = &h.trace {
+            let mut t = trace.lock().unwrap_or_else(|e| e.into_inner());
+            t.record(
+                h.policy.step.load(Ordering::Relaxed),
+                !h.policy.scoring.load(Ordering::Relaxed),
+                blk,
+                ids,
+            );
+        }
     })
 }
 
-fn policy_query_inner(ctx: *mut c_void, tensor: *const c_void, n_experts: i32) -> *const i32 {
-    // SAFETY: ctx was installed by `enable` as a leaked `&'static PoolHandle`
-    // and is never mutated afterwards; it outlives every callback.
-    let h = unsafe { &*(ctx as *const PoolHandle) };
-    let Some(entry) = h.entry_for(tensor) else {
-        // Defensive: C queries only expert tensors; anything else gets a
-        // legal identity permutation (invariant 4: any permutation is valid).
-        return h.policy.publish_order(None);
-    };
-    if n_experts != entry.n_experts as i32 {
-        p3_fatal(format!(
-            "P2: policy_query n_experts {n_experts} vs registered {} for layer {}",
-            entry.n_experts, entry.layer
-        ));
-    }
-    h.policy.last_queried.store(entry.layer, Ordering::Relaxed);
-    h.policy.publish_order(Some(entry.layer))
-}
-
-/// The P4 `notify_access` trampoline: one routed expert of the tensor most
-/// recently passed to [`policy_query`] — call-site adjacency guarantees the
-/// attribution for the single decode thread (see [`PolicyQueryState`]).
-extern "C" fn notify_access(ctx: *mut c_void, expert_id: i64) {
-    // SAFETY: see policy_query.
-    let h = unsafe { &*(ctx as *const PoolHandle) };
-    guarded("notify_access", || h.policy.note_access(expert_id));
-}
-
-impl PoolHandle {
+impl HookState {
     /// Registered entry for `tensor`, registering it on first sight.
     ///
-    /// First sight = the first callback for this tensor: `policy_query`
-    /// when P2 is active (it precedes `ensure_host_resident` in
-    /// `ggml_backend_sched_compute_splits`), else `ensure_host_resident`.
-    /// Either way the callback runs while the loader-populated weights
-    /// buffer is still pristine — exactly the window the load-time
-    /// cross-checks need.
+    /// First sight = the first ensure callback for this tensor, which runs
+    /// while the loader-populated weights buffer is still pristine — exactly
+    /// the window the load-time cross-checks need.
     fn entry_for(&self, tensor: *const c_void) -> Option<TensorEntry> {
         if tensor.is_null() {
             return None;
         }
         let key = tensor as usize;
-        if let Some((k, entry)) = LAST_ENTRY.get()
-            && k == key
         {
-            return Some(entry);
+            let last = self.last_entry.lock().unwrap_or_else(|e| e.into_inner());
+            // The generation tag rejects a recycled address left over from a
+            // previous session's registration.
+            if let Some((k, tag, entry)) = last.as_ref()
+                && *k == key
+                && *tag == self.generation
+            {
+                return Some(*entry);
+            }
         }
-        if let Some(&entry) = self.tensors.lock().unwrap().get(&key) {
-            LAST_ENTRY.set(Some((key, entry)));
+        if let Some(&entry) = self
+            .tensors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            *self.last_entry.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((key, self.generation, entry));
             return Some(entry);
         }
         // First sight: identify, cross-check, register.
@@ -1142,13 +1531,13 @@ impl PoolHandle {
             ));
         }
 
-        let entry = TensorEntry {
-            layer,
-            kind,
-            n_experts: n_experts as u32,
-        };
-        self.tensors.lock().unwrap().insert(key, entry);
-        LAST_ENTRY.set(Some((key, entry)));
+        let entry = TensorEntry { layer };
+        self.tensors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, entry);
+        *self.last_entry.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((key, self.generation, entry));
         tracing::debug!(tensor = %name, layer, ?kind, stride, "P3 tensor registered");
         Some(entry)
     }
@@ -1215,14 +1604,6 @@ mod tests {
         let mut order = vec![0; keys.len()];
         build_order(keys, &mut order);
         order
-    }
-
-    impl PolicyQueryState {
-        fn order_for_test(&self, layer: u32) -> Vec<i32> {
-            let p = self.publish_order(Some(layer));
-            // SAFETY: the published buffer holds n_experts entries until the next publish.
-            unsafe { std::slice::from_raw_parts(p, self.n_experts as usize) }.to_vec()
-        }
     }
 
     #[test]
@@ -1319,54 +1700,61 @@ mod tests {
     }
 
     #[test]
-    fn policy_order_and_access_are_shared_by_the_layers_three_tensors() {
-        let p = PolicyQueryState::new(2, 4);
+    fn routing_books_recency_for_whole_layer_and_marks_dirty() {
+        let p = PolicyState::new(2, 4);
         p.step.store(5, Ordering::Relaxed); // recent_union keeps steps > step − k
-        p.last_queried.store(1, Ordering::Relaxed); // last query: layer 1 (any kind)
-        p.note_access(2);
+        p.book_routed(1, &[2, 2, 7, -1]); // duplicates idempotent; out-of-range rejected
+        p.mark_dirty(1); // the trampoline does this right after booking
         assert_eq!(
-            p.order_for_test(1),
-            vec![0, 1, 3, 2],
-            "expert 2 accessed → evicted last"
+            p.recent_union(3),
+            vec![(1, 2)],
+            "expert 2 of layer 1 booked; 7 and −1 rejected"
         );
-        assert_eq!(p.recent_union(3), vec![(1, 2)]);
+        assert!(p.dirty[1].load(Ordering::Relaxed) && p.dirty_any.load(Ordering::Relaxed));
+        assert!(!p.dirty[0].load(Ordering::Relaxed), "other layer untouched");
+        // Scoring off (prefill, §6.2): books nothing (layer 0's row stays
+        // untouched; layer 1's earlier stamp is from the scored leg above).
+        p.scoring.store(false, Ordering::Relaxed);
+        p.step.store(9, Ordering::Relaxed);
+        p.book_routed(0, &[0, 1, 2, 3]);
+        assert!(
+            (0..4).all(|i| p.access_step(i).is_none()),
+            "prefill readbacks must not stamp recency (§6.2)"
+        );
     }
 
     #[test]
-    fn blk_prefix_parses_ggml_and_gguf_names() {
-        assert_eq!(blk_of("blk.1.ffn_gate_exps"), Some(1));
-        assert_eq!(blk_of("blk.12.ffn_up_exps.weight"), Some(12));
-        assert_eq!(blk_of("output.weight"), None);
-        assert_eq!(blk_of("blk.x.ffn_gate_exps"), None);
+    fn out_of_range_id_never_spills_into_the_next_layer() {
+        // id == n_experts would have passed a loose bounds guard and booked
+        // layer 1's row 0.
+        let p = PolicyState::new(2, 4);
+        p.step.store(3, Ordering::Relaxed);
+        p.book_routed(0, &[4, -1, 100]);
+        assert!(
+            (0..8).all(|i| p.access_step(i).is_none()),
+            "out-of-range ids are rejected, not wrapped into the next layer"
+        );
+        p.book_routed(0, &[3]);
+        assert_eq!(p.access_step(3), Some(3), "max valid id still books");
     }
 
     #[test]
-    fn order_built_once_per_layer_per_step_and_content_is_correct() {
-        let pq = PolicyQueryState::new(2, 6);
-        // distinct access patterns per layer so the orders differ
-        pq.last_queried.store(0, Ordering::Relaxed);
-        pq.note_access(3);
-        let o0_a = pq.order_for_test(0);
-        pq.last_queried.store(1, Ordering::Relaxed);
-        pq.note_access(5);
-        let o1 = pq.order_for_test(1); // interleaved layer, same step
-        let o0_b = pq.order_for_test(0); // cache hit for layer 0, same step
+    fn order_built_once_per_call_and_content_is_correct() {
+        let p = PolicyState::new(2, 6);
+        p.step.store(7, Ordering::Relaxed);
+        p.book_routed(0, &[3]);
+        p.step.store(9, Ordering::Relaxed);
+        p.book_routed(1, &[5]);
+        let mut order = vec![0i32; 6];
+        p.build_order(0, &mut order);
         assert_eq!(
-            o0_a, o0_b,
-            "cache hit must return layer 0's order, not the last-built buffer"
+            order,
+            vec![0, 1, 2, 4, 5, 3],
+            "expert 3 accessed → evicted last"
         );
-        assert_ne!(o0_a, o1);
-        assert_eq!(pq.order_builds(), 2, "one build per (layer, step)");
-        // None (identity) must invalidate/never poison the layer cache
-        let _ = pq.publish_order(None);
-        let o0_c = pq.order_for_test(0);
-        assert_eq!(
-            o0_a, o0_c,
-            "identity publish must not corrupt the layer-0 cache"
-        );
-        pq.step.fetch_add(1, Ordering::Relaxed);
-        let _ = pq.order_for_test(0);
-        assert_eq!(pq.order_builds(), 3, "new step must rebuild");
+        p.build_order(1, &mut order);
+        assert_eq!(*order.last().unwrap(), 5);
+        assert!(is_permutation(&order, 6));
     }
 
     #[test]
@@ -1381,19 +1769,16 @@ mod tests {
     }
 
     #[test]
-    fn published_order_is_identity_for_non_expert_and_a_permutation_otherwise() {
-        let pq = PolicyQueryState::new(2, 6);
-        let id = pq.publish_order(None);
-        // SAFETY: the published buffer holds n_experts entries until the next publish.
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts(id, 6) },
-            &[0, 1, 2, 3, 4, 5]
-        );
-        pq.last_queried.store(1, Ordering::Relaxed);
-        pq.note_access(4);
-        let o = pq.order_for_test(1);
-        assert!(is_permutation(&o, 6));
-        assert_eq!(*o.last().unwrap(), 4);
+    fn published_order_is_identity_for_fresh_experts_and_a_permutation_otherwise() {
+        let p = PolicyState::new(1, 6);
+        let mut order = vec![0i32; 6];
+        p.build_order(0, &mut order);
+        assert_eq!(order, vec![0, 1, 2, 3, 4, 5], "no accesses → identity");
+        p.step.store(4, Ordering::Relaxed);
+        p.book_routed(0, &[4]);
+        p.build_order(0, &mut order);
+        assert!(is_permutation(&order, 6));
+        assert_eq!(*order.last().unwrap(), 4);
     }
 
     #[test]
@@ -1406,73 +1791,14 @@ mod tests {
     }
 
     #[test]
-    fn notify_books_recency_at_the_current_decode_step() {
-        let pq = PolicyQueryState::new(2, 4);
-        // Notify before any query: defensive ignore.
-        pq.note_access(0);
-        assert!((0..8).all(|i| pq.access_step(i).is_none()));
-
-        assert_eq!(pq.order_for_test(0), vec![0, 1, 2, 3]);
-        pq.last_queried.store(0, Ordering::Relaxed);
-        pq.step.store(7, Ordering::Relaxed);
-        for id in 0..4 {
-            pq.note_access(id);
-        }
-        assert_eq!(
-            pq.step.load(Ordering::Relaxed),
-            7,
-            "notify never moves the step — Session's decode paths own it"
-        );
-        assert!((0..4).all(|i| pq.access_step(i) == Some(7)));
-
-        // A later step's notify rewrites recency and feeds the prefetcher.
-        pq.step.store(9, Ordering::Relaxed);
-        pq.note_access(2);
-        assert_eq!(pq.access_step(2), Some(9));
-        assert_eq!(
-            pq.recent_union(1),
-            vec![(0, 2)],
-            "only the newest step is in the last-1 union"
-        );
+    fn recent_union_bounds_and_cutoff() {
+        let p = PolicyState::new(1, 4);
+        p.step.store(9, Ordering::Relaxed);
+        p.book_routed(0, &[2]);
+        assert_eq!(p.recent_union(1), vec![(0, 2)]);
         assert!(
-            pq.recent_union(0).is_empty(),
+            p.recent_union(0).is_empty(),
             "k = 0 excludes everything (cutoff = current step)"
         );
-    }
-
-    #[test]
-    fn prefill_routed_experts_are_not_booked_as_recent() {
-        let pq = PolicyQueryState::new(2, 4);
-        pq.last_queried.store(0, Ordering::Relaxed);
-        pq.step.store(5, Ordering::Relaxed);
-        pq.scoring.store(false, Ordering::Relaxed);
-        for id in 0..4 {
-            pq.note_access(id);
-        }
-        assert!(
-            (0..8).all(|i| pq.access_step(i).is_none()),
-            "prefill accesses must not stamp recency (§6.2)"
-        );
-        pq.scoring.store(true, Ordering::Relaxed);
-        pq.note_access(1);
-        assert_eq!(pq.access_step(1), Some(5));
-    }
-
-    #[test]
-    fn out_of_range_id_never_spills_into_the_next_layer() {
-        let pq = PolicyQueryState::new(2, 4);
-        pq.last_queried.store(0, Ordering::Relaxed);
-        pq.step.store(3, Ordering::Relaxed);
-        // id == n_experts would have passed the old idx < map.len() guard and
-        // booked layer 1's row 0.
-        pq.note_access(4);
-        pq.note_access(-1);
-        pq.note_access(100);
-        assert!(
-            (0..8).all(|i| pq.access_step(i).is_none()),
-            "out-of-range ids are rejected, not wrapped into the next layer"
-        );
-        pq.note_access(3);
-        assert_eq!(pq.access_step(3), Some(3), "max valid id still books");
     }
 }

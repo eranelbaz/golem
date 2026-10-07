@@ -18,4 +18,17 @@ fn hooks_header_resolves_from_vendor_tree() {
         text.contains("golem_register_hooks"),
         "hook registration missing"
     );
+    assert!(
+        text.contains("#define GOLEM_HOOKS_ABI_VERSION 5"),
+        "hook ABI must be v5 (per-model golem_ctx)"
+    );
+    for sym in [
+        "golem_ctx_create",
+        "golem_ctx_free",
+        "golem_routing_fn",
+        "golem_policy_order_push",
+        "llama_golem_model_attach",
+    ] {
+        assert!(text.contains(sym), "v5 surface missing: {sym}");
+    }
 }

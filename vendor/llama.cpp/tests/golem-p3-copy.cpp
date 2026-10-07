@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "golem-p3-copy.h"
+#include "golem-hook-context.hpp"
+#include "golem-test-sched.hpp"
 
 namespace {
 
@@ -99,6 +101,66 @@ int main() {
         REQUIRE((unsigned char) dst[expert_size] == 0x5a,
                 "padding tail must hold the last expert's own bytes");
         munmap(map, body + page);
+    }
+
+    // --- plan Task 2: ONE ensure_host_resident call per (layer, step) with
+    // all planes' misses; per-plane pointers distributed to the right copies. ---
+    {
+        using namespace golem_test;
+        pool_init();
+        HState s;
+        golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
+        golem_set_device_cache_experts(c, 2);
+        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, &s);
+        (void) h;
+        {
+            ExpertSched es;
+            es.build(3); // gate + up + down, one blk, one ids tensor
+            golem_sched_set_ctx(es.sched, c);
+            fprintf(stderr, "DBG n_splits=%d\n", ggml_backend_sched_get_n_splits(es.sched));
+            ggml_backend_sched_graph_compute(es.sched, es.gf);
+            // upstream gives each CPU-weighted MUL_MAT_ID its own split, so a
+            // 3-plane layer spans 3 segments — one ensure per (layer, step,
+            // segment), each carrying that segment's planes' misses
+            T_REQUIRE(s.ensure_calls.load() == 3, "one ensure per segment, got %d",
+                      s.ensure_calls.load());
+            T_REQUIRE(s.all_kinds.size() == 6, "all planes' misses, got %zu entries",
+                      s.miss_kinds.size());
+            // per segment: both experts of that segment's plane (first step)
+            T_REQUIRE(s.all_kinds[0] == 1 && s.all_kinds[1] == 1 && s.all_kinds[2] == 2 &&
+                          s.all_kinds[3] == 2 && s.all_kinds[4] == 3 && s.all_kinds[5] == 3,
+                      "kinds must be per-segment planes in segment order");
+            fprintf(stderr, "DBG all_ids sz=%zu: %d %d %d %d %d %d\n", s.all_ids.size(),
+                    s.all_ids.size() > 0 ? s.all_ids[0] : -9, s.all_ids.size() > 1 ? s.all_ids[1] : -9,
+                    s.all_ids.size() > 2 ? s.all_ids[2] : -9, s.all_ids.size() > 3 ? s.all_ids[3] : -9,
+                    s.all_ids.size() > 4 ? s.all_ids[4] : -9, s.all_ids.size() > 5 ? s.all_ids[5] : -9);
+            T_REQUIRE(s.all_ids.size() == 6 && s.all_ids[0] == 0 && s.all_ids[1] == 1 &&
+                          s.all_ids[4] == 0 && s.all_ids[5] == 1,
+                      "each plane misses its own set (both experts, first step)");
+            // the ids tensor is shared: ONE routing readback per step, even
+            // across the 3 segments
+            T_REQUIRE(s.routing_calls.load() == 1, "routing fires once per changed ids tensor, got %d",
+                      s.routing_calls.load());
+            T_REQUIRE(s.copy_done_calls.load() >= 1, "copy_done must fire after the copies");
+
+            const int before = s.ensure_calls.load();
+            // step 2 on the same weights: experts 0,1 are bit-valid in the
+            // slab — no ensure at all (one-shot P3), routing still fires
+            ggml_backend_sched_graph_compute(es.sched, es.gf);
+            T_REQUIRE(s.ensure_calls.load() == before,
+                      "bit-valid experts must not re-ensure");
+            T_REQUIRE(s.routing_calls.load() == 2, "routing once per step, got %d", s.routing_calls.load());
+            // llama re-reserve builds a FRESH sched and re-applies the model's
+            // ctx: the next step must still route through it.
+            ExpertSched es2;
+            es2.build(3);
+            golem_sched_set_ctx(es2.sched, c);
+            ggml_backend_sched_graph_compute(es2.sched, es2.gf);
+            T_REQUIRE(s.routing_calls.load() == 3, "re-reserved sched routes through the ctx");
+        }
+        golem_unregister_hooks(h);
+        golem_reset_device_cache(c);
+        golem_ctx_free(c);
     }
 
     if (g_failures != 0) {

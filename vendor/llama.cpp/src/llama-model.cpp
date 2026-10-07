@@ -3351,3 +3351,13 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+// --- Golem per-model hook context seam (ABI v5). Null-guarded; the engine
+// attaches BEFORE llama_init_from_model so the self-check decode already
+// runs with hooks. ---
+void llama_golem_model_attach(struct llama_model * model, golem_ctx_t ctx) {
+    if (model == NULL) {
+        return;
+    }
+    model->golem_ctx = ctx;
+}
