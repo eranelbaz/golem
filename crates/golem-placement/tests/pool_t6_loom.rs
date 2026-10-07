@@ -264,3 +264,37 @@ fn t6_ensure_batch_interleaves_with_range_claims() {
         step.next_step();
     });
 }
+
+/// Demand and prefetch race for the same unit (P17 + §6.5 counters): at most
+/// one fill happens, the demand copy never reads torn bytes, and the
+/// prefetch counts a hit exactly when its fill served the demand claim. A
+/// prefetch that finds the only slot mid-fill under the demand claim skips
+/// with `Busy` (it never waits or retries).
+#[test]
+fn t6_demand_and_prefetch_same_key_one_fill_hit_iff_prefetch_filled() {
+    primitives::model(|| {
+        let pool = loom_pool();
+        let copies = counter();
+        let p2 = pool.clone();
+        let prefetch = primitives::spawn(move || match p2.ensure_unit(false, 0, 0) {
+            Ok(()) | Err(PoolError::Busy) => {}
+            Err(e) => panic!("unexpected pool error: {e}"),
+        });
+        ensure_counted(&pool, 0, &copies, ExpertKind::Gate);
+        prefetch.join().unwrap();
+        assert_eq!(copies.load(Ordering::Relaxed), 1, "the demand copy ran");
+        let s = &pool.stats;
+        let (demand, pre) = (
+            s.demand_slow_pageins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            s.prefetch_pageins
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert_eq!(demand + pre, 1, "one fill per unit");
+        assert_eq!(
+            s.prefetch_hits.load(std::sync::atomic::Ordering::Relaxed),
+            pre,
+            "a prefetch fill is always claimed by the demand that follows it"
+        );
+    });
+}

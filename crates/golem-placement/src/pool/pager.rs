@@ -569,9 +569,12 @@ impl ExpertPool {
         expert: u32,
         snapshot: &PolicySnapshot,
     ) -> Result<Lease, PoolError> {
-        let slot = match self.residency.claim(layer, expert, snapshot) {
-            Ok(Claim::Resident { slot }) => {
+        let slot = match self.residency.claim_for(layer, expert, snapshot, demand) {
+            Ok(Claim::Resident { slot, prefetch_hit }) => {
                 self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+                if prefetch_hit {
+                    self.stats.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                }
                 slot
             }
             Ok(Claim::Filled { slot, claim }) => {
@@ -582,6 +585,12 @@ impl ExpertPool {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                 let slot = evicted.slot;
                 debug_assert_eq!(slot, evicted.victim.slot);
+                if evicted.victim.prefetched {
+                    let unit = &self.geometry.layers[evicted.victim.layer as usize];
+                    self.stats
+                        .prefetch_wasted_bytes
+                        .fetch_add(unit.bytes(), Ordering::Relaxed);
+                }
                 self.page_in(demand, layer, expert, evicted.claim)?;
                 slot
             }
@@ -679,7 +688,8 @@ impl ExpertPool {
             "lease_for_test on a non-resident unit"
         );
         let snapshot = PolicySnapshot::empty();
-        let Ok(Claim::Resident { slot }) = self.residency.claim(layer, expert, &snapshot) else {
+        let Ok(Claim::Resident { slot, .. }) = self.residency.claim(layer, expert, &snapshot)
+        else {
             panic!("lease_for_test: resident unit was not claimed as Resident");
         };
         Lease {
