@@ -57,6 +57,37 @@ pub struct EngineConfig {
     /// `# golem-routing-trace v1` header; `None` (the default) traces
     /// nothing — the trampoline's only cost is one `Option` check.
     pub routing_trace: Option<PathBuf>,
+    /// P2 evict-first order (§6.2). The policy replay
+    /// (`docs/baselines/m3.7-policy-replay.md`) puts the decayed score
+    /// ahead of recency on real traces.
+    pub vram_order: VramOrder,
+    /// §6.5 next-layer prediction (P5): `Off` (the default) builds no
+    /// prediction nodes and runs no prefetch thread.
+    pub prefetch: PrefetchMode,
+    /// Layers ahead each MoE layer predicts (1 = the next layer only).
+    pub prefetch_lookahead: u32,
+}
+
+/// What a P5 next-layer prediction drives (§6.5, `--prefetch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrefetchMode {
+    /// No prediction.
+    #[default]
+    Off,
+    /// Predicted experts are shielded from RAM-pool eviction; no extra I/O.
+    Protect,
+    /// Predicted experts missing from the pool are read at prefetch priority.
+    Read,
+}
+
+/// How the P2 slab picks its victim among a layer's non-routed slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VramOrder {
+    /// Least recently routed first.
+    Recency,
+    /// Lowest §6.2 decayed score first.
+    #[default]
+    Score,
 }
 
 impl Default for EngineConfig {
@@ -78,6 +109,9 @@ impl Default for EngineConfig {
             manifest_path: None,
             timing_csv: None,
             routing_trace: None,
+            vram_order: VramOrder::default(),
+            prefetch: PrefetchMode::default(),
+            prefetch_lookahead: 1,
         }
     }
 }

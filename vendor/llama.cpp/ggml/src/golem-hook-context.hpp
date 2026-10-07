@@ -50,6 +50,10 @@ struct golem_ctx {
     golem_routing_fn routing = nullptr;
     golem_copy_done_fn copy_done = nullptr;
     void *payload = nullptr;
+    // P5 next-layer prediction (golem_set_predict; 0 = off)
+    golem_predict_fn predict = nullptr;
+    std::atomic<int32_t> pred_lookahead{0};
+    std::atomic<int32_t> pred_margin{0};
     std::atomic<bool> hooked{false};
 
     // in-flight whole-step depth (join point for unregister) + the reader

@@ -19,8 +19,8 @@ fn hooks_header_resolves_from_vendor_tree() {
         "hook registration missing"
     );
     assert!(
-        text.contains("#define GOLEM_HOOKS_ABI_VERSION 5"),
-        "hook ABI must be v5 (per-model golem_ctx)"
+        text.contains("#define GOLEM_HOOKS_ABI_VERSION 6"),
+        "hook ABI must be v6 (per-model golem_ctx + P5 predict)"
     );
     for sym in [
         "golem_ctx_create",

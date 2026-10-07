@@ -29,6 +29,7 @@
 #![allow(unsafe_code)]
 
 use golem_placement::pool::SlotClass;
+use golem_placement::{HALF_LIFE_STEPS, decay_factor};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 #[cfg(test)]
@@ -41,12 +42,12 @@ use golem_gguf::blk_of;
 use golem_llama_sys::raw;
 use golem_llama_sys::{CtxRaw, GolemCtx, HookFns, Hooked};
 use golem_placement::pool::{
-    AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PREFETCH_K,
-    PolicySnapshot, PrefetchHandle, SnapshotHandle, StoreExpertSource, spawn_prefetch,
+    AccessFeed, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats, PolicySnapshot,
+    PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource, spawn_prefetch,
 };
 use golem_store::ChunkQueue;
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, PrefetchMode, VramOrder};
 use crate::error::EngineError;
 
 /// One traced routing readback: fixed fields plus a range into the ring's
@@ -76,6 +77,15 @@ struct TraceRing {
     rec_cap: usize,
     id_cap: usize,
     dropped: usize,
+}
+
+/// Routing-trace ring capacities for one turn: every prompt and generated
+/// token routes `top_k` ids on each of the `n_layers` MoE layers, one record
+/// per (chunk or step, layer); a turn's tokens are bounded by `n_ctx +
+/// n_predict`. GLM at ctx 4096 + 512: 193k records, 1.5M ids ≈ 6 MiB.
+fn trace_caps(n_ctx: u32, n_predict: u32, n_layers: u32, top_k: u32) -> (usize, usize) {
+    let recs = (n_ctx as usize + n_predict as usize) * n_layers as usize;
+    (recs, recs * top_k as usize)
 }
 
 impl TraceRing {
@@ -251,23 +261,172 @@ struct HookState {
     miss_scratch: Mutex<Vec<(ExpertKind, u32)>>,
     /// Scratch the `copy_done` flush sorts into, preallocated at enable
     /// (decode-thread-only writer; mutex for `&self`).
-    flush_scratch: Mutex<Vec<i32>>,
+    flush_scratch: Mutex<OrderScratch>,
     /// §6.2 recency + §6.6 dirty tracking (shared with the publisher).
     policy: PolicyState,
     /// §11-style routing-trace ring when `config.routing_trace` is set; the
     /// routing readback appends (preallocated, no per-id heap), turn end
     /// flushes. `None` costs the trampoline one `Option` check.
     trace: Option<Mutex<TraceRing>>,
+    /// §6.5 P5 prediction state (mode `Off`: never touched).
+    pred: PredState,
 }
 
-/// §6.2 policy state: per-expert last-access steps feeding the evict-first
-/// order, the decode-step counter, and the per-layer dirty flags consumed by
-/// the order publisher.
+/// Experts predicted beyond the routed top-k (§6.5): 8 + 4 = 12 per layer.
+/// `read` reads at most 4 × 15.2 MB ≈ 61 MB more per layer than a perfect
+/// predictor; the predictor itself is one 4,096 × 288 GEMV per predicted
+/// layer (≈1.2 M MACs), negligible next to the expert matmuls.
+const PREDICT_MARGIN: u32 = 4;
+
+/// §6.5 P5 next-layer predictions: per target layer, the union of the
+/// predictions made since its last routing readback (one bitset row per
+/// layer), the accuracy counters, and the `read` mode's queue. Written only
+/// on the decode thread (predict and routing trampolines).
+struct PredState {
+    mode: PrefetchMode,
+    bits: Vec<AtomicU64>,
+    pending: Vec<AtomicBool>,
+    words: usize,
+    /// Decode-step routed ids of layers that had a prediction, and how
+    /// many of them it named.
+    routed: AtomicU64,
+    hits: AtomicU64,
+    queue: Option<Arc<PredictionQueue>>,
+}
+
+impl PredState {
+    fn new(mode: PrefetchMode, n_layers: u32, n_experts: u32, queue_cap: usize) -> Self {
+        let words = (n_experts as usize).div_ceil(64);
+        let rows = if mode == PrefetchMode::Off {
+            0
+        } else {
+            n_layers as usize
+        };
+        Self {
+            mode,
+            bits: (0..rows * words).map(|_| AtomicU64::new(0)).collect(),
+            pending: (0..rows).map(|_| AtomicBool::new(false)).collect(),
+            words,
+            routed: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            queue: (mode == PrefetchMode::Read).then(|| Arc::new(PredictionQueue::new(queue_cap))),
+        }
+    }
+
+    /// Adds one prediction for `layer` to its pending union; the returned
+    /// iterator (must be driven) sets the bits and yields the ids not
+    /// already predicted, so lookahead > 1 never queues an id twice.
+    fn add<'a>(
+        &'a self,
+        layer: usize,
+        ids: &'a [i32],
+        n_experts: u32,
+    ) -> impl Iterator<Item = u32> + 'a {
+        let row = &self.bits[layer * self.words..][..self.words];
+        if !self.pending[layer].swap(true, Ordering::Relaxed) {
+            row.iter().for_each(|w| w.store(0, Ordering::Relaxed));
+        }
+        ids.iter()
+            .filter(move |&&id| id >= 0 && (id as u32) < n_experts)
+            .filter(move |&&id| {
+                let bit = 1u64 << (id % 64);
+                row[id as usize / 64].fetch_or(bit, Ordering::Relaxed) & bit == 0
+            })
+            .map(|&id| id as u32)
+    }
+
+    /// The pending union of `layer` as expert ids.
+    fn predicted(&self, layer: usize) -> impl Iterator<Item = u32> + '_ {
+        let row = &self.bits[layer * self.words..][..self.words];
+        row.iter().enumerate().flat_map(|(w, word)| {
+            let v = word.load(Ordering::Relaxed);
+            (0..64u32)
+                .filter(move |b| v >> b & 1 == 1)
+                .map(move |b| w as u32 * 64 + b)
+        })
+    }
+
+    /// Books `layer`'s routed ids against its pending prediction, then
+    /// retires the prediction. Returns whether one was pending.
+    fn score(&self, layer: usize, ids: &[i32]) -> bool {
+        if self
+            .pending
+            .get(layer)
+            .is_none_or(|p| !p.swap(false, Ordering::Relaxed))
+        {
+            return false;
+        }
+        let row = &self.bits[layer * self.words..][..self.words];
+        let hits = ids
+            .iter()
+            .filter(|&&id| {
+                id >= 0
+                    && row
+                        .get(id as usize / 64)
+                        .is_some_and(|w| w.load(Ordering::Relaxed) >> (id % 64) & 1 == 1)
+            })
+            .count();
+        self.routed.fetch_add(ids.len() as u64, Ordering::Relaxed);
+        self.hits.fetch_add(hits as u64, Ordering::Relaxed);
+        true
+    }
+}
+
+/// §6.5 prefetch counters for one session (`Session::prefetch_stats`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefetchStats {
+    /// Configured mode.
+    pub mode: PrefetchMode,
+    /// Routed ids of decode steps whose layer had a prediction.
+    pub predicted_routed: u64,
+    /// Of those, ids the prediction named (prediction recall).
+    pub predicted_hits: u64,
+    /// Units the prefetcher paged in.
+    pub prefetch_pageins: u64,
+    /// Prefetched units claimed on demand before eviction.
+    pub prefetch_hits: u64,
+    /// Bytes of prefetched units evicted unused.
+    pub prefetch_wasted_bytes: u64,
+}
+
+impl std::fmt::Display for PrefetchStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pct = |n: u64, d: u64| {
+            if d == 0 {
+                0.0
+            } else {
+                100.0 * n as f64 / d as f64
+            }
+        };
+        write!(
+            f,
+            "prefetch mode={:?} prediction_recall={:.1}% ({}/{}) prefetch_pageins={} \
+             prefetch_hit_rate={:.1}% prefetch_wasted_bytes={}",
+            self.mode,
+            pct(self.predicted_hits, self.predicted_routed),
+            self.predicted_hits,
+            self.predicted_routed,
+            self.prefetch_pageins,
+            pct(self.prefetch_hits, self.prefetch_pageins),
+            self.prefetch_wasted_bytes
+        )
+    }
+}
+
+/// §6.2 policy state: per-expert last-access steps and decayed scores
+/// feeding the evict-first order, the decode-step counter, and the per-layer
+/// dirty flags consumed by the order publisher.
 struct PolicyState {
     /// Flat `layer × n_experts` last-access step + 1; 0 = never accessed.
     /// Atomics: the routing readback books one routed id per element on the
     /// decode hot path, which takes no lock.
     last_access: Vec<AtomicU64>,
+    /// Flat §6.2 score as of the key's last booking, packed with that step
+    /// in one word (`f32 bits << 32 | step + 1`, 0 = never) so the
+    /// publisher never pairs a score with another step's age. The decode
+    /// thread is the only writer. GLM: 12,096 keys × 8 B ≈ 97 KB.
+    score: Vec<AtomicU64>,
+    vram_order: VramOrder,
     /// Decode-step counter: one post-prefill trunk `llama_decode` = one step
     /// (§6.2: prefill chunks are excluded from scoring), bumped by
     /// [`advance_decode_step`] from `Session`'s generation decode.
@@ -286,11 +445,12 @@ struct PolicyState {
 }
 
 impl PolicyState {
-    fn new(n_layers: u32, n_experts: u32) -> Self {
+    fn new(n_layers: u32, n_experts: u32, vram_order: VramOrder) -> Self {
+        let keys = n_layers as usize * n_experts as usize;
         Self {
-            last_access: (0..n_layers as usize * n_experts as usize)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            last_access: (0..keys).map(|_| AtomicU64::new(0)).collect(),
+            score: (0..keys).map(|_| AtomicU64::new(0)).collect(),
+            vram_order,
             step: AtomicU64::new(0),
             scoring: AtomicBool::new(true),
             dirty: (0..n_layers as usize)
@@ -303,21 +463,40 @@ impl PolicyState {
     }
 
     /// Books one step's routed ids of `layer` (the dense ids readback):
-    /// every routed expert's recency moves to `step + 1`. Out-of-range and
-    /// negative ids are rejected (never wrapped into the next layer's row).
-    /// Lock-free: one relaxed store per routed id.
+    /// every routed expert's recency moves to `step + 1` and its score to
+    /// `decayed + 1`. Out-of-range and negative ids are rejected (never
+    /// wrapped into the next layer's row). Lock-free: relaxed loads/stores
+    /// per routed id; repeated ids in one readback book once per step.
     fn book_routed(&self, layer: usize, ids: &[i32]) {
         if !self.scoring.load(Ordering::Relaxed) {
             return;
         }
         let step = self.step.load(Ordering::Relaxed);
         let n = self.n_experts;
-        let row = &self.last_access[layer * n..][..n];
+        let base = layer * n;
         for &id in ids {
-            if id >= 0 && (id as usize) < n {
-                row[id as usize].store(step + 1, Ordering::Relaxed);
+            if id < 0 || id as usize >= n {
+                continue;
             }
+            let i = base + id as usize;
+            if self.last_access[i].load(Ordering::Relaxed) == step + 1 {
+                continue;
+            }
+            let s = (self.decayed(i, step) + 1.0) as f32;
+            let word = u64::from(s.to_bits()) << 32 | (step + 1) & u64::from(u32::MAX);
+            self.score[i].store(word, Ordering::Relaxed);
+            self.last_access[i].store(step + 1, Ordering::Relaxed);
         }
+    }
+
+    /// §6.2 score of flat key `i` decayed to `step` (0 when never booked).
+    fn decayed(&self, i: usize, step: u64) -> f64 {
+        let word = self.score[i].load(Ordering::Relaxed);
+        let Some(last) = (word & u64::from(u32::MAX)).checked_sub(1) else {
+            return 0.0;
+        };
+        let age = (step & u64::from(u32::MAX)).saturating_sub(last);
+        f64::from(f32::from_bits((word >> 32) as u32)) * decay_factor(age, HALF_LIFE_STEPS)
     }
 
     /// Marks `layer`'s order dirty for the publisher.
@@ -327,38 +506,37 @@ impl PolicyState {
     }
 
     /// Last-access step of flat index `idx`; `None` = never accessed.
+    #[cfg(test)]
     fn access_step(&self, idx: usize) -> Option<u64> {
         self.last_access[idx].load(Ordering::Relaxed).checked_sub(1)
     }
 
-    /// §6.5 prefetch feed: union of accessed `(layer, expert)` units from
-    /// the last `k` steps. Layer-major, expert-ascending order.
-    fn recent_union(&self, k: usize) -> Vec<(u32, u32)> {
-        let cutoff = self.step.load(Ordering::Relaxed).saturating_sub(k as u64);
+    /// Builds the evict-first order for `layer` into `order`: never-accessed
+    /// first, then ascending last-access step ([`VramOrder::Recency`]) or
+    /// ascending decayed score ([`VramOrder::Score`]); ties by ascending
+    /// index. Preallocated scratch; no allocation (runs on the publisher).
+    fn build_order(&self, layer: usize, s: &mut OrderScratch) {
         let n = self.n_experts;
-        let mut out = Vec::new();
-        for layer in 0..self.n_layers {
-            for e in 0..n {
-                if self
-                    .access_step(layer * n + e)
-                    .is_some_and(|step| step > cutoff)
-                {
-                    out.push((layer as u32, e as u32));
-                }
-            }
+        debug_assert_eq!(s.order.len(), n);
+        s.order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
+        let base = layer * n;
+        let row = &self.last_access[base..][..n];
+        // Keys are snapshotted once per expert before sorting: the decode
+        // thread writes these atomics mid-sort, and a comparator reading
+        // them live is not a total order.
+        let step = self.step.load(Ordering::Relaxed);
+        for (k, (w, i)) in s.keys.iter_mut().zip(row.iter().zip(base..)) {
+            let raw = w.load(Ordering::Relaxed);
+            *k = match self.vram_order {
+                VramOrder::Recency => raw,
+                // Decayed scores are ≥ 0 and finite, so their f64 bits order
+                // like the values; never-accessed (raw 0) keys 0, first.
+                VramOrder::Score if raw == 0 => 0,
+                VramOrder::Score => self.decayed(i, step).to_bits().max(1),
+            };
         }
-        out
-    }
-
-    /// Builds the evict-first order for `layer` into `order` (recency sort:
-    /// never-accessed first, then ascending last-access step; ties by
-    /// ascending index). Preallocated `order`; no allocation.
-    fn build_order(&self, layer: usize, order: &mut [i32]) {
-        let n = self.n_experts;
-        debug_assert_eq!(order.len(), n);
-        order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
-        let row = &self.last_access[layer * n..][..n];
-        order.sort_unstable_by_key(|&i| (row[i as usize].load(Ordering::Relaxed), i));
+        let keys = &s.keys;
+        s.order.sort_unstable_by_key(|&i| (keys[i as usize], i));
     }
 }
 
@@ -381,6 +559,22 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
         order
             .iter()
             .all(|&i| !std::mem::replace(&mut seen[i as usize], true))
+    }
+}
+
+/// Preallocated `build_order` buffers: the published order and one snapshot
+/// key per expert.
+struct OrderScratch {
+    order: Vec<i32>,
+    keys: Vec<u64>,
+}
+
+impl OrderScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            order: vec![0; n],
+            keys: vec![0; n],
+        }
     }
 }
 
@@ -519,9 +713,9 @@ pub fn hooks_registered() -> bool {
 /// (the ABI v5 contract): unregister-join → clear the ctx window + stop the
 /// publisher → ctx free (inside the sys RAII guard).
 pub struct SessionHooks {
-    /// §6.5 prefetch thread. Stopped before the hooks are torn down so its
-    /// pool feed cannot outlive the pool state.
-    prefetch: PrefetchHandle,
+    /// §6.5 prefetch thread (`--prefetch read` only). Stopped before the
+    /// hooks are torn down so its pool feed cannot outlive the pool state.
+    prefetch: Option<PrefetchHandle>,
     /// The eviction-order publisher (background thread).
     publisher: PublisherHandle,
     /// The live hook registration; also owns the ctx (`Arc` inside the
@@ -560,6 +754,20 @@ impl SessionHooks {
     /// calls the free function; direct-`enable` harnesses call this).
     pub fn advance_decode_step(&self) {
         self.state.policy.step.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// §6.5 prefetch and prediction counters.
+    pub fn prefetch_stats(&self) -> PrefetchStats {
+        let p = &self.state.pred;
+        let s = &self.state.pool.stats;
+        PrefetchStats {
+            mode: p.mode,
+            predicted_routed: p.routed.load(Ordering::Relaxed),
+            predicted_hits: p.hits.load(Ordering::Relaxed),
+            prefetch_pageins: s.prefetch_pageins.load(Ordering::Relaxed),
+            prefetch_hits: s.prefetch_hits.load(Ordering::Relaxed),
+            prefetch_wasted_bytes: s.prefetch_wasted_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Test/counters observability: trampoline call counts.
@@ -651,7 +859,9 @@ impl Drop for SessionHooks {
         self.state
             .ctx_ptr
             .store(std::ptr::null_mut(), Ordering::SeqCst);
-        self.prefetch.stop();
+        if let Some(p) = &self.prefetch {
+            p.stop();
+        }
         // 3. `ctx_keep` (last field) drops now — golem_ctx_free aborts while
         //    a sched attach refcount remains, and `llama_free` (which ran
         //    earlier in the Session order) has already run the sched
@@ -703,7 +913,7 @@ fn spawn_order_publisher(state: Arc<HookState>, interval: std::time::Duration) -
             .spawn(move || {
                 // Off-hot-path scratch: allocated once per thread, never in
                 // the publish loop.
-                let mut order: Vec<i32> = vec![0; state.n_experts as usize];
+                let mut order = OrderScratch::new(state.n_experts as usize);
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         return;
@@ -728,7 +938,7 @@ fn spawn_order_publisher(state: Arc<HookState>, interval: std::time::Duration) -
 /// competitors; exactly one wins a given dirty bit). A failed push (no free
 /// slot under the epoch gate) re-marks the layer dirty and counts a skip —
 /// never blocks, never overwrites a buffer a reader may still hold.
-fn publish_dirty(state: &HookState, limit: usize, order_scratch: &mut [i32]) -> usize {
+fn publish_dirty(state: &HookState, limit: usize, scratch: &mut OrderScratch) -> usize {
     // SAFETY: the ctx pointer is non-null only while hooks are registered;
     // it is cleared after the unregister-join, and this runs either on the
     // decode thread inside a registered hook (copy_done flush) or on the
@@ -747,14 +957,14 @@ fn publish_dirty(state: &HookState, limit: usize, order_scratch: &mut [i32]) -> 
         if !state.policy.dirty[layer].swap(false, Ordering::Relaxed) {
             continue;
         }
-        state.policy.build_order(layer, order_scratch);
+        state.policy.build_order(layer, scratch);
         let blk = layer as i32 + state.dense_lead as i32;
         let mut all_pushed = true;
         for kind in 1..=3 {
-            // SAFETY: `ctx` is live (see above); `order_scratch` holds n
+            // SAFETY: `ctx` is live (see above); `scratch.order` holds n
             // initialized i32s.
             let ok = unsafe {
-                raw::golem_policy_order_push(ctx, blk, kind, order_scratch.as_ptr(), n as i32)
+                raw::golem_policy_order_push(ctx, blk, kind, scratch.order.as_ptr(), n as i32)
             };
             if ok == 0 {
                 all_pushed = false;
@@ -984,21 +1194,15 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // unlimited, never proportional to total experts — AGENTS.md).
     unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k as i32) };
 
-    // P2 state: per-expert recency (never-accessed first, then ascending
-    // last-access step) — pure recency order.
-    let policy = PolicyState::new(n_layers, geo.n_experts);
-    // Routing-trace ring (§11 pattern), preallocated at enable: decode steps
-    // are bounded by n_predict, prefill ids by chunk_tokens × top_k —
-    // overflow drops and counts instead of reallocating on the hot path.
+    // P2 state: per-expert recency and §6.2 decayed score; the evict-first
+    // order sorts by `config.vram_order`.
+    let policy = PolicyState::new(n_layers, geo.n_experts, config.vram_order);
+    // Routing-trace ring (§11 pattern), preallocated at enable — overflow
+    // drops and counts instead of reallocating on the hot path.
     let trace = config.routing_trace.as_ref().map(|_| {
-        let rec_cap = config.n_predict as usize + 256; // + prefill-chunk headroom
-        let prefill_ids = (config.batch_tokens as usize).max(1) * n_expert_used as usize;
-        Mutex::new(TraceRing::new(
-            // Model file (hashed into the header), not the trace output path.
-            config.model_path.clone(),
-            rec_cap,
-            rec_cap.saturating_mul(prefill_ids),
-        ))
+        let (rec_cap, id_cap) = trace_caps(config.n_ctx, config.n_predict, n_layers, n_expert_used);
+        // Model file (hashed into the header), not the trace output path.
+        Mutex::new(TraceRing::new(config.model_path.clone(), rec_cap, id_cap))
     });
     let state = Arc::new(HookState {
         p3_wait_ns: AtomicU64::new(0),
@@ -1015,7 +1219,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             unsafe { raw::golem_ctx_generation(ctx.as_ptr()) }
         },
         miss_scratch: Mutex::new(Vec::with_capacity(3 * k.min(geo.n_experts) as usize)),
-        flush_scratch: Mutex::new(vec![0; geo.n_experts as usize]),
+        flush_scratch: Mutex::new(OrderScratch::new(geo.n_experts as usize)),
         policy,
         n_layers,
         dense_lead,
@@ -1024,13 +1228,32 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         source,
         store,
         trace,
+        pred: PredState::new(
+            config.prefetch,
+            n_layers,
+            geo.n_experts,
+            // Two steps of every layer's predictions; older ones are stale.
+            2 * (config.prefetch_lookahead.max(1) * (n_expert_used + PREDICT_MARGIN)) as usize
+                * n_layers as usize,
+        ),
     });
-
-    let prefetch = spawn_prefetch(
-        state.pool.clone(),
-        Arc::new(PolicyFeed(state.clone())),
-        PREFETCH_K,
-    );
+    if config.prefetch != PrefetchMode::Off {
+        // SAFETY: FFI setter on the live ctx, before the first graph build;
+        // `predict` is a valid C ABI fn receiving the registered payload.
+        unsafe {
+            raw::golem_set_predict(
+                ctx.as_ptr(),
+                config.prefetch_lookahead as i32,
+                PREDICT_MARGIN as i32,
+                Some(predict),
+            )
+        };
+    }
+    let prefetch = state
+        .pred
+        .queue
+        .clone()
+        .map(|q| spawn_prefetch(state.pool.clone(), q as Arc<dyn AccessFeed>));
     // Order publisher: 250 µs poll — the order may lag ≥ 1 step by design;
     // the copy_done flush bounds the worst case without blocking.
     let publisher = spawn_order_publisher(state.clone(), std::time::Duration::from_micros(250));
@@ -1128,16 +1351,11 @@ fn class_layout(
     pool_bytes: u64,
     k: u32,
 ) -> Result<Vec<SlotClass>, EngineError> {
-    let total_unit_bytes: u64 = classes
-        .iter()
-        .map(|&(unit, ref ls)| unit.saturating_mul(ls.len() as u64))
-        .sum();
     let mut out = Vec::with_capacity(classes.len());
-    for &(unit, ref layers) in classes {
-        // slots = ⌊pool_bytes × share / unit⌋ = ⌊pool_bytes × layers / Σ unit⌋
-        // (the unit cancels); u128 because pool_bytes × layers can exceed u64.
-        let slots =
-            u128::from(pool_bytes) * u128::from(layers.len() as u64) / u128::from(total_unit_bytes);
+    for (&(unit, ref layers), slots) in classes
+        .iter()
+        .zip(golem_placement::pool::class_slots(classes, pool_bytes))
+    {
         let slots = u32::try_from(slots)
             .map_err(|_| EngineError::PoolInit("slot count exceeds u32::MAX".into()))?;
         let floor = layers.len() as u64 * u64::from(k) + 1;
@@ -1353,14 +1571,46 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
     });
 }
 
-/// §6.5 prefetch feed backed by the P2 access map: the routing readback
-/// books per-expert recency; the prefetcher unions the last `k` steps.
-struct PolicyFeed(Arc<HookState>);
-
-impl AccessFeed for PolicyFeed {
-    fn take_union(&self, k: usize) -> Vec<(u32, u32)> {
-        self.0.policy.recent_union(k)
-    }
+/// The P5 next-layer prediction trampoline (ABI v6, §6.5): fired after
+/// `src_blk`'s routing readback with the top (k + margin) experts predicted
+/// for `target_blk`, decode ubatches only. Adds them to the target layer's
+/// pending prediction and acts per mode: `protect` shields the union from
+/// RAM eviction, `read` queues it for the prefetch thread. One shard lock or
+/// one queue lock per call — never per expert.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn predict(
+    payload: *mut c_void,
+    _src_blk: i32,
+    target_blk: i32,
+    ids: *const i32,
+    n_ids: i32,
+) {
+    guarded("predict", || {
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        let lead = h.dense_lead as i32;
+        if h.pred.mode == PrefetchMode::Off
+            || !h.policy.scoring.load(Ordering::Relaxed)
+            || ids.is_null()
+            || n_ids <= 0
+            || target_blk < lead
+            || target_blk >= lead + h.n_layers as i32
+        {
+            return;
+        }
+        let layer = (target_blk - lead) as usize;
+        // SAFETY: C passes `n_ids` ids it read this step.
+        let ids = unsafe { std::slice::from_raw_parts(ids, n_ids as usize) };
+        let new = h.pred.add(layer, ids, h.n_experts);
+        match (&h.pred.mode, &h.pred.queue) {
+            (PrefetchMode::Protect, _) => {
+                new.for_each(drop);
+                h.pool.protect(layer as u32, h.pred.predicted(layer));
+            }
+            (PrefetchMode::Read, Some(q)) => q.push(layer as u32, new),
+            _ => new.for_each(drop),
+        }
+    })
 }
 
 /// The v5 merged routing readback trampoline: fired ONCE per changed ids
@@ -1403,6 +1653,11 @@ pub extern "C" fn routing(
         let ids = unsafe { std::slice::from_raw_parts(ids_dense, n_ids as usize) };
         h.policy.book_routed(layer, ids);
         h.policy.mark_dirty(layer);
+        // The layer ran: its prediction is spent, so `protect` releases
+        // the shield (a stale one would pin slots through prefill).
+        if h.pred.score(layer, ids) && h.pred.mode == PrefetchMode::Protect {
+            h.pool.protect(layer as u32, std::iter::empty());
+        }
         if let Some(trace) = &h.trace {
             let mut t = trace.lock().unwrap_or_else(|e| e.into_inner());
             t.record(
@@ -1547,6 +1802,15 @@ impl HookState {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn trace_caps_cover_every_layer_of_every_token() {
+        // GLM: 32 generated tokens + a 1024-token ctx × 42 layers. The old
+        // `n_predict + 256` record cap held 288 records = 6.9 decode steps.
+        let (recs, ids) = trace_caps(1024, 32, 42, 8);
+        assert_eq!(recs, 1056 * 42);
+        assert_eq!(ids, 1056 * 42 * 8);
+    }
 
     #[test]
     fn abi_mismatch_is_poolinit_with_both_versions() {
@@ -1701,15 +1965,12 @@ mod tests {
 
     #[test]
     fn routing_books_recency_for_whole_layer_and_marks_dirty() {
-        let p = PolicyState::new(2, 4);
-        p.step.store(5, Ordering::Relaxed); // recent_union keeps steps > step − k
+        let p = PolicyState::new(2, 4, VramOrder::Recency);
+        p.step.store(5, Ordering::Relaxed);
         p.book_routed(1, &[2, 2, 7, -1]); // duplicates idempotent; out-of-range rejected
         p.mark_dirty(1); // the trampoline does this right after booking
-        assert_eq!(
-            p.recent_union(3),
-            vec![(1, 2)],
-            "expert 2 of layer 1 booked; 7 and −1 rejected"
-        );
+        let booked: Vec<usize> = (0..8).filter(|&i| p.access_step(i).is_some()).collect();
+        assert_eq!(booked, [6], "expert 2 of layer 1 booked; 7 and −1 rejected");
         assert!(p.dirty[1].load(Ordering::Relaxed) && p.dirty_any.load(Ordering::Relaxed));
         assert!(!p.dirty[0].load(Ordering::Relaxed), "other layer untouched");
         // Scoring off (prefill, §6.2): books nothing (layer 0's row stays
@@ -1727,7 +1988,7 @@ mod tests {
     fn out_of_range_id_never_spills_into_the_next_layer() {
         // id == n_experts would have passed a loose bounds guard and booked
         // layer 1's row 0.
-        let p = PolicyState::new(2, 4);
+        let p = PolicyState::new(2, 4, VramOrder::Recency);
         p.step.store(3, Ordering::Relaxed);
         p.book_routed(0, &[4, -1, 100]);
         assert!(
@@ -1740,21 +2001,42 @@ mod tests {
 
     #[test]
     fn order_built_once_per_call_and_content_is_correct() {
-        let p = PolicyState::new(2, 6);
+        let p = PolicyState::new(2, 6, VramOrder::Recency);
         p.step.store(7, Ordering::Relaxed);
         p.book_routed(0, &[3]);
         p.step.store(9, Ordering::Relaxed);
         p.book_routed(1, &[5]);
-        let mut order = vec![0i32; 6];
-        p.build_order(0, &mut order);
+        let mut s = OrderScratch::new(6);
+        p.build_order(0, &mut s);
         assert_eq!(
-            order,
+            s.order,
             vec![0, 1, 2, 4, 5, 3],
             "expert 3 accessed → evicted last"
         );
-        p.build_order(1, &mut order);
-        assert_eq!(*order.last().unwrap(), 5);
-        assert!(is_permutation(&order, 6));
+        p.build_order(1, &mut s);
+        assert_eq!(*s.order.last().unwrap(), 5);
+        assert!(is_permutation(&s.order, 6));
+    }
+
+    #[test]
+    fn score_order_evicts_the_once_used_before_the_frequent_older_expert() {
+        // Expert 1 routed at steps 0..4, expert 2 once at step 5; 0 and 3
+        // never. Recency evicts the older 1 first; the §6.2 decayed score
+        // (≈ 4 vs ≈ 1) evicts 2 first. Never-accessed lead both orders.
+        let book = |order| {
+            let p = PolicyState::new(1, 4, order);
+            for s in 0..4 {
+                p.step.store(s, Ordering::Relaxed);
+                p.book_routed(0, &[1]);
+            }
+            p.step.store(5, Ordering::Relaxed);
+            p.book_routed(0, &[2]);
+            let mut s = OrderScratch::new(4);
+            p.build_order(0, &mut s);
+            s.order
+        };
+        assert_eq!(book(VramOrder::Recency), [0, 3, 1, 2]);
+        assert_eq!(book(VramOrder::Score), [0, 3, 2, 1]);
     }
 
     #[test]
@@ -1770,15 +2052,15 @@ mod tests {
 
     #[test]
     fn published_order_is_identity_for_fresh_experts_and_a_permutation_otherwise() {
-        let p = PolicyState::new(1, 6);
-        let mut order = vec![0i32; 6];
-        p.build_order(0, &mut order);
-        assert_eq!(order, vec![0, 1, 2, 3, 4, 5], "no accesses → identity");
+        let p = PolicyState::new(1, 6, VramOrder::Recency);
+        let mut s = OrderScratch::new(6);
+        p.build_order(0, &mut s);
+        assert_eq!(s.order, vec![0, 1, 2, 3, 4, 5], "no accesses → identity");
         p.step.store(4, Ordering::Relaxed);
         p.book_routed(0, &[4]);
-        p.build_order(0, &mut order);
-        assert!(is_permutation(&order, 6));
-        assert_eq!(*order.last().unwrap(), 4);
+        p.build_order(0, &mut s);
+        assert!(is_permutation(&s.order, 6));
+        assert_eq!(*s.order.last().unwrap(), 4);
     }
 
     #[test]
@@ -1791,14 +2073,25 @@ mod tests {
     }
 
     #[test]
-    fn recent_union_bounds_and_cutoff() {
-        let p = PolicyState::new(1, 4);
-        p.step.store(9, Ordering::Relaxed);
-        p.book_routed(0, &[2]);
-        assert_eq!(p.recent_union(1), vec![(0, 2)]);
-        assert!(
-            p.recent_union(0).is_empty(),
-            "k = 0 excludes everything (cutoff = current step)"
+    fn prediction_recall_counts_routed_ids_the_union_named_and_retires_it() {
+        let p = PredState::new(PrefetchMode::Protect, 2, 70, 16);
+        let new: Vec<_> = p.add(1, &[3, 65, 99, -1], 70).collect(); // 99, −1 out of range
+        assert_eq!(new, [3, 65]);
+        let new: Vec<_> = p.add(1, &[4, 3], 70).collect();
+        assert_eq!(new, [4], "union: 3 already predicted");
+        assert_eq!(p.predicted(1).collect::<Vec<_>>(), [3, 4, 65]);
+        p.score(1, &[3, 65, 7, 8]);
+        assert_eq!(
+            (
+                p.hits.load(Ordering::Relaxed),
+                p.routed.load(Ordering::Relaxed)
+            ),
+            (2, 4)
         );
+        p.score(1, &[3]); // retired: no prediction pending
+        p.score(0, &[3]); // never predicted
+        assert_eq!(p.routed.load(Ordering::Relaxed), 4);
+        p.add(1, &[9], 70).for_each(drop); // a new step's prediction replaces the old union
+        assert_eq!(p.predicted(1).collect::<Vec<_>>(), [9]);
     }
 }

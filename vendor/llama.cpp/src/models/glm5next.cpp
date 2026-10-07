@@ -649,6 +649,34 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_build_forward_expand(gf, post);
         ggml_build_forward_expand(gf, comb);
 
+        // Golem P5 (design 6.5): predict layer il+d's routed experts from this
+        // layer's FFN input, normed with layer il+d's ffn_norm, through the
+        // same gating as build_moe_ffn. Staging only; routing is untouched.
+        // Decode graphs only: the scheduler delivers single-token rows.
+        const int pred_ahead = n_tokens == 1 ? golem_predict_lookahead(model.golem_ctx) : 0;
+        for (int d = 1; d <= pred_ahead && il + d < n_layer; ++d) {
+            const int t = il + d;
+            if (t < (int) hparams.n_layer_dense_lead) {
+                continue;
+            }
+            const auto & nxt = model.layers[t];
+            if (nxt.ffn_gate_inp == nullptr || nxt.ffn_norm == nullptr) {
+                continue;
+            }
+            ggml_tensor * h = build_norm(cur, nxt.ffn_norm, nullptr, LLM_NORM_RMS, -1);
+            ggml_tensor * logits = build_lora_mm(nxt.ffn_gate_inp, h);
+            ggml_tensor * probs = hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID
+                ? ggml_sigmoid(ctx0, logits) : ggml_soft_max(ctx0, logits);
+            if (nxt.ffn_exp_probs_b) {
+                probs = ggml_add(ctx0, probs, nxt.ffn_exp_probs_b);
+            }
+            const int k = std::min<int>(n_expert, hparams.n_expert_used() + golem_predict_margin(model.golem_ctx));
+            ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, probs, k));
+            ggml_format_name(pred, "golem_pred-%d-%d", t, il);
+            ggml_set_output(pred);
+            ggml_build_forward_expand(gf, pred);
+        }
+
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 

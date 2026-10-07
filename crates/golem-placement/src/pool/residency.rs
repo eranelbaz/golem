@@ -10,7 +10,6 @@
 // alternatives are no clearer.
 #![allow(clippy::single_range_in_vec_init)]
 
-use std::collections::HashSet;
 use std::fmt;
 
 use super::primitives::{AtomicU64, Condvar, Mutex};
@@ -28,11 +27,10 @@ pub use golem_gguf::ExpertKind;
 /// once the policy scorer drives the pool.
 #[derive(Debug, Clone, Default)]
 pub struct PolicySnapshot {
-    protected: HashSet<Key>,
+    /// Per-layer bitset over experts, grown on first protect: one shift per
+    /// CLOCK step, no hashing (GLM: 42 × 288 bits ≈ 1.5 KB when full).
+    protected: Vec<Vec<u64>>,
 }
-
-/// Layer/expert unit identity (layer-independent).
-type Key = (u32, u32);
 
 impl PolicySnapshot {
     /// Empty snapshot: nothing pinned, nothing protected.
@@ -42,12 +40,22 @@ impl PolicySnapshot {
 
     /// Protect a unit exactly like an outstanding map lease would.
     pub fn lease(&mut self, layer: u32, expert: u32) {
-        self.protected.insert((layer, expert));
+        let (l, w) = (layer as usize, expert as usize / 64);
+        if self.protected.len() <= l {
+            self.protected.resize_with(l + 1, Vec::new);
+        }
+        let row = &mut self.protected[l];
+        if row.len() <= w {
+            row.resize(w + 1, 0);
+        }
+        row[w] |= 1 << (expert % 64);
     }
 
     fn excludes(&self, layer: u32, expert: u32) -> bool {
-        // The set is empty in production today; skip the SipHash per CLOCK step.
-        !self.protected.is_empty() && self.protected.contains(&(layer, expert))
+        self.protected
+            .get(layer as usize)
+            .and_then(|row| row.get(expert as usize / 64))
+            .is_some_and(|w| w >> (expert % 64) & 1 == 1)
     }
 }
 
@@ -70,6 +78,13 @@ struct Shard {
     /// keys (same `bit_*` helpers as `bits`): no hash lookup on the
     /// `Resident` fast path.
     filling: Vec<u64>,
+    /// Keys filled by a prefetch claim and not yet claimed on demand: the
+    /// first demand claim counts a prefetch hit, an eviction while set
+    /// counts wasted prefetch bytes (§6.5).
+    prefetched: Vec<u64>,
+    /// Keys a next-layer prediction shields from eviction (`--prefetch
+    /// protect`, §6.5), replaced per prediction of the layer.
+    protected: Vec<u64>,
 }
 
 /// A shard's lock paired with the condvar its fill gate waits on. The lock is
@@ -137,6 +152,8 @@ pub enum Claim<'m> {
     Resident {
         /// The filled slot the lease covers.
         slot: u32,
+        /// This demand claim is the first use of a prefetched fill.
+        prefetch_hit: bool,
     },
 }
 
@@ -229,6 +246,8 @@ pub struct Victim {
     pub expert: u32,
     /// The slot whose bytes the victim owned.
     pub slot: u32,
+    /// The victim was a prefetched fill never claimed on demand.
+    pub prefetched: bool,
 }
 
 impl ResidencyMap {
@@ -287,6 +306,8 @@ impl ResidencyMap {
                     leases: vec![0; keys_per_layer],
                     slot_of: vec![-1; keys_per_layer],
                     filling: vec![0; filling_words],
+                    prefetched: vec![0; filling_words],
+                    protected: vec![0; filling_words],
                 }),
                 fill_cv: Condvar::new(),
             })
@@ -327,6 +348,22 @@ impl ResidencyMap {
         bits[i / 64] &= !(1 << (i % 64));
     }
 
+    /// Replaces `layer`'s prediction-protected set with `experts` (§6.5
+    /// `protect`): CLOCK skips them like snapshot-excluded keys. One shard
+    /// lock per call; out-of-range ids are ignored.
+    pub fn protect(&self, layer: u32, experts: impl IntoIterator<Item = u32>) {
+        let Some(shard) = self.shards.get(layer as usize) else {
+            return;
+        };
+        let mut sh = shard.shard.lock().unwrap();
+        sh.protected.fill(0);
+        for e in experts {
+            if e < self.n_experts {
+                Self::bit_set(&mut sh.protected, self.local(e));
+            }
+        }
+    }
+
     /// Residency of one unit (shard lock, flip-length hold).
     pub fn is_resident(&self, layer: u32, expert: u32) -> bool {
         let sh = self.shards[layer as usize].shard.lock().unwrap();
@@ -360,11 +397,29 @@ impl ResidencyMap {
     /// cancel) wakes it, so leased readers never observe slot bytes a
     /// concurrent filler is still writing. A claimer parked through a
     /// cancelled fill re-enters the loop and claims fresh.
+    #[cfg(test)]
     pub(crate) fn claim(
         &self,
         layer: u32,
         expert: u32,
         snapshot: &PolicySnapshot,
+    ) -> Result<Claim<'_>, ClaimError<'_>> {
+        self.claim_for(layer, expert, snapshot, true)
+    }
+
+    /// [`Self::claim`] for a demand (`true`) or prefetch (`false`) claimer.
+    /// A prefetch claim never evicts a key whose reference bit is set
+    /// (demand-hot, P17): its sweep is read-only — the hand and every
+    /// reference bit stay as they are — and finding no cold victim returns
+    /// [`ClaimError::Busy`] at once instead of retrying. Its fill is marked
+    /// prefetched with the reference bit clear; the first demand claim
+    /// clears the mark (a prefetch hit) and sets the reference bit.
+    pub(crate) fn claim_for(
+        &self,
+        layer: u32,
+        expert: u32,
+        snapshot: &PolicySnapshot,
+        demand: bool,
     ) -> Result<Claim<'_>, ClaimError<'_>> {
         let li = layer as usize;
         let class = self.class_of_layer[li] as usize;
@@ -395,9 +450,14 @@ impl ResidencyMap {
                         return Err(ClaimError::Busy);
                     }
                     sh.leases[i] += 1;
-                    Self::ref_set(&mut sh.ref_bits, i);
+                    let prefetch_hit = demand && Self::bit_test(&sh.prefetched, i);
+                    if demand {
+                        Self::bit_clear(&mut sh.prefetched, i);
+                        Self::ref_set(&mut sh.ref_bits, i);
+                    }
                     return Ok(Claim::Resident {
                         slot: sh.slot_of[i] as u32,
+                        prefetch_hit,
                     });
                 }
                 // Fill was cancelled while parked: fall through and claim
@@ -420,11 +480,13 @@ impl ResidencyMap {
                     if starved > starve_bound {
                         return Err(ClaimError::Busy);
                     }
-                    self.clock_evict(class, snapshot).map(|(v, s)| (s, Some(v)))
+                    self.clock_evict(class, snapshot, demand, (li, i))
+                        .map(|(v, s)| (s, Some(v)))
                 }
             };
             let (slot, victim) = match acquired {
                 Some(x) => x,
+                None if !demand => return Err(ClaimError::Busy),
                 None => {
                     super::primitives::yield_now();
                     continue;
@@ -444,6 +506,11 @@ impl ResidencyMap {
             Self::bit_set(&mut sh.filling, i);
             sh.slot_of[i] = slot as i32;
             Self::bit_set(&mut sh.bits, i);
+            if demand {
+                Self::bit_clear(&mut sh.prefetched, i);
+            } else {
+                Self::bit_set(&mut sh.prefetched, i);
+            }
             // Reference bit stays clear on first fill: a key evicts on its
             // first sweep unless it was re-touched (Resident) in between.
             // A non-resident key holds no leases (eviction and cancel clear
@@ -475,11 +542,32 @@ impl ResidencyMap {
     /// immediately evictable, while a reused key survives until a full pass
     /// finds nothing else. Returns the victim and its slot, with the victim's
     /// residency already cleared under its shard lock.
-    fn clock_evict(&self, class: usize, snapshot: &PolicySnapshot) -> Option<(Victim, u32)> {
+    ///
+    /// A prefetch sweep (`demand == false`) is read-only: it neither moves
+    /// the hand nor clears reference bits, and skips every key whose bit is
+    /// set, so it can only take a key CLOCK would already evict.
+    ///
+    /// The claimer's own key (`claimer` = layer, local key) is never the
+    /// victim: a concurrent claimer may have filled it after this claimer
+    /// saw it non-resident, and evicting it would only re-read it.
+    fn clock_evict(
+        &self,
+        class: usize,
+        snapshot: &PolicySnapshot,
+        demand: bool,
+        claimer: (usize, usize),
+    ) -> Option<(Victim, u32)> {
         let kpl = Self::keys_per_layer(self.n_experts);
         let class_key_count = self.class_keys[class];
         let mut hands = self.sweep.lock().unwrap();
-        let hand = &mut hands[class];
+        let mut scratch = ClockHand {
+            hand: hands[class].hand,
+        };
+        let hand = if demand {
+            &mut hands[class]
+        } else {
+            &mut scratch
+        };
         let start = hand.hand;
         for step in 0..SWEEP_BUDGET.min(class_key_count) {
             let idx = (start + step) % class_key_count;
@@ -487,6 +575,10 @@ impl ResidencyMap {
             // back to the real layer and its shard-local key.
             let li = self.class_layers[class][idx / kpl] as usize;
             let c = idx % kpl;
+            if (li, c) == claimer {
+                hand.hand = idx + 1;
+                continue;
+            }
             let mut sh = self.shards[li].shard.lock().unwrap();
             if !Self::bit_test(&sh.bits, c) || sh.leases[c] != 0 {
                 drop(sh);
@@ -498,12 +590,14 @@ impl ResidencyMap {
             // second chance and stays demoted forever (it can't be picked
             // to earn the bit back).
             let expert = c as u32;
-            if snapshot.excludes(li as u32, expert) {
+            if snapshot.excludes(li as u32, expert) || Self::bit_test(&sh.protected, c) {
                 drop(sh);
                 continue;
             }
             if Self::ref_test(&sh.ref_bits, c) {
-                Self::ref_clear(&mut sh.ref_bits, c);
+                if demand {
+                    Self::ref_clear(&mut sh.ref_bits, c);
+                }
                 drop(sh);
                 hand.hand = idx + 1;
                 continue;
@@ -511,6 +605,8 @@ impl ResidencyMap {
             let slot = sh.slot_of[c] as u32;
             Self::bit_clear(&mut sh.bits, c);
             sh.slot_of[c] = -1;
+            let prefetched = Self::bit_test(&sh.prefetched, c);
+            Self::bit_clear(&mut sh.prefetched, c);
             drop(sh);
             hand.hand = idx + 1;
             return Some((
@@ -518,6 +614,7 @@ impl ResidencyMap {
                     layer: li as u32,
                     expert,
                     slot,
+                    prefetched,
                 },
                 slot,
             ));
@@ -573,6 +670,7 @@ impl ResidencyMap {
             sh.leases[i] = sh.leases[i].saturating_sub(1);
             debug_assert_eq!(sh.leases[i], 0, "cancel_claim holds the only lease");
             Self::bit_clear(&mut sh.bits, i);
+            Self::bit_clear(&mut sh.prefetched, i);
             let s = sh.slot_of[i];
             sh.slot_of[i] = -1;
             (s >= 0).then_some(s as u32)
@@ -604,6 +702,11 @@ pub struct P3Stats {
     pub demand_slow_pageins: AtomicU64,
     /// Page-ins issued by the §6.5 prefetcher.
     pub prefetch_pageins: AtomicU64,
+    /// Prefetched units later claimed on demand before eviction:
+    /// `prefetch_hit_rate = prefetch_hits / prefetch_pageins` (§6.5).
+    pub prefetch_hits: AtomicU64,
+    /// Bytes of prefetched units evicted without a demand claim (§11).
+    pub prefetch_wasted_bytes: AtomicU64,
     /// Claims served from residency (no I/O).
     pub fast_hits: AtomicU64,
     /// Total bytes moved from source into pool slots.
@@ -669,7 +772,7 @@ mod tests {
                 claim.finish();
                 Got::Filled(slot)
             }
-            Ok(Claim::Resident { slot }) => Got::Resident(slot),
+            Ok(Claim::Resident { slot, .. }) => Got::Resident(slot),
             Err(ClaimError::Evicted(e)) => {
                 let (victim, slot) = (e.victim, e.slot);
                 e.claim.finish();
@@ -688,6 +791,122 @@ mod tests {
 
     fn map(layers: usize, n_experts: u32, classes: Vec<std::ops::Range<u32>>) -> ResidencyMap {
         ResidencyMap::new(vec![0; layers], n_experts, classes).unwrap()
+    }
+
+    /// A prefetch claim with its fill finished and its lease released.
+    fn prefetch(m: &ResidencyMap, snap: &PolicySnapshot, layer: u32, expert: u32) -> Got {
+        let got = match m.claim_for(layer, expert, snap, false) {
+            Ok(Claim::Filled { slot, claim }) => {
+                claim.finish();
+                Got::Filled(slot)
+            }
+            Ok(Claim::Resident { slot, .. }) => Got::Resident(slot),
+            Err(ClaimError::Evicted(e)) => {
+                let (victim, slot) = (e.victim, e.slot);
+                e.claim.finish();
+                Got::Evicted(victim, slot)
+            }
+            Err(ClaimError::Busy) => return Got::Busy,
+        };
+        m.release_lease(layer, expert);
+        got
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn prefetch_never_evicts_a_demand_hot_key_nor_touches_its_reference_bit() {
+        // Two slots: 0 is demand-hot (reused → ref bit), 1 is leased. The
+        // prefetch finds no cold victim: Busy, and 0's bit survives, so the
+        // next demand sweep spends it on 0 (second chance) and evicts 0
+        // only after 1's lease is gone and 0 is cold again.
+        let m = map(1, 8, vec![0..2]);
+        let snap = PolicySnapshot::empty();
+        warm(&m, &snap, 0, 0);
+        warm(&m, &snap, 0, 0); // Resident reuse sets the reference bit
+        take(&m, &snap, 0, 1); // leased
+        assert_eq!(prefetch(&m, &snap, 0, 5), Got::Busy);
+        assert!(m.is_resident(0, 0), "demand-hot key kept");
+        m.release_lease(0, 1);
+        // Demand sweep from the untouched hand: 0 has its bit (cleared now),
+        // 1 is cold → victim 1. Had the prefetch cleared 0's bit, 0 would go.
+        let Got::Evicted(v, _) = take(&m, &snap, 0, 6) else {
+            panic!("demand claim evicts")
+        };
+        assert_eq!(v.expert, 1);
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn prefetch_takes_a_cold_key_and_its_first_demand_use_is_a_hit() {
+        let m = map(1, 8, vec![0..2]);
+        let snap = PolicySnapshot::empty();
+        warm(&m, &snap, 0, 0);
+        warm(&m, &snap, 0, 0); // hot
+        warm(&m, &snap, 0, 1); // cold
+        let Got::Evicted(v, _) = prefetch(&m, &snap, 0, 3) else {
+            panic!("prefetch takes the cold key")
+        };
+        assert_eq!((v.expert, v.prefetched), (1, false));
+        let first = m.claim(0, 3, &snap);
+        assert!(matches!(
+            first,
+            Ok(Claim::Resident {
+                prefetch_hit: true,
+                ..
+            })
+        ));
+        m.release_lease(0, 3);
+        let again = m.claim(0, 3, &snap);
+        assert!(matches!(
+            again,
+            Ok(Claim::Resident {
+                prefetch_hit: false,
+                ..
+            })
+        ));
+        m.release_lease(0, 3);
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn an_unused_prefetch_is_reported_when_evicted() {
+        let m = map(1, 8, vec![0..1]);
+        let snap = PolicySnapshot::empty();
+        assert_eq!(prefetch(&m, &snap, 0, 2), Got::Filled(0));
+        let Got::Evicted(v, _) = take(&m, &snap, 0, 4) else {
+            panic!("demand evicts the prefetched fill")
+        };
+        assert_eq!((v.expert, v.prefetched), (2, true));
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn protected_keys_are_never_victims_until_replaced() {
+        let m = map(1, 8, vec![0..2]);
+        let snap = PolicySnapshot::empty();
+        warm(&m, &snap, 0, 0);
+        warm(&m, &snap, 0, 1);
+        m.protect(0, [0, 99]);
+        let Got::Evicted(v, _) = take(&m, &snap, 0, 2) else {
+            panic!("evicts the unprotected key")
+        };
+        assert_eq!(v.expert, 1);
+        m.release_lease(0, 2);
+        m.protect(0, [2]);
+        let Got::Evicted(v, _) = take(&m, &snap, 0, 3) else {
+            panic!("the replaced set frees expert 0")
+        };
+        assert_eq!(v.expert, 0);
+    }
+
+    #[test]
+    fn snapshot_bitset_covers_the_glm_shape() {
+        let mut snap = PolicySnapshot::empty();
+        snap.lease(41, 287);
+        snap.lease(0, 63);
+        snap.lease(0, 64);
+        assert!(snap.excludes(41, 287) && snap.excludes(0, 63) && snap.excludes(0, 64));
+        assert!(!snap.excludes(41, 286) && !snap.excludes(1, 0) && !snap.excludes(99, 0));
     }
 
     #[test]
@@ -984,7 +1203,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let m2 = m.clone();
         let t = std::thread::spawn(move || {
-            let resident = matches!(m2.claim(0, 5, &snap), Ok(Claim::Resident { slot: 0 }));
+            let resident = matches!(m2.claim(0, 5, &snap), Ok(Claim::Resident { slot: 0, .. }));
             tx.send(()).unwrap();
             resident
         });

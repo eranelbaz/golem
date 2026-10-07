@@ -137,6 +137,23 @@ impl PoolGeometry {
     }
 }
 
+/// Per-class RAM slot counts for a `pool_bytes` pool (§5.4): each class's
+/// budget is its byte share, ⌊pool × layers_c / Σ unit bytes⌋ (the unit
+/// cancels). `classes` as from [`PoolGeometry::classes`].
+pub fn class_slots(classes: &[(u64, Vec<u32>)], pool_bytes: u64) -> Vec<u64> {
+    let total: u128 = classes
+        .iter()
+        .map(|(unit, ls)| u128::from(*unit) * ls.len() as u128)
+        .sum();
+    classes
+        .iter()
+        .map(|(_, ls)| {
+            // ≤ pool_bytes / min unit, so the narrowing cannot truncate.
+            (u128::from(pool_bytes) * ls.len() as u128 / total.max(1)) as u64
+        })
+        .collect()
+}
+
 /// Reads one expert plane from a byte source.
 pub trait ExpertSource: Send + Sync {
     /// Read one expert plane into `into[head..head + stride]` (`into` may be

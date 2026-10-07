@@ -1887,6 +1887,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static thread_local std::vector<golem_plane_plan> golem_planes;
     static thread_local std::vector<int32_t> golem_dense;    // dense ids (routing readback + remap)
     static thread_local std::vector<int32_t> golem_identity; // NULL-order fallback (identity permutation)
+    // P5: prediction nodes named golem_pred-<target blk>-<source blk>, indexed
+    // once per compute (one strncmp per node) and delivered in the source
+    // layer's pre-pass, right after its ids readback synchronized the device.
+    struct golem_pred_ref {
+        int src;
+        int target;
+        struct ggml_tensor * t;
+    };
+    static thread_local std::vector<golem_pred_ref> golem_preds;
+    static thread_local std::vector<int32_t> golem_pred_ids;
+    golem_preds.clear();
+    if (golem_hooked && gctx->predict != NULL) {
+        for (int i = 0; i < sched->graph.n_nodes; ++i) {
+            struct ggml_tensor * t = sched->graph.nodes[i];
+            int target = -1;
+            int src = -1;
+            if (strncmp(t->name, "golem_pred-", 11) == 0 && sscanf(t->name + 11, "%d-%d", &target, &src) == 2 &&
+                t->type == GGML_TYPE_I32 && t->ne[1] == 1 && ggml_is_contiguous(t)) {
+                golem_preds.push_back({src, target, t});
+            }
+        }
+    }
     static thread_local std::vector<int32_t> golem_miss_kinds, golem_miss_ids;
     static thread_local std::vector<const void *> golem_miss_out;
     // (src slot, original) of every MUL_MAT_ID src[0]/src[2] redirected to the
@@ -2049,6 +2071,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         golem_cb_guard cb;
                         gctx->routing(gctx->payload, golem_tensor_blk(input->name), input,
                                       golem_dense.data(), (int64_t) golem_dense.size(), (int32_t) n_expert);
+                    }
+                    const int src_blk = golem_tensor_blk(input->name);
+                    for (const auto & p : golem_preds) {
+                        if (p.src != src_blk) {
+                            continue;
+                        }
+                        GGML_ASSERT(ggml_nbytes(p.t) == (size_t) p.t->ne[0] * sizeof(int32_t));
+                        golem_pred_ids.resize(p.t->ne[0]);
+                        // Usually computed on the ids backend (already
+                        // synchronized); otherwise drain its own backend.
+                        ggml_backend_t pb = ggml_backend_sched_get_tensor_backend(sched, p.t);
+                        if (pb != NULL && pb != ids_backend) {
+                            ggml_backend_synchronize(pb);
+                        }
+                        ggml_backend_tensor_get(p.t, golem_pred_ids.data(), 0, ggml_nbytes(p.t));
+                        golem_cb_guard cb;
+                        gctx->predict(gctx->payload, src_blk, p.target, golem_pred_ids.data(),
+                                      (int32_t) golem_pred_ids.size());
                     }
                 }
                 const int blk = golem_tensor_blk(input->name);
@@ -2345,9 +2385,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_len);
                     };
 
-                    if (!golem_planned) {
-                        // planned above
-                    } else if (plan.mode == 1) {
+                    if (!golem_planned && golem_expert && golem_hooked && gctx->ensure != NULL) {
+                        // hooked expert plane the pre-pass left unplanned
+                        // (no routed ids): nothing to copy
+                    } else if (golem_planned && plan.mode == 1) {
                         // Pooled path (ensure only, no routing): the misses
                         // were ensured in the layer-level pre-pass; runs of
                         // consecutive routed experts map onto contiguous
@@ -2364,7 +2405,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ++i;
                             copy_experts(first_id, last_id, &plan.ptrs[run0]);
                         }
-                    } else if (plan.mode == 2) {
+                    } else if (golem_planned && plan.mode == 2) {
                         // Slab path: the decision pass ran in the pre-pass;
                         // here only the physical writes: remapped-ids H2D
                         // from PINNED host memory, consumer redirects, and
@@ -3397,6 +3438,24 @@ void golem_set_device_cache_experts(golem_ctx_t ctx, int32_t k) {
 
 int32_t golem_device_cache_experts(golem_ctx_t ctx) {
     return ctx == NULL ? 0 : ctx->k_cfg.load(std::memory_order_relaxed);
+}
+
+void golem_set_predict(golem_ctx_t ctx, int32_t lookahead, int32_t margin, golem_predict_fn predict) {
+    if (ctx == NULL) {
+        return;
+    }
+    const bool on = lookahead > 0 && predict != NULL;
+    ctx->predict = on ? predict : NULL;
+    ctx->pred_margin.store(on ? std::max<int32_t>(margin, 0) : 0, std::memory_order_relaxed);
+    ctx->pred_lookahead.store(on ? lookahead : 0, std::memory_order_relaxed);
+}
+
+int32_t golem_predict_lookahead(golem_ctx_t ctx) {
+    return ctx == NULL ? 0 : ctx->pred_lookahead.load(std::memory_order_relaxed);
+}
+
+int32_t golem_predict_margin(golem_ctx_t ctx) {
+    return ctx == NULL ? 0 : ctx->pred_margin.load(std::memory_order_relaxed);
 }
 
 const struct golem_device_cache_stats *golem_get_device_cache_stats(golem_ctx_t ctx) {
