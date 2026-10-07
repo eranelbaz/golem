@@ -209,7 +209,15 @@ impl Policy {
     }
 
     fn decay_factor(&self, from: u64, to: u64) -> f64 {
-        decay_factor(from.max(to) - from.min(to), self.cfg.half_life_steps)
+        // Magnitude-based by design: callers may legitimately decay
+        // backwards in virtual time (`pass` sweeps every key to one step;
+        // the journal sweep decays to a horizon below a replayed access),
+        // so the delta is the absolute difference built from saturating
+        // subs — no wrap on either ordering.
+        let fwd = to.saturating_sub(from);
+        let back = from.saturating_sub(to);
+        debug_assert!(fwd == 0 || back == 0, "from and to cannot both lead");
+        decay_factor(fwd + back, self.cfg.half_life_steps)
     }
 
     /// Record an access at `step` (§6.2): lazy decay since the expert's last
