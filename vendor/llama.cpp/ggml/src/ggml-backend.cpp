@@ -2077,6 +2077,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (p.src != src_blk) {
                             continue;
                         }
+                        GGML_ASSERT(ggml_nbytes(p.t) == (size_t) p.t->ne[0] * sizeof(int32_t));
                         golem_pred_ids.resize(p.t->ne[0]);
                         ggml_backend_tensor_get(p.t, golem_pred_ids.data(), 0, ggml_nbytes(p.t));
                         golem_cb_guard cb;
@@ -2378,9 +2379,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_len);
                     };
 
-                    if (!golem_planned) {
-                        // planned above
-                    } else if (plan.mode == 1) {
+                    if (!golem_planned && golem_expert && golem_hooked && gctx->ensure != NULL) {
+                        // hooked expert plane the pre-pass left unplanned
+                        // (no routed ids): nothing to copy
+                    } else if (golem_planned && plan.mode == 1) {
                         // Pooled path (ensure only, no routing): the misses
                         // were ensured in the layer-level pre-pass; runs of
                         // consecutive routed experts map onto contiguous
@@ -2397,7 +2399,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ++i;
                             copy_experts(first_id, last_id, &plan.ptrs[run0]);
                         }
-                    } else if (plan.mode == 2) {
+                    } else if (golem_planned && plan.mode == 2) {
                         // Slab path: the decision pass ran in the pre-pass;
                         // here only the physical writes: remapped-ids H2D
                         // from PINNED host memory, consumer redirects, and

@@ -233,8 +233,12 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         .filter(|s| s.mode != PrefetchMode::Off)
     {
         eprintln!("golem: {stats}");
-        if let Some(f) = timing_out.as_mut() {
-            writeln!(f, "# {stats}")?;
+        // A trailer write failure must not mask the run's own result.
+        if let Some(Err(e)) = timing_out
+            .as_mut()
+            .map(|f| writeln!(f, "# {stats}").and_then(|()| f.flush()))
+        {
+            eprintln!("golem: timing CSV trailer: {e}");
         }
     }
     result

@@ -6,14 +6,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-files="$(git ls-files -co --exclude-standard vendor/llama.cpp | sed 's#^vendor/llama.cpp/#./#')"
+untracked="$(git ls-files -o --exclude-standard vendor/llama.cpp)"
+[[ -z "$untracked" ]] || { echo "untracked vendor files (git add or remove them first):" >&2; echo "$untracked" >&2; exit 1; }
+files="$(git ls-files -c vendor/llama.cpp | sed 's#^vendor/llama.cpp/#./#')"
 sum="$(cd vendor/llama.cpp && printf '%s\n' "$files" | LC_ALL=C sort | tr '\n' '\0' |
   xargs -0 -r sha256sum | sha256sum | awk '{print $1}')"
 n="$(printf '%s\n' "$files" | wc -l)"
 
 if [[ "${1:-}" == --check ]]; then
-  want="$(rg -o '^content_sha256 = (\S+)' -r '$1' vendor/VENDOR_SHA)"
-  [[ "$sum" == "$want" ]] || { echo "PIN DRIFT: $sum != $want"; exit 1; }
+  want="$(sed -n 's/^content_sha256 = \([0-9a-f]*\).*/\1/p' vendor/VENDOR_SHA)"
+  lock="$(sed -n 's/^content_sha256 = \([0-9a-f]*\).*/\1/p' engine/llama-cpp.lock)"
+  [[ "$sum" == "$want" && "$sum" == "$lock" ]] || { echo "PIN DRIFT: tree $sum, VENDOR_SHA $want, lock $lock"; exit 1; }
   echo "pin ok: $sum ($n files)"
   exit 0
 fi

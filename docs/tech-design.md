@@ -370,6 +370,13 @@ This is exponential-decay frequency: a blend of LRU (recency dominates for small
   - Cost: one D2H per VRAM eviction (15.2 MB at ≈25 GB/s ≈ 0.6 ms, off the critical path on the promotion stream), plus a pool-slot claim on the eviction path.
   - Sized by the M3.7 replay: build it if the extra ≈10.6 GiB of unique capacity moves the replayed RAM hit rate.
 - *Amended 2026-10-06: routing profile for first start.* M2.5's journal seeds a warm start. A first start has no journal, so ship or record an offline **routing profile**: per-(layer, expert) access counts from M3.8 traces over real prompts. Seed scores from it and pre-fill the pool and the VRAM slots before the first request. The hit-rate curve comes from the M3.7 replay.
+- *Amended 2026-10-07 (M3.7 replay, `docs/baselines/m3.7-policy-replay.md`).* Four real 512-token traces replayed at production geometry (K = 18). Findings:
+  - **VRAM.** The §6.2 decayed score beats LRU by 2.1 points of VRAM hit and becomes the P2 evict-first order (`--vram-order score`, default).
+  - **RAM.** CLOCK stays under inclusive residency: decay at both tiers duplicates the hot set (d 17.8% vs 16.7% at 63 GiB).
+  - **Exclusive residency + decay at both tiers:** d 13.8% vs 18.0% today, so O10 builds it with a decayed RAM tier.
+  - **Score-driven background promotion** lowers the VRAM hit rate (44.2 → 43.9% at 8/step). Not built (user ruling).
+  - **The routing profile** leaves decode d unchanged (18.0 → 17.9%); it is deferred until after §7.6 streaming (user ruling).
+  - **`Policy::pass`** keeps no production consumer: per-layer forced-admission slabs consume only its score math.
 
 Startup warm-up: if a previous run's placement journal (§11) exists, scores are seeded from it, and the top-scored experts (up to each tier's cap) are page-in'd and promoted before the first request — this is what makes "warm start" measurable separately from cold (§12.3).
 
@@ -384,6 +391,12 @@ Autoregressive decoding means step N+1's routing is highly correlated with step 
 *Amended 2026-09-29 (review H-6):* the last-k union above can only re-fetch experts that were *just* demand-paged and later evicted. It never loads an expert before its first use, so it cannot turn cold misses into hits. The replacement is **next-layer routing prediction**: after layer L's router runs, apply layer L+1's gate weights (VRAM-resident, tiny) to layer L's hidden state, and prefetch the predicted top-k (plus a margin) for layer L+1. That gives about one layer of compute as lead time. Real routing is untouched, because only staging is speculative, so I1 holds. It needs a post-router hook (a new patch, P5). Success metric: `prefetch_hit_rate` = prefetched keys accessed before eviction.
 
 *Amended 2026-10-03 (BMoE, §16): prefetch ships behind a kill switch, off by default until it measurably wins.* BMoE's next-layer predictor (the same scheme) was right 80–89% of the time, yet acting on it cost 21–38% throughput when storage was already the bottleneck: wrong guesses spend the disk bandwidth that demand misses need. Using the prediction only to protect predicted experts from eviction gained ≈0.4 hit-rate points at no I/O cost. Golem is disk-bound on cold decode too (§2.4), and once layer-batched reads (§3.4 P3) saturate the queue during misses there is little idle bandwidth to spend. So: `--prefetch {off,protect,read}` (default `off`); `read` issues reads only at prefetch priority behind demand (§5.2); `prefetch_wasted_bytes` (prefetched, evicted unaccessed) is a metric; M3.7 acceptance is decode tok/s off vs protect vs read, cold and warm, A/B in both orders (§12.3), and the default changes only for a mode that wins. Build it after layer-batched reads.
+
+*Amended 2026-10-07 (M3.7, implemented).* P5 is a graph node per MoE layer L, built only when `--prefetch` is not `off`:
+- **Prediction.** `golem_pred-<L+d>-<L>` = the top (k + 4) of layer L+d's router over layer L's FFN input (the `hc_ffn_pre` output), normed with L+d's `ffn_norm`, with the same gating and selection bias. d = 1..`--prefetch-lookahead`.
+- **Delivery.** The scheduler reads the predictions in layer L's pre-pass, right after its ids readback has synchronized the device, and passes them to the `predict` hook (ABI v6). There are no eval-callback views and no extra syncs.
+- **Modes.** `protect` shields the predicted union from RAM eviction. `read` queues it for the prefetch thread, which runs behind demand and never evicts a reference-bit key (P17). The last-k union prefetcher is removed.
+- **Real model.** Recall is 84% at lookahead 1 and 87% at 2; output is byte-identical across modes.
 
 ### 6.6 Correctness under eviction
 
@@ -731,7 +744,10 @@ Every finding from the design/code reviews (2026-09-29 onward) is either fixed i
 - D-4: per-plane CRC32C computed at import and carried in the manifest `expert_index` (§5.3).
 - D-5: O7.
 - D-6: §2.4.
-- H-6: design side done (§6.5); the code lands in M3.7.
+- H-6: design side done (§6.5); the code landed in M3.7.
+- P11: `PolicySnapshot` excludes are a per-layer bitset (M3.7).
+- P17: a prefetch claim never evicts a reference-bit key and leaves CLOCK state untouched (M3.7).
+- P23: `Policy::pass` stays unconsumed: production VRAM is per-layer forced-admission slabs, so only its score math is used (`--vram-order score`, §6.3, M3.7). Not replayed.
 
 **Design / architecture:**
 - **R-1 (§2.5, §10):** `golem plan` must derive memory from the hybrid architecture, per layer type: recurrent state × parallel, plus KV for the 11 attention layers only. The §12.3 ctx sweep is still picked blind. Owner: M4.6.
@@ -741,10 +757,6 @@ Every finding from the design/code reviews (2026-09-29 onward) is either fixed i
 - **R-8 (§4.3):** start-time verify should be size + mtime + sampled hash, with `--full-verify` opt-in. No start-time check is implemented yet.
 - **D-14 (§3.2):** the scheduler patch-size trigger (≈1.5k lines, or two conflicting rebases) re-opens D2 option B. Re-estimate at every vendor rebase.
 - **R-15:** CCD pinning, with decode on the V-cache CCD and I/O threads elsewhere.
-- **P11, P17, P23 (placement):**
-  - `PolicySnapshot::excludes` is a `HashSet`, skipped while empty, as it is in production today. It must become a flat bitset before real snapshots exist.
-  - Prefetch fills get ref = 0 and can evict demand-hot keys.
-  - `Policy::pass` has no production consumer.
 
 **Code:**
 - **M-2:** `golem-store` `read_page` takes a caller covering buffer, so it no longer bounces. Confirm no `Vec` bounce is left on the P3 path once M3.3's `store_source` is the only source. Otherwise closed.

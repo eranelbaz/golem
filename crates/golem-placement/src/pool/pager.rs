@@ -577,7 +577,9 @@ impl ExpertPool {
     ) -> Result<Lease, PoolError> {
         let slot = match self.residency.claim_for(layer, expert, snapshot, demand) {
             Ok(Claim::Resident { slot, prefetch_hit }) => {
-                self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+                if demand {
+                    self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+                }
                 if prefetch_hit {
                     self.stats.prefetch_hits.fetch_add(1, Ordering::Relaxed);
                 }

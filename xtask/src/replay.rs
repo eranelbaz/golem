@@ -303,7 +303,9 @@ impl Tier {
                         .iter()
                         .copied()
                         .filter(|&k| unleased(self, k))
-                        .filter(|&k| !dwelled || now - self.admitted[k as usize] > min_dwell)
+                        .filter(|&k| {
+                            !dwelled || now.saturating_sub(self.admitted[k as usize]) > min_dwell
+                        })
                         .min_by(|&a, &b| self.decayed(a, now).total_cmp(&self.decayed(b, now)))
                 };
                 lowest(true).or_else(|| lowest(false))
@@ -892,7 +894,14 @@ pub fn run(args: Vec<String>) {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--model" => model = it.next(),
-            "--k" => k = it.next().and_then(|v| v.parse::<u32>().ok()),
+            "--k" => {
+                let v = it.next().unwrap_or_default();
+                k = Some(
+                    v.parse::<u32>()
+                        .unwrap_or_else(|e| die(format!("--k {v:?}: {e}"))),
+                );
+            }
+            f if f.starts_with("--") => die(format!("unknown flag {f}")),
             _ => paths.push(a),
         }
     }

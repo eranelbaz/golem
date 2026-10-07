@@ -652,14 +652,18 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         // Golem P5 (§6.5): predict layer il+d's routed experts from this
         // layer's FFN input, normed with layer il+d's ffn_norm, through the
         // same gating as build_moe_ffn. Staging only; routing is untouched.
-        const int pred_ahead = golem_predict_lookahead(model.golem_ctx);
+        // Decode graphs only: the scheduler delivers single-token rows.
+        const int pred_ahead = n_tokens == 1 ? golem_predict_lookahead(model.golem_ctx) : 0;
         for (int d = 1; d <= pred_ahead && il + d < n_layer; ++d) {
             const int t = il + d;
             if (t < (int) hparams.n_layer_dense_lead) {
                 continue;
             }
             const auto & nxt = model.layers[t];
-            ggml_tensor * h = build_norm(cur, nxt.ffn_norm, nullptr, LLM_NORM_RMS, t);
+            if (nxt.ffn_gate_inp == nullptr || nxt.ffn_norm == nullptr) {
+                continue;
+            }
+            ggml_tensor * h = build_norm(cur, nxt.ffn_norm, nullptr, LLM_NORM_RMS, -1);
             ggml_tensor * logits = build_lora_mm(nxt.ffn_gate_inp, h);
             ggml_tensor * probs = hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID
                 ? ggml_sigmoid(ctx0, logits) : ggml_soft_max(ctx0, logits);

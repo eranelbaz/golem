@@ -109,6 +109,8 @@ impl Drop for PrefetchHandle {
 /// thread.
 pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> PrefetchHandle {
     const IDLE: Duration = Duration::from_millis(25);
+    // One unit page-in is ≈ 15.2 MB / 6.5 GB/s ≈ 2.3 ms; re-check well inside it.
+    const DEMAND_BACKOFF: Duration = Duration::from_micros(200);
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let stop = stop.clone();
@@ -120,7 +122,8 @@ pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> Pre
                 // Demand priority: a demand page-in in flight wins the I/O;
                 // skip the whole round and re-check after one idle.
                 if pool.demand_inflight() > 0 {
-                    access.idle(IDLE);
+                    // Not `idle`: it returns at once while work is queued.
+                    std::thread::sleep(DEMAND_BACKOFF);
                     continue;
                 }
                 let batch: Vec<_> = access

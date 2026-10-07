@@ -261,7 +261,7 @@ struct HookState {
     miss_scratch: Mutex<Vec<(ExpertKind, u32)>>,
     /// Scratch the `copy_done` flush sorts into, preallocated at enable
     /// (decode-thread-only writer; mutex for `&self`).
-    flush_scratch: Mutex<Vec<i32>>,
+    flush_scratch: Mutex<OrderScratch>,
     /// §6.2 recency + §6.6 dirty tracking (shared with the publisher).
     policy: PolicyState,
     /// §11-style routing-trace ring when `config.routing_trace` is set; the
@@ -313,17 +313,26 @@ impl PredState {
         }
     }
 
-    /// Adds one prediction for `layer` to its pending union.
-    fn add(&self, layer: usize, ids: &[i32], n_experts: u32) {
+    /// Adds one prediction for `layer` to its pending union; the returned
+    /// iterator (must be driven) sets the bits and yields the ids not
+    /// already predicted, so lookahead > 1 never queues an id twice.
+    fn add<'a>(
+        &'a self,
+        layer: usize,
+        ids: &'a [i32],
+        n_experts: u32,
+    ) -> impl Iterator<Item = u32> + 'a {
         let row = &self.bits[layer * self.words..][..self.words];
         if !self.pending[layer].swap(true, Ordering::Relaxed) {
             row.iter().for_each(|w| w.store(0, Ordering::Relaxed));
         }
-        for &id in ids {
-            if id >= 0 && (id as u32) < n_experts {
-                row[id as usize / 64].fetch_or(1 << (id % 64), Ordering::Relaxed);
-            }
-        }
+        ids.iter()
+            .filter(move |&&id| id >= 0 && (id as u32) < n_experts)
+            .filter(move |&&id| {
+                let bit = 1u64 << (id % 64);
+                row[id as usize / 64].fetch_or(bit, Ordering::Relaxed) & bit == 0
+            })
+            .map(|&id| id as u32)
     }
 
     /// The pending union of `layer` as expert ids.
@@ -338,14 +347,14 @@ impl PredState {
     }
 
     /// Books `layer`'s routed ids against its pending prediction, then
-    /// retires the prediction.
-    fn score(&self, layer: usize, ids: &[i32]) {
+    /// retires the prediction. Returns whether one was pending.
+    fn score(&self, layer: usize, ids: &[i32]) -> bool {
         if self
             .pending
             .get(layer)
             .is_none_or(|p| !p.swap(false, Ordering::Relaxed))
         {
-            return;
+            return false;
         }
         let row = &self.bits[layer * self.words..][..self.words];
         let hits = ids
@@ -359,6 +368,7 @@ impl PredState {
             .count();
         self.routed.fetch_add(ids.len() as u64, Ordering::Relaxed);
         self.hits.fetch_add(hits as u64, Ordering::Relaxed);
+        true
     }
 }
 
@@ -504,29 +514,29 @@ impl PolicyState {
     /// Builds the evict-first order for `layer` into `order`: never-accessed
     /// first, then ascending last-access step ([`VramOrder::Recency`]) or
     /// ascending decayed score ([`VramOrder::Score`]); ties by ascending
-    /// index. Preallocated `order`; no allocation (runs on the publisher).
-    fn build_order(&self, layer: usize, order: &mut [i32]) {
+    /// index. Preallocated scratch; no allocation (runs on the publisher).
+    fn build_order(&self, layer: usize, s: &mut OrderScratch) {
         let n = self.n_experts;
-        debug_assert_eq!(order.len(), n);
-        order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
+        debug_assert_eq!(s.order.len(), n);
+        s.order.iter_mut().zip(0..).for_each(|(o, i)| *o = i);
         let base = layer * n;
         let row = &self.last_access[base..][..n];
-        match self.vram_order {
-            VramOrder::Recency => {
-                order.sort_unstable_by_key(|&i| (row[i as usize].load(Ordering::Relaxed), i));
-            }
-            VramOrder::Score => {
-                let step = self.step.load(Ordering::Relaxed);
-                let key = |i: i32| {
-                    let never = row[i as usize].load(Ordering::Relaxed) == 0;
-                    (!never, self.decayed(base + i as usize, step))
-                };
-                order.sort_unstable_by(|&a, &b| {
-                    let (ka, kb) = (key(a), key(b));
-                    ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1)).then(a.cmp(&b))
-                });
-            }
+        // Keys are snapshotted once per expert before sorting: the decode
+        // thread writes these atomics mid-sort, and a comparator reading
+        // them live is not a total order.
+        let step = self.step.load(Ordering::Relaxed);
+        for (k, (w, i)) in s.keys.iter_mut().zip(row.iter().zip(base..)) {
+            let raw = w.load(Ordering::Relaxed);
+            *k = match self.vram_order {
+                VramOrder::Recency => raw,
+                // Decayed scores are ≥ 0 and finite, so their f64 bits order
+                // like the values; never-accessed (raw 0) keys 0, first.
+                VramOrder::Score if raw == 0 => 0,
+                VramOrder::Score => self.decayed(i, step).to_bits().max(1),
+            };
         }
+        let keys = &s.keys;
+        s.order.sort_unstable_by_key(|&i| (keys[i as usize], i));
     }
 }
 
@@ -549,6 +559,22 @@ fn is_permutation(order: &[i32], n: usize) -> bool {
         order
             .iter()
             .all(|&i| !std::mem::replace(&mut seen[i as usize], true))
+    }
+}
+
+/// Preallocated `build_order` buffers: the published order and one snapshot
+/// key per expert.
+struct OrderScratch {
+    order: Vec<i32>,
+    keys: Vec<u64>,
+}
+
+impl OrderScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            order: vec![0; n],
+            keys: vec![0; n],
+        }
     }
 }
 
@@ -887,7 +913,7 @@ fn spawn_order_publisher(state: Arc<HookState>, interval: std::time::Duration) -
             .spawn(move || {
                 // Off-hot-path scratch: allocated once per thread, never in
                 // the publish loop.
-                let mut order: Vec<i32> = vec![0; state.n_experts as usize];
+                let mut order = OrderScratch::new(state.n_experts as usize);
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         return;
@@ -912,7 +938,7 @@ fn spawn_order_publisher(state: Arc<HookState>, interval: std::time::Duration) -
 /// competitors; exactly one wins a given dirty bit). A failed push (no free
 /// slot under the epoch gate) re-marks the layer dirty and counts a skip —
 /// never blocks, never overwrites a buffer a reader may still hold.
-fn publish_dirty(state: &HookState, limit: usize, order_scratch: &mut [i32]) -> usize {
+fn publish_dirty(state: &HookState, limit: usize, scratch: &mut OrderScratch) -> usize {
     // SAFETY: the ctx pointer is non-null only while hooks are registered;
     // it is cleared after the unregister-join, and this runs either on the
     // decode thread inside a registered hook (copy_done flush) or on the
@@ -931,14 +957,14 @@ fn publish_dirty(state: &HookState, limit: usize, order_scratch: &mut [i32]) -> 
         if !state.policy.dirty[layer].swap(false, Ordering::Relaxed) {
             continue;
         }
-        state.policy.build_order(layer, order_scratch);
+        state.policy.build_order(layer, scratch);
         let blk = layer as i32 + state.dense_lead as i32;
         let mut all_pushed = true;
         for kind in 1..=3 {
-            // SAFETY: `ctx` is live (see above); `order_scratch` holds n
+            // SAFETY: `ctx` is live (see above); `scratch.order` holds n
             // initialized i32s.
             let ok = unsafe {
-                raw::golem_policy_order_push(ctx, blk, kind, order_scratch.as_ptr(), n as i32)
+                raw::golem_policy_order_push(ctx, blk, kind, scratch.order.as_ptr(), n as i32)
             };
             if ok == 0 {
                 all_pushed = false;
@@ -1193,7 +1219,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             unsafe { raw::golem_ctx_generation(ctx.as_ptr()) }
         },
         miss_scratch: Mutex::new(Vec::with_capacity(3 * k.min(geo.n_experts) as usize)),
-        flush_scratch: Mutex::new(vec![0; geo.n_experts as usize]),
+        flush_scratch: Mutex::new(OrderScratch::new(geo.n_experts as usize)),
         policy,
         n_layers,
         dense_lead,
@@ -1575,11 +1601,14 @@ pub extern "C" fn predict(
         let layer = (target_blk - lead) as usize;
         // SAFETY: C passes `n_ids` ids it read this step.
         let ids = unsafe { std::slice::from_raw_parts(ids, n_ids as usize) };
-        h.pred.add(layer, ids, h.n_experts);
+        let new = h.pred.add(layer, ids, h.n_experts);
         match (&h.pred.mode, &h.pred.queue) {
-            (PrefetchMode::Protect, _) => h.pool.protect(layer as u32, h.pred.predicted(layer)),
-            (PrefetchMode::Read, Some(q)) => q.push(layer as u32, h.pred.predicted(layer)),
-            _ => {}
+            (PrefetchMode::Protect, _) => {
+                new.for_each(drop);
+                h.pool.protect(layer as u32, h.pred.predicted(layer));
+            }
+            (PrefetchMode::Read, Some(q)) => q.push(layer as u32, new),
+            _ => new.for_each(drop),
         }
     })
 }
@@ -1624,8 +1653,10 @@ pub extern "C" fn routing(
         let ids = unsafe { std::slice::from_raw_parts(ids_dense, n_ids as usize) };
         h.policy.book_routed(layer, ids);
         h.policy.mark_dirty(layer);
-        if h.policy.scoring.load(Ordering::Relaxed) {
-            h.pred.score(layer, ids);
+        // The layer ran: its prediction is spent, so `protect` releases
+        // the shield (a stale one would pin slots through prefill).
+        if h.pred.score(layer, ids) && h.pred.mode == PrefetchMode::Protect {
+            h.pool.protect(layer as u32, std::iter::empty());
         }
         if let Some(trace) = &h.trace {
             let mut t = trace.lock().unwrap_or_else(|e| e.into_inner());
@@ -1975,16 +2006,16 @@ mod tests {
         p.book_routed(0, &[3]);
         p.step.store(9, Ordering::Relaxed);
         p.book_routed(1, &[5]);
-        let mut order = vec![0i32; 6];
-        p.build_order(0, &mut order);
+        let mut s = OrderScratch::new(6);
+        p.build_order(0, &mut s);
         assert_eq!(
-            order,
+            s.order,
             vec![0, 1, 2, 4, 5, 3],
             "expert 3 accessed → evicted last"
         );
-        p.build_order(1, &mut order);
-        assert_eq!(*order.last().unwrap(), 5);
-        assert!(is_permutation(&order, 6));
+        p.build_order(1, &mut s);
+        assert_eq!(*s.order.last().unwrap(), 5);
+        assert!(is_permutation(&s.order, 6));
     }
 
     #[test]
@@ -2000,9 +2031,9 @@ mod tests {
             }
             p.step.store(5, Ordering::Relaxed);
             p.book_routed(0, &[2]);
-            let mut out = vec![0i32; 4];
-            p.build_order(0, &mut out);
-            out
+            let mut s = OrderScratch::new(4);
+            p.build_order(0, &mut s);
+            s.order
         };
         assert_eq!(book(VramOrder::Recency), [0, 3, 1, 2]);
         assert_eq!(book(VramOrder::Score), [0, 3, 2, 1]);
@@ -2022,14 +2053,14 @@ mod tests {
     #[test]
     fn published_order_is_identity_for_fresh_experts_and_a_permutation_otherwise() {
         let p = PolicyState::new(1, 6, VramOrder::Recency);
-        let mut order = vec![0i32; 6];
-        p.build_order(0, &mut order);
-        assert_eq!(order, vec![0, 1, 2, 3, 4, 5], "no accesses → identity");
+        let mut s = OrderScratch::new(6);
+        p.build_order(0, &mut s);
+        assert_eq!(s.order, vec![0, 1, 2, 3, 4, 5], "no accesses → identity");
         p.step.store(4, Ordering::Relaxed);
         p.book_routed(0, &[4]);
-        p.build_order(0, &mut order);
-        assert!(is_permutation(&order, 6));
-        assert_eq!(*order.last().unwrap(), 4);
+        p.build_order(0, &mut s);
+        assert!(is_permutation(&s.order, 6));
+        assert_eq!(*s.order.last().unwrap(), 4);
     }
 
     #[test]
@@ -2044,8 +2075,10 @@ mod tests {
     #[test]
     fn prediction_recall_counts_routed_ids_the_union_named_and_retires_it() {
         let p = PredState::new(PrefetchMode::Protect, 2, 70, 16);
-        p.add(1, &[3, 65, 99, -1], 70); // 99 and −1 out of range
-        p.add(1, &[4], 70); // same layer, same step: union
+        let new: Vec<_> = p.add(1, &[3, 65, 99, -1], 70).collect(); // 99, −1 out of range
+        assert_eq!(new, [3, 65]);
+        let new: Vec<_> = p.add(1, &[4, 3], 70).collect();
+        assert_eq!(new, [4], "union: 3 already predicted");
         assert_eq!(p.predicted(1).collect::<Vec<_>>(), [3, 4, 65]);
         p.score(1, &[3, 65, 7, 8]);
         assert_eq!(
@@ -2058,7 +2091,7 @@ mod tests {
         p.score(1, &[3]); // retired: no prediction pending
         p.score(0, &[3]); // never predicted
         assert_eq!(p.routed.load(Ordering::Relaxed), 4);
-        p.add(1, &[9], 70); // a new step's prediction replaces the old union
+        p.add(1, &[9], 70).for_each(drop); // a new step's prediction replaces the old union
         assert_eq!(p.predicted(1).collect::<Vec<_>>(), [9]);
     }
 }

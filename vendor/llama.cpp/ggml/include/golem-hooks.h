@@ -69,6 +69,9 @@ typedef void (*golem_routing_fn)(void *payload, int32_t blk, const void *tensor,
  * router would pick (target = src + 1 .. src + lookahead). The scheduler
  * reads them right after src_blk's routing readback (the device is already
  * synchronized there) and passes them here, decode ubatches (1 token) only.
+ * Delivered only from source layers whose expert weights are host-resident
+ * (the pooled path that runs the routing readback); the prediction nodes
+ * must share the source layer's split or an earlier one (all-GPU layers).
  * Real routing is untouched (I1): predictions only steer staging. */
 typedef void (*golem_predict_fn)(void *payload, int32_t src_blk, int32_t target_blk,
                                  const int32_t *ids, int32_t n_ids);
@@ -155,8 +158,9 @@ void golem_set_device_cache_experts(golem_ctx_t ctx, int32_t k);
 
 /* P5: enable next-layer prediction nodes (lookahead layers ahead, top
  * n_expert_used + margin each) delivered to `predict` with the registered
- * payload. lookahead <= 0 or predict == NULL disables (no graph nodes). Set
- * before the first graph build. */
+ * payload. lookahead <= 0 or predict == NULL disables (no graph nodes).
+ * Init-only: set before the first graph build, never changed afterwards
+ * (built graphs keep the node set they were built with). */
 void golem_set_predict(golem_ctx_t ctx, int32_t lookahead, int32_t margin, golem_predict_fn predict);
 /* Graph-build query: prediction lookahead (0 = off, also for a NULL ctx). */
 int32_t golem_predict_lookahead(golem_ctx_t ctx);
