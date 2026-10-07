@@ -1,6 +1,6 @@
 """Suite leg orchestration: provenance gate, sequential legs, compare, report.
 
-Sequencing (M1.4): provenance gate → T1 op legs → T2 prompt legs (8 M0.5
+Sequencing: provenance gate → T1 op legs → T2 prompt legs (8 frozen benchmark
 prompts, one dump per prompt per backend) → `xtask parity-compare` per pair →
 merged scrubbed report.json, rewritten incrementally after every stage.
 
@@ -37,7 +37,7 @@ DEFAULT_TIMEOUT_S = 3600
 DEFAULT_EPSILON = 1e-2
 DEFAULT_THRESHOLD_PCT = 100.0
 DEFAULT_BOUND = 1e-2
-# Task-7 hardware-leg knobs (baseline-001 method): 96-token generations,
+# Hardware-leg knobs (baseline-001 method): 96-token generations,
 # whole-model GPU offload with the first 45 layers' expert FFNs pinned to
 # CPU buffers (the public-API equivalent of -ncmoe 45).
 DEFAULT_N_PREDICT = 96
@@ -108,7 +108,7 @@ def t2_args(bin_path: str, model: str, prompt: str, dump_path: str,
             threads: int | None = None, n_predict: int = DEFAULT_N_PREDICT,
             gpu_layers: int | None = None, cpu_moe: int | None = None,
             flash_attn: bool = True) -> list[str]:
-    """One T2 leg invocation. Task-7 hardware-leg knobs: `threads` (the
+    """One T2 leg invocation. Hardware-leg knobs: `threads` (the
     calibration knob) maps to `golem run --threads`; `n_predict` is the
     frozen generation length (96, the baseline method); `flash_attn` is
     forced on for hardware legs on both backends; `gpu_layers`/`cpu_moe`

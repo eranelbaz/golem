@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pool-size report: parse timing.csv legs and print a markdown rollup (M3.14).
+"""Pool-size report: parse timing.csv legs and print a markdown rollup .
 
 Usage: python3 pool-size-report.py <workdir>
 Each leg is a dir containing timing.csv; legs named asc|desc|smoke|probe-<gib>-<temp>.

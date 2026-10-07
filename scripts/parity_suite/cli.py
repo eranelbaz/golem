@@ -13,7 +13,7 @@ from .selftest import selftest
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="parity-suite.py",
-        description="M1.4 parity suite: T1 op parity + T2 end-to-end greedy token parity "
+        description="Parity suite: T1 op parity + T2 end-to-end greedy token parity "
                     "over two substrate builds (run from the repo root: vendor/ and "
                     "engine/ are resolved relative to cwd).")
     ap.add_argument("--selftest", action="store_true",

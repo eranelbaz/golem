@@ -1,7 +1,7 @@
-"""M1.4 parity-suite driver package.
+"""Parity-suite driver package.
 
 Sequences the T1 (MUL_MAT_ID op parity) and T2 (end-to-end greedy token
-parity, 8 M0.5 prompts) harness legs over two substrate builds and merges the
+parity, the 8 frozen benchmark prompts) harness legs over two substrate builds and merges the
 per-pair comparator reports into one scrubbed report.json:
   - model identity is sha256 + byte size only (never a path)
   - binaries appear as basenames; the provenance anchor is the vendored-tree

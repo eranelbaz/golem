@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M0.3: build a manifest.json for one quant dir of GGUF shards.
+"""Build a manifest.json for one quant dir of GGUF shards.
 
 Usage:
   manifest-builder.py <dir> <name> <repo> <revision> <quant> [--replica PATH ...] [--header-only]
