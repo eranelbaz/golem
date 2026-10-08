@@ -17,16 +17,17 @@ def leg_row(d: Path) -> str:
         sys.exit(f"{d.name}: no decode rows")
     try:
         wall = sum(float(r["wall_ms"]) for r in rows)
-        disk = sum(float(r["disk_bytes"]) for r in rows)
+        # The plain-GGUF leg (no manifest) has no store counters.
+        disk = None if any(r["disk_bytes"] == "unmeasured" for r in rows) else sum(float(r["disk_bytes"]) for r in rows)
     except (KeyError, ValueError) as e:
         sys.exit(f"{d.name}: unusable timing.csv ({e})")
     trailer = next((l[2:] for l in lines if l.startswith("# prefetch")), "")
     stats = dict(re.findall(r"(\w+)=(\S+)", trailer))
-    return "| {} | {} | {:.3f} | {:.2f} | {} | {} | {} |".format(
+    return "| {} | {} | {:.3f} | {} | {} | {} | {} |".format(
         d.name,
         len(rows),
         len(rows) / wall * 1000,
-        disk / len(rows) / 1e9,
+        "-" if disk is None else f"{disk / len(rows) / 1e9:.2f}",
         stats.get("prediction_recall", "-"),
         stats.get("prefetch_hit_rate", "-"),
         f"{int(stats['prefetch_wasted_bytes']) / len(rows) / 1e9:.2f}" if "prefetch_wasted_bytes" in stats else "-",

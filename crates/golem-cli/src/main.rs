@@ -47,6 +47,16 @@ enum Command {
 }
 
 fn main() {
+    // Engine diagnostics (store health transitions, pool/stream warnings) go
+    // to stderr; `RUST_LOG` overrides the warn default.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
     let cli = Cli::parse();
     let status = match cli.command {
         None => {

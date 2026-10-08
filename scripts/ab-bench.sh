@@ -29,9 +29,17 @@ if [[ "$TEMP" == cold ]]; then
   echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null || { echo "FATAL: drop_caches needs the sudoers entry" >&2; exit 2; }
 fi
 
-PROMPT="Write a detailed technical explanation of how a modern database engine executes a SQL query, from parsing through planning, optimization and execution, with examples."
-flags=(--n-gpu-layers 99 --cpu-moe-layers 99 --greedy --ram-experts-gib "$GIB" --manifest "$MANIFEST"
+PROMPT="${GOLEM_AB_PROMPT:-Write a detailed technical explanation of how a modern database engine executes a SQL query, from parsing through planning, optimization and execution, with examples.}"
+flags=(--n-gpu-layers 99 --cpu-moe-layers 99 --greedy --ram-experts-gib "$GIB"
        --ctx 1024 --n-predict "$TOKENS" --timing-csv "$OUT/timing.csv" "$@")
+# GOLEM_AB_MANIFEST=0 runs the plain-GGUF leg (no --manifest) for the §4
+# cold-decode manifest-vs-none A/B; --ram-experts-gib still applies, so
+# both legs share the pool path.
+case "${GOLEM_AB_MANIFEST:-1}" in
+  1) flags=(--manifest "$MANIFEST" "${flags[@]}") ;;
+  0) ;;
+  *) echo "FATAL: GOLEM_AB_MANIFEST must be 0 or 1" >&2; exit 2 ;;
+esac
 {
   echo "leg=$LEG temp=$TEMP date=$(date -Is) host=$(hostname)"
   echo "flags=${flags[*]}"
