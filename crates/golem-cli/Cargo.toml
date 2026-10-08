@@ -1,6 +1,6 @@
 [package]
 name = "golem-cli"
-description = "golem CLI: run, parity-op, import (tech design section 9)"
+description = "golem CLI: run (tech design section 9)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
