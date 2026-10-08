@@ -864,7 +864,12 @@ impl Session {
             && self.offloaded()
             && substrate_backend() == Backend::Hip;
         let placement_before = expert_placement();
-        let traffic_before = self.p3.as_ref().map_or(0, |p| pool_traffic(&p.stats));
+        // Streamed planes are expert copies served on the GPU split too
+        // (stream_source fires only from that copy loop, §7.6).
+        let traffic_of = |p: &p3_glue::SessionHooks| {
+            pool_traffic(&p.stats) + p.stream_stats().map_or(0, |s| s.planes)
+        };
+        let traffic_before = self.p3.as_ref().map_or(0, traffic_of);
         if let Some(p3) = self.p3.as_ref() {
             // Stale-record guard: a failed prior turn's routing records are
             // dropped (the header survives for the real file flush) before
@@ -951,7 +956,7 @@ impl Session {
         if verify {
             check_experts_on_gpu(placement_before, expert_placement())?;
             if let Some(p3) = &self.p3 {
-                check_pool_engaged(traffic_before, &p3.stats)?;
+                check_pool_engaged(traffic_before, traffic_of(p3))?;
             }
         }
 
@@ -1341,14 +1346,15 @@ fn pool_traffic(stats: &P3Stats) -> u64 {
     stats.demand_slow_pageins.load(Relaxed) + stats.fast_hits.load(Relaxed)
 }
 
-/// Runtime proof of design I2 for a pooled offloaded run: since `before`
-/// (a [`pool_traffic`] snapshot taken before the prefill), the pool must have
-/// served expert copies (`ensure_host_resident` fires only from the GPU
-/// split's expert-copy path). Zero traffic means the expert `MUL_MAT_ID` ran
-/// somewhere else — silently on the CPU, or the experts never left the
-/// device — and decoding on would be a silent violation.
-fn check_pool_engaged(before: u64, stats: &P3Stats) -> Result<(), EngineError> {
-    if pool_traffic(stats) == before {
+/// Runtime proof of design I2 for a pooled offloaded run: between the
+/// `before` and `now` traffic snapshots (pool copies plus streamed planes),
+/// the GPU split's expert-copy path must have served copies
+/// (`ensure_host_resident` and `stream_source` fire only from there). Zero
+/// traffic means the expert `MUL_MAT_ID` ran somewhere else — silently on
+/// the CPU, or the experts never left the device — and decoding on would be
+/// a silent violation.
+fn check_pool_engaged(before: u64, now: u64) -> Result<(), EngineError> {
+    if now == before {
         return Err(EngineError::PoolInit(
             "the expert pool served no copies during this pooled prefill: expert \
              MUL_MAT_ID is not running through the GPU split (CPU fallback, or experts \
@@ -1501,15 +1507,15 @@ mod tests {
     #[test]
     fn pool_engaged_check_counts_only_traffic_since_the_snapshot() {
         let stats = P3Stats::new();
-        let err = check_pool_engaged(0, &stats).unwrap_err();
+        let err = check_pool_engaged(0, pool_traffic(&stats)).unwrap_err();
         assert!(matches!(err, EngineError::PoolInit(_)), "{err}");
         stats.fast_hits.store(1, Ordering::Relaxed);
-        check_pool_engaged(0, &stats).unwrap();
+        check_pool_engaged(0, pool_traffic(&stats)).unwrap();
         let before = pool_traffic(&stats);
-        let err = check_pool_engaged(before, &stats).unwrap_err();
+        let err = check_pool_engaged(before, pool_traffic(&stats)).unwrap_err();
         assert!(matches!(err, EngineError::PoolInit(_)), "{err}");
         stats.demand_slow_pageins.store(1, Ordering::Relaxed);
-        check_pool_engaged(before, &stats).unwrap();
+        check_pool_engaged(before, pool_traffic(&stats)).unwrap();
     }
 
     #[test]
