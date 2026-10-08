@@ -561,7 +561,7 @@ impl Session {
         // BEFORE the model loads — the ctx must attach to the llama_model
         // before `llama_init_from_model` so its first `sched_reserve` sees
         // the hooks (cpy shrink). If the load fails, the guards drop cleanly.
-        let p3 = if config.ram_experts_gib > 0 {
+        let mut p3 = if config.ram_experts_gib > 0 {
             Some(p3_glue::enable(config)?)
         } else {
             None
@@ -573,6 +573,11 @@ impl Session {
                 return Err(e);
             }
         };
+        // Derived K needs the resident weights, KV and compute buffer
+        // (ruling R3). On error the slabs are already freed by the fit.
+        if let Some(p) = p3.as_mut() {
+            p.fit_device_cache()?;
+        }
         let template_src = loaded
             .model()
             .chat_template()

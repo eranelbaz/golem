@@ -755,8 +755,11 @@ pub struct SessionHooks {
     /// — the §3.4 drop order ends with `golem_ctx_free` (which aborts while
     /// any sched attach refcount remains) and then the pool.
     ctx_keep: Arc<CtxRaw>,
-    /// Device slab slots per layer, as priced at enable (§3.4).
+    /// Device slab slots per layer (§3.4): explicit, or derived by
+    /// [`Self::fit_device_cache`].
     pub device_cache_experts: u32,
+    /// Pending derived-K fit; `None` once fitted or with an explicit K.
+    fit: Option<DeviceFit>,
     /// Model routed top-k (`expert_used_count`).
     pub top_k: u32,
     /// Prefill-stream state (§7.6); `None` when disabled.
@@ -825,6 +828,49 @@ impl SessionHooks {
     /// [`set_scoring`] used by `Session`.
     pub fn set_scoring(&self, on: bool) {
         set_scoring(on);
+    }
+
+    /// Derived-K fit (ruling R3), once the model, KV and compute buffer are
+    /// resident: frees the load's top-k slab, then K = (free − stream slabs
+    /// − headroom) / per-expert slab bytes − 1, capped at the pre-load
+    /// bound. With streaming on and that K below top-k, streaming
+    /// auto-disables with a warning and K is refit without the slabs.
+    /// No-op for an explicit K or after the first call.
+    pub(crate) fn fit_device_cache(&mut self) -> Result<(), EngineError> {
+        let Some(fit) = self.fit.take() else {
+            return Ok(());
+        };
+        let ctx = self.ctx_ptr();
+        // SAFETY: FFI on the live ctx between computes (no slab in flight).
+        unsafe { raw::golem_reset_device_cache(ctx) };
+        self.device_cache_reset();
+        #[cfg(golem_backend_hip)]
+        let free = golem_llama_sys::pinned::free_device_mem().map_or(0, |(f, _)| f as u64);
+        #[cfg(not(golem_backend_hip))]
+        let free = 0u64;
+        let k_of = |budget: u64| {
+            k_from_free_vram(budget, fit.slab_bytes_per_expert, self.top_k)
+                .map(|k| k.min(fit.k_bound))
+        };
+        let k = match k_of(free.saturating_sub(fit.stream_slab_vram)) {
+            Ok(k) => k,
+            Err(e) if self.stream.is_some() => {
+                tracing::warn!(
+                    stream_slab_vram = fit.stream_slab_vram,
+                    error = %e,
+                    "prefill-stream disabled: the stream slabs do not fit alongside a \
+                     K ≥ top-k device cache; continuing without streaming"
+                );
+                self.stream = None;
+                self.stream_cfg = None;
+                k_of(free)?
+            }
+            Err(e) => return Err(e),
+        };
+        // SAFETY: FFI setter on the live ctx between computes.
+        unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
+        self.device_cache_experts = k;
+        Ok(())
     }
 
     /// Whether prefill streaming is enabled for this session.
@@ -1240,8 +1286,11 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // budget, streaming auto-disables with a warning (never fails enable);
     // K below top-k without streaming is still a hard error (a routed set
     // larger than K aborts mid-decode).
-    let (k, stream_enabled) =
-        derive_device_cache_experts(config, slab, n_expert_used, stream_slab_vram)?;
+    // `k` is the explicit K, or (derived) an upper bound priced off the
+    // free VRAM before the model loads; [`SessionHooks::fit_device_cache`]
+    // sets the real K once the weights, KV and compute buffer are resident.
+    let (k, derived_k) = derive_device_cache_experts(config, slab, n_expert_used)?;
+    let stream_enabled = config.prefill_stream;
     // Per-class RAM layout (§5.4): each unit-size class gets slots
     // proportional to its share of total unit bytes; remainder bytes are
     // trimmed by integer division.
@@ -1328,7 +1377,10 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         .ok_or_else(|| EngineError::PoolInit("golem_ctx_create failed".into()))?;
     // SAFETY: FFI setter on a live ctx; bounded per-layer slab (never
     // unlimited, never proportional to total experts — AGENTS.md).
-    unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k as i32) };
+    // A derived K starts at top-k (the smallest legal slab) for the load's
+    // self-check decode; `fit_device_cache` raises it.
+    let k_start = if derived_k { n_expert_used.min(k) } else { k };
+    unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k_start as i32) };
     // Stash the stream config C-side (slabs allocate lazily on the first
     // streamed split's backend); chunks arm/disarm via SessionHooks.
     let mut stream_cfg = None;
@@ -1462,26 +1514,28 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         stats: state.pool.stats.clone(),
         state,
         ctx_keep: hooked_ctx_keep,
-        device_cache_experts: k,
+        device_cache_experts: k_start,
+        fit: derived_k.then_some(DeviceFit {
+            k_bound: k,
+            slab_bytes_per_expert: slab,
+            stream_slab_vram,
+        }),
         top_k: n_expert_used,
         stream: stream.clone(),
         stream_cfg,
     })
 }
 
-/// Per-layer device-slab expert count for this pool. Explicit
-/// `device_cache_experts > 0` wins; otherwise derived from free VRAM against
-/// the exact budget (ruling R3: free − stream slabs − headroom — no halving;
-/// the measured free already nets out KV, `ws` and the non-expert weights).
-/// Returns whether prefill streaming stays enabled: auto-disabled with a
-/// warning when the slab budget would push K below top-k (never fails the
-/// enable). Never unlimited, never zero: a routed set larger than K aborts,
-/// so K = 0 could not decode at all.
+/// Per-layer device-slab expert count for this pool, and whether it is
+/// derived. Explicit `device_cache_experts > 0` wins as-is. Otherwise the
+/// result is an upper bound from the free VRAM before the model loads (the
+/// weights, KV and compute buffer are not resident yet); the session refits
+/// it after context creation. Never unlimited, never zero: a routed set
+/// larger than K aborts, so K = 0 could not decode at all.
 fn derive_device_cache_experts(
-    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] config: &EngineConfig,
+    config: &EngineConfig,
     #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] slab_bytes_per_expert: u64,
     n_expert_used: u32,
-    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] stream_slab_vram: u64,
 ) -> Result<(u32, bool), EngineError> {
     if config.device_cache_experts > 0 {
         let k = config.device_cache_experts;
@@ -1498,37 +1552,13 @@ fn derive_device_cache_experts(
                 "device_cache_experts {k} exceeds i32::MAX"
             )));
         }
-        return Ok((k, config.prefill_stream));
+        return Ok((k, false));
     }
     #[cfg(golem_backend_hip)]
     if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
-        let free = free as u64;
-        // Ruling R3: K off the exact budget; with streaming requested but
-        // the slabs pushing K below top-k, auto-disable streaming (never
-        // fail the enable).
-        let k_stream = k_from_free_vram(
-            free.saturating_sub(stream_slab_vram),
-            slab_bytes_per_expert,
-            n_expert_used,
-        );
-        if config.prefill_stream {
-            match k_stream {
-                Ok(k) => return Ok((k, true)),
-                Err(e) => {
-                    let k_plain = k_from_free_vram(free, slab_bytes_per_expert, n_expert_used)?;
-                    tracing::warn!(
-                        stream_slab_vram,
-                        error = %e,
-                        "prefill-stream disabled: the stream slabs do not fit alongside a \
-                         K ≥ top-k device cache; continuing without streaming"
-                    );
-                    return Ok((k_plain, false));
-                }
-            }
-        }
         return Ok((
-            k_from_free_vram(free, slab_bytes_per_expert, n_expert_used)?,
-            false,
+            k_from_free_vram(free as u64, slab_bytes_per_expert, n_expert_used)?,
+            true,
         ));
     }
     Err(EngineError::PoolInit(
@@ -1536,6 +1566,16 @@ fn derive_device_cache_experts(
          slab budget — set device_cache_experts explicitly"
             .into(),
     ))
+}
+
+/// Inputs of the post-load derived-K fit (ruling R3).
+struct DeviceFit {
+    /// Pre-load bound; also the pool layout's in-flight bound.
+    k_bound: u32,
+    slab_bytes_per_expert: u64,
+    /// Both prefill-stream slabs (0 without streaming); they allocate
+    /// lazily, so the post-load free VRAM does not net them out yet.
+    stream_slab_vram: u64,
 }
 
 /// Device bytes one slab slot costs across the model: Σ_layers unit bytes —
@@ -2317,7 +2357,7 @@ mod tests {
             ..EngineConfig::default()
         };
         assert_eq!(
-            derive_device_cache_experts(&c, 42 * 5_777_000, 8, 0).unwrap(),
+            derive_device_cache_experts(&c, 42 * 5_777_000, 8).unwrap(),
             (9, false)
         );
         // Explicit K below the model's top-k must fail at enable, not abort
@@ -2326,13 +2366,13 @@ mod tests {
             device_cache_experts: 7,
             ..EngineConfig::default()
         };
-        let err = derive_device_cache_experts(&c_small, 42 * 5_777_000, 8, 0).unwrap_err();
+        let err = derive_device_cache_experts(&c_small, 42 * 5_777_000, 8).unwrap_err();
         assert!(err.to_string().contains("expert_used_count"), "{err}");
         // Default (0): derived, bounded, never 0. On the CPU backend there is
         // no VRAM query, so derivation is a loud error, not an unbounded cap.
         #[cfg(not(golem_backend_hip))]
         assert!(
-            derive_device_cache_experts(&EngineConfig::default(), 42 * 5_777_000, 8, 0).is_err(),
+            derive_device_cache_experts(&EngineConfig::default(), 42 * 5_777_000, 8).is_err(),
             "no VRAM query: derivation must fail loudly"
         );
         // An explicit K that would wrap the i32 ABI is refused, not passed
@@ -2341,7 +2381,7 @@ mod tests {
             device_cache_experts: u32::MAX,
             ..EngineConfig::default()
         };
-        let err = derive_device_cache_experts(&c_huge, 42 * 5_777_000, 8, 0).unwrap_err();
+        let err = derive_device_cache_experts(&c_huge, 42 * 5_777_000, 8).unwrap_err();
         assert!(err.to_string().contains("i32::MAX"), "{err}");
     }
 
