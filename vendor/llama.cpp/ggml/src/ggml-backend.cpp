@@ -1905,11 +1905,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // before that segment's staged H2D refills (stream order: the D2H must
     // read a stolen slot's bytes before the refill overwrites them). All
     // segments of one step run inside one compute_splits call, ahead of the
-    // next copy_done drain, so per-compute clearing keeps no entry alive
-    // past the pool lease that pins its destination slot.
-    struct golem_evict_d2h_entry { int32_t blk; int32_t slot; void * dst[3]; uint32_t done; };
+    // next copy_done drain. Entries whose planes never all drain are
+    // reported abandoned at compute end (ABI v9), so nothing incomplete
+    // survives to a copy_done commit.
+    struct golem_evict_d2h_entry { int32_t blk; int32_t id; int32_t slot; void * dst[3]; uint32_t done; };
     static thread_local std::vector<golem_evict_d2h_entry> golem_evict_d2h;
     golem_evict_d2h.clear();
+    // ABI v9 abandon scratch: expert ids of one blk's unfinished parked D2Hs.
+    static thread_local std::vector<int32_t> golem_evict_abandon_ids;
+    // ABI v9 abandon reporter: groups the still-parked (done != 7)
+    // D2H entries by blk and hands their expert ids to the pool's
+    // evict_abandon hook. Complete entries (done == 7) were removed
+    // at their last drain, so whatever remains here is incomplete
+    // by construction; the caller synchronizes the backends first.
+    auto golem_evict_abandon_unfinished = [&]() {
+        if (gctx->evict_abandon == NULL) {
+            golem_evict_d2h.clear();
+            return;
+        }
+        for (size_t r = 0; r < golem_evict_d2h.size();) {
+            const int32_t blk_a = golem_evict_d2h[r].blk;
+            golem_evict_abandon_ids.clear();
+            size_t w = r;
+            for (size_t q = r; q < golem_evict_d2h.size(); ++q) {
+                if (golem_evict_d2h[q].blk == blk_a) {
+                    golem_evict_abandon_ids.push_back(golem_evict_d2h[q].id);
+                } else {
+                    golem_evict_d2h[w++] = golem_evict_d2h[q];
+                }
+            }
+            golem_evict_d2h.resize(w);
+            {
+                golem_cb_guard cb;
+                gctx->evict_abandon(gctx->payload, blk_a,
+                                    golem_evict_abandon_ids.data(),
+                                    (int32_t) golem_evict_abandon_ids.size());
+            }
+        }
+    };
     // P5: prediction nodes named golem_pred-<target blk>-<source blk>, indexed
     // once per compute (one strncmp per node) and delivered in the source
     // layer's pre-pass, right after its ids readback synchronized the device.
@@ -2336,6 +2369,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // the planes that happen to live in THIS split.
                         golem_evict_d2h_entry e;
                         e.blk = blk;
+                        e.id = golem_evicts[i_ev].second;
                         e.slot = golem_evicts[i_ev].first;
                         for (int k = 0; k < 3; ++k) {
                             GGML_ASSERT(golem_evict_out[3 * i_ev + k] != NULL);
@@ -2599,6 +2633,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             golem_restore_ids();
             if (ec != GGML_STATUS_SUCCESS) {
+                for (int i = 0; i < sched->n_backends; i++) {
+                    ggml_backend_synchronize(sched->backends[i]);
+                }
+                if (!golem_evict_d2h.empty()) {
+                    golem_evict_abandon_unfinished();
+                }
+                if (golem_hooked) {
+                    golem_in_flight_done(gctx);
+                }
                 return ec;
             }
         } else {
@@ -2622,6 +2665,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     golem_restore_ids();
+                    for (int i = 0; i < sched->n_backends; i++) {
+                        ggml_backend_synchronize(sched->backends[i]);
+                    }
+                    if (!golem_evict_d2h.empty()) {
+                        golem_evict_abandon_unfinished();
+                    }
+                    if (golem_hooked) {
+                        golem_in_flight_done(gctx);
+                    }
                     return ec;
                 }
 
@@ -2645,6 +2697,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    // ABI v9: report parked D2H entries whose plane copies were not all
+    // issued (see golem_evict_d2h_entry) so the pool cancels their claims
+    // instead of committing unwritten plane bytes. All segments have run,
+    // so anything still parked here is undrainable; sync the backends first
+    // so any issued copy has landed before the destinations are recycled.
+    if (golem_hooked && !golem_evict_d2h.empty()) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
+        golem_evict_abandon_unfinished();
+    }
     // Release this entry's in-flight pin (the graph_compute_async caller
     // holds its own; the depth is per nested entry).
     if (golem_hooked) {
@@ -3438,6 +3501,7 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
                                          golem_routing_fn routing,
                                          golem_copy_done_fn copy_done,
                                          golem_evict_batch_fn evict_batch,
+                                         golem_evict_abandon_fn evict_abandon,
                                          void *payload) {
     if (ctx == NULL) {
         return NULL;
@@ -3453,6 +3517,7 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
     ctx->routing = routing;
     ctx->copy_done = copy_done;
     ctx->evict_batch = evict_batch;
+    ctx->evict_abandon = evict_abandon;
     ctx->payload = payload;
     ctx->generation.fetch_add(1, std::memory_order_relaxed);
     return new golem_hook_handle{ctx};
@@ -3479,6 +3544,7 @@ void golem_unregister_hooks(golem_hook_handle_t handle) {
     ctx->routing = NULL;
     ctx->copy_done = NULL;
     ctx->evict_batch = NULL;
+    ctx->evict_abandon = NULL;
     ctx->payload = NULL;
 }
 

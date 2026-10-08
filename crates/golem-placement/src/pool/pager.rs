@@ -645,6 +645,29 @@ impl ExpertPool {
         }
     }
 
+    /// Cancels one pending VRAM-eviction D2H whose copies the substrate
+    /// never fully issued (ABI v9 abandon): clears the fill gate and the
+    /// key's residency, returns the slot to the free list and wakes class
+    /// waiters — the key stays non-resident, its bytes re-read from disk
+    /// later (the VRAM bit was already cleared at eviction time). No
+    /// `finish_d2h`, so no pool reader ever observes the unwritten bytes.
+    /// No-op if the expert's claim was never pending (dropped/resident at
+    /// claim time). The pending lease drops after the cancel (release_lease
+    /// 1 → 0) — cancel_d2h deliberately does not touch the lease count.
+    pub fn abandon_d2h(&self, layer: u32, expert: u32) {
+        let pending = {
+            let mut pending = self.d2h_pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending
+                .iter()
+                .rposition(|p| p.layer == layer && p.expert == expert)
+                .map(|pos| pending.swap_remove(pos))
+        };
+        if let Some(p) = pending {
+            self.residency.cancel_d2h(layer, expert);
+            drop(p.lease);
+        }
+    }
+
     /// Single-expert form of [`Self::claim_d2h_batch`] (tests and the
     /// inclusive ABI path).
     pub fn claim_d2h(&self, layer: u32, expert: u32, floor: f32) -> D2hIncoming {
@@ -1626,6 +1649,46 @@ mod tests {
             step.ensure_range_leased(0, ExpertKind::Gate, 1, 0, &mut []),
             Err(PoolError::Contract { .. })
         ));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn abandoned_d2h_leaves_the_slot_free_gate_open_and_wakes_waiters() {
+        let pool = test_pool(2);
+        let _gen0 = pool.residency.class_generation(0);
+        // Evict expert 1's slab slot; the pool takes the D2H (gate closed,
+        // slot leased, pending).
+        pool.clear_vram(0, 1);
+        assert!(matches!(pool.claim_d2h(0, 1, 0.0), D2hIncoming::Dest(_)));
+        assert!(pool.is_resident(0, 1));
+        // The copies were never fully issued: abandon instead of commit.
+        pool.abandon_d2h(0, 1);
+        assert!(
+            !pool.is_resident(0, 1),
+            "abandoned key must not be resident"
+        );
+        assert!(
+            !pool.is_vram(0, 1),
+            "abandoned key must not be VRAM-present"
+        );
+        assert_eq!(
+            pool.residency.lease_count(0, 1),
+            0,
+            "abandon must release the pending lease"
+        );
+        // Slot back on the free list: a fresh D2H claim for the same key
+        // re-fills (Dest, not Resident) — no ghost residency.
+        pool.clear_vram(0, 1);
+        assert!(matches!(pool.claim_d2h(0, 1, 0.0), D2hIncoming::Dest(_)));
+        // Claim/release paths also bump the generation — sample after them.
+        let gen1 = pool.residency.class_generation(0);
+        pool.abandon_d2h(0, 1);
+        // The cancel bumped the class wake generation: no-victim parkers
+        // re-check instead of sleeping through the freed slot.
+        assert!(
+            pool.residency.class_generation(0) > gen1,
+            "abandon must bump the class generation"
+        );
     }
 
     #[test]

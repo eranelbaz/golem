@@ -1314,6 +1314,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             routing: Some(routing),
             copy_done: Some(copy_done),
             evict_batch: exclusive.then_some(evict_dest_batch),
+            evict_abandon: exclusive.then_some(evict_abandon),
         },
         state.clone(),
     );
@@ -1723,6 +1724,38 @@ pub extern "C" fn evict_dest_batch(
                 }
                 D2hIncoming::Resident | D2hIncoming::Dropped => keep[i] = 0,
             }
+        }
+    })
+}
+
+/// The abandoned-D2H hook (ABI v9, §6.3 O10): the substrate reports parked
+/// eviction D2Hs whose plane copies were not all issued by compute end. The
+/// claims must be cancelled — the slot returns to the free list, the fill
+/// gate reopens, and the key stays non-resident (its VRAM bit was cleared at
+/// eviction time, so the unit is re-read from disk later) — never committed
+/// with unwritten plane bytes. Runs on the decode thread after the substrate
+/// synchronized its backends, so any issued copy has landed before the slot
+/// is recycled.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn evict_abandon(payload: *mut c_void, blk: i32, experts: *const i32, n: i32) {
+    guarded("evict_abandon", || {
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        if experts.is_null() || n < 0 {
+            p3_fatal("P3: evict_abandon called with null/negative argument".into());
+        }
+        if blk < h.dense_lead as i32 || blk >= (h.dense_lead + h.n_layers) as i32 {
+            p3_fatal(format!(
+                "P3: evict_abandon blk {blk} outside the expert blk range [{}, {})",
+                h.dense_lead,
+                h.dense_lead + h.n_layers
+            ));
+        }
+        let layer = (blk - h.dense_lead as i32) as u32;
+        // SAFETY: C allocates `n` expert ids it parked this compute.
+        let ids = unsafe { std::slice::from_raw_parts(experts, n as usize) };
+        for &expert in ids {
+            h.pool.abandon_d2h(layer, expert as u32);
         }
     })
 }

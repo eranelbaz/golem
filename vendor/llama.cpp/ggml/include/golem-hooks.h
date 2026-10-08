@@ -1,7 +1,9 @@
-// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v8:
+// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v9:
 // per-model hook context; v7 added the exclusive-residency eviction hook,
 // v8 batches it per (layer, compute) — one call for all of a layer's
-// evictions in one shot). Part of the vendored ggml include tree; the ABI is
+// evictions in one shot; v9 adds the abandoned-D2H hook — a parked eviction
+// whose plane copies were not all issued by compute end must be reported so
+// the pool cancels the claim instead of committing unwritten bytes). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
@@ -27,7 +29,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 8
+#define GOLEM_HOOKS_ABI_VERSION 9
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -67,6 +69,20 @@ typedef void (*golem_ensure_host_resident_fn)(void *payload, const void *tensor,
 typedef void (*golem_evict_batch_fn)(void *payload, const void *tensor,
                                      const int32_t *experts, int32_t n_evicts,
                                      void *const *out_ptrs, int32_t *keep);
+
+/* Hook (exclusive residency, ABI v9): a parked eviction D2H whose plane
+ * copies were NOT all issued by compute end (the owning plane's drain was
+ * skipped — node2 NULL, non-host/non-weights buffer, mode-0/1 plan — or the
+ * eviction was parked from a segment later than an earlier plane's copy
+ * phase). ONE call per (layer, compute) listing the affected experts; runs
+ * after the scheduler synchronized its backends, so any issued copy has
+ * landed and the destinations are safe to recycle. The pool must cancel the
+ * claim: slot back to its free list, fill gate re-opened, key NOT marked
+ * pool-resident (its VRAM bit was already cleared at eviction time, so it
+ * is re-read from disk later). Never delivered for experts whose three
+ * copies were all issued — those commit via the matching copy_done. */
+typedef void (*golem_evict_abandon_fn)(void *payload, int32_t blk,
+                                       const int32_t *experts, int32_t n_experts);
 
 /* Hook: releases the host-pool leases taken by ensure_host_resident since
  * the previous copy_done. Called at the start of each scheduler compute,
@@ -126,6 +142,7 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
                                          golem_routing_fn routing,
                                          golem_copy_done_fn copy_done,
                                          golem_evict_batch_fn evict_batch,
+                                         golem_evict_abandon_fn evict_abandon,
                                          void *payload);
 
 /* Marks the ctx unhooked, then JOINS: waits until the ctx's in-flight step

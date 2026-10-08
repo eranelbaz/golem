@@ -807,6 +807,13 @@ impl ResidencyMap {
         sh.leases[self.local(expert)]
     }
 
+    /// The class's wake generation (test seam: the abandon path must bump
+    /// it so no-victim parkers re-check the free list).
+    #[cfg(test)]
+    pub(crate) fn class_generation(&self, class: usize) -> u64 {
+        *self.class_wake[class].generation.lock().unwrap()
+    }
+
     /// Abandons a page-in (reached only through [`FillClaim`]): drops the claim's lease — by contract the
     /// only one on the key (concurrent claimers park on the fill gate until
     /// this cancel or the fill completes) — clears the key's residency and
@@ -919,6 +926,39 @@ impl ResidencyMap {
     /// semantics once the gate is open.
     pub(crate) fn finish_d2h(&self, layer: u32, expert: u32) {
         self.finish_fill(layer, expert);
+    }
+
+    /// Cancels one pending D2H claim whose copies were never fully issued
+    /// (exclusive-residency abandon, ABI v9): clears the fill gate, clears
+    /// the key's residency and returns the slot to the free list, waking
+    /// claimers parked on the gate (they re-claim fresh) and no-victim
+    /// parkers on the class. The pending [`Lease`](super::pager::Lease) is
+    /// dropped by the caller AFTER this — no lease-count touch here.
+    pub(crate) fn cancel_d2h(&self, layer: u32, expert: u32) {
+        let li = layer as usize;
+        let freed = {
+            let mut sh = self.shards[li].shard.lock().unwrap();
+            let i = self.local(expert);
+            debug_assert!(
+                Self::bit_test(&sh.filling, i),
+                "cancel_d2h without a closed fill gate"
+            );
+            Self::bit_clear(&mut sh.filling, i);
+            Self::bit_clear(&mut sh.bits, i);
+            Self::bit_clear(&mut sh.prefetched, i);
+            let s = sh.slot_of[i];
+            sh.slot_of[i] = -1;
+            (s >= 0).then_some(s as u32)
+            // Shard guard dropped before the leaf free list.
+        };
+        if let Some(s) = freed {
+            let class = self.class_of_layer[li] as usize;
+            self.free_slots.lock().unwrap()[class].push(s);
+            let wake = &self.class_wake[class];
+            *wake.generation.lock().unwrap() += 1;
+            wake.cv.notify_all();
+        }
+        self.shards[li].fill_cv.notify_all();
     }
 }
 

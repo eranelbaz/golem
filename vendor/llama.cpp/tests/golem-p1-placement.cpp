@@ -187,7 +187,7 @@ int main() {
         printf("FAIL: abi %d != header %d\n", golem_hooks_abi_version(), GOLEM_HOOKS_ABI_VERSION);
         return 1;
     }
-    REQUIRE(GOLEM_HOOKS_ABI_VERSION == 8, "abi v8 expected");
+    REQUIRE(GOLEM_HOOKS_ABI_VERSION == 9, "abi v9 expected");
     pool_init();
 
     {   // --- leg 1: placement counters (unchanged semantics, global stats) ---
@@ -227,8 +227,8 @@ int main() {
         golem_ctx_t cb = golem_ctx_create(N_LAYERS, N_EXP);
         golem_set_device_cache_experts(ca, 2);
         golem_set_device_cache_experts(cb, 2);
-        auto * ha = golem_register_hooks(ca, h_ensure, h_routing, h_copy_done, nullptr, &sa);
-        auto * hb = golem_register_hooks(cb, h_ensure, h_routing, h_copy_done, nullptr, &sb);
+        auto * ha = golem_register_hooks(ca, h_ensure, h_routing, h_copy_done, nullptr, nullptr, &sa);
+        auto * hb = golem_register_hooks(cb, h_ensure, h_routing, h_copy_done, nullptr, nullptr, &sb);
         ExpertSched ea, eb;
         ea.build();
         eb.build();
@@ -271,7 +271,7 @@ int main() {
         g_join_sleep_ms.store(200);
         golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
         golem_set_device_cache_experts(c, 2);
-        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, nullptr, &s);
+        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, nullptr, nullptr, &s);
         ExpertSched es;
         es.build();
         golem_sched_set_ctx(es.sched, c);
@@ -300,7 +300,7 @@ int main() {
         HState s;
         golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
         golem_set_device_cache_experts(c, 2);
-        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, nullptr, &s);
+        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, nullptr, nullptr, &s);
         ExpertSched es;
         es.build();
         golem_sched_set_ctx(es.sched, c);
@@ -324,7 +324,7 @@ int main() {
         if (fork() == 0) {
             HState s;
             golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
-            g_h_abort = golem_register_hooks(c, h_abort_ensure, nullptr, nullptr, nullptr, &s);
+            g_h_abort = golem_register_hooks(c, h_abort_ensure, nullptr, nullptr, nullptr, nullptr, &s);
             // Invoke the hook exactly as the scheduler would (inside the
             // C-side golem_cb_guard); computing in a forked child of a
             // multithreaded parent deadlocks in the CPU threadpool.

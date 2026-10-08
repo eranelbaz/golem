@@ -54,6 +54,23 @@ struct EvictState {
 
 static EvictState g_ev;
 
+// ABI v9: substrate-reported abandoned parked D2Hs (plane copies not all
+// issued by compute end). The pool stand-in records the call; the commit
+// stand-in (ev_copy_done) never sees these experts again.
+struct AbandonState {
+    int calls = 0;
+    int32_t last_blk = -1;
+    std::vector<int32_t> experts;
+};
+
+static AbandonState g_ab;
+
+static void ev_abandon(void *, int32_t blk, const int32_t * experts, int32_t n) {
+    g_ab.calls++;
+    g_ab.last_blk = blk;
+    g_ab.experts.assign(experts, experts + n);
+}
+
 static void ev_ensure(void *, const void *, const int32_t * mk, const int32_t * mi,
                       int32_t n, const void ** out) {
     for (int32_t i = 0; i < n; ++i) {
@@ -92,7 +109,7 @@ int main() {
     golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXPERTS);
     golem_set_device_cache_experts(c, 2); // K = 2 < 8: forced eviction churn
     auto * h = golem_register_hooks(c, ev_ensure, ev_routing, ev_copy_done,
-                                    ev_evict, &s);
+                                    ev_evict, ev_abandon, &s);
     (void) h;
     {
         ExpertSched es;
@@ -130,6 +147,74 @@ int main() {
             }
         }
     }
+    // A plane whose segment is absent from a compute (fused/upstream path
+    // variations) can never receive its D2H, yet its slab bytes may still be
+    // fully valid and get evicted. The substrate must report the parked
+    // entry abandoned at compute end — committing it would admit unwritten
+    // plane bytes — and the skipped plane's destination must stay untouched.
+    // Scenario A omits the down plane; scenario B omits the gate plane (the
+    // eviction is then parked from the first PRESENT segment, later than the
+    // missing plane's would-be copy phase). Step 3 proves no re-abandon.
+    // --- Mid-compute failure after a parked eviction: the gate segment's
+    // evict_batch + D2H share land (done = gate bit only), then the next
+    // segment's graph compute fails. The error return must report the parked
+    // entries abandoned — committing them at the next copy_done would open
+    // the fill gate over unwritten up/down plane bytes — and never re-fire
+    // on the recovery step. (This is the substrate-side contract; the pool
+    // side — slot back to the free list, gate open, key non-resident,
+    // waiters woken — is covered by the Rust abandon_d2h unit test.)
+    {
+        g_ev = EvictState{};
+        g_ab = AbandonState{};
+        ExpertSched es2;
+        es2.build(3);
+        golem_sched_set_ctx(es2.sched, c);
+
+        {
+            const int32_t hids[2] = {0, 1};
+            ggml_backend_tensor_set(es2.ids, hids, 0, ggml_nbytes(es2.ids));
+        }
+        ggml_backend_sched_graph_compute(es2.sched, es2.gf);
+        REQUIRE(g_ev.evict_calls == 0, "C: no evictions before slots are full");
+
+        {
+            const int32_t hids[2] = {2, 3};
+            ggml_backend_tensor_set(es2.ids, hids, 0, ggml_nbytes(es2.ids));
+        }
+        fg_fail_next_graph().store(true);
+        ggml_backend_sched_graph_compute(es2.sched, es2.gf);
+        REQUIRE(g_ev.evict_calls == 1, "C: one batched evict call, got %d",
+                g_ev.evict_calls);
+        REQUIRE(g_ab.calls == 1, "C: one abandon call at the error return, got %d",
+                g_ab.calls);
+        REQUIRE(g_ab.last_blk == 0, "C: abandon blk 0, got %d", (int) g_ab.last_blk);
+        REQUIRE(g_ab.experts.size() == 2, "C: both evicted experts abandoned, got %zu",
+                g_ab.experts.size());
+        for (int32_t e : {0, 1}) {
+            REQUIRE(g_ab.experts.size() == 2 &&
+                        (g_ab.experts[0] == e || g_ab.experts[1] == e),
+                    "C: expert %d in the abandon list", e);
+            const auto & dg = g_ev.dst[0 * N_EXPERTS + e];
+            REQUIRE(dg.size() == PLANE_BYTES && dg == pool_plane(0, e),
+                    "C: expert %d gate plane drained before the failure", e);
+            for (int k : {1, 2}) {
+                const auto & d = g_ev.dst[(size_t) k * N_EXPERTS + e];
+                bool zero = d.size() == PLANE_BYTES;
+                for (char ch : d) {
+                    zero = zero && ch == 0;
+                }
+                REQUIRE(zero, "C: abandoned expert %d plane %d never written", e, k);
+            }
+        }
+
+        {
+            const int32_t hids[2] = {0, 1};
+            ggml_backend_tensor_set(es2.ids, hids, 0, ggml_nbytes(es2.ids));
+        }
+        ggml_backend_sched_graph_compute(es2.sched, es2.gf);
+        REQUIRE(g_ab.calls == 1, "C: no second abandon, got %d", g_ab.calls);
+    }
+
     golem_unregister_hooks(h);
     golem_reset_device_cache(c);
     golem_ctx_free(c);

@@ -19,10 +19,11 @@ fn hooks_header_resolves_from_vendor_tree() {
         "hook registration missing"
     );
     assert!(
-        text.contains("#define GOLEM_HOOKS_ABI_VERSION 8"),
-        "hook ABI must be v8 (per-model golem_ctx + P5 predict + batched eviction)"
+        text.contains("#define GOLEM_HOOKS_ABI_VERSION 9"),
+        "hook ABI must be v9 (per-model golem_ctx + P5 predict + batched eviction + abandoned D2H)"
     );
     for sym in [
+        "golem_evict_abandon_fn",
         "golem_ctx_create",
         "golem_ctx_free",
         "golem_routing_fn",

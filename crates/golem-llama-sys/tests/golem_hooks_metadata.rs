@@ -63,6 +63,7 @@ fn register_null_ctx_smoke() {
             None,
             None,
             None,
+            None,
             std::ptr::null_mut(),
         );
         assert!(h.is_null(), "NULL ctx must not produce a handle");
@@ -115,6 +116,7 @@ fn hooked_guard_unregisters_and_recovers_payload() {
             routing: Some(nop2),
             copy_done: Some(nop3),
             evict_batch: None,
+            evict_abandon: None,
         },
         std::sync::Arc::new([0u64; 4]),
     );
