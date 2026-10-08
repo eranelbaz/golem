@@ -967,6 +967,7 @@ mod tests {
         /// concurrently inside `read_chunk` — a deterministic "≥2 workers
         /// ran" signal, robust to scheduler noise.
         wait_for_pair: Option<Arc<AtomicBool>>,
+        gate: Option<Arc<Gate>>,
     }
 
     impl Concurrency {
@@ -980,6 +981,7 @@ mod tests {
 
     impl ChunkSource for FailingSource {
         fn read_chunk(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+            let start = std::time::Instant::now();
             self.log.lock().unwrap().push((self.id, offset));
             if self.delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
@@ -997,6 +999,17 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
+            if let Some(g) = &self.gate {
+                if let Some(w) = g.wait_until {
+                    while g.done.load(Ordering::SeqCst) < w {
+                        assert!(
+                            start.elapsed() < std::time::Duration::from_secs(30),
+                            "gate deadline exceeded: fast replica stalled"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
             // usize::MAX = always fail (never decremented).
             if self.fail_nth.load(Ordering::SeqCst) == 0
                 || self.fail_nth.load(Ordering::SeqCst) == usize::MAX
@@ -1004,7 +1017,13 @@ mod tests {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             self.fail_nth.fetch_sub(1, Ordering::SeqCst);
-            self.inner.read_at(offset, buf)
+            self.inner.read_at(offset, buf)?;
+            if let Some(g) = &self.gate {
+                if g.bump {
+                    g.done.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1030,6 +1049,21 @@ mod tests {
         /// Pair-achievement flag handed to every source (see
         /// [`FailingSource::wait_for_pair`]).
         wait_for_pair: Option<Arc<AtomicBool>>,
+        /// Per-replica ordering gate (index = replica, empty = ungated);
+        /// makes cross-drive interleavings deterministic (see [`Gate`]).
+        gates: Vec<Option<Arc<Gate>>>,
+    }
+
+    /// Deterministic cross-replica ordering for multi-drive tests: one
+    /// replica counts completed reads (`bump`), another blocks until the
+    /// count reaches `wait_until`. Replaces wall-clock sleep assumptions
+    /// that flake under parallel test load.
+    struct Gate {
+        done: Arc<AtomicUsize>,
+        /// This replica increments `done` after each successful read.
+        bump: bool,
+        /// This replica blocks in `read_chunk` until `done` ≥ this count.
+        wait_until: Option<usize>,
     }
 
     impl ShardSources for TestSources {
@@ -1060,6 +1094,7 @@ mod tests {
                             .unwrap_or(self.delay_ms),
                         conc: self.conc.clone(),
                         wait_for_pair: self.wait_for_pair.clone(),
+                        gate: self.gates.get(replica).cloned().flatten(),
                     }) as Arc<dyn ChunkSource>
                 })
                 .collect()
@@ -1112,6 +1147,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(0));
@@ -1157,6 +1193,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(0));
@@ -1208,6 +1245,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(0));
@@ -1274,6 +1312,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1315,6 +1354,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1386,6 +1426,7 @@ mod tests {
             delay_ms: 250,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(0)); // 0 = derived, one worker per drive
@@ -1417,10 +1458,11 @@ mod tests {
         // Two replicas on two drives; replica 0 (drive 0) is fast (10 ms/chunk),
         // replica 1 (drive 1) is slow (500 ms/chunk). 10 chunks, one worker per
         // drive: with self-selection (§5.2) both replicas are eligible for every
-        // chunk, so the fast worker pops proportionally more — nominally ~90%.
-        // Even if the fast worker is descheduled several times under parallel
-        // test load, its share must stay ≥60%, and the drain must beat a static
-        // 50/50 split (5 × 500 ms = 2.5 s), let alone the slow-only bound.
+        // chunk, so the fast worker pops proportionally more.
+        // Determinism: a slow-drive read blocks until the fast drive has
+        // completed 8 chunk reads, so the slow worker can hold at most 2 chunks
+        // regardless of thread scheduling under parallel test load — the fast
+        // share is ≥80% by construction, not by wall-clock luck.
         let bytes = crate::stripe::CHUNK * 10;
         let root = std::env::temp_dir().join("golem-store-queue-self-select");
         let mut replicas = Vec::with_capacity(2);
@@ -1442,6 +1484,17 @@ mod tests {
         };
         let reg = ReplicaRegistry::open(&manifest).unwrap();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate {
+            done: Arc::clone(&done),
+            bump: false,
+            wait_until: Some(8),
+        });
+        let fast_gate = Arc::new(Gate {
+            done,
+            bump: true,
+            wait_until: None,
+        });
         let sources = TestSources {
             reg,
             fail: Vec::new(),
@@ -1450,11 +1503,11 @@ mod tests {
             delay_ms: 0,
             delays_ms: vec![10, 500],
             conc: None,
+            gates: vec![Some(fast_gate), Some(gate)],
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(0)); // derived: one worker per drive
         let mut dst = vec![0u8; bytes];
-        let t0 = std::time::Instant::now();
         queue
             .enqueue(ReadJob {
                 shard_index: 0,
@@ -1468,7 +1521,6 @@ mod tests {
             })
             .wait()
             .unwrap();
-        let elapsed = t0.elapsed();
         assert_eq!(dst, pattern(0, bytes));
         let reads = sources.log.lock().unwrap().clone();
         assert_eq!(reads.len(), 10, "every chunk served once: {reads:?}");
@@ -1478,10 +1530,11 @@ mod tests {
             fast * 10 >= reads.len() * 6,
             "fast drive must self-select ≥60% of chunks (nominally ~90%): fast={fast} slow={slow}"
         );
-        // Beats a static 50/50 split (5 × 500 ms) — and the slow-only bound.
+        // Structurally beats a static 50/50 split: the gate pins the slow
+        // drive to ≤2 of 10 chunks, so fast > slow is guaranteed, not timed.
         assert!(
-            elapsed < std::time::Duration::from_millis(5 * 500),
-            "drain ({elapsed:?}) must beat the 50/50 bound of 2.5 s"
+            fast > slow,
+            "fast must out-select slow: fast={fast} slow={slow}"
         );
     }
 
@@ -1499,6 +1552,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1552,6 +1606,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: Some(Arc::clone(&conc)),
+            gates: Vec::new(),
             wait_for_pair: Some(Arc::clone(&pair)),
         };
         let queue = Arc::new(ChunkQueue::new(4));
@@ -1597,6 +1652,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1639,6 +1695,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1663,6 +1720,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1712,6 +1770,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1737,6 +1796,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1765,6 +1825,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(4));
@@ -1792,6 +1853,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(1));
@@ -1834,6 +1896,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         };
         let queue = Arc::new(ChunkQueue::new(2));
@@ -1868,6 +1931,7 @@ mod tests {
             delay_ms: 0,
             delays_ms: Vec::new(),
             conc: None,
+            gates: Vec::new(),
             wait_for_pair: None,
         });
         let queue = Arc::new(ChunkQueue::new(4));
