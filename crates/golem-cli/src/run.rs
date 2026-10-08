@@ -1,5 +1,5 @@
 //! `golem run` (tech design §9): greedy decode of a local GGUF model, either
-//! one-shot via `--prompt` or as a stdin REPL of independent single turns.
+//! one-shot via `--prompt` or as a stdin multi-turn chat REPL.
 // The RLIMIT_MEMLOCK preflight is the one sanctioned unsafe call-site here.
 #![allow(unsafe_code)]
 
@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 pub struct RunArgs {
     /// Path to the GGUF model file.
     pub model: PathBuf,
-    /// One-shot prompt text; when omitted, the stdin REPL runs instead.
+    /// One-shot prompt text; when omitted, the stdin chat REPL runs instead.
     #[arg(long)]
     pub prompt: Option<String>,
     /// Maximum tokens to generate per completion (engine §7.2 default: 64).
@@ -205,7 +205,7 @@ impl RunArgs {
 }
 
 /// Runs one greedy `run` invocation: loads the model, then either prints a
-/// single completion (`--prompt`) or serves per-line single-turn conversations
+/// single completion (`--prompt`) or serves a multi-turn chat REPL
 /// on stdin until EOF. Returns `Err` for load/init failures and one-shot
 /// decode errors (process unusable); per-turn REPL errors are printed and the
 /// loop continues.
@@ -579,6 +579,9 @@ fn model_identity(path: &Path) -> std::io::Result<(String, u64)> {
     Ok((hex, total))
 }
 
+/// Stdin chat REPL. Each turn re-sends the whole conversation: the engine
+/// clears the KV cache per turn, so history only survives by being replayed
+/// in the prompt. `/reset` drops it, `/exit` ends the session.
 fn repl(
     session: &mut Session,
     timing_out: &mut Option<std::fs::File>,
@@ -586,6 +589,9 @@ fn repl(
 ) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
+    // (role, content) in send order; owned because each turn borrows it all.
+    let mut history: Vec<(&'static str, String)> = Vec::new();
+    eprintln!("golem: multi-turn chat; /reset clears history, /exit quits");
     loop {
         eprint!("golem> ");
         let _ = std::io::stderr().flush();
@@ -594,12 +600,32 @@ fn repl(
             Some(Err(e)) => return Err(e.into()),
             None => return Ok(()),
         };
-        let turn = [ChatTurn {
-            role: "user",
-            content: line.as_str(),
-        }];
-        match session.chat_turn(&turn, &mut emit_stdout) {
+        match line.trim() {
+            "" => continue,
+            "/exit" | "/quit" => return Ok(()),
+            "/reset" => {
+                history.clear();
+                eprintln!("golem: history cleared");
+                continue;
+            }
+            _ => {}
+        }
+        history.push(("user", line));
+        let turns: Vec<ChatTurn<'_>> = history
+            .iter()
+            .map(|(role, content)| ChatTurn {
+                role,
+                content: content.as_str(),
+            })
+            .collect();
+        let mut reply = String::new();
+        let mut emit = |piece: &str| {
+            reply.push_str(piece);
+            emit_stdout(piece);
+        };
+        match session.chat_turn(&turns, &mut emit) {
             Ok(_) => {
+                history.push(("assistant", reply));
                 if let Err(e) = flush_timing(session, timing_out) {
                     eprintln!("error: timing csv: {e}");
                 }
@@ -609,6 +635,9 @@ fn repl(
                 println!()
             }
             Err(e) => {
+                // Drop the failed turn: replaying a prompt that already
+                // overran the context would fail the same way every turn.
+                history.pop();
                 println!();
                 eprintln!("error: {e}");
             }
