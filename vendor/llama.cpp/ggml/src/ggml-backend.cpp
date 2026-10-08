@@ -1896,6 +1896,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static thread_local std::vector<int32_t> golem_evict_ids;
     static thread_local std::vector<void *> golem_evict_out;
     static thread_local std::vector<int32_t> golem_evict_keep;
+    // Exclusive D2H deferral: a layer's planes span several split segments
+    // (fused MoE graphs), but evict_batch delivers all three plane
+    // destinations at once, in the segment that triggered the eviction. A
+    // plane's D2H can only be issued from the segment that owns that plane's
+    // slab entry, so park (blk, slot → dst[3]) here until each plane's copy
+    // has been issued (done bit per kind); drained in the slab copy phase
+    // before that segment's staged H2D refills (stream order: the D2H must
+    // read a stolen slot's bytes before the refill overwrites them). All
+    // segments of one step run inside one compute_splits call, ahead of the
+    // next copy_done drain, so per-compute clearing keeps no entry alive
+    // past the pool lease that pins its destination slot.
+    struct golem_evict_d2h_entry { int32_t blk; int32_t slot; void * dst[3]; uint32_t done; };
+    static thread_local std::vector<golem_evict_d2h_entry> golem_evict_d2h;
+    golem_evict_d2h.clear();
     // P5: prediction nodes named golem_pred-<target blk>-<source blk>, indexed
     // once per compute (one strncmp per node) and delivered in the source
     // layer's pre-pass, right after its ids readback synchronized the device.
@@ -2316,18 +2330,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (golem_evict_keep[i_ev] == 0) {
                             continue;
                         }
-                        for (int j = input_id; j < split->n_inputs; ++j) {
-                            const golem_plane_plan & plan = golem_planes[j];
-                            const int kind = golem_expert_stem_kind(split->inputs[j]->name);
-                            if (plan.mode != 2 || plan.st == nullptr || kind == 0 ||
-                                golem_tensor_blk(split->inputs[j]->name) != blk) {
-                                continue;
-                            }
-                            GGML_ASSERT(golem_evict_out[3 * i_ev + kind - 1] != NULL);
-                            ggml_backend_tensor_get_async(split_backend, plan.st->slab,
-                                golem_evict_out[3 * i_ev + kind - 1],
-                                (size_t) golem_evicts[i_ev].first * plan.st->expert_size, plan.st->expert_size);
+                        // Park the D2H: each plane's copy is issued by the
+                        // segment that owns that plane's slab entry (see
+                        // golem_evict_d2h) — issuing here would only cover
+                        // the planes that happen to live in THIS split.
+                        golem_evict_d2h_entry e;
+                        e.blk = blk;
+                        e.slot = golem_evicts[i_ev].first;
+                        for (int k = 0; k < 3; ++k) {
+                            GGML_ASSERT(golem_evict_out[3 * i_ev + k] != NULL);
+                            e.dst[k] = golem_evict_out[3 * i_ev + k];
                         }
+                        e.done = 0;
+                        golem_evict_d2h.push_back(e);
                     }
                 }
                 // ONE ensure call per (layer, step, segment): all planes'
@@ -2467,6 +2482,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // one async copy per staged slot from the batched
                         // ensure pointers (no extra copy).
                         golem::GolemSlabEntry & st = *plan.st;
+                        // Exclusive D2H drain (see golem_evict_d2h): issue
+                        // this plane's share of the layer's pending evictions
+                        // BEFORE the staged H2D refills below — stream order
+                        // must land the D2H read of a stolen slot ahead of
+                        // the refill that overwrites it.
+                        {
+                            const int blk_d = golem_tensor_blk(input->name);
+                            const int kind_d = golem_expert_stem_kind(input->name) - 1;
+                            if (blk_d >= 0 && kind_d >= 0 && kind_d < 3) {
+                                const uint32_t bit = 1u << kind_d;
+                                size_t w = 0;
+                                for (size_t r = 0; r < golem_evict_d2h.size(); ++r) {
+                                    golem_evict_d2h_entry & e = golem_evict_d2h[r];
+                                    if (e.blk != blk_d) {
+                                        golem_evict_d2h[w++] = e;
+                                        continue;
+                                    }
+                                    if (!(e.done & bit)) {
+                                        ggml_backend_tensor_get_async(split_backend, st.slab,
+                                            e.dst[kind_d], (size_t) e.slot * st.expert_size,
+                                            st.expert_size);
+                                        e.done |= bit;
+                                    }
+                                    if (e.done != 7u) {
+                                        golem_evict_d2h[w++] = e;
+                                    }
+                                }
+                                golem_evict_d2h.resize(w);
+                            }
+                        }
                         // SAFETY (ordering invariant): the step-(N+1) memcpy
                         // below into ids_pin must never overlap the step-N DMA
                         // reading it. This holds because compute_splits drains
