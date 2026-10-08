@@ -656,6 +656,13 @@ impl Session {
         self.p3.as_ref().map(|p| p.stats.as_ref())
     }
 
+    /// The session's hook guards (test/observability seam: stream counters,
+    /// trampoline call counts, prefill-stream arming). `None` when the pool
+    /// is off.
+    pub fn p3_hooks(&self) -> Option<&crate::p3_glue::SessionHooks> {
+        self.p3.as_ref()
+    }
+
     /// The session's per-model hook context pointer (ABI v5), for test seams
     /// that address per-ctx substrate state (the P4 budget setter/reset).
     /// `None` when the pool is off.

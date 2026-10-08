@@ -2496,8 +2496,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
+                // Golem: upstream only inspects nodes[0], which stops being the
+                // MUL_MAT_ID once other ops share the split (prefill ubatches
+                // > 32); hooked scheds find the plane's MUL_MAT_ID like the
+                // pre-pass does, hookless ones keep upstream verbatim.
+                ggml_tensor * node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
+                if (golem_hooked && gctx->ensure != NULL && golem_expert_stem_kind(input->name) != 0) {
+                    node = nullptr;
+                    for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
+                        ggml_tensor * n2 = split->graph.nodes[ni];
+                        if (n2->op == GGML_OP_MUL_MAT_ID && n2->src[0] == input_cpy) {
+                            node = n2;
+                            break;
+                        }
+                    }
+                }
+                if (node != nullptr &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)

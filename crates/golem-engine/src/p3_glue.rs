@@ -1439,8 +1439,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             copy_done: Some(copy_done),
             evict_batch: exclusive.then_some(evict_dest_batch),
             evict_abandon: exclusive.then_some(evict_abandon),
-            stream_source: state.stream.as_ref().map_or(None, |_| Some(stream_source)),
-            stream_release: state.stream.as_ref().map_or(None, |_| Some(stream_release)),
+            stream_source: state.stream.as_ref().map(|_| stream_source as _),
+            stream_release: state.stream.as_ref().map(|_| stream_release as _),
         },
         state.clone(),
     );
@@ -1481,7 +1481,7 @@ fn derive_device_cache_experts(
     #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] config: &EngineConfig,
     #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] slab_bytes_per_expert: u64,
     n_expert_used: u32,
-    stream_slab_vram: u64,
+    #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] stream_slab_vram: u64,
 ) -> Result<(u32, bool), EngineError> {
     if config.device_cache_experts > 0 {
         let k = config.device_cache_experts;
