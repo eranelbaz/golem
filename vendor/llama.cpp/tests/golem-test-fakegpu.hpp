@@ -95,12 +95,22 @@ inline ggml_backend_dev_t fake_dev() {
     return &dev;
 }
 
+// One-shot failure injection: when armed, the next fake graph_compute
+// returns GGML_STATUS_FAILED without running (mid-compute error tests).
+inline std::atomic<bool> & fg_fail_next_graph() {
+    static std::atomic<bool> f{false};
+    return f;
+}
+
 inline ggml_backend_t fake_backend() {
     static ggml_backend bk = {};
     if (bk.iface.get_name == nullptr) {
         bk.iface.get_name = [](ggml_backend_t) { return "FAKEGPU"; };
         bk.iface.synchronize = [](ggml_backend_t) {};
         bk.iface.graph_compute = [](ggml_backend_t, ggml_cgraph * gf) {
+            if (fg_fail_next_graph().exchange(false)) {
+                return GGML_STATUS_FAILED;
+            }
             ggml_cplan plan = ggml_graph_plan(gf, 1, nullptr);
             if (plan.work_size > 0) {
                 plan.work_data = (uint8_t *) malloc(plan.work_size);

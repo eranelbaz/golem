@@ -387,6 +387,14 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(golem-p3-copy PRIVATE ggml)
     target_include_directories(golem-p3-copy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+    # Golem exclusive-residency regression: evicted fully-valid slab bytes
+    # must reach the D2H destination for ALL three planes even when the
+    # layer's planes span separate split segments (the segment owning each
+    # plane issues its D2H share). Links ggml for the scheduler paths.
+    llama_build_and_test(golem-p2-evict.cpp)
+    target_link_libraries(golem-p2-evict PRIVATE ggml)
+    target_include_directories(golem-p2-evict PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
     # Golem P1 placement counters: expert MUL_MAT_ID nodes counted per
     # backend device type at graph split (golem_get_expert_placement_stats).
     llama_build_and_test(golem-p1-placement.cpp)

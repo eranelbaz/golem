@@ -111,7 +111,7 @@ int main() {
         HState s;
         golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
         golem_set_device_cache_experts(c, 2);
-        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, &s);
+        auto * h = golem_register_hooks(c, h_ensure, h_routing, h_copy_done, nullptr, nullptr, &s);
         (void) h;
         {
             ExpertSched es;

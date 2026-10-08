@@ -29,12 +29,48 @@ pub struct PolicySnapshot {
     /// Per-layer bitset over experts, grown on first protect: one shift per
     /// CLOCK step, no hashing (GLM: 42 × 288 bits ≈ 1.5 KB when full).
     protected: Vec<Vec<u64>>,
+    /// Flat `layer × n_experts` tier scores (§6.2 decayed, published once per
+    /// step by the engine). Empty = no cross-tier scoring: victim picks use
+    /// CLOCK order only. With scores present, the claim's score floor (see
+    /// [`ResidencyMap::claim_for`]) shields every key scoring above it — the
+    /// exclusive-residency drop decision (O10).
+    scores: Vec<f32>,
+    /// Experts per score row (0 = no scoring). Kept beside `scores` so
+    /// `score_of` needs no map geometry.
+    scores_stride: usize,
 }
 
 impl PolicySnapshot {
     /// Empty snapshot: nothing pinned, nothing protected.
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Snapshot carrying per-key scores (engine-published decayed §6.2
+    /// scores, flat `layer × n_experts` with the given stride); nothing
+    /// pinned, nothing protected.
+    pub fn scored(scores: Vec<f32>, stride: usize) -> Self {
+        Self {
+            protected: Vec::new(),
+            scores,
+            scores_stride: stride,
+        }
+    }
+
+    /// Replaces the score table in place (scores published once per decode
+    /// step; the caller reuses one snapshot to avoid a per-step allocation).
+    pub fn replace_scores(&mut self, scores: Vec<f32>) {
+        self.scores = scores;
+    }
+
+    /// The published score of one key (0.0 when no scores are published or
+    /// the table is short — a shorter table scores strictly cold).
+    pub fn score_of(&self, layer: u32, expert: u32) -> f32 {
+        if self.scores_stride == 0 {
+            return 0.0;
+        }
+        let i = layer as usize * self.scores_stride + expert as usize;
+        self.scores.get(i).copied().unwrap_or(0.0)
     }
 
     /// Protect a unit exactly like an outstanding map lease would.
@@ -185,6 +221,17 @@ pub enum ClaimError<'m> {
     Busy,
 }
 
+/// Exclusive-residency D2H claim outcome (O10): `Resident` — the expert's
+/// RAM copy is current, the VRAM bytes are droppable; `Claimed` — the slot is
+/// assigned with its fill gate closed (finish via [`ResidencyMap::finish_d2h`]
+/// after the copy lands); `Dropped` — no acceptable pool slot (the score
+/// floor kept every candidate), the VRAM bytes are droppable.
+pub(crate) enum D2hClaim<'m> {
+    Resident,
+    Claimed { slot: u32, claim: FillClaim<'m> },
+    Dropped,
+}
+
 /// An expert evicted by this claim; its slot is reassigned to the claimer,
 /// whose I/O replaces the victim's bytes.
 #[derive(Debug)]
@@ -223,6 +270,14 @@ impl FillClaim<'_> {
     pub(crate) fn finish(mut self) {
         self.settled = true;
         self.map.finish_fill(self.layer, self.expert);
+    }
+
+    /// Consumes the claim WITHOUT opening the fill gate: the exclusive-D2H
+    /// path keeps the gate closed (parking every reader of the key) until the
+    /// copy lands, then finishes via [`ResidencyMap::finish_d2h`]. The
+    /// claim's lease stays held; the pending-D2H owner drops it explicitly.
+    pub(crate) fn defer(mut self) {
+        self.settled = true;
     }
 
     /// Abandons a failed page-in; see [`ResidencyMap::cancel_claim`].
@@ -423,7 +478,7 @@ impl ResidencyMap {
         expert: u32,
         snapshot: &PolicySnapshot,
     ) -> Result<Claim<'_>, ClaimError<'_>> {
-        self.claim_for(layer, expert, snapshot, true)
+        self.claim_for(layer, expert, snapshot, true, f32::NEG_INFINITY)
     }
 
     /// [`Self::claim`] for a demand (`true`) or prefetch (`false`) claimer.
@@ -433,12 +488,18 @@ impl ResidencyMap {
     /// [`ClaimError::Busy`] at once instead of retrying. Its fill is marked
     /// prefetched with the reference bit clear; the first demand claim
     /// clears the mark (a prefetch hit) and sets the reference bit.
+    /// `floor`: when the snapshot carries tier scores, a CLOCK victim whose
+    /// score is STRICTLY ABOVE the floor is never taken — the claimer sees
+    /// [`ClaimError::Busy`] instead (exclusive residency's drop decision:
+    /// an incoming VRAM eviction copy displaces only colder RAM keys, O10).
+    /// Regular claims pass `NEG_INFINITY` (never floor-shielded).
     pub(crate) fn claim_for(
         &self,
         layer: u32,
         expert: u32,
         snapshot: &PolicySnapshot,
         demand: bool,
+        floor: f32,
     ) -> Result<Claim<'_>, ClaimError<'_>> {
         let li = layer as usize;
         let class = self.class_of_layer[li] as usize;
@@ -506,7 +567,7 @@ impl ResidencyMap {
                     }
                     let wake = &self.class_wake[class];
                     sweep_gen = *wake.generation.lock().unwrap();
-                    self.clock_evict(class, snapshot, demand, (li, i))
+                    self.clock_evict(class, snapshot, demand, (li, i), floor)
                         .map(|(v, s)| (s, Some(v)))
                 }
             };
@@ -608,6 +669,7 @@ impl ResidencyMap {
         snapshot: &PolicySnapshot,
         demand: bool,
         claimer: (usize, usize),
+        floor: f32,
     ) -> Option<(Victim, u32)> {
         let kpl = Self::keys_per_layer(self.n_experts);
         let class_key_count = self.class_keys[class];
@@ -642,7 +704,10 @@ impl ResidencyMap {
             // second chance and stays demoted forever (it can't be picked
             // to earn the bit back).
             let expert = c as u32;
-            if snapshot.excludes(li as u32, expert) || Self::bit_test(&sh.protected, c) {
+            if snapshot.excludes(li as u32, expert)
+                || Self::bit_test(&sh.protected, c)
+                || (snapshot.scores_stride != 0 && snapshot.score_of(li as u32, expert) > floor)
+            {
                 drop(sh);
                 continue;
             }
@@ -690,8 +755,10 @@ impl ResidencyMap {
     }
 
     /// Clears the fill gate and wakes parked `Resident` claimers; reached
-    /// only through [`FillClaim::finish`], after the slot's bytes are written.
-    fn finish_fill(&self, layer: u32, expert: u32) {
+    /// through [`FillClaim::finish`] (demand page-in) and
+    /// [`ResidencyMap::finish_d2h`] (exclusive-residency D2H, whose claim is
+    /// deferred at claim time), after the slot's bytes are written.
+    pub(crate) fn finish_fill(&self, layer: u32, expert: u32) {
         let mut sh = self.shards[layer as usize].shard.lock().unwrap();
         let i = self.local(expert);
         Self::bit_clear(&mut sh.filling, i);
@@ -717,6 +784,34 @@ impl ResidencyMap {
         let wake = &self.class_wake[self.class_of_layer[li] as usize];
         *wake.generation.lock().unwrap() += 1;
         wake.cv.notify_all();
+    }
+
+    /// The slot a resident key currently occupies, if any (diag/prefetch seam:
+    /// pairs with [`Self::release_resident`] for callers that hold no claim
+    /// token). `None` while mid-fill — the slot is not readable yet.
+    pub(crate) fn resident_slot(&self, layer: u32, expert: u32) -> Option<u32> {
+        let li = layer as usize;
+        let sh = self.shards[li].shard.lock().unwrap();
+        let i = self.local(expert);
+        if Self::bit_test(&sh.bits, i) && !Self::bit_test(&sh.filling, i) {
+            Some(sh.slot_of[i] as u32)
+        } else {
+            None
+        }
+    }
+
+    /// The key's outstanding lease count (test/diagnostic seam: the D2H
+    /// `Resident` path must not leak the probe's lease).
+    pub(crate) fn lease_count(&self, layer: u32, expert: u32) -> u16 {
+        let sh = self.shards[layer as usize].shard.lock().unwrap();
+        sh.leases[self.local(expert)]
+    }
+
+    /// The class's wake generation (test seam: the abandon path must bump
+    /// it so no-victim parkers re-check the free list).
+    #[cfg(test)]
+    pub(crate) fn class_generation(&self, class: usize) -> u64 {
+        *self.class_wake[class].generation.lock().unwrap()
     }
 
     /// Abandons a page-in (reached only through [`FillClaim`]): drops the claim's lease — by contract the
@@ -747,6 +842,118 @@ impl ResidencyMap {
             // The freed slot is claimable without a CLOCK sweep: bump the
             // class generation and wake no-victim parkers, as a lease
             // release would (they re-enter the loop and pop the free list).
+            let wake = &self.class_wake[class];
+            *wake.generation.lock().unwrap() += 1;
+            wake.cv.notify_all();
+        }
+        self.shards[li].fill_cv.notify_all();
+    }
+
+    /// Releases a unit's RAM residency (exclusive promotion, O10): after the
+    /// expert's H2D copy has landed, its VRAM copy is the only one — the pool
+    /// slot returns to the free list. Refuses (returns `false`, touching
+    /// nothing) unless the key is resident in exactly `slot` with zero
+    /// outstanding leases: a concurrent prefetch claim on the key keeps the
+    /// unit inclusive until its own lifecycle resolves it.
+    pub fn release_resident(&self, layer: u32, expert: u32, slot: u32) -> bool {
+        let li = layer as usize;
+        let freed = {
+            let mut sh = self.shards[li].shard.lock().unwrap();
+            let i = self.local(expert);
+            if !Self::bit_test(&sh.bits, i)
+                || Self::bit_test(&sh.filling, i)
+                || sh.leases[i] != 0
+                || sh.slot_of[i] != slot as i32
+            {
+                return false;
+            }
+            Self::bit_clear(&mut sh.bits, i);
+            Self::bit_clear(&mut sh.ref_bits, i);
+            Self::bit_clear(&mut sh.prefetched, i);
+            sh.slot_of[i] = -1;
+            slot
+            // Shard guard dropped before the leaf free list.
+        };
+        let class = self.class_of_layer[li] as usize;
+        self.free_slots.lock().unwrap()[class].push(freed);
+        let wake = &self.class_wake[class];
+        *wake.generation.lock().unwrap() += 1;
+        wake.cv.notify_all();
+        true
+    }
+
+    /// Claims a slot for an incoming VRAM eviction copy (O10): the expert is
+    /// not pool-resident and its D2H is about to start. The claim mirrors a
+    /// demand claim — free slot first, else CLOCK with the snapshot's score
+    /// floor (a victim scoring strictly above `floor` is kept, the copy is
+    /// dropped) — but the fill gate STAYS CLOSED: the caller must complete
+    /// the D2H and then call [`Self::finish_d2h`], which opens the gate and
+    /// wakes parked claimers. No pool reader exists between claim and finish:
+    /// the gate parks every reader of the key, and the caller commits only
+    /// after the substrate synchronized its backends (the D2H has landed).
+    /// A key already pool-resident needs no copy: [`D2hClaim::Resident`].
+    pub(crate) fn claim_d2h(
+        &self,
+        layer: u32,
+        expert: u32,
+        snapshot: &PolicySnapshot,
+        floor: f32,
+    ) -> D2hClaim<'_> {
+        match self.claim_for(layer, expert, snapshot, true, floor) {
+            Ok(Claim::Resident { .. }) => {
+                // claim_for granted this probe a lease on the resident key;
+                // the D2H outcome hands no token out, so release it here —
+                // the caller copies nothing and the slot stays resident.
+                self.release_lease(layer, expert);
+                D2hClaim::Resident
+            }
+            Ok(Claim::Filled { slot, claim }) => D2hClaim::Claimed { slot, claim },
+            Err(ClaimError::Evicted(evicted)) => D2hClaim::Claimed {
+                slot: evicted.slot,
+                claim: evicted.claim,
+            },
+            // Every candidate scores above the floor: keep the RAM victim,
+            // drop the VRAM bytes (they are re-read from disk only after this
+            // eviction — i.e. when no VRAM copy exists).
+            Err(ClaimError::Busy) => D2hClaim::Dropped,
+        }
+    }
+
+    /// Completes one D2H claim: opens the fill gate (the caller guarantees
+    /// the copy landed — the substrate drains its backends before the
+    /// matching `copy_done`) and wakes parked claimers. The claim's lease
+    /// stays held; the caller drops it (with the slot) via [`Lease`](super::pager::Lease)
+    /// semantics once the gate is open.
+    pub(crate) fn finish_d2h(&self, layer: u32, expert: u32) {
+        self.finish_fill(layer, expert);
+    }
+
+    /// Cancels one pending D2H claim whose copies were never fully issued
+    /// (exclusive-residency abandon, ABI v9): clears the fill gate, clears
+    /// the key's residency and returns the slot to the free list, waking
+    /// claimers parked on the gate (they re-claim fresh) and no-victim
+    /// parkers on the class. The pending [`Lease`](super::pager::Lease) is
+    /// dropped by the caller AFTER this — no lease-count touch here.
+    pub(crate) fn cancel_d2h(&self, layer: u32, expert: u32) {
+        let li = layer as usize;
+        let freed = {
+            let mut sh = self.shards[li].shard.lock().unwrap();
+            let i = self.local(expert);
+            debug_assert!(
+                Self::bit_test(&sh.filling, i),
+                "cancel_d2h without a closed fill gate"
+            );
+            Self::bit_clear(&mut sh.filling, i);
+            Self::bit_clear(&mut sh.bits, i);
+            Self::bit_clear(&mut sh.prefetched, i);
+            let s = sh.slot_of[i];
+            sh.slot_of[i] = -1;
+            (s >= 0).then_some(s as u32)
+            // Shard guard dropped before the leaf free list.
+        };
+        if let Some(s) = freed {
+            let class = self.class_of_layer[li] as usize;
+            self.free_slots.lock().unwrap()[class].push(s);
             let wake = &self.class_wake[class];
             *wake.generation.lock().unwrap() += 1;
             wake.cv.notify_all();
@@ -867,7 +1074,7 @@ mod tests {
 
     /// A prefetch claim with its fill finished and its lease released.
     fn prefetch(m: &ResidencyMap, snap: &PolicySnapshot, layer: u32, expert: u32) -> Got {
-        let got = match m.claim_for(layer, expert, snap, false) {
+        let got = match m.claim_for(layer, expert, snap, false, f32::NEG_INFINITY) {
             Ok(Claim::Filled { slot, claim }) => {
                 claim.finish();
                 Got::Filled(slot)
@@ -1390,6 +1597,107 @@ mod tests {
             });
             claim.cancel();
             assert!(t.join().unwrap());
+        });
+    }
+
+    // --- Exclusive residency (O10) ---
+
+    /// A d2h claim: `Resident`/`Dropped` mapped to those names, `Claimed`
+    /// finished via `finish_d2h` (as the pager's commit does) and reported
+    /// with its slot.
+    fn d2h(
+        m: &ResidencyMap,
+        snap: &PolicySnapshot,
+        layer: u32,
+        expert: u32,
+        floor: f32,
+    ) -> (&'static str, u32) {
+        match m.claim_d2h(layer, expert, snap, floor) {
+            D2hClaim::Resident => ("Resident", 0),
+            D2hClaim::Dropped => ("Dropped", 0),
+            D2hClaim::Claimed { slot, claim } => {
+                claim.defer();
+                m.finish_d2h(layer, expert);
+                ("Claimed", slot)
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn promotion_release_frees_the_slot() {
+        let m = map(1, 8, vec![0..1]);
+        let snap = PolicySnapshot::empty();
+        assert_eq!(warm(&m, &snap, 0, 0), Got::Filled(0));
+        assert!(m.release_resident(0, 0, 0), "release succeeds");
+        assert!(!m.is_resident(0, 0), "unit left the RAM tier");
+        // The freed slot is reused by the next fill (no duplicate residency).
+        assert_eq!(warm(&m, &snap, 0, 7), Got::Filled(0));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn release_refuses_when_leased_or_gone() {
+        let m = map(1, 8, vec![0..1]);
+        let snap = PolicySnapshot::empty();
+        let Got::Filled(slot) = take(&m, &snap, 0, 0) else {
+            panic!("fills")
+        };
+        // The take's lease is outstanding: release must refuse.
+        assert!(!m.release_resident(0, 0, slot));
+        m.release_lease(0, 0);
+        assert!(m.release_resident(0, 0, slot));
+        // Second release: the slot is gone (or recycled) — refuses.
+        assert!(!m.release_resident(0, 0, slot));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn d2h_claim_skips_pool_resident_and_drops_on_score_floor() {
+        let m = map(1, 8, vec![0..1]);
+        let empty = PolicySnapshot::empty();
+        // Scores: expert 1 scores 10.0, everything else 0.
+        let mut scores = vec![0.0f32; 8];
+        scores[1] = 10.0;
+        let scored = PolicySnapshot::scored(scores, 8);
+        // Warm a hot key (score 10): a cold incoming copy (floor 0) must not
+        // displace it.
+        assert_eq!(warm(&m, &scored, 0, 1), Got::Filled(0));
+        let (what, _) = d2h(&m, &scored, 0, 2, 0.0);
+        assert_eq!(what, "Dropped", "hot RAM victim kept, VRAM bytes dropped");
+        // With an empty (unscored) snapshot the same claim succeeds.
+        let (what, _) = d2h(&m, &empty, 0, 2, f32::NEG_INFINITY);
+        assert_eq!(what, "Claimed", "no scores: CLOCK decides");
+        // Once committed the key is pool-resident; the next d2h claim for it
+        // (a fresh eviction while the RAM copy lives) skips the copy.
+        let (what, _) = d2h(&m, &empty, 0, 2, f32::NEG_INFINITY);
+        assert_eq!(what, "Resident");
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn d2h_fill_gates_parked_readers_until_finish() {
+        let m = Arc::new(map(1, 8, vec![0..1]));
+        let snap = Arc::new(PolicySnapshot::empty());
+        primitives::model(move || {
+            let m2 = m.clone();
+            let snap2 = snap.clone();
+            let D2hClaim::Claimed { slot, claim } = m.claim_d2h(0, 3, &snap, f32::NEG_INFINITY)
+            else {
+                panic!("d2h claim fills the free pool")
+            };
+            assert_eq!(slot, 0);
+            let t = primitives::spawn(move || {
+                // The parked reader must not see the copy before finish_d2h;
+                // after commit it reads Resident on the claimed slot.
+                let _ = take(&m2, &snap2, 0, 3);
+            });
+            claim.defer();
+            // Not finished yet: give the reader a chance to park (loom
+            // explores the interleaving; the preemption bound covers it).
+            m.finish_d2h(0, 3);
+            assert!(t.join().is_ok());
+            assert!(m.is_resident(0, 3));
         });
     }
 }

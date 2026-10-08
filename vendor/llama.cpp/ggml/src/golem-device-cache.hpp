@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 struct ggml_context;
@@ -128,6 +129,21 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
                                   const int32_t *ids, int64_t ids_count, const int32_t *order,
                                   int32_t K, int32_t n_experts, std::vector<int32_t> &remap,
                                   OnCopy &&on_copy) {
+    return golem_slab_step_ev(L, kind, routed, ids, ids_count, order, K, n_experts, remap,
+                              nullptr, std::forward<OnCopy>(on_copy));
+}
+
+// Exclusive-residency extension (ABI v7): when `evicted` is non-NULL, every
+// slot stolen from a FULLY plane-valid owner is reported as (slot, owner id)
+// BEFORE its bits are cleared, so the caller can D2H the bytes into the RAM
+// pool (design §6.3 O10). Partially-valid owners (never fully copied) are
+// evicted silently — their bytes are not current in all planes.
+template <typename OnCopy>
+GolemSlabCounters golem_slab_step_ev(GolemLayerSlots &L, int kind, const std::vector<int32_t> &routed,
+                                     const int32_t *ids, int64_t ids_count, const int32_t *order,
+                                     int32_t K, int32_t n_experts, std::vector<int32_t> &remap,
+                                     std::vector<std::pair<int32_t, int32_t>> *evicted,
+                                     OnCopy &&on_copy) {
     GolemSlabCounters c;
     GGML_ASSERT(K > 0 && K <= n_experts);
     GGML_ASSERT(kind >= 0 && kind < 3);
@@ -178,6 +194,15 @@ GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vecto
                 const int32_t cand = order[i];
                 const int32_t cs = L.slot_of[cand];
                 if (cs != -1 && !ggml_bitset_get(is_routed.data(), cand)) {
+                    if (evicted != nullptr) {
+                        bool full = true;
+                        for (int k = 0; k < 3; ++k) {
+                            full = full && ggml_bitset_get(L.valid[k].data(), cs);
+                        }
+                        if (full) {
+                            evicted->emplace_back(cs, cand);
+                        }
+                    }
                     L.slot_of[cand] = -1;
                     L.owner_of[cs] = -1;
                     for (int k = 0; k < 3; ++k) {
@@ -238,8 +263,8 @@ inline GolemSlabCounters golem_slab_step_nop(GolemLayerSlots &L, int kind,
                                              const int32_t *ids, int64_t ids_count,
                                              const int32_t *order, int32_t K, int32_t n_experts,
                                              std::vector<int32_t> &remap) {
-    return golem_slab_step(L, kind, routed, ids, ids_count, order, K, n_experts, remap,
-                           [](int32_t, int32_t) {});
+    return golem_slab_step_ev(L, kind, routed, ids, ids_count, order, K, n_experts, remap,
+                              nullptr, [](int32_t, int32_t) {});
 }
 
 } // namespace golem

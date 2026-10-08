@@ -80,6 +80,48 @@ fn pooled_and_unpooled_output_are_byte_identical() {
     );
 }
 
+/// Exclusive residency (O10) output parity: with a budgeted device cache
+/// (K = 4 < tiny-moe n_expert = 8, so slab evictions + the eviction D2H path
+/// engage), `--residency exclusive` must decode the same greedy text as the
+/// inclusive baseline — evicted slab bytes must reach the pool for all three
+/// planes (the multi-segment D2H deferral is covered exactly by the vendor
+/// ctest golem-p2-evict.cpp; this leg covers the end-to-end CLI mode).
+#[test]
+fn exclusive_residency_output_matches_inclusive() {
+    assert_eq!(
+        golem_llama_sys::substrate_backend(),
+        golem_llama_sys::Backend::Hip,
+        "hip-tests requires a HIP-built substrate (GOLEM_LLAMA_SYS_BACKEND=hip)"
+    );
+    let excl = run_greedy_args(
+        "1",
+        &["--device-cache-experts", "4", "--residency", "exclusive"],
+    );
+    let incl = run_greedy_args(
+        "1",
+        &["--device-cache-experts", "4", "--residency", "inclusive"],
+    );
+    assert!(
+        excl.status.success(),
+        "exclusive run failed: {}",
+        String::from_utf8_lossy(&excl.stderr)
+    );
+    assert!(
+        incl.status.success(),
+        "inclusive run failed: {}",
+        String::from_utf8_lossy(&incl.stderr)
+    );
+    assert!(!excl.stdout.is_empty(), "exclusive run produced no output");
+    assert_eq!(
+        incl.stdout,
+        excl.stdout,
+        "exclusive residency must not change greedy output vs inclusive: \
+         incl={:?} excl={:?}",
+        String::from_utf8_lossy(&incl.stdout),
+        String::from_utf8_lossy(&excl.stdout)
+    );
+}
+
 /// Cross-budget output parity (review O6/Q5): a device cache budgeted to
 /// K = 4 experts (< tiny-moe n_expert = 8, so the slab evicts under routing
 /// breadth) must produce the same greedy output as the K = 8 (K ≥ n_expert)

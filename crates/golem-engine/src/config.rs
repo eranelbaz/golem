@@ -66,6 +66,22 @@ pub struct EngineConfig {
     pub prefetch: PrefetchMode,
     /// Layers ahead each MoE layer predicts (1 = the next layer only).
     pub prefetch_lookahead: u32,
+    /// RAM/VRAM expert residency (§6.3 O10): `Inclusive` (the default) keeps
+    /// an expert's pool slot while its VRAM copy exists; `Exclusive` releases
+    /// the pool slot once the H2D lands and D2Hs evictions back into the
+    /// pool. Exclusive stays opt-in until the A/B proves it on decode.
+    pub residency: Residency,
+}
+
+/// RAM/VRAM expert residency policy (§6.3 O10, `--residency`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Residency {
+    /// An expert may live in both tiers (today's behaviour).
+    #[default]
+    Inclusive,
+    /// At most one tier holds an expert: promotion releases the pool slot,
+    /// VRAM eviction copies back into the pool or drops.
+    Exclusive,
 }
 
 /// What a P5 next-layer prediction drives (§6.5, `--prefetch`).
@@ -112,6 +128,7 @@ impl Default for EngineConfig {
             vram_order: VramOrder::default(),
             prefetch: PrefetchMode::default(),
             prefetch_lookahead: 1,
+            residency: Residency::default(),
         }
     }
 }

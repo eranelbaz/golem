@@ -1887,6 +1887,62 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static thread_local std::vector<golem_plane_plan> golem_planes;
     static thread_local std::vector<int32_t> golem_dense;    // dense ids (routing readback + remap)
     static thread_local std::vector<int32_t> golem_identity; // NULL-order fallback (identity permutation)
+    // Exclusive residency (ABI v8, design §6.3 O10): this layer's fully-valid
+    // slab evictions of the current pre-pass, as (slot, owner id); drained per
+    // layer into one evict_batch call + per-plane D2H copies.
+    static thread_local std::vector<std::pair<int32_t, int32_t>> golem_evicts;
+    // Batched evict_batch scratch: owner ids, per-expert destinations (3 per
+    // expert, kind-1 order) and per-expert keep flags.
+    static thread_local std::vector<int32_t> golem_evict_ids;
+    static thread_local std::vector<void *> golem_evict_out;
+    static thread_local std::vector<int32_t> golem_evict_keep;
+    // Exclusive D2H deferral: a layer's planes span several split segments
+    // (fused MoE graphs), but evict_batch delivers all three plane
+    // destinations at once, in the segment that triggered the eviction. A
+    // plane's D2H can only be issued from the segment that owns that plane's
+    // slab entry, so park (blk, slot → dst[3]) here until each plane's copy
+    // has been issued (done bit per kind); drained in the slab copy phase
+    // before that segment's staged H2D refills (stream order: the D2H must
+    // read a stolen slot's bytes before the refill overwrites them). All
+    // segments of one step run inside one compute_splits call, ahead of the
+    // next copy_done drain. Entries whose planes never all drain are
+    // reported abandoned at compute end (ABI v9), so nothing incomplete
+    // survives to a copy_done commit.
+    struct golem_evict_d2h_entry { int32_t blk; int32_t id; int32_t slot; void * dst[3]; uint32_t done; };
+    static thread_local std::vector<golem_evict_d2h_entry> golem_evict_d2h;
+    golem_evict_d2h.clear();
+    // ABI v9 abandon scratch: expert ids of one blk's unfinished parked D2Hs.
+    static thread_local std::vector<int32_t> golem_evict_abandon_ids;
+    // ABI v9 abandon reporter: groups the still-parked (done != 7)
+    // D2H entries by blk and hands their expert ids to the pool's
+    // evict_abandon hook. Complete entries (done == 7) were removed
+    // at their last drain, so whatever remains here is incomplete
+    // by construction; the caller synchronizes the backends first.
+    auto golem_evict_abandon_unfinished = [&]() {
+        if (gctx->evict_abandon == NULL) {
+            golem_evict_d2h.clear();
+            return;
+        }
+        for (size_t r = 0; r < golem_evict_d2h.size();) {
+            const int32_t blk_a = golem_evict_d2h[r].blk;
+            golem_evict_abandon_ids.clear();
+            size_t w = r;
+            for (size_t q = r; q < golem_evict_d2h.size(); ++q) {
+                if (golem_evict_d2h[q].blk == blk_a) {
+                    golem_evict_abandon_ids.push_back(golem_evict_d2h[q].id);
+                } else {
+                    golem_evict_d2h[w++] = golem_evict_d2h[q];
+                }
+            }
+            golem_evict_d2h.resize(w);
+            {
+                golem_cb_guard cb;
+                gctx->evict_abandon(gctx->payload, blk_a,
+                                    golem_evict_abandon_ids.data(),
+                                    (int32_t) golem_evict_abandon_ids.size());
+            }
+        }
+    };
     // P5: prediction nodes named golem_pred-<target blk>-<source blk>, indexed
     // once per compute (one strncmp per node) and delivered in the source
     // layer's pre-pass, right after its ids readback synchronized the device.
@@ -2102,6 +2158,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 golem_miss_kinds.clear();
                 golem_miss_ids.clear();
+                golem_evicts.clear();
                 for (int j = input_id; j < split->n_inputs; ++j) {
                     struct ggml_tensor * inp = split->inputs[j];
                     const int kind = golem_expert_stem_kind(inp->name);
@@ -2242,8 +2299,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 golem_ids_pin_alloc(st, split_backend, node2->src[2]->ne[0], node2->src[2]->ne[1]);
                             }
                             // Slab step: decide skips/copies/evictions + remap.
-                            plan.dc = golem::golem_slab_step(L, kind - 1, plan.routed, golem_dense.data(),
+                            plan.dc = golem::golem_slab_step_ev(L, kind - 1, plan.routed, golem_dense.data(),
                                 (int64_t) golem_dense.size(), order, K, (int32_t) n_expert_j, st.remap,
+                                gctx->evict_batch != NULL ? &golem_evicts : nullptr,
                                 [&](int32_t slot, int32_t id5) { plan.pending.emplace_back(slot, id5); });
                             GGML_ASSERT((int64_t) st.remap.size() == ggml_nelements(st.ids_dev));
                             GGML_ASSERT(ggml_backend_buffer_is_host(st.ids_pin_buf));
@@ -2273,6 +2331,52 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             golem_miss_kinds.push_back(kind);
                             golem_miss_ids.push_back(id3);
                         }
+                    }
+                }
+                // Exclusive residency (O10): hand the layer's fully-valid
+                // evictions to the pool in ONE batched call — it returns D2H
+                // destinations per kept expert (copied here, before any H2D
+                // re-fill of the stolen slots; both run on the split
+                // backend's stream — the SAME stream as the H2D refills, not
+                // a separate promotion stream — and the D2H is issued first,
+                // so stream order lands it before the refill; ≈ 15.2 MB /
+                // 25 GB/s ≈ 0.6 ms per evicted expert, measured decode
+                // impact pending A/B) or scores the bytes droppable. Runs
+                // only when the evict_batch hook is registered; NULL-hooked
+                // runs keep inclusive residency verbatim. Post-drain, so the
+                // previous compute has finished reading these slots.
+                if (gctx->evict_batch != NULL && !golem_evicts.empty()) {
+                    const size_t n_ev = golem_evicts.size();
+                    golem_evict_ids.resize(n_ev);
+                    golem_evict_out.assign(3 * n_ev, NULL);
+                    golem_evict_keep.assign(n_ev, 0);
+                    for (size_t i_ev = 0; i_ev < n_ev; ++i_ev) {
+                        golem_evict_ids[i_ev] = golem_evicts[i_ev].second;
+                    }
+                    {
+                        golem_cb_guard cb;
+                        gctx->evict_batch(gctx->payload, input, golem_evict_ids.data(),
+                                          (int32_t) n_ev, golem_evict_out.data(),
+                                          golem_evict_keep.data());
+                    }
+                    for (size_t i_ev = 0; i_ev < n_ev; ++i_ev) {
+                        if (golem_evict_keep[i_ev] == 0) {
+                            continue;
+                        }
+                        // Park the D2H: each plane's copy is issued by the
+                        // segment that owns that plane's slab entry (see
+                        // golem_evict_d2h) — issuing here would only cover
+                        // the planes that happen to live in THIS split.
+                        golem_evict_d2h_entry e;
+                        e.blk = blk;
+                        e.id = golem_evicts[i_ev].second;
+                        e.slot = golem_evicts[i_ev].first;
+                        for (int k = 0; k < 3; ++k) {
+                            GGML_ASSERT(golem_evict_out[3 * i_ev + k] != NULL);
+                            e.dst[k] = golem_evict_out[3 * i_ev + k];
+                        }
+                        e.done = 0;
+                        golem_evict_d2h.push_back(e);
                     }
                 }
                 // ONE ensure call per (layer, step, segment): all planes'
@@ -2412,6 +2516,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // one async copy per staged slot from the batched
                         // ensure pointers (no extra copy).
                         golem::GolemSlabEntry & st = *plan.st;
+                        // Exclusive D2H drain (see golem_evict_d2h): issue
+                        // this plane's share of the layer's pending evictions
+                        // BEFORE the staged H2D refills below — stream order
+                        // must land the D2H read of a stolen slot ahead of
+                        // the refill that overwrites it.
+                        {
+                            const int blk_d = golem_tensor_blk(input->name);
+                            const int kind_d = golem_expert_stem_kind(input->name) - 1;
+                            if (blk_d >= 0 && kind_d >= 0 && kind_d < 3) {
+                                const uint32_t bit = 1u << kind_d;
+                                size_t w = 0;
+                                for (size_t r = 0; r < golem_evict_d2h.size(); ++r) {
+                                    golem_evict_d2h_entry & e = golem_evict_d2h[r];
+                                    if (e.blk != blk_d) {
+                                        golem_evict_d2h[w++] = e;
+                                        continue;
+                                    }
+                                    if (!(e.done & bit)) {
+                                        ggml_backend_tensor_get_async(split_backend, st.slab,
+                                            e.dst[kind_d], (size_t) e.slot * st.expert_size,
+                                            st.expert_size);
+                                        e.done |= bit;
+                                    }
+                                    if (e.done != 7u) {
+                                        golem_evict_d2h[w++] = e;
+                                    }
+                                }
+                                golem_evict_d2h.resize(w);
+                            }
+                        }
                         // SAFETY (ordering invariant): the step-(N+1) memcpy
                         // below into ids_pin must never overlap the step-N DMA
                         // reading it. This holds because compute_splits drains
@@ -2499,6 +2633,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             golem_restore_ids();
             if (ec != GGML_STATUS_SUCCESS) {
+                for (int i = 0; i < sched->n_backends; i++) {
+                    ggml_backend_synchronize(sched->backends[i]);
+                }
+                if (!golem_evict_d2h.empty()) {
+                    golem_evict_abandon_unfinished();
+                }
+                if (golem_hooked) {
+                    golem_in_flight_done(gctx);
+                }
                 return ec;
             }
         } else {
@@ -2522,6 +2665,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     golem_restore_ids();
+                    for (int i = 0; i < sched->n_backends; i++) {
+                        ggml_backend_synchronize(sched->backends[i]);
+                    }
+                    if (!golem_evict_d2h.empty()) {
+                        golem_evict_abandon_unfinished();
+                    }
+                    if (golem_hooked) {
+                        golem_in_flight_done(gctx);
+                    }
                     return ec;
                 }
 
@@ -2545,6 +2697,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    // ABI v9: report parked D2H entries whose plane copies were not all
+    // issued (see golem_evict_d2h_entry) so the pool cancels their claims
+    // instead of committing unwritten plane bytes. All segments have run,
+    // so anything still parked here is undrainable; sync the backends first
+    // so any issued copy has landed before the destinations are recycled.
+    if (golem_hooked && !golem_evict_d2h.empty()) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
+        golem_evict_abandon_unfinished();
+    }
     // Release this entry's in-flight pin (the graph_compute_async caller
     // holds its own; the depth is per nested entry).
     if (golem_hooked) {
@@ -3337,6 +3500,8 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
                                          golem_ensure_host_resident_fn ensure,
                                          golem_routing_fn routing,
                                          golem_copy_done_fn copy_done,
+                                         golem_evict_batch_fn evict_batch,
+                                         golem_evict_abandon_fn evict_abandon,
                                          void *payload) {
     if (ctx == NULL) {
         return NULL;
@@ -3351,6 +3516,8 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
     ctx->ensure = ensure;
     ctx->routing = routing;
     ctx->copy_done = copy_done;
+    ctx->evict_batch = evict_batch;
+    ctx->evict_abandon = evict_abandon;
     ctx->payload = payload;
     ctx->generation.fetch_add(1, std::memory_order_relaxed);
     return new golem_hook_handle{ctx};
@@ -3376,6 +3543,8 @@ void golem_unregister_hooks(golem_hook_handle_t handle) {
     ctx->ensure = NULL;
     ctx->routing = NULL;
     ctx->copy_done = NULL;
+    ctx->evict_batch = NULL;
+    ctx->evict_abandon = NULL;
     ctx->payload = NULL;
 }
 
