@@ -19,9 +19,10 @@ enum Command {
     /// Run a local GGUF model (greedy sampling); `--parity-dump
     /// <FILE>` emits a T2 parity dump (JSONL) instead of streaming text.
     Run {
-        /// The only sampler for now; the flag is kept so later samplers slot in
-        /// without a breaking change.
-        #[arg(long, required = true)]
+        /// The only sampler, on by default; the flag stays so later samplers
+        /// slot in without a breaking change.
+        #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
+            require_equals = true, default_missing_value = "true", default_value_t = true)]
         greedy: bool,
         #[command(flatten)]
         args: run::RunArgs,
@@ -45,7 +46,20 @@ fn main() {
             println!("golem {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(Command::Run { args, .. }) => run::run(&args),
+        Some(Command::Run { args, .. }) => {
+            // No model path → print the run help (every valid flag) instead
+            // of clap's bare "required arguments" error.
+            if args.model.is_none() {
+                use clap::CommandFactory as _;
+                let mut cmd = Cli::command();
+                cmd.find_subcommand_mut("run")
+                    .expect("run subcommand exists")
+                    .print_help()
+                    .expect("write help");
+                std::process::exit(0);
+            }
+            run::run(&args)
+        }
     };
     if let Err(e) = status {
         eprintln!("error: {e}");

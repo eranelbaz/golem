@@ -14,7 +14,7 @@ use golem_engine::config::{EngineConfig, PrefetchMode, Residency, VramOrder};
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::timing::TimingRecorder;
-use golem_llama_sys::substrate_backend;
+use golem_llama_sys::{Backend, substrate_backend};
 use golem_placement::pool::{GgufPreadSource, StoreExpertSource};
 use golem_store::ChunkQueue;
 use serde::Serialize;
@@ -24,8 +24,9 @@ use sha2::{Digest, Sha256};
 /// only — §9.4 precedence rules are not implemented).
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    /// Path to the GGUF model file.
-    pub model: PathBuf,
+    /// Path to the GGUF model file (first shard of a split).
+    /// When omitted, `golem run` prints the full flag list and exits.
+    pub model: Option<PathBuf>,
     /// One-shot prompt text; when omitted, the stdin chat REPL runs instead.
     #[arg(long)]
     pub prompt: Option<String>,
@@ -41,12 +42,12 @@ pub struct RunArgs {
     /// flag per leg.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub threads: Option<u32>,
-    /// Model layers to offload to the GPU (`EngineConfig::n_gpu_layers`):
-    /// 0 keeps the whole model on CPU (the CI-leg default); the hardware HIP
-    /// parity leg uses 99. Without this knob a "hip"-labeled binary would
-    /// silently run on CPU.
-    #[arg(long, default_value_t = 0)]
-    pub n_gpu_layers: u32,
+    /// 0 keeps the whole model on CPU (the CI-leg default); an omitted flag
+    /// infers 99 on HIP builds (hardware-parity legs pass it explicitly), 0 on
+    /// CPU. Without any GPU offload a "hip"-labeled binary would silently run
+    /// on CPU.
+    #[arg(long, value_parser = clap::value_parser!(u32))]
+    pub n_gpu_layers: Option<u32>,
     /// Force Flash Attention on (`EngineConfig::flash_attn_on` —
     /// `LLAMA_FLASH_ATTN_TYPE_ENABLED`); without it llama.cpp's AUTO default
     /// applies. Hardware parity legs run `fa = on` on both backends.
@@ -62,7 +63,8 @@ pub struct RunArgs {
     /// Fractional GiB are floored to whole GiB (the engine config is whole-GiB).
     /// The pool is `mlock`ed: before loading anything, the preflight checks
     /// `RLIMIT_MEMLOCK` and available RAM, and fails with an actionable
-    /// suggestion instead of failing mid-load.
+    /// suggestion instead of failing mid-load. With an inferred manifest but
+    /// no explicit size, the pool is sized to the preflight cap itself.
     #[arg(long, value_name = "GIB")]
     pub ram_experts_gib: Option<f64>,
     /// Per-layer device expert-slab size in experts
@@ -78,7 +80,8 @@ pub struct RunArgs {
     pub io_threads: Option<usize>,
     /// Model manifest (§4.2): the P3 expert pool then reads expert planes
     /// from the manifest's replica set through the shared chunk queue
-    /// (striped, CRC-checked) instead of the single GGUF replica.
+    /// (striped, CRC-checked) instead of the single GGUF replica. Omitted →
+    /// `manifest.json` next to the model file, when present.
     #[arg(long, value_name = "PATH")]
     pub manifest: Option<PathBuf>,
     /// Write a T2 parity dump (JSONL: line-1 header, then one record per
@@ -173,14 +176,14 @@ impl RunArgs {
     /// `n_gpu_layers`, `--flash-attn` → `flash_attn_on`, `--cpu-moe-layers`
     /// → `cpu_moe_layers`, `--device-cache-experts` → `device_cache_experts`.
     /// Everything else stays at the engine default.
-    pub fn to_config(&self) -> EngineConfig {
+    pub fn to_config(&self, model: PathBuf) -> EngineConfig {
         let default = EngineConfig::default();
         EngineConfig {
-            model_path: self.model.clone(),
+            model_path: model,
             n_ctx: self.ctx,
             n_predict: self.n_predict,
             threads: self.threads.unwrap_or(default.threads),
-            n_gpu_layers: self.n_gpu_layers,
+            n_gpu_layers: self.n_gpu_layers.unwrap_or(0),
             flash_attn_on: self.flash_attn,
             cpu_moe_layers: self.cpu_moe_layers,
             // Fractional GiB floor to the engine's whole-GiB unit; a value in
@@ -210,7 +213,36 @@ impl RunArgs {
 /// decode errors (process unusable); per-turn REPL errors are printed and the
 /// loop continues.
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
-    let config = args.to_config();
+    let model = match args.model.clone() {
+        Some(m) => m,
+        // No model: main() already printed the run help.
+        None => return Ok(()),
+    };
+    let mut config = args.to_config(model.clone());
+    // §9 inference: explicit flags already won in `to_config`; fill the rest
+    // from the model folder and the compiled backend.
+    let inferred = infer_defaults(&mut config, args.n_gpu_layers);
+    if !inferred.is_empty() {
+        eprintln!(
+            "golem: inferred {}",
+            inferred
+                .iter()
+                .map(|name| match *name {
+                    "manifest" => format!(
+                        "manifest={}",
+                        config
+                            .manifest_path
+                            .as_deref()
+                            .unwrap_or(Path::new(""))
+                            .display()
+                    ),
+                    "n-gpu-layers" => format!("n-gpu-layers={}", config.n_gpu_layers),
+                    _ => format!("ram-experts-gib={}", config.ram_experts_gib),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
     let mut timing_out = match &config.timing_csv {
         Some(path) => {
@@ -248,7 +280,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    if args.manifest.is_some() && config.ram_experts_gib == 0 {
+    if config.manifest_path.is_some() && config.ram_experts_gib == 0 {
         return Err(
             "--manifest requires --ram-experts-gib > 0: the expert pool \
              is the only consumer of the store-backed source"
@@ -257,8 +289,8 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     }
     if config.ram_experts_gib > 0 {
         preflight_ram_pool(
-            &args.model,
-            args.manifest.as_deref(),
+            &model,
+            config.manifest_path.as_deref(),
             config.ram_experts_gib,
         )?;
     }
@@ -269,7 +301,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
 
     let result = match (&args.prompt, &args.parity_dump) {
         (Some(prompt), Some(dump)) => {
-            one_shot_parity(&mut session, &args.model, prompt, dump, args.n_predict)
+            one_shot_parity(&mut session, &model, prompt, dump, args.n_predict)
         }
         (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out, &mut trace_out),
         // The dump records exactly one prompt (header `prompt_tokens`), so a
@@ -292,6 +324,74 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         }
     }
     result
+}
+
+/// §9 defaults: infer what the model folder and the compiled backend already
+/// decide — explicit flags always win (`to_config` ran first). Order matters:
+/// the manifest is located before the pool is sized, so the size can derive
+/// from the manifest's expert bytes. Returns the names of what was inferred.
+fn infer_defaults(
+    config: &mut EngineConfig,
+    explicit_gpu_layers: Option<u32>,
+) -> Vec<&'static str> {
+    let mut inferred = Vec::new();
+    if config.manifest_path.is_none() {
+        if let Some(dir) = config.model_path.parent() {
+            let m = dir.join("manifest.json");
+            if m.is_file() {
+                config.manifest_path = Some(m);
+                inferred.push("manifest");
+            }
+        }
+    }
+    if explicit_gpu_layers.is_none()
+        && config.n_gpu_layers == 0
+        && substrate_backend() == Backend::Hip
+    {
+        config.n_gpu_layers = 99;
+        inferred.push("n-gpu-layers");
+    }
+    if config.ram_experts_gib == 0 && config.manifest_path.is_some() {
+        match suggest_pool_gib(&config.model_path, config.manifest_path.as_deref()) {
+            Some(gib) => {
+                config.ram_experts_gib = gib;
+                inferred.push("ram-experts-gib");
+            }
+            // No workable pool size → the manifest would hard-error against
+            // the pool requirement while the plain GGUF path would have
+            // worked: drop the inferred manifest, keep the run going.
+            None => {
+                config.manifest_path = None;
+                inferred.retain(|&name| name != "manifest");
+            }
+        }
+    }
+    inferred
+}
+
+/// Workable pool size for a manifest-bearing run: the preflight's own cap,
+/// min(RLIMIT_MEMLOCK, 75% available RAM, expert bytes), floored to GiB.
+/// `None` → no workable pool; the caller proceeds without one (the manifest
+/// then stays unused and the run decodes off the plain GGUF path).
+fn suggest_pool_gib(model: &Path, manifest: Option<&Path>) -> Option<u64> {
+    let expert_bytes = match expert_plane_bytes(model, manifest) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("warning: cannot pre-scan expert tensors from {model:?}: {e}");
+            return None;
+        }
+    };
+    if expert_bytes == 0 {
+        return None;
+    }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let mut cap = sys.available_memory() * 3 / 4;
+    if let Some(limit) = memlock_limit() {
+        cap = cap.min(limit);
+    }
+    let gib = cap.min(expert_bytes) / (1 << 30);
+    (gib > 0).then_some(gib)
 }
 
 /// `RLIMIT_MEMLOCK` bytes, `None` = unlimited.
@@ -326,18 +426,15 @@ fn preflight_ram_pool(
         0
     });
 
-    // Available-RAM suggestion: min(75% of available, what the experts actually need).
+    // Available-RAM suggestion: min(75% of available, RLIMIT_MEMLOCK, what
+    // the experts actually need).
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let free = sys.available_memory();
-    let suggest = (free * 3 / 4).min(if expert_bytes > 0 {
-        expert_bytes
-    } else {
-        u64::MAX
-    });
     // .max(1): a sub-GiB suggestion would print `--ram-experts-gib 0`, which
     // disables the pool entirely — suggest the smallest workable pool instead.
-    let suggest_gib = (suggest / (1 << 30)).max(1);
+    let suggest_gib =
+        suggest_pool_gib(model, manifest).unwrap_or((free * 3 / 4 / (1 << 30)).max(1));
 
     if let Some(limit) = memlock_limit() {
         if want_bytes > limit {
@@ -853,8 +950,71 @@ mod tests {
     }
 
     #[test]
+    fn infer_defaults_discovers_manifest_and_keeps_explicit_flags() {
+        let dir = scratch_dir("infer");
+        let model = dir.join("model.gguf");
+        std::fs::write(&model, b"not a gguf").unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+
+        // Bare args: manifest found next to the model, then rolled back — a
+        // junk manifest carries no expert bytes, so no pool size can be
+        // inferred and keeping the manifest would hard-error the run.
+        let mut config = parse_run_args(&["run", "model.gguf"]).to_config("model.gguf".into());
+        config.model_path = model.clone();
+        let inferred = infer_defaults(&mut config, None);
+        assert_eq!(
+            config.manifest_path, None,
+            "unusable manifest → plain GGUF path, no hard error"
+        );
+        assert_eq!(
+            config.n_gpu_layers,
+            if substrate_backend() == Backend::Hip {
+                99
+            } else {
+                0
+            },
+            "HIP builds infer full offload, CPU builds stay on CPU"
+        );
+        assert_eq!(config.ram_experts_gib, 0, "no expert bytes → no pool");
+        assert!(
+            inferred == ["n-gpu-layers"] || inferred.is_empty(),
+            "only the backend offload may remain inferred: {inferred:?}"
+        );
+
+        // Explicit `--n-gpu-layers 0` keeps the run CPU-only even on HIP
+        // builds — the CPU-leg repro on GPU hardware must stay reachable.
+        let mut config = parse_run_args(&["run", "--n-gpu-layers", "0", "model.gguf"])
+            .to_config("model.gguf".into());
+        config.model_path = model.clone();
+        infer_defaults(&mut config, Some(0));
+        assert_eq!(config.n_gpu_layers, 0, "explicit 0 must not be re-inferred");
+
+        // Explicit flags win: no manifest file in the folder, no inference.
+        let mut config = parse_run_args(&[
+            "run",
+            "--n-gpu-layers",
+            "7",
+            "--ram-experts-gib",
+            "3",
+            "--manifest",
+            "/elsewhere/manifest.json",
+            "model.gguf",
+        ])
+        .to_config("model.gguf".into());
+        config.model_path = model;
+        infer_defaults(&mut config, Some(7));
+        assert_eq!(config.n_gpu_layers, 7);
+        assert_eq!(config.ram_experts_gib, 3);
+        assert_eq!(
+            config.manifest_path,
+            Some(PathBuf::from("/elsewhere/manifest.json"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn run_args_default_to_the_cpu_only_config() {
-        let config = parse_run_args(&["run", "model.gguf"]).to_config();
+        let config = parse_run_args(&["run", "model.gguf"]).to_config("model.gguf".into());
         assert_eq!(config.model_path, PathBuf::from("model.gguf"));
         assert_eq!(config.n_ctx, 256);
         assert_eq!(config.n_predict, 64);
@@ -879,26 +1039,30 @@ mod tests {
 
     #[test]
     fn run_args_map_ram_experts_gib_flag_into_config() {
-        let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2"])
+            .to_config("model.gguf".into());
         assert_eq!(config.ram_experts_gib, 2);
         // Fractional GiB floor to the engine's whole-GiB unit.
-        let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2.75"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2.75"])
+            .to_config("model.gguf".into());
         assert_eq!(config.ram_experts_gib, 2);
     }
 
     #[test]
     fn run_args_map_device_cache_experts_flag_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
         assert_eq!(config.device_cache_experts, 0, "unset = derive from VRAM");
-        let config = parse_run_args(&["run", "m.gguf", "--device-cache-experts", "9"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf", "--device-cache-experts", "9"])
+            .to_config("model.gguf".into());
         assert_eq!(config.device_cache_experts, 9);
     }
 
     #[test]
     fn run_args_map_vram_order_flag_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
         assert_eq!(config.vram_order, VramOrder::Score);
-        let config = parse_run_args(&["run", "m.gguf", "--vram-order", "recency"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf", "--vram-order", "recency"])
+            .to_config("model.gguf".into());
         assert_eq!(config.vram_order, VramOrder::Recency);
         let bad = RunArgs::augment_args(clap::Command::new("run")).try_get_matches_from([
             "run",
@@ -911,7 +1075,7 @@ mod tests {
 
     #[test]
     fn run_args_map_prefetch_flags_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
         assert_eq!(
             (config.prefetch, config.prefetch_lookahead),
             (PrefetchMode::Off, 1)
@@ -924,7 +1088,7 @@ mod tests {
             "--prefetch-lookahead",
             "2",
         ])
-        .to_config();
+        .to_config("model.gguf".into());
         assert_eq!(
             (config.prefetch, config.prefetch_lookahead),
             (PrefetchMode::Read, 2)
@@ -938,9 +1102,10 @@ mod tests {
 
     #[test]
     fn run_args_map_io_threads_flag_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
         assert_eq!(config.io_threads, None, "unset = derived per-drive count");
-        let config = parse_run_args(&["run", "m.gguf", "--io-threads", "4"]).to_config();
+        let config =
+            parse_run_args(&["run", "m.gguf", "--io-threads", "4"]).to_config("model.gguf".into());
         assert_eq!(config.io_threads, Some(4));
     }
 
@@ -967,7 +1132,7 @@ mod tests {
             "45",
         ]);
         assert_eq!(args.n_predict, 64, "n_predict default untouched");
-        let config = args.to_config();
+        let config = args.to_config("model.gguf".into());
         assert_eq!(config.threads, 16);
         assert_eq!(config.n_gpu_layers, 99);
         assert!(config.flash_attn_on);
@@ -978,19 +1143,22 @@ mod tests {
     fn run_args_flags_are_independent() {
         // Each knob maps on its own — e.g. the t16-vs-t4 calibration legs
         // change only threads, the mislabeled-leg probe changes only layers.
-        let config = parse_run_args(&["run", "m.gguf", "--threads", "4"]).to_config();
+        let config =
+            parse_run_args(&["run", "m.gguf", "--threads", "4"]).to_config("model.gguf".into());
         assert_eq!(config.threads, 4);
         assert_eq!(config.n_gpu_layers, 0);
         assert!(!config.flash_attn_on);
         assert_eq!(config.cpu_moe_layers, None);
 
-        let config = parse_run_args(&["run", "m.gguf", "--n-gpu-layers", "7"]).to_config();
+        let config = parse_run_args(&["run", "m.gguf", "--n-gpu-layers", "7"])
+            .to_config("model.gguf".into());
         assert_eq!(config.threads, EngineConfig::default().threads);
         assert_eq!(config.n_gpu_layers, 7);
         assert!(!config.flash_attn_on);
         assert_eq!(config.cpu_moe_layers, None);
 
-        let config = parse_run_args(&["run", "m.gguf", "--flash-attn"]).to_config();
+        let config =
+            parse_run_args(&["run", "m.gguf", "--flash-attn"]).to_config("model.gguf".into());
         assert!(config.flash_attn_on);
         assert_eq!(config.n_gpu_layers, 0);
         assert_eq!(config.cpu_moe_layers, None);
