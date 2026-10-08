@@ -220,11 +220,25 @@ pub(crate) fn load_with_hooks(
     }
 
     let n_batch = config.batch_tokens.min(config.n_ctx);
+    // Prefill streaming (§7.6): the context's ubatch (and with it the
+    // compute buffer `ws`, resident for decode too) is sized for the
+    // streamed prefill shape. n_batch covers the larger of the two chunk
+    // shapes so both the streamed and per-token paths stay one-ubatch.
+    let n_ubatch = if config.prefill_stream {
+        let ub = if config.prefill_ubatch == 0 {
+            2048
+        } else {
+            config.prefill_ubatch
+        };
+        ub.min(config.n_ctx)
+    } else {
+        n_batch
+    };
     // SAFETY: returns llama.cpp's default context params by value.
     let mut params = unsafe { raw::llama_context_default_params() };
     params.n_ctx = config.n_ctx;
-    params.n_batch = n_batch;
-    params.n_ubatch = n_batch;
+    params.n_batch = n_batch.max(n_ubatch);
+    params.n_ubatch = n_ubatch;
     params.n_threads = config.threads as i32;
     params.n_threads_batch = config.threads as i32;
     params.no_perf = true;
@@ -545,6 +559,13 @@ impl Session {
         // A second CONCURRENT pool-enabled session is refused before any
         // model load (VRAM arithmetic in the refusal). Sequential sessions —
         // pooled or not — are legal: the hooks are per-model (ABI v5).
+        // Streaming stages from the RAM expert pool (§7.6); without one it
+        // would silently fall back to the per-token path.
+        if config.prefill_stream && config.ram_experts_gib == 0 {
+            return Err(EngineError::InvalidConfig(
+                "prefill_stream requires the RAM expert pool (ram_experts_gib > 0)".into(),
+            ));
+        }
         if config.ram_experts_gib > 0 {
             p3_glue::refuse_if_pool_session_live()?;
         }
@@ -552,7 +573,7 @@ impl Session {
         // BEFORE the model loads — the ctx must attach to the llama_model
         // before `llama_init_from_model` so its first `sched_reserve` sees
         // the hooks (cpy shrink). If the load fails, the guards drop cleanly.
-        let p3 = if config.ram_experts_gib > 0 {
+        let mut p3 = if config.ram_experts_gib > 0 {
             Some(p3_glue::enable(config)?)
         } else {
             None
@@ -564,6 +585,11 @@ impl Session {
                 return Err(e);
             }
         };
+        // Derived K needs the resident weights, KV and compute buffer
+        // (ruling R3). On error the slabs are already freed by the fit.
+        if let Some(p) = p3.as_mut() {
+            p.fit_device_cache()?;
+        }
         let template_src = loaded
             .model()
             .chat_template()
@@ -645,6 +671,13 @@ impl Session {
     /// page-ins are counted separately (design §6.6).
     pub fn p3_stats(&self) -> Option<&P3Stats> {
         self.p3.as_ref().map(|p| p.stats.as_ref())
+    }
+
+    /// The session's hook guards (test/observability seam: stream counters,
+    /// trampoline call counts, prefill-stream arming). `None` when the pool
+    /// is off.
+    pub fn p3_hooks(&self) -> Option<&crate::p3_glue::SessionHooks> {
+        self.p3.as_ref()
     }
 
     /// The session's per-model hook context pointer (ABI v5), for test seams
@@ -813,14 +846,16 @@ impl Session {
             // return 1; fail with that same code instead of chunking by zero.
             return Err(EngineError::Decode(1));
         }
-
-        let mut batch = Batch::init(chunk_cap as i32, 0, 1);
         // One llama_decode must carry exactly one ubatch (the C lease-release
         // contract, §2.4): n_ubatch is a load-time constant (§4.2), fetched once.
         // SAFETY: ctx is a live context.
         let n_ubatch = unsafe { raw::llama_n_ubatch(ctx.as_ptr()) } as usize;
-        let mut n_past: usize = 0;
-        let mut last_chunk_len = 0;
+        // Prefill streaming (§7.6): whole-plane ubatches above the
+        // --prefill-stream-min tail threshold; the per-token cap below it.
+        let streaming = self.p3.as_ref().is_some_and(|p| p.stream_enabled());
+        let batch_cap = chunk_cap.max(if streaming { n_ubatch } else { 0 });
+
+        let mut batch = Batch::init(batch_cap as i32, 0, 1);
         // §6.2: prefill routes nearly every expert; keep it out of recency.
         // I2 runtime proof window: this turn's prefill and first batch-1 decode
         // (the op-offload threshold is per ubatch, so both shapes are checked).
@@ -829,7 +864,12 @@ impl Session {
             && self.offloaded()
             && substrate_backend() == Backend::Hip;
         let placement_before = expert_placement();
-        let traffic_before = self.p3.as_ref().map_or(0, |p| pool_traffic(&p.stats));
+        // Streamed planes are expert copies served on the GPU split too
+        // (stream_source fires only from that copy loop, §7.6).
+        let traffic_of = |p: &p3_glue::SessionHooks| {
+            pool_traffic(&p.stats) + p.stream_stats().map_or(0, |s| s.planes)
+        };
+        let traffic_before = self.p3.as_ref().map_or(0, traffic_of);
         if let Some(p3) = self.p3.as_ref() {
             // Stale-record guard: a failed prior turn's routing records are
             // dropped (the header survives for the real file flush) before
@@ -837,18 +877,41 @@ impl Session {
             p3.drain_routing_trace();
         }
         let prefill = p3_glue::PrefillScope::enter();
-        for chunk in prompt.chunks(chunk_cap) {
-            let len = chunk.len();
+        // Stream chunks arm the C flag + read-ahead and pause the prefetcher;
+        // the guard disarms/resumes on every exit path (§7.6.4).
+        struct StreamGuard<'a>(&'a p3_glue::SessionHooks);
+        impl Drop for StreamGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set_prefill_stream(false);
+                // llama_decode returned: no H2D in flight.
+                self.0.release_stream();
+            }
+        }
+        let _stream_guard = self.p3.as_ref().map(StreamGuard);
+        let stream_min = self.config.prefill_stream_min as usize;
+        let mut n_past: usize = 0;
+        let mut last_chunk_len = 0;
+        while n_past < prompt_len {
+            let remaining = prompt_len - n_past;
+            let stream_chunk = streaming && remaining >= stream_min;
+            let len = if stream_chunk {
+                remaining.min(n_ubatch)
+            } else {
+                remaining.min(chunk_cap)
+            };
+            if let Some(p3) = &self.p3 {
+                p3.set_prefill_stream(stream_chunk);
+            }
             let is_final_chunk = n_past + len == prompt_len;
             {
                 // SAFETY: slots 0..len are within the chunk_cap-sized allocation;
                 // every used slot is fully written before decode (llama_batch_init
                 // mallocs and does not zero).
                 let b = &mut batch.inner;
-                for (i, &t) in chunk.iter().enumerate() {
+                for (i, &t) in prompt[n_past..n_past + len].iter().enumerate() {
                     // Logits only on the final token of the final chunk: that
                     // sample bootstraps generation; intermediate tokens never need it.
-                    // SAFETY: i < len <= chunk_cap slots allocated by Batch::init.
+                    // SAFETY: i < len <= batch_cap slots allocated by Batch::init.
                     unsafe {
                         fill_slot(
                             b,
@@ -885,11 +948,15 @@ impl Session {
             last_chunk_len = len;
         }
         drop(prefill);
+        // Disarm before the generation decodes (the guard is the backstop).
+        if let Some(p3) = &self.p3 {
+            p3.set_prefill_stream(false);
+        }
 
         if verify {
             check_experts_on_gpu(placement_before, expert_placement())?;
             if let Some(p3) = &self.p3 {
-                check_pool_engaged(traffic_before, &p3.stats)?;
+                check_pool_engaged(traffic_before, traffic_of(p3))?;
             }
         }
 
@@ -1279,14 +1346,15 @@ fn pool_traffic(stats: &P3Stats) -> u64 {
     stats.demand_slow_pageins.load(Relaxed) + stats.fast_hits.load(Relaxed)
 }
 
-/// Runtime proof of design I2 for a pooled offloaded run: since `before`
-/// (a [`pool_traffic`] snapshot taken before the prefill), the pool must have
-/// served expert copies (`ensure_host_resident` fires only from the GPU
-/// split's expert-copy path). Zero traffic means the expert `MUL_MAT_ID` ran
-/// somewhere else — silently on the CPU, or the experts never left the
-/// device — and decoding on would be a silent violation.
-fn check_pool_engaged(before: u64, stats: &P3Stats) -> Result<(), EngineError> {
-    if pool_traffic(stats) == before {
+/// Runtime proof of design I2 for a pooled offloaded run: between the
+/// `before` and `now` traffic snapshots (pool copies plus streamed planes),
+/// the GPU split's expert-copy path must have served copies
+/// (`ensure_host_resident` and `stream_source` fire only from there). Zero
+/// traffic means the expert `MUL_MAT_ID` ran somewhere else — silently on
+/// the CPU, or the experts never left the device — and decoding on would be
+/// a silent violation.
+fn check_pool_engaged(before: u64, now: u64) -> Result<(), EngineError> {
+    if now == before {
         return Err(EngineError::PoolInit(
             "the expert pool served no copies during this pooled prefill: expert \
              MUL_MAT_ID is not running through the GPU split (CPU fallback, or experts \
@@ -1439,15 +1507,15 @@ mod tests {
     #[test]
     fn pool_engaged_check_counts_only_traffic_since_the_snapshot() {
         let stats = P3Stats::new();
-        let err = check_pool_engaged(0, &stats).unwrap_err();
+        let err = check_pool_engaged(0, pool_traffic(&stats)).unwrap_err();
         assert!(matches!(err, EngineError::PoolInit(_)), "{err}");
         stats.fast_hits.store(1, Ordering::Relaxed);
-        check_pool_engaged(0, &stats).unwrap();
+        check_pool_engaged(0, pool_traffic(&stats)).unwrap();
         let before = pool_traffic(&stats);
-        let err = check_pool_engaged(before, &stats).unwrap_err();
+        let err = check_pool_engaged(before, pool_traffic(&stats)).unwrap_err();
         assert!(matches!(err, EngineError::PoolInit(_)), "{err}");
         stats.demand_slow_pageins.store(1, Ordering::Relaxed);
-        check_pool_engaged(before, &stats).unwrap();
+        check_pool_engaged(before, pool_traffic(&stats)).unwrap();
     }
 
     #[test]

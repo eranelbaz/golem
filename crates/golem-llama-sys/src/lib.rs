@@ -45,7 +45,7 @@ pub fn hooks_abi_version() -> i32 {
 // handle-returning register, batched ensure, triple-buffered order push).
 // A header drift past v6 must fail this build, not silently re-shape the
 // guards.
-const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 9);
+const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 10);
 
 /// Per-model hook context (ABI v5): owns a `golem_ctx_t` from
 /// `golem_ctx_create` and frees it on drop. `golem_ctx_free` aborts while
@@ -121,6 +121,8 @@ impl GolemCtx {
                 hooks.copy_done,
                 hooks.evict_batch,
                 hooks.evict_abandon,
+                hooks.stream_source,
+                hooks.stream_release,
                 payload_ptr as *mut T as *mut std::ffi::c_void,
             )
         };
@@ -145,6 +147,12 @@ pub struct HookFns {
     /// whose plane copies were not all issued; `None` keeps inclusive
     /// residency (the substrate only fires it alongside `evict_batch`).
     pub evict_abandon: raw::golem_evict_abandon_fn,
+    /// Prefill-stream byte source (ABI v10, design §7.6); `None` makes
+    /// `golem_set_prefill_stream(on=1)` abort C-side.
+    pub stream_source: raw::golem_stream_source_fn,
+    /// Prefill-stream release (ABI v10): drops the leases/staging slots
+    /// keyed ≤ seq.
+    pub stream_release: raw::golem_stream_release_fn,
 }
 
 /// A live hook registration: `Drop` unregisters (C joins in-flight

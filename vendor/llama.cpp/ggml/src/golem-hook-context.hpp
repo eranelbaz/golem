@@ -24,6 +24,11 @@
 #include <unordered_map>
 #include <vector>
 
+struct ggml_context;
+struct ggml_tensor;
+struct ggml_backend_buffer;
+struct ggml_backend_event;
+
 // P4 counters; layout mirrors the Rust [AtomicU64; 3] FFI cast (the
 // placement stats are process-global and stay in ggml-backend.cpp).
 struct golem_device_cache_stats {
@@ -51,6 +56,8 @@ struct golem_ctx {
     golem_copy_done_fn copy_done = nullptr;
     golem_evict_batch_fn evict_batch = nullptr; // exclusive residency (ABI v8)
     golem_evict_abandon_fn evict_abandon = nullptr; // abandoned D2H (ABI v9)
+    golem_stream_source_fn stream_source = nullptr; // prefill stream (ABI v10)
+    golem_stream_release_fn stream_release = nullptr; // prefill stream (ABI v10)
     void *payload = nullptr;
     // P5 next-layer prediction (golem_set_predict; 0 = off)
     golem_predict_fn predict = nullptr;
@@ -78,6 +85,27 @@ struct golem_ctx {
     // P2 budget (<= 0 = unset; the slab path aborts) + P4 counters
     std::atomic<int32_t> k_cfg{0};
     golem_device_cache_stats dc_stats{};
+
+    // --- prefill stream (design section 7.6, ABI v10) ---
+    // Double-buffered device slabs, one plane each: plane p computes from
+    // slab p%2 while p+1 fills. Allocated lazily on the first streamed
+    // split's backend (the allocation needs it), freed by
+    // golem_reset_device_cache. `stream_seq` is the global plane counter --
+    // it keys the stream_source/stream_release pair and picks the slab.
+    struct golem_stream_slab {
+        struct ggml_context * ctx = nullptr;
+        struct ggml_backend_buffer * buf = nullptr;
+        struct ggml_tensor * tensor = nullptr; // typed view, rebuilt on shape change
+        uint64_t fp = 0;                       // (type, ne0, ne1) fingerprint
+        struct ggml_backend_event * event = nullptr; // recorded after the compute reading this slab
+        bool used = false;
+    };
+    std::atomic<int32_t> stream_on{0};
+    std::atomic<uint64_t> stream_seq{0};
+    float stream_routed_max = 0.85f;
+    int32_t stream_n_experts = 0;
+    int32_t stream_max_stride = 0;
+    golem_stream_slab stream_slabs[2];
 
     // persistent device slab maps (moved here from ggml-backend.cpp file
     // statics; key of `dc` = HOST weights tensor data pointer)
@@ -108,6 +136,10 @@ struct golem_ctx {
     std::vector<order_entry> orders; // flat: [blk * 3 + (kind - 1)]
     const int32_t n_experts;
     std::atomic<bool> order_warned{false}; // one-time NULL-order warning
+
+    // decode-thread-only; kept here so the copy loop can flag which slabs a
+    // split streamed (their events are recorded after that split's compute).
+    bool stream_used_in_split[2] = {false, false};
 
     golem_ctx(int32_t n_layers, int32_t n_experts_)
         : orders((size_t) (n_layers > 0 ? n_layers : 1) * 3), n_experts(n_experts_) {

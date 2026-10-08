@@ -1,9 +1,12 @@
-// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v9:
+// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v10:
 // per-model hook context; v7 added the exclusive-residency eviction hook,
 // v8 batches it per (layer, compute) — one call for all of a layer's
 // evictions in one shot; v9 adds the abandoned-D2H hook — a parked eviction
 // whose plane copies were not all issued by compute end must be reported so
-// the pool cancels the claim instead of committing unwritten bytes). Part of the vendored ggml include tree; the ABI is
+// the pool cancels the claim instead of committing unwritten bytes; v10 adds
+// the prefill-stream hooks -- design section 7.6: per-plane expert streaming through
+// double-buffered device slabs, byte sources decided by the pool without
+// touching decode residency). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
@@ -29,7 +32,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 9
+#define GOLEM_HOOKS_ABI_VERSION 10
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -103,6 +106,30 @@ typedef void (*golem_routing_fn)(void *payload, int32_t blk, const void *tensor,
                                  const int32_t *ids_dense, int64_t n_ids,
                                  int32_t n_experts);
 
+/* Hook (prefill stream, design section 7.6): host byte source for ONE streamed
+ * plane (all n_ids experts of layer `blk`, plane `kind` 1=gate 2=up 3=down).
+ * `ids` holds the experts whose ranges C will copy (routed-only set, or the
+ * whole identity range when the routed share exceeds the configured
+ * threshold); the hook fills out_ptrs[i] with a stable host pointer for
+ * expert ids[i]: the RAM-pool plane when the unit is resident (a lease keyed
+ * by `seq` is taken -- no score, no residency change), else a pinned staging
+ * slot the reader thread has already filled (the call blocks on that fill;
+ * the overlap comes from the routing readback enqueueing reads ahead of the
+ * copy). Never pages misses into the pool: a streamed ubatch must not move
+ * the decode hot set (section 7.6.4). `seq` is C's monotonic plane counter -- the
+ * matching golem_stream_release(seq) releases the leases and staging slot.
+ * NULL hook -> golem_set_prefill_stream aborts (streaming unavailable). */
+typedef void (*golem_stream_source_fn)(void *payload, int32_t blk, int32_t kind,
+                                       uint64_t seq, const int32_t *ids,
+                                       int32_t n_ids, const void **out_ptrs);
+
+/* Hook (prefill stream, design section 7.6): everything keyed by `seq` and every
+ * smaller seq is released -- pool leases drop, staging slots recycle. C calls
+ * it when a slab is about to be refilled (seq >= 2: sync of the slab's
+ * recorded event first, so the H2D + compute reading those bytes completed)
+ * and, for anything left, the engine releases the remainder at copy_done. */
+typedef void (*golem_stream_release_fn)(void *payload, uint64_t seq);
+
 /* Hook (P5, design 6.5): next-layer routing prediction. When
  * golem_set_predict enabled it, the model graph builds, from layer `src_blk`'s
  * FFN input, the top (n_expert_used + margin) experts layer `target_blk`'s
@@ -143,6 +170,8 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
                                          golem_copy_done_fn copy_done,
                                          golem_evict_batch_fn evict_batch,
                                          golem_evict_abandon_fn evict_abandon,
+                                         golem_stream_source_fn stream_source,
+                                         golem_stream_release_fn stream_release,
                                          void *payload);
 
 /* Marks the ctx unhooked, then JOINS: waits until the ctx's in-flight step
@@ -212,8 +241,19 @@ int32_t golem_predict_margin(golem_ctx_t ctx);
 int32_t golem_device_cache_experts(golem_ctx_t ctx);
 
 /* Clear the ctx's device cache maps — the invalidation seam (also the
- * cold-start lever). */
+ * cold-start lever). Also frees the prefill-stream slabs. */
 void golem_reset_device_cache(golem_ctx_t ctx);
+
+/* Prefill-stream configuration (design section 7.6, ABI v10). `on != 0` arms
+ * streaming for subsequent computes; the device slabs (two, each
+ * `n_experts x max_plane_stride` bytes) are allocated lazily on the first
+ * streamed split's backend and freed by golem_reset_device_cache. When a
+ * plane's routed share exceeds `routed_max` (0 < r <= 1) C hands the stream
+ * source the whole identity id range instead of the routed set. Requires the
+ * stream hooks to be registered (else aborts). Init/config-time call --
+ * not concurrent with a compute. */
+void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
+                              int32_t max_plane_stride, float routed_max);
 
 /* P4 counters. Opaque here (C++ side keeps the members atomic); each member
  * is a lock-free 8-byte counter read by Rust as u64. The pointer is stable

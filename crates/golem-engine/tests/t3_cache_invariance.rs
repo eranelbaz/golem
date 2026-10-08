@@ -202,6 +202,8 @@ fn register_p2_hooks() {
             routing: Some(on_routing),
             copy_done: None,
             evict_abandon: None,
+            stream_source: None,
+            stream_release: None,
         },
         std::sync::Arc::new(()),
     );

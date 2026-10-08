@@ -9,6 +9,7 @@ pub mod parity;
 pub mod parity_op;
 pub mod sanity;
 pub mod session;
+pub mod stream;
 pub mod timing;
 
 pub use atomic::write_atomic;

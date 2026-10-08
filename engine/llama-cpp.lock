@@ -4,7 +4,7 @@ branch = glm5next/upstream
 commit = 86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9
 pr = 27754
 base_upstream = 930e2fa5995789efbf249a8bf61325bb626e417b  # ggml-org/llama.cpp merge-base at pin
-content_sha256 = f5ce52fcfee5f167921ca0518588af0dd73d16f24c14d300ae2bf38e91bbfc71
+content_sha256 = b30921865c7469b12391bd2c2da7f03e59f2af115f51c755337699df4d7a07a7
 archive_sha256 = dfe22d466b1ceb824651ada7c6f20347f4f18caa241dc3459fb5f10560d265e3                  # provenance only; unverifiable after tarball deletion
 rocm = 7.2.4              # advisory minimum (design §3.5); build.rs warns on a ROCm version mismatch and skips the check when ROCm is absent (CI/no-GPU) — it does not hard-assert
 patches = P1+P2+P3+P3copy+P1place+P1ctx+LLctx+P5pred+LLarch+O10excl  # P3copy: golem_copy_pooled_expert_run — pooled-run H2D copy plan (padding tail = last expert's own bytes, never past the slot); P1place: golem_get_expert_placement_stats — expert MUL_MAT_ID per-backend counters at split (I2 proof); P1ctx: golem_ctx per-model hook context + batched ensure/routing (ABI v5) + sched-attached state; LLctx: llama_golem_model_attach/detach — libllama seam, ctx set on the model, re-applied per sched_reserve; P5pred: golem_pred-<target>-<src> next-layer routing prediction nodes (glm5next) read in the layer pre-pass + golem_set_predict/predict hook (ABI v6); LLarch: glm5next/glm5-next spellings both load, KV prefix = the file's spelling; O10excl: evict_dest hook (ABI v7) — exclusive-residency slab evictions D2H into the pool on the split stream (design §6.3 O10)

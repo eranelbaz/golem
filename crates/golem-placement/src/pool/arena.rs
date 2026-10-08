@@ -196,6 +196,19 @@ impl Arena {
         (self.ptr(), self.len)
     }
 
+    /// Raw pointer to the base of one slot (prefill-stream staging: the
+    /// engine hands slot bytes to the reader thread and to the substrate's
+    /// H2D under the stream seq protocol, which serializes every use — no
+    /// safe alias can overlap a live read).
+    ///
+    /// # Panics
+    /// Panics when `slot >= slot_count`.
+    pub fn slot_base(&self, slot: u32) -> *mut u8 {
+        assert!(slot < self.slots, "slot {slot} out of range");
+        // SAFETY: `slot < slots` keeps the address inside the mapping; offset 0.
+        unsafe { self.ptr().add(self.offset_of(slot)) }
+    }
+
     fn ptr(&self) -> *mut u8 {
         self.base.get() as *mut u8
     }
