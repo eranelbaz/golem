@@ -800,6 +800,25 @@ impl ResidencyMap {
         }
     }
 
+    /// Grants one lease on a RESIDENT key without paging it in, scoring it
+    /// or moving residency (prefill stream, design §7.6.4: a streamed ubatch
+    /// must not touch the decode hot set). `None` when not resident (or the
+    /// u16 lease count is saturated — treat as not leasable).
+    pub(crate) fn lease_if_resident(&self, layer: u32, expert: u32) -> Option<u32> {
+        let li = layer as usize;
+        let mut sh = self.shards[li].shard.lock().unwrap();
+        let i = self.local(expert);
+        if !Self::bit_test(&sh.bits, i)
+            || Self::bit_test(&sh.filling, i)
+            || sh.leases[i] == u16::MAX
+        {
+            return None;
+        }
+        Self::ref_set(&mut sh.ref_bits, i);
+        sh.leases[i] += 1;
+        Some(sh.slot_of[i] as u32)
+    }
+
     /// The key's outstanding lease count (test/diagnostic seam: the D2H
     /// `Resident` path must not leak the probe's lease).
     pub(crate) fn lease_count(&self, layer: u32, expert: u32) -> u16 {

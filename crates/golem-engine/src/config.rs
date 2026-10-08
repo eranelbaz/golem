@@ -71,6 +71,23 @@ pub struct EngineConfig {
     /// the pool slot once the H2D lands and D2Hs evictions back into the
     /// pool. Exclusive stays opt-in until the A/B proves it on decode.
     pub residency: Residency,
+    /// Prefill layer streaming (§7.6, `--prefill-stream`): prompt chunks of
+    /// `prefill_ubatch` tokens stream each expert plane through
+    /// double-buffered device slabs instead of paging misses into the pool.
+    /// Off by default; auto-disabled at enable when the VRAM budget cannot
+    /// fit both the stream slabs and a K ≥ top-k (a warning, never an error).
+    pub prefill_stream: bool,
+    /// Streamed prefill ubatch (`--prefill-ubatch`); `n_ubatch` of the
+    /// context when `prefill_stream` is on. 0 = 2048 (the §7.6 default).
+    pub prefill_ubatch: u32,
+    /// Minimum prompt-tail length that still streams (`--prefill-stream-min`):
+    /// below it the chunk takes the per-token path (streaming a whole-plane
+    /// ubatch costs ≥ one disk pass regardless of chunk size).
+    pub prefill_stream_min: u32,
+    /// Routed-share switch (`--prefill-stream-routed-max`): above this share
+    /// of the ubatch's routed experts a plane streams whole instead of
+    /// routed-only (BMoE's 0.85; Golem measures its own crossover).
+    pub prefill_stream_routed_max: f32,
 }
 
 /// RAM/VRAM expert residency policy (§6.3 O10, `--residency`).
@@ -129,6 +146,10 @@ impl Default for EngineConfig {
             prefetch: PrefetchMode::default(),
             prefetch_lookahead: 1,
             residency: Residency::default(),
+            prefill_stream: false,
+            prefill_ubatch: 2048,
+            prefill_stream_min: 256,
+            prefill_stream_routed_max: 0.85,
         }
     }
 }

@@ -78,8 +78,14 @@ impl AccessFeed for PredictionQueue {
 /// Handle to the spawned prefetch thread. `stop()` signals; `Drop` signals
 /// and joins. The loop idles between empty rounds (25 ms bound) so stop
 /// latency is bounded by one idle.
+/// Handle to the spawned prefetch thread. `stop()` signals; `Drop` signals
+/// and joins. The loop idles between empty rounds (25 ms bound) so stop
+/// latency is bounded by one idle. `pause`/`resume` gate the whole loop
+/// (prefill stream, design §7.6.4: stream chunks must not contend for the
+/// disk queue or pool slots — decode-path demand keeps priority).
 pub struct PrefetchHandle {
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -87,6 +93,16 @@ impl PrefetchHandle {
     /// Signals the thread to stop (join happens on `Drop`).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Suspends the prefetch loop (`paused` rounds spin on a short backoff).
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    /// Resumes the prefetch loop.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
     }
 }
 
@@ -111,12 +127,18 @@ pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> Pre
     // One unit page-in is ≈ 15.2 MB / 6.5 GB/s ≈ 2.3 ms; re-check well inside it.
     const DEMAND_BACKOFF: Duration = Duration::from_micros(200);
     let stop = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
     let thread = {
         let stop = stop.clone();
+        let paused = paused.clone();
         spawn(move || {
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
+                }
+                if paused.load(Ordering::Relaxed) {
+                    std::thread::sleep(DEMAND_BACKOFF);
+                    continue;
                 }
                 // Demand priority: a demand page-in in flight wins the I/O;
                 // skip the whole round and re-check after one idle.
@@ -166,6 +188,7 @@ pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> Pre
     };
     PrefetchHandle {
         stop,
+        paused,
         thread: Some(thread),
     }
 }

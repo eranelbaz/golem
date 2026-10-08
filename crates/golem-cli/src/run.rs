@@ -120,6 +120,26 @@ pub struct RunArgs {
     /// exclusive A/B proves it on decode tok/s.
     #[arg(long, value_name = "MODE", default_value = "inclusive", value_parser = parse_residency)]
     pub residency: Residency,
+    /// Prefill layer streaming (design §7.6): prompt chunks of
+    /// `--prefill-ubatch` tokens stream each expert plane through
+    /// double-buffered device slabs instead of paging misses into the pool.
+    /// Needs the RAM expert pool. Auto-disabled with a warning when the
+    /// stream slabs cannot fit alongside a K ≥ top-k device cache.
+    #[arg(long, default_value_t = false)]
+    pub prefill_stream: bool,
+    /// Streamed prefill ubatch (`EngineConfig::prefill_ubatch`); the
+    /// context's n_ubatch (and compute buffer) when `--prefill-stream` is
+    /// on. Default 2048 (§7.6).
+    #[arg(long, value_name = "TOKENS", default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..))]
+    pub prefill_ubatch: u32,
+    /// Minimum prompt-tail length that still streams (`EngineConfig::
+    /// prefill_stream_min`); shorter tails take the per-token path.
+    #[arg(long, value_name = "TOKENS", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..))]
+    pub prefill_stream_min: u32,
+    /// Routed-share switch above which a streamed plane fills whole instead
+    /// of routed-only (hidden measurement knob).
+    #[arg(long, hide = true, default_value_t = 0.85)]
+    pub prefill_stream_routed_max: f32,
 }
 
 fn parse_residency(s: &str) -> Result<Residency, String> {
@@ -175,6 +195,10 @@ impl RunArgs {
             prefetch: self.prefetch,
             prefetch_lookahead: self.prefetch_lookahead,
             residency: self.residency,
+            prefill_stream: self.prefill_stream,
+            prefill_ubatch: self.prefill_ubatch,
+            prefill_stream_min: self.prefill_stream_min,
+            prefill_stream_routed_max: self.prefill_stream_routed_max,
             ..default
         }
     }
@@ -213,6 +237,15 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     if config.prefetch != PrefetchMode::Off && config.ram_experts_gib == 0 {
         return Err(
             "--prefetch requires --ram-experts-gib > 0: predictions steer the expert pool".into(),
+        );
+    }
+    // Prefill stream (§7.6) drives the pool's byte sources and the device
+    // slabs; without the pool there is nothing to stream from.
+    if config.prefill_stream && config.ram_experts_gib == 0 {
+        return Err(
+            "--prefill-stream requires --ram-experts-gib > 0: streamed planes lease \
+             pool slots and stage misses in the pool's store-backed reader"
+                .into(),
         );
     }
     if args.manifest.is_some() && config.ram_experts_gib == 0 {

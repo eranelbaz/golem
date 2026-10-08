@@ -220,11 +220,20 @@ pub(crate) fn load_with_hooks(
     }
 
     let n_batch = config.batch_tokens.min(config.n_ctx);
+    // Prefill streaming (§7.6): the context's ubatch (and with it the
+    // compute buffer `ws`, resident for decode too) is sized for the
+    // streamed prefill shape. n_batch covers the larger of the two chunk
+    // shapes so both the streamed and per-token paths stay one-ubatch.
+    let n_ubatch = if config.prefill_stream {
+        config.prefill_ubatch.max(1).min(config.n_ctx)
+    } else {
+        n_batch
+    };
     // SAFETY: returns llama.cpp's default context params by value.
     let mut params = unsafe { raw::llama_context_default_params() };
     params.n_ctx = config.n_ctx;
-    params.n_batch = n_batch;
-    params.n_ubatch = n_batch;
+    params.n_batch = n_batch.max(n_ubatch);
+    params.n_ubatch = n_ubatch;
     params.n_threads = config.threads as i32;
     params.n_threads_batch = config.threads as i32;
     params.no_perf = true;
@@ -813,14 +822,16 @@ impl Session {
             // return 1; fail with that same code instead of chunking by zero.
             return Err(EngineError::Decode(1));
         }
-
-        let mut batch = Batch::init(chunk_cap as i32, 0, 1);
         // One llama_decode must carry exactly one ubatch (the C lease-release
         // contract, §2.4): n_ubatch is a load-time constant (§4.2), fetched once.
         // SAFETY: ctx is a live context.
         let n_ubatch = unsafe { raw::llama_n_ubatch(ctx.as_ptr()) } as usize;
-        let mut n_past: usize = 0;
-        let mut last_chunk_len = 0;
+        // Prefill streaming (§7.6): whole-plane ubatches above the
+        // --prefill-stream-min tail threshold; the per-token cap below it.
+        let streaming = self.p3.as_ref().is_some_and(|p| p.stream_enabled());
+        let batch_cap = chunk_cap.max(if streaming { n_ubatch } else { 0 });
+
+        let mut batch = Batch::init(batch_cap as i32, 0, 1);
         // §6.2: prefill routes nearly every expert; keep it out of recency.
         // I2 runtime proof window: this turn's prefill and first batch-1 decode
         // (the op-offload threshold is per ubatch, so both shapes are checked).
@@ -837,18 +848,39 @@ impl Session {
             p3.drain_routing_trace();
         }
         let prefill = p3_glue::PrefillScope::enter();
-        for chunk in prompt.chunks(chunk_cap) {
-            let len = chunk.len();
+        // Stream chunks arm the C flag + read-ahead and pause the prefetcher;
+        // the guard disarms/resumes on every exit path (§7.6.4).
+        struct StreamGuard<'a>(&'a p3_glue::SessionHooks);
+        impl Drop for StreamGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set_prefill_stream(false);
+            }
+        }
+        let _stream_guard = self.p3.as_ref().map(StreamGuard);
+        let stream_min = self.config.prefill_stream_min as usize;
+        let mut n_past: usize = 0;
+        let mut last_chunk_len = 0;
+        while n_past < prompt_len {
+            let remaining = prompt_len - n_past;
+            let stream_chunk = streaming && remaining >= stream_min;
+            let len = if stream_chunk {
+                remaining.min(n_ubatch)
+            } else {
+                remaining.min(chunk_cap)
+            };
+            if let Some(p3) = &self.p3 {
+                p3.set_prefill_stream(stream_chunk);
+            }
             let is_final_chunk = n_past + len == prompt_len;
             {
                 // SAFETY: slots 0..len are within the chunk_cap-sized allocation;
                 // every used slot is fully written before decode (llama_batch_init
                 // mallocs and does not zero).
                 let b = &mut batch.inner;
-                for (i, &t) in chunk.iter().enumerate() {
+                for (i, &t) in prompt[n_past..n_past + len].iter().enumerate() {
                     // Logits only on the final token of the final chunk: that
                     // sample bootstraps generation; intermediate tokens never need it.
-                    // SAFETY: i < len <= chunk_cap slots allocated by Batch::init.
+                    // SAFETY: i < len <= batch_cap slots allocated by Batch::init.
                     unsafe {
                         fill_slot(
                             b,
@@ -885,6 +917,10 @@ impl Session {
             last_chunk_len = len;
         }
         drop(prefill);
+        // Disarm before the generation decodes (the guard is the backstop).
+        if let Some(p3) = &self.p3 {
+            p3.set_prefill_stream(false);
+        }
 
         if verify {
             check_experts_on_gpu(placement_before, expert_placement())?;

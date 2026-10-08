@@ -38,6 +38,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 
 use std::sync::{Arc, Mutex};
 
+use crate::stream::StreamState;
+
 use golem_gguf::blk_of;
 use golem_llama_sys::raw;
 use golem_llama_sys::{CtxRaw, GolemCtx, HookFns, Hooked};
@@ -279,6 +281,12 @@ struct HookState {
     evict_scratch: Mutex<Vec<(u32, f32)>>,
     /// §6.5 P5 prediction state (mode `Off`: never touched).
     pred: PredState,
+    /// Prefill-stream state (§7.6, ABI v10); `None` when streaming is off
+    /// or the derivation dropped it (ruling R3).
+    stream: Option<Arc<StreamState>>,
+    /// Whether stream chunks are active (drives the routing readback's
+    /// read-ahead warm); toggled per chunk by `Session`.
+    stream_armed: AtomicBool,
 }
 
 /// Experts predicted beyond the routed top-k (§6.5): 8 + 4 = 12 per layer.
@@ -751,6 +759,11 @@ pub struct SessionHooks {
     pub device_cache_experts: u32,
     /// Model routed top-k (`expert_used_count`).
     pub top_k: u32,
+    /// Prefill-stream state (§7.6); `None` when disabled.
+    stream: Option<Arc<StreamState>>,
+    /// The C-side stream config stashed at enable (n_experts, max stride,
+    /// routed_max): re-passed on every arm/disarm (the setter takes all).
+    stream_cfg: Option<(i32, i32, f32)>,
 }
 
 impl SessionHooks {
@@ -812,6 +825,48 @@ impl SessionHooks {
     /// [`set_scoring`] used by `Session`.
     pub fn set_scoring(&self, on: bool) {
         set_scoring(on);
+    }
+
+    /// Whether prefill streaming is enabled for this session.
+    pub fn stream_enabled(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// Arms/disarms stream chunks (§7.6): flips the C flag, the routing
+    /// readback's read-ahead, and pauses the prefetcher for the chunk
+    /// (stream chunks must not contend for the disk queue or pool slots).
+    /// No-op when streaming is disabled.
+    pub fn set_prefill_stream(&self, on: bool) {
+        let Some(_s) = &self.stream else {
+            return;
+        };
+        self.state.stream_armed.store(on, Ordering::Relaxed);
+        if on {
+            if let Some(p) = &self.prefetch {
+                p.pause();
+            }
+        } else if let Some(p) = &self.prefetch {
+            p.resume();
+        }
+        // SAFETY: FFI flag setter on the live ctx; not concurrent with a
+        // compute (called between llama_decode calls).
+        if let Some((n_experts, max_stride, routed_max)) = self.stream_cfg {
+            // SAFETY: FFI config setter on the live ctx.
+            unsafe {
+                raw::golem_set_prefill_stream(
+                    self.ctx_ptr(),
+                    on as i32,
+                    n_experts,
+                    max_stride,
+                    routed_max,
+                )
+            };
+        }
+    }
+
+    /// Cumulative stream counters (test/observability seam).
+    pub fn stream_stats(&self) -> Option<crate::stream::StreamStats> {
+        self.stream.as_ref().map(|s| s.stats())
     }
 
     /// The substrate's device cache was reset between turns (session.rs
@@ -887,6 +942,9 @@ impl Drop for SessionHooks {
         self.state
             .ctx_ptr
             .store(std::ptr::null_mut(), Ordering::SeqCst);
+        if let Some(s) = &self.stream {
+            s.stop();
+        }
         if let Some(p) = &self.prefetch {
             p.stop();
         }
@@ -1155,16 +1213,35 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         })?;
     let n_expert_used = u32::try_from(n_expert_used)
         .map_err(|_| EngineError::PoolInit("expert_used_count > u32::MAX".into()))?;
+    // Prefill-stream slab pricing (§7.6.1): two device slabs, each
+    // n_experts × max plane stride. Priced BEFORE the K derivation so K
+    // comes off the exact remaining budget (user ruling R3).
+    let max_plane_stride = geo
+        .layers
+        .iter()
+        .flat_map(|l| [ExpertKind::Gate, ExpertKind::Up, ExpertKind::Down].map(|k| l.plane(k).1))
+        .max()
+        .unwrap_or(0);
+    let stream_slab_vram = if config.prefill_stream {
+        2u64 * u64::from(geo.n_experts) * max_plane_stride
+    } else {
+        0
+    };
     // The device-cache budget is a per-layer expert count, never a
     // byte cap on whichever tensor registers first.
     // It is never "unlimited": device allocations are bounded by the VRAM
     // budget, never proportional to expert count (unbounded slabs are ≈184 GB
     // on GLM-5.3-Flash — 126 live tensors × 288 experts × ≈5 MB — against a
     // 24 GiB card). An explicit config value wins; otherwise K derives from
-    // the free VRAM at enable time, with half held back as growth headroom
-    // (K = 9 on the target). K is rejected below the model's top-k: a routed
-    // set larger than K aborts mid-decode, so a smaller K must fail at enable.
-    let k = derive_device_cache_experts(config, slab, n_expert_used)?;
+    // the free VRAM at enable time against the exact budget (R3: free −
+    // stream slabs − headroom; the measured `free` already nets out the
+    // non-expert weights, KV and the compute buffer — they were allocated
+    // at load). With streaming requested but K < top_k under the slab
+    // budget, streaming auto-disables with a warning (never fails enable);
+    // K below top-k without streaming is still a hard error (a routed set
+    // larger than K aborts mid-decode).
+    let (k, stream_enabled) =
+        derive_device_cache_experts(config, slab, n_expert_used, stream_slab_vram)?;
     // Per-class RAM layout (§5.4): each unit-size class gets slots
     // proportional to its share of total unit bytes; remainder bytes are
     // trimmed by integer division.
@@ -1219,6 +1296,31 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     )
     .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
+    // Prefill-stream state (§7.6, ruling R3 kept streaming on): the pinned
+    // staging ring + reader thread. Registration is a startup failure, not
+    // a silent pageable downgrade (§3.5, same as the pool arena).
+    let stream = if stream_enabled {
+        let slot_bytes = geo.n_experts as usize * max_plane_stride as usize;
+        let st = StreamState::new(pool.clone(), source.clone(), slot_bytes)
+            .map_err(|e| EngineError::PoolInit(format!("stream staging ring: {e}")))?;
+        #[cfg(golem_backend_hip)]
+        {
+            let (ptr, len) = st.arena_ptr_range();
+            // SAFETY: the ring is a live, page-aligned, solely-owned mlocked
+            // mapping of exactly `len` bytes; registration happens before
+            // any slot is handed out and unregister rides the state's drop.
+            if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
+                return Err(EngineError::PoolInit(format!(
+                    "hipHostRegister failed on the {len}-byte prefill-stream staging ring \
+                     (HIP result {r})"
+                )));
+            }
+        }
+        Some(st)
+    } else {
+        None
+    };
+
     // Per-model hook context (ABI v5). n_layers covers the full blk range —
     // C indexes its order buffers by the raw blk number, and the dense lead
     // has no expert tensors but does not shift blk numbering.
@@ -1227,6 +1329,26 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // SAFETY: FFI setter on a live ctx; bounded per-layer slab (never
     // unlimited, never proportional to total experts — AGENTS.md).
     unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k as i32) };
+    // Stash the stream config C-side (slabs allocate lazily on the first
+    // streamed split's backend); chunks arm/disarm via SessionHooks.
+    let mut stream_cfg = None;
+    if stream.is_some() {
+        // SAFETY: FFI config setter on a live ctx, no compute in flight.
+        unsafe {
+            raw::golem_set_prefill_stream(
+                ctx.as_ptr(),
+                0,
+                geo.n_experts as i32,
+                max_plane_stride as i32,
+                config.prefill_stream_routed_max,
+            )
+        };
+        stream_cfg = Some((
+            geo.n_experts as i32,
+            max_plane_stride as i32,
+            config.prefill_stream_routed_max,
+        ));
+    }
 
     // P2 state: per-expert recency and §6.2 decayed score; the evict-first
     // order sorts by `config.vram_order`.
@@ -1278,6 +1400,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             2 * (config.prefetch_lookahead * (n_expert_used + PREDICT_MARGIN)) as usize
                 * n_layers as usize,
         ),
+        stream: stream.clone(),
+        stream_armed: AtomicBool::new(false),
     });
     if config.prefetch != PrefetchMode::Off {
         // SAFETY: FFI setter on the live ctx, before the first graph build;
@@ -1315,6 +1439,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             copy_done: Some(copy_done),
             evict_batch: exclusive.then_some(evict_dest_batch),
             evict_abandon: exclusive.then_some(evict_abandon),
+            stream_source: state.stream.as_ref().map_or(None, |_| Some(stream_source)),
+            stream_release: state.stream.as_ref().map_or(None, |_| Some(stream_release)),
         },
         state.clone(),
     );
@@ -1338,18 +1464,25 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         ctx_keep: hooked_ctx_keep,
         device_cache_experts: k,
         top_k: n_expert_used,
+        stream: stream.clone(),
+        stream_cfg,
     })
 }
 
 /// Per-layer device-slab expert count for this pool. Explicit
-/// `device_cache_experts > 0` wins; otherwise derived from free VRAM. Never
-/// unlimited, never zero: a routed set larger than K aborts, so K = 0 could
-/// not decode at all.
+/// `device_cache_experts > 0` wins; otherwise derived from free VRAM against
+/// the exact budget (ruling R3: free − stream slabs − headroom — no halving;
+/// the measured free already nets out KV, `ws` and the non-expert weights).
+/// Returns whether prefill streaming stays enabled: auto-disabled with a
+/// warning when the slab budget would push K below top-k (never fails the
+/// enable). Never unlimited, never zero: a routed set larger than K aborts,
+/// so K = 0 could not decode at all.
 fn derive_device_cache_experts(
     #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] config: &EngineConfig,
     #[cfg_attr(not(golem_backend_hip), allow(unused_variables))] slab_bytes_per_expert: u64,
     n_expert_used: u32,
-) -> Result<u32, EngineError> {
+    stream_slab_vram: u64,
+) -> Result<(u32, bool), EngineError> {
     if config.device_cache_experts > 0 {
         let k = config.device_cache_experts;
         if k < n_expert_used {
@@ -1365,11 +1498,38 @@ fn derive_device_cache_experts(
                 "device_cache_experts {k} exceeds i32::MAX"
             )));
         }
-        return Ok(k);
+        return Ok((k, config.prefill_stream));
     }
     #[cfg(golem_backend_hip)]
     if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
-        return k_from_free_vram(free as u64, slab_bytes_per_expert, n_expert_used);
+        let free = free as u64;
+        // Ruling R3: K off the exact budget; with streaming requested but
+        // the slabs pushing K below top-k, auto-disable streaming (never
+        // fail the enable).
+        let k_stream = k_from_free_vram(
+            free.saturating_sub(stream_slab_vram),
+            slab_bytes_per_expert,
+            n_expert_used,
+        );
+        if config.prefill_stream {
+            match k_stream {
+                Ok(k) => return Ok((k, true)),
+                Err(e) => {
+                    let k_plain = k_from_free_vram(free, slab_bytes_per_expert, n_expert_used)?;
+                    tracing::warn!(
+                        stream_slab_vram,
+                        error = %e,
+                        "prefill-stream disabled: the stream slabs do not fit alongside a \
+                         K ≥ top-k device cache; continuing without streaming"
+                    );
+                    return Ok((k_plain, false));
+                }
+            }
+        }
+        return Ok((
+            k_from_free_vram(free, slab_bytes_per_expert, n_expert_used)?,
+            false,
+        ));
     }
     Err(EngineError::PoolInit(
         "device_cache_experts unset and no VRAM query available to derive a bounded \
@@ -1423,16 +1583,22 @@ fn class_layout(
     Ok(out)
 }
 
-/// Derived K from free VRAM: half is slab budget, the rest KV + compute-buffer
-/// growth headroom; `− 1` is per-slab headroom. Rejected below top-k — a
-/// routed set larger than K aborts mid-decode, it is never floored.
+/// Derived K from free VRAM against the exact budget (ruling R3):
+/// `⌊free / slab⌋ − 1` — the stream slabs, KV, `ws` and the non-expert
+/// weights were all subtracted (or already allocated) before this runs;
+/// `VRAM_HEADROOM_BYTES` (1 GiB) covers allocator fragmentation and driver
+/// drift. Rejected below top-k — a routed set larger than K aborts
+/// mid-decode, it is never floored.
+#[cfg_attr(not(golem_backend_hip), allow(dead_code))]
+const VRAM_HEADROOM_BYTES: u64 = 1 << 30;
+
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 fn k_from_free_vram(
     free: u64,
     slab_bytes_per_expert: u64,
     n_expert_used: u32,
 ) -> Result<u32, EngineError> {
-    let k = (free / 2) / slab_bytes_per_expert.max(1);
+    let k = free.saturating_sub(VRAM_HEADROOM_BYTES) / slab_bytes_per_expert.max(1);
     let k = k.saturating_sub(1).clamp(1, i32::MAX as u64);
     if k < u64::from(n_expert_used) {
         return Err(EngineError::PoolInit(format!(
@@ -1458,7 +1624,7 @@ fn kind_from_code(code: i32) -> Option<ExpertKind> {
 /// Loud terminal state for FFI-adjacent contract violations (the void ABI
 /// leaves no non-silent failure path; corrupt-weight
 /// decode is worse than a dead process — documented, deliberate).
-fn p3_fatal(context: String) -> ! {
+pub(crate) fn p3_fatal(context: String) -> ! {
     // stderr is the one channel always available in an abort path (tracing
     // may have no subscriber installed).
     eprintln!("golem p3 fatal: {context}");
@@ -1615,6 +1781,14 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
             // backends before this hook): the slots are safe to recycle.
             h.pool.end_batch_step();
         }
+        // Prefill-stream backstop: release whatever the per-plane
+        // stream_release calls left (the last ≤ 2 planes of the chunk) and
+        // drop unconsumed warm planes (a chunk may end below the streaming
+        // minimum). C drained its backends above, so H2D reads of staging
+        // slots and pool leases are complete.
+        if let Some(s) = &h.stream {
+            s.release_all();
+        }
         // Bounded flush-if-dirty: if the publisher has not caught up (it
         // polls at 250 µs), publish up to 8 dirty layers here. push never
         // blocks — a full triple-buffer set leaves the layer dirty for the
@@ -1622,6 +1796,57 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
         if h.policy.dirty_any.load(Ordering::Relaxed) {
             let mut scratch = h.flush_scratch.lock().unwrap_or_else(|e| e.into_inner());
             publish_dirty(h, 8, &mut scratch);
+        }
+    });
+}
+
+/// The prefill-stream byte-source hook (ABI v10, design §7.6): one call per
+/// streamed plane from the copy loop; translates the raw blk into the
+/// pool's dense-lead-adjusted layer and forwards to the stream state.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn stream_source(
+    payload: *mut c_void,
+    blk: i32,
+    kind: i32,
+    seq: u64,
+    ids: *const i32,
+    n_ids: i32,
+    out_ptrs: *mut *const c_void,
+) {
+    guarded("stream_source", || {
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        let Some(s) = &h.stream else {
+            p3_fatal("stream_source without stream state (streaming not enabled)".into());
+        };
+        if blk < h.dense_lead as i32 || blk >= (h.dense_lead + h.n_layers) as i32 {
+            p3_fatal(format!(
+                "stream_source: blk {blk} outside the expert blk range [{}, {})",
+                h.dense_lead,
+                h.dense_lead + h.n_layers
+            ));
+        }
+        // SAFETY: C passes `n_ids` ids and preallocates the matching out array.
+        let (ids, out) = unsafe {
+            (
+                std::slice::from_raw_parts(ids, n_ids.max(0) as usize),
+                std::slice::from_raw_parts_mut(out_ptrs, n_ids.max(0) as usize),
+            )
+        };
+        s.source(blk - h.dense_lead as i32, kind, seq, ids, out);
+    });
+}
+
+/// The prefill-stream release hook (ABI v10): C drops the seq−2 plane's
+/// leases and staging slot after the slab's event sync; the copy_done
+/// backstop covers the tail.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn stream_release(payload: *mut c_void, seq: u64) {
+    guarded("stream_release", || {
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        if let Some(s) = &h.stream {
+            s.release(seq);
         }
     });
 }
@@ -1856,6 +2081,13 @@ pub extern "C" fn routing(
                 ids,
             );
         }
+        // Prefill-stream read-ahead (§7.6.3): this layer's ids are known —
+        // warm its up/down planes and the next layer's whole gate plane.
+        if h.stream_armed.load(Ordering::Relaxed) {
+            if let Some(s) = &h.stream {
+                s.warm(layer as u32, ids);
+            }
+        }
     })
 }
 
@@ -2085,8 +2317,8 @@ mod tests {
             ..EngineConfig::default()
         };
         assert_eq!(
-            derive_device_cache_experts(&c, 42 * 5_777_000, 8).unwrap(),
-            9
+            derive_device_cache_experts(&c, 42 * 5_777_000, 8, 0).unwrap(),
+            (9, false)
         );
         // Explicit K below the model's top-k must fail at enable, not abort
         // on the first decode (a routed set larger than K aborts).
@@ -2094,13 +2326,13 @@ mod tests {
             device_cache_experts: 7,
             ..EngineConfig::default()
         };
-        let err = derive_device_cache_experts(&c_small, 42 * 5_777_000, 8).unwrap_err();
+        let err = derive_device_cache_experts(&c_small, 42 * 5_777_000, 8, 0).unwrap_err();
         assert!(err.to_string().contains("expert_used_count"), "{err}");
         // Default (0): derived, bounded, never 0. On the CPU backend there is
         // no VRAM query, so derivation is a loud error, not an unbounded cap.
         #[cfg(not(golem_backend_hip))]
         assert!(
-            derive_device_cache_experts(&EngineConfig::default(), 42 * 5_777_000, 8).is_err(),
+            derive_device_cache_experts(&EngineConfig::default(), 42 * 5_777_000, 8, 0).is_err(),
             "no VRAM query: derivation must fail loudly"
         );
         // An explicit K that would wrap the i32 ABI is refused, not passed
@@ -2109,7 +2341,7 @@ mod tests {
             device_cache_experts: u32::MAX,
             ..EngineConfig::default()
         };
-        let err = derive_device_cache_experts(&c_huge, 42 * 5_777_000, 8).unwrap_err();
+        let err = derive_device_cache_experts(&c_huge, 42 * 5_777_000, 8, 0).unwrap_err();
         assert!(err.to_string().contains("i32::MAX"), "{err}");
     }
 
@@ -2157,13 +2389,13 @@ mod tests {
             .map(|(u, ls)| u * ls.len() as u64)
             .sum();
         assert_eq!(geo_bytes, 644_022_272);
-        // 6.657 GB slab budget / 644 MB = 10.34 → K = 9. Pricing by 42 × 3 × max
-        // stride (867 MB) gave 7.68 → K = 6 < top-k: enable refused the real model.
+        // Ruling R3 (exact budget): K = ⌊(free − 1 GiB headroom) / 644 MB⌋ − 1.
+        // (2 × 6.657 GB − 1 GiB) / 644 MB = 19.0 → K = 18.
         assert_eq!(
             k_from_free_vram(2 * 6_657_000_000, geo_bytes, 8).unwrap(),
-            9
+            18
         );
-        assert!(k_from_free_vram(2 * 6_657_000_000, 42 * 3 * Q6, 8).is_err());
+        assert!(k_from_free_vram(1 << 30, geo_bytes, 8).is_err());
         // Huge free VRAM stays within the i32 ABI (≤ 0 reads as "full slab" in C).
         assert_eq!(
             k_from_free_vram(u64::MAX, geo_bytes, 8).unwrap(),

@@ -925,6 +925,34 @@ impl ExpertPool {
         &lease.bytes()[off as usize..(off + stride) as usize]
     }
 
+    /// Leases the `kind` plane of a RESIDENT `(layer, expert)` unit and
+    /// returns its pool-side pointer plus the undropped lease (prefill
+    /// stream, design §7.6.2: pooled hits copy H2D from the pinned slot
+    /// under a lease, but never score or page in — a streamed ubatch must
+    /// not change the decode hot set). `None` when the unit is not resident;
+    /// the caller stages the plane instead. The lease drops at the plane's
+    /// stream release (or the step's copy_done backstop).
+    pub fn lease_resident(
+        &self,
+        layer: u32,
+        kind: ExpertKind,
+        expert: u32,
+    ) -> Option<(*const u8, Lease)> {
+        if (layer as usize) >= self.geometry.layers.len() || expert >= self.geometry.n_experts {
+            return None;
+        }
+        let slot = self.residency.lease_if_resident(layer, expert)?;
+        let lease = Lease {
+            map: self.residency.clone(),
+            _arena: self.arena.clone(),
+            layer,
+            expert,
+            slot,
+        };
+        let ptr = self.plane_bytes(layer, &lease, kind).as_ptr();
+        Some((ptr, lease))
+    }
+
     /// Fills one slot from the source. The `Filled`/evict claim left this key
     /// mid-fill in the residency shard: the fill writes through the claim's
     /// exclusive view, and only `finish` (before the lease-held copy) lets
