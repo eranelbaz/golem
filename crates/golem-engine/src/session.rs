@@ -225,7 +225,12 @@ pub(crate) fn load_with_hooks(
     // streamed prefill shape. n_batch covers the larger of the two chunk
     // shapes so both the streamed and per-token paths stay one-ubatch.
     let n_ubatch = if config.prefill_stream {
-        config.prefill_ubatch.max(1).min(config.n_ctx)
+        let ub = if config.prefill_ubatch == 0 {
+            2048
+        } else {
+            config.prefill_ubatch
+        };
+        ub.min(config.n_ctx)
     } else {
         n_batch
     };
@@ -554,6 +559,13 @@ impl Session {
         // A second CONCURRENT pool-enabled session is refused before any
         // model load (VRAM arithmetic in the refusal). Sequential sessions —
         // pooled or not — are legal: the hooks are per-model (ABI v5).
+        // Streaming stages from the RAM expert pool (§7.6); without one it
+        // would silently fall back to the per-token path.
+        if config.prefill_stream && config.ram_experts_gib == 0 {
+            return Err(EngineError::InvalidConfig(
+                "prefill_stream requires the RAM expert pool (ram_experts_gib > 0)".into(),
+            ));
+        }
         if config.ram_experts_gib > 0 {
             p3_glue::refuse_if_pool_session_live()?;
         }
@@ -866,6 +878,8 @@ impl Session {
         impl Drop for StreamGuard<'_> {
             fn drop(&mut self) {
                 self.0.set_prefill_stream(false);
+                // llama_decode returned: no H2D in flight.
+                self.0.release_stream();
             }
         }
         let _stream_guard = self.p3.as_ref().map(StreamGuard);

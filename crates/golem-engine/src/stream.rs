@@ -68,6 +68,8 @@ struct Pending {
     base: *mut u8,
     /// Staged (non-resident at warm time) ids, ascending.
     staged_ids: Vec<u32>,
+    /// Every id warmed for this plane (routed set), ascending.
+    warmed_ids: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -206,11 +208,16 @@ impl StreamState {
             // n_experts × max stride ≥ plane_len); the task is exclusively
             // owned here and C reads the bytes only after pending hits 0.
             let plane = unsafe { std::slice::from_raw_parts_mut(task.dst, task.plane_len) };
-            let read = self
-                .source
-                .read_expert(task.layer, task.kind, task.expert, plane, 0);
+            // A panicking source must not strand pending_reads (every
+            // waiter would hang): it counts as a failed read.
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.source
+                    .read_expert(task.layer, task.kind, task.expert, plane, 0)
+                    .is_ok()
+            }))
+            .unwrap_or(false);
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if read.is_err() {
+            if !ok {
                 inner.failed = true;
             }
             inner.pending_reads[task.slot] -= 1;
@@ -250,6 +257,9 @@ impl StreamState {
             p3_fatal("stream reader failed; aborting rather than decoding on garbage".into());
         }
         let plane_len = self.plane_lens[(layer as usize) * 3 + kind as usize] as usize;
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
         let staged_ids: Vec<u32> = ids
             .iter()
             .copied()
@@ -266,6 +276,9 @@ impl StreamState {
                     p3_fatal(
                         "stream reader failed; aborting rather than decoding on garbage".into(),
                     );
+                }
+                if inner.stop {
+                    p3_fatal("stream warm after stop".into());
                 }
                 if let Some(&s) = inner.free_slots.last() {
                     inner.free_slots.pop();
@@ -297,6 +310,7 @@ impl StreamState {
                 slot,
                 base,
                 staged_ids,
+                warmed_ids: ids,
             },
         );
     }
@@ -367,12 +381,12 @@ impl StreamState {
         }
 
         // Fill the pointers: pooled hits lease now (held until release, no
-        // score, no page-in — §7.6.4); staged ids point into the warm slot;
-        // anything C asked for that was neither resident nor staged (whole
-        // fill over a routed-only warm) points at the slot's stale but
-        // finite bytes — `MUL_MAT_ID` never reads unrouted ranges, and the
-        // slab/MMQ padding stays finite (§7.6.6).
-        let mut leases: Vec<Lease> = Vec::new();
+        // score, no page-in — §7.6.4); staged ids point into the warm slot.
+        // An id outside the warmed set (whole fill over a routed-only warm)
+        // points at the slot's stale but finite bytes — `MUL_MAT_ID` never
+        // reads unrouted ranges (§7.6.6). A warmed id that is now neither
+        // resident nor staged lost residency after warm: fatal, never stale.
+        let mut leases: Vec<Lease> = Vec::with_capacity(ids.len());
         for (i, &id) in ids.iter().enumerate() {
             if id < 0 {
                 p3_fatal(format!("stream_source: negative expert id {id}"));
@@ -390,9 +404,9 @@ impl StreamState {
                 self.bytes.fetch_add(plane_len as u64, Ordering::Relaxed);
                 // SAFETY: id × plane_len inside the slot (slot_bytes bound).
                 out[i] = unsafe { pending.base.add(id as usize * plane_len) } as *const c_void;
-            } else if pending.slot != usize::MAX {
+            } else if pending.slot != usize::MAX && pending.warmed_ids.binary_search(&id).is_err() {
                 // SAFETY: as above; the bytes are stale (never staged this
-                // plane) but finite.
+                // plane) but finite, and the id is unrouted.
                 out[i] = unsafe { pending.base.add(id as usize * plane_len) } as *const c_void;
             } else {
                 // Warm had no slot (everything resident) but this id is no

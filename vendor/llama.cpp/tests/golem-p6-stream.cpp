@@ -1,14 +1,14 @@
-// Golem prefill-stream regression (design §7.6, ABI v10): drives the sched's
+// Golem prefill-stream regression (design section 7.6, ABI v10): drives the sched's
 // mode-3 stream plane path on the fake-GPU harness:
 //   1. golem_set_prefill_stream without the stream hooks aborts loudly.
-//   2. A streamed step never calls ensure (no pool page-in — §7.6.4), calls
+//   2. A streamed step never calls ensure (no pool page-in -- section 7.6.4), calls
 //      stream_source once per plane with the routed ids (routed share below
 //      the switch) and produces the same MUL_MAT_ID output as the pooled
-//      path (bytes bit-identical — I1).
+//      path (bytes bit-identical -- I1).
 //   3. Above the routed-share switch the source gets the whole identity
 //      range.
 //   4. Slab reuse releases: filling seq 2 syncs and calls stream_release(0)
-//      before its copies (the seq−2 contract).
+//      before its copies (the seq-2 contract).
 //   5. Disarming restores the pooled path verbatim.
 #include "golem-hook-context.hpp"
 #include "golem-test-sched.hpp"
@@ -165,7 +165,7 @@ int main() {
         golem_reset_device_cache(c);
         golem_ctx_free(c);
 
-        // leg 4: three planes on a FRESH ctx → slab reuse releases seq−2
+        // leg 4: three planes on a FRESH ctx -> slab reuse releases seq-2
         // after the sync (seq starts at 0).
         st.source_calls.store(0);
         st.released.clear();
@@ -190,7 +190,7 @@ int main() {
             golem_ctx_free(c3);
         }
 
-        // leg 5: disarmed → pooled path verbatim.
+        // leg 5: disarmed -> pooled path verbatim.
         st.source_calls.store(0);
         st.ensure_calls.store(0);
         {

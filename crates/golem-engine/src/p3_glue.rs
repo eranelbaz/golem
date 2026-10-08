@@ -845,9 +845,17 @@ impl SessionHooks {
         unsafe { raw::golem_reset_device_cache(ctx) };
         self.device_cache_reset();
         #[cfg(golem_backend_hip)]
-        let free = golem_llama_sys::pinned::free_device_mem().map_or(0, |(f, _)| f as u64);
+        let free = golem_llama_sys::pinned::free_device_mem().map(|(f, _)| f as u64);
         #[cfg(not(golem_backend_hip))]
-        let free = 0u64;
+        let free: Option<u64> = None;
+        let Some(free) = free else {
+            // No post-load reading: keep the top-k slab set at enable.
+            tracing::warn!(
+                k = self.device_cache_experts,
+                "VRAM query failed after load; device cache stays at top-k"
+            );
+            return Ok(());
+        };
         let k_of = |budget: u64| {
             k_from_free_vram(budget, fit.slab_bytes_per_expert, self.top_k)
                 .map(|k| k.min(fit.k_bound))
@@ -858,8 +866,10 @@ impl SessionHooks {
                 tracing::warn!(
                     stream_slab_vram = fit.stream_slab_vram,
                     error = %e,
+                    staging_ring_bytes = self.stream.as_ref().map_or(0, |s| s.staged_bytes()),
                     "prefill-stream disabled: the stream slabs do not fit alongside a \
-                     K ≥ top-k device cache; continuing without streaming"
+                     K ≥ top-k device cache; continuing without streaming (the pinned \
+                     staging ring stays allocated for the session)"
                 );
                 self.stream = None;
                 self.stream_cfg = None;
@@ -907,6 +917,15 @@ impl SessionHooks {
                     routed_max,
                 )
             };
+        }
+    }
+
+    /// Drops every staging slot and pool lease the stream chunks still
+    /// hold (a failed decode never reaches copy_done's backstop). Call only
+    /// with no compute in flight.
+    pub(crate) fn release_stream(&self) {
+        if let Some(s) = &self.stream {
+            s.release_all();
         }
     }
 

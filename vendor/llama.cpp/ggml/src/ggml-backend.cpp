@@ -103,6 +103,9 @@ void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
     if (on && (ctx->stream_source == NULL || ctx->stream_release == NULL)) {
         GGML_ABORT("golem_set_prefill_stream without the stream hooks registered");
     }
+    if (on && (n_experts <= 0 || max_plane_stride <= 0 || !(routed_max > 0.0f && routed_max <= 1.0f))) {
+        GGML_ABORT("golem_set_prefill_stream: bad config");
+    }
     ctx->stream_n_experts = n_experts;
     ctx->stream_max_stride = max_plane_stride;
     ctx->stream_routed_max = routed_max;
@@ -110,10 +113,13 @@ void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
 }
 
 // Frees the prefill-stream slabs + events (device buffers: the owner must run
-// this while the backend is alive — golem_reset_device_cache).
+// this while the backend is alive -- golem_reset_device_cache).
 static void golem_stream_slabs_free(golem_ctx_t ctx) {
     for (auto & sl : ctx->stream_slabs) {
         if (sl.event != nullptr) {
+            if (sl.used) {
+                ggml_backend_event_synchronize(sl.event);
+            }
             ggml_backend_event_free(sl.event);
             sl.event = nullptr;
         }
@@ -2195,7 +2201,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 done_blk = blk;
                 const bool slab_mode = gctx->routing != NULL;
-                // Prefill stream (ABI v10, design §7.6): armed per chunk by
+                // Prefill stream (ABI v10, design section 7.6): armed per chunk by
                 // the engine; takes the same single-GPU shape as the slab
                 // path (one split per layer segment, n_copies == 1).
                 const bool stream_mode = gctx->stream_on.load(std::memory_order_acquire) != 0;
@@ -2234,8 +2240,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     golem_plane_plan & plan = golem_planes[j];
                     if (stream_mode) {
                         // Prefill stream: no ensure misses (never pages into
-                        // the pool — the decode hot set must survive a long
-                        // prompt, §7.6.4), no slab step (P2 slot-cache slabs
+                        // the pool -- the decode hot set must survive a long
+                        // prompt, section 7.6.4), no slab step (P2 slot-cache slabs
                         // untouched); the copy loop calls stream_source.
                         plan.mode = 3;
                         plan.slab = nullptr;
@@ -2573,18 +2579,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // hooked expert plane the pre-pass left unplanned
                         // (no routed ids): nothing to copy
                     } else if (golem_planned && plan.mode == 3) {
-                        // Prefill stream (design §7.6): fill this plane's
+                        // Prefill stream (design section 7.6): fill this plane's
                         // range of the double-buffered stream slab from the
                         // stream_source pointers (pooled slots under lease or
                         // pinned staging slots the reader thread filled),
                         // then redirect the MUL_MAT_ID's weights to the slab.
-                        // Identity ids: src[2] stays untouched — no remap.
+                        // Identity ids: src[2] stays untouched -- no remap.
                         const int32_t kind_s = golem_expert_stem_kind(input->name);
                         const int32_t blk_s = golem_tensor_blk(input->name);
                         const uint64_t seq = gctx->stream_seq.fetch_add(1, std::memory_order_relaxed);
                         golem_ctx::golem_stream_slab & sl = gctx->stream_slabs[seq & 1];
                         // Slab reuse: plane seq-2's compute read the other
-                        // half — its event (or a full drain) proves the H2D +
+                        // half -- its event (or a full drain) proves the H2D +
                         // graph reads finished before the new H2D overwrites
                         // the bytes. Release order: sync first, then release
                         // the engine's leases/staging slot for seq-2.
@@ -2600,15 +2606,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
                         // Typed slab view, (re)built on shape/type change;
-                        // bytes zeroed once at allocation — unfilled ranges
-                        // stay finite (MMQ padding guard, §7.6.6).
+                        // bytes zeroed once at allocation -- unfilled ranges
+                        // stay finite (MMQ padding guard, section 7.6.6).
                         const uint64_t fp = ((uint64_t) input->type << 48) ^
                             ((uint64_t) (uint32_t) input->ne[0] << 24) ^
                             (uint64_t) (uint32_t) input->ne[1];
-                        if (sl.buf == nullptr || sl.fp != fp) {
-                            if (sl.buf != nullptr) {
-                                ggml_backend_buffer_free(sl.buf);
-                            }
+                        GGML_ASSERT((int64_t) input->nb[2] <= gctx->stream_max_stride);
+                        GGML_ASSERT(input->ne[2] <= gctx->stream_n_experts);
+                        if (sl.buf == nullptr) {
+                            // One fixed n_experts x max-stride buffer per half
+                            // (design 7.6.1); only the typed view changes.
+                            sl.buf = ggml_backend_buft_alloc_buffer(
+                                ggml_backend_get_default_buffer_type(split_backend),
+                                (size_t) gctx->stream_n_experts * (size_t) gctx->stream_max_stride);
+                            GGML_ASSERT(sl.buf != nullptr);
+                            ggml_backend_buffer_clear(sl.buf, 0);
+                            sl.fp = 0;
+                            sl.used = false;
+                        }
+                        if (sl.fp != fp) {
                             if (sl.ctx != nullptr) {
                                 ggml_free(sl.ctx);
                             }
@@ -2618,13 +2634,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             sl.tensor = ggml_new_tensor_3d(sl.ctx, input->type,
                                 input->ne[0], input->ne[1], gctx->stream_n_experts);
                             GGML_ASSERT(sl.tensor != nullptr);
-                            sl.buf = ggml_backend_alloc_ctx_tensors(sl.ctx, split_backend);
-                            GGML_ASSERT(sl.buf != nullptr);
-                            GGML_ASSERT((int64_t) input->nb[2] <= gctx->stream_max_stride);
-                            ggml_backend_buffer_clear(sl.buf, 0);
+                            GGML_ASSERT(ggml_backend_tensor_alloc(sl.buf, sl.tensor,
+                                ggml_backend_buffer_get_base(sl.buf)) == GGML_STATUS_SUCCESS);
                             sl.fp = fp;
-                            sl.used = false;
-                            sl.event = nullptr; // re-created for the new buffer's backend below
                         }
                         if (sl.event == nullptr) {
                             sl.event = ggml_backend_event_new(split_backend->device);
@@ -2662,7 +2674,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // Coalesced H2D: one set_async per run of consecutive
                         // ids whose host pointers are contiguous (staging
                         // runs); pooled slots are independent allocations and
-                        // copy per expert — no extra byte is copied.
+                        // copy per expert -- no extra byte is copied.
                         {
                             size_t i7 = 0;
                             while (i7 < golem_stream_ids.size()) {
@@ -2821,7 +2833,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-            // Prefill stream: the compute above consumed this split's slabs —
+            // Prefill stream: the compute above consumed this split's slabs --
             // record their events so the next fill of the same half waits
             // exactly for this work (not the whole backend).
             if (golem_hooked) {

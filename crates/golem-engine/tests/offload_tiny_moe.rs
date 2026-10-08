@@ -94,3 +94,16 @@ fn flash_attn_on_loads_and_decodes() {
         "flash_attn_on must not break the decode"
     );
 }
+
+#[test]
+fn prefill_stream_without_pool_is_invalid_config() {
+    let cfg = EngineConfig {
+        model_path: common::tiny_moe_path(),
+        prefill_stream: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        Session::new(&cfg),
+        Err(golem_engine::error::EngineError::InvalidConfig(_))
+    ));
+}

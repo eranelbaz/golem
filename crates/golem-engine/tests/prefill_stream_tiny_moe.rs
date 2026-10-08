@@ -23,7 +23,8 @@ fn config(stream: bool, n_predict: u32) -> EngineConfig {
         device_cache_experts: 4,
         prefill_stream: stream,
         prefill_ubatch: 64,
-        // The tiny prompt is a handful of tokens: stream everything.
+        // The templated prompt is ~131 tokens: three stream chunks at 64,
+        // the last one a short tail (prefill_stream_min 1 streams it too).
         prefill_stream_min: 1,
         n_predict,
         ..EngineConfig::default()
@@ -76,4 +77,23 @@ fn streamed_prefill_matches_per_token_and_spares_the_pool() {
         pool_traffic(false),
         "stream chunks touched the pool"
     );
+
+    // A tail shorter than prefill_stream_min takes the per-token path: no
+    // plane streams, output unchanged.
+    let mut session = Session::new(&EngineConfig {
+        prefill_stream_min: u32::MAX,
+        ..config(true, 8)
+    })
+    .expect("session");
+    let mut out = String::new();
+    session
+        .chat_turn(&TURNS, &mut |piece| out.push_str(piece))
+        .expect("turn");
+    let gated = session.p3_hooks().expect("pooled session").stream_stats();
+    assert_eq!(
+        gated.expect("stream stats").planes,
+        0,
+        "gated tail streamed"
+    );
+    assert_eq!(out, out_token, "gated output must match");
 }

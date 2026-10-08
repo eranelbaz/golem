@@ -86,11 +86,11 @@ struct golem_ctx {
     std::atomic<int32_t> k_cfg{0};
     golem_device_cache_stats dc_stats{};
 
-    // --- prefill stream (design §7.6, ABI v10) ---
+    // --- prefill stream (design section 7.6, ABI v10) ---
     // Double-buffered device slabs, one plane each: plane p computes from
     // slab p%2 while p+1 fills. Allocated lazily on the first streamed
     // split's backend (the allocation needs it), freed by
-    // golem_reset_device_cache. `stream_seq` is the global plane counter —
+    // golem_reset_device_cache. `stream_seq` is the global plane counter --
     // it keys the stream_source/stream_release pair and picks the slab.
     struct golem_stream_slab {
         struct ggml_context * ctx = nullptr;
