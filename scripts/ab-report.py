@@ -18,7 +18,7 @@ def leg_row(d: Path) -> str:
     try:
         wall = sum(float(r["wall_ms"]) for r in rows)
         # The plain-GGUF leg (no manifest) has no store counters.
-        disk = None if rows[0]["disk_bytes"] == "unmeasured" else sum(float(r["disk_bytes"]) for r in rows)
+        disk = None if any(r["disk_bytes"] == "unmeasured" for r in rows) else sum(float(r["disk_bytes"]) for r in rows)
     except (KeyError, ValueError) as e:
         sys.exit(f"{d.name}: unusable timing.csv ({e})")
     trailer = next((l[2:] for l in lines if l.startswith("# prefetch")), "")

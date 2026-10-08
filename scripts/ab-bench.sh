@@ -35,9 +35,11 @@ flags=(--n-gpu-layers 99 --cpu-moe-layers 99 --greedy --ram-experts-gib "$GIB"
 # GOLEM_AB_MANIFEST=0 runs the plain-GGUF leg (no --manifest) for the §4
 # cold-decode manifest-vs-none A/B; --ram-experts-gib still applies, so
 # both legs share the pool path.
-if [[ "${GOLEM_AB_MANIFEST:-1}" == 1 ]]; then
-  flags=(--manifest "$MANIFEST" "${flags[@]}")
-fi
+case "${GOLEM_AB_MANIFEST:-1}" in
+  1) flags=(--manifest "$MANIFEST" "${flags[@]}") ;;
+  0) ;;
+  *) echo "FATAL: GOLEM_AB_MANIFEST must be 0 or 1" >&2; exit 2 ;;
+esac
 {
   echo "leg=$LEG temp=$TEMP date=$(date -Is) host=$(hostname)"
   echo "flags=${flags[*]}"

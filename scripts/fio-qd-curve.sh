@@ -2,11 +2,12 @@
 # fio random-read queue-depth curve on one file: O_DIRECT, io_uring, one job.
 # Prints CSV: qd,bs,MB/s,iops,p50_us,p99_us.
 # usage: fio-qd-curve.sh <file> [chunk-kib]
-#   chunk-kib: read block size in KiB, a multiple of 4 for O_DIRECT
+#   chunk-kib (or GOLEM_FIO_BS_K): read block size in KiB, a multiple of 4 for O_DIRECT
 #   (default 5940 ~ the 5.8 MB expert plane; 4812 ~ the 4.7 MB one). Override points with GOLEM_FIO_QDS,
 #   per-point runtime with GOLEM_FIO_RUNTIME (seconds, default 10).
 set -euo pipefail
 
+command -v jq >/dev/null || { echo "FATAL: jq missing" >&2; exit 2; }
 command -v fio >/dev/null || { echo "FATAL: fio missing (sudo pacman -S fio)" >&2; exit 2; }
 [[ $# -ge 1 && $# -le 2 ]] || { echo "usage: fio-qd-curve.sh <file> [chunk-kib]" >&2; exit 2; }
 [[ -f $1 ]] || { echo "FATAL: no such file: $1" >&2; exit 2; }
