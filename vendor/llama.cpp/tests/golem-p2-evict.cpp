@@ -109,7 +109,7 @@ int main() {
     golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXPERTS);
     golem_set_device_cache_experts(c, 2); // K = 2 < 8: forced eviction churn
     auto * h = golem_register_hooks(c, ev_ensure, ev_routing, ev_copy_done,
-                                    ev_evict, ev_abandon, &s);
+                                    ev_evict, ev_abandon, nullptr, nullptr, &s);
     (void) h;
     {
         ExpertSched es;

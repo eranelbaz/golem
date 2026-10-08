@@ -395,6 +395,13 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(golem-p2-evict PRIVATE ggml)
     target_include_directories(golem-p2-evict PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+    # Golem prefill-stream regression (design §7.6, ABI v10): the sched's
+    # mode-3 stream plane path — routed-only vs whole fill, no pool page-in,
+    # slab-reuse release ordering, disarm restores the pooled path.
+    llama_build_and_test(golem-p6-stream.cpp)
+    target_link_libraries(golem-p6-stream PRIVATE ggml)
+    target_include_directories(golem-p6-stream PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
     # Golem P1 placement counters: expert MUL_MAT_ID nodes counted per
     # backend device type at graph split (golem_get_expert_placement_stats).
     llama_build_and_test(golem-p1-placement.cpp)
