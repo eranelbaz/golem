@@ -96,6 +96,8 @@ pub struct HealthState {
     state: AtomicU8,
     snapshot: Mutex<HealthSnapshot>,
     in_flight: Mutex<Option<Arc<AtomicBool>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    hooks: TestHooks,
 }
 
 impl HealthState {
@@ -104,6 +106,8 @@ impl HealthState {
             state: AtomicU8::new(ServeState::Loading as u8),
             snapshot: Mutex::new(HealthSnapshot::default()),
             in_flight: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            hooks: TestHooks::default(),
         }
     }
 
@@ -189,13 +193,32 @@ impl WorkerHandle {
 /// Loads `cfg` on a new thread (the `Session` never leaves it) and returns
 /// once the model is loaded, or the load error.
 pub fn spawn_worker(cfg: EngineConfig) -> Result<WorkerHandle, EngineError> {
+    spawn(cfg, HealthState::new())
+}
+
+/// [`spawn_worker`] with fault injection scoped to this worker.
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawn_worker_with_hooks(
+    cfg: EngineConfig,
+    hooks: TestHooks,
+) -> Result<WorkerHandle, EngineError> {
+    spawn(
+        cfg,
+        HealthState {
+            hooks,
+            ..HealthState::new()
+        },
+    )
+}
+
+fn spawn(cfg: EngineConfig, health: HealthState) -> Result<WorkerHandle, EngineError> {
     if cfg.parallel != 1 {
         return Err(EngineError::InvalidConfig(format!(
             "parallel = {} unsupported: the v0 scheduler serves one slot",
             cfg.parallel
         )));
     }
-    let health = Arc::new(HealthState::new());
+    let health = Arc::new(health);
     let (jobs, rx) = sync_channel::<Job>(0);
     let (loaded_tx, loaded_rx) = sync_channel::<Result<(), EngineError>>(0);
     let h = health.clone();
@@ -231,11 +254,14 @@ pub fn spawn_worker(cfg: EngineConfig) -> Result<WorkerHandle, EngineError> {
 
 fn run(session: &mut Session, rx: &Receiver<Job>, health: &HealthState) {
     while let Ok(job) = rx.recv() {
+        // Published before the drain check: `begin_drain` sets Draining then
+        // cancels, so either we see Draining or it sees this job.
+        health.set_in_flight(Some(job.cancel.clone()));
         if health.get() == ServeState::Draining {
+            health.set_in_flight(None);
             let _ = job.events.try_send(Event::Failed(draining()));
             continue;
         }
-        health.set_in_flight(Some(job.cancel.clone()));
         let fatal = match catch_unwind(AssertUnwindSafe(|| run_job(session, &job, health))) {
             Ok(fatal) => fatal,
             Err(p) => {
@@ -244,7 +270,11 @@ fn run(session: &mut Session, rx: &Receiver<Job>, health: &HealthState) {
                     .map(|s| s.to_string())
                     .or_else(|| p.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
-                tracing::error!("decode worker panicked: {msg}");
+                let env = ErrorEnvelope::new(
+                    ErrorCode::BackendUnavailable,
+                    format!("decode worker panicked: {msg}"),
+                );
+                tracing::error!("{env}");
                 true
             }
         };
@@ -265,7 +295,9 @@ fn draining() -> ErrorEnvelope {
 /// Runs one job; returns `true` when the session is no longer usable.
 fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
     #[cfg(any(test, feature = "test-support"))]
-    if INJECT
+    if health
+        .hooks
+        .panic
         .compare_exchange(INJECT_AT_START, 0, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
@@ -311,7 +343,9 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
     // allocs/s, off the per-expert path.
     let res = session.turn(&turn, &mut |t| {
         #[cfg(any(test, feature = "test-support"))]
-        if INJECT
+        if health
+            .hooks
+            .panic
             .compare_exchange(INJECT_AFTER_TOKEN, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
@@ -319,7 +353,7 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
             panic!("injected worker panic after first token");
         }
         #[cfg(any(test, feature = "test-support"))]
-        std::thread::sleep(Duration::from_millis(SLOW_MS.load(Ordering::SeqCst)));
+        std::thread::sleep(Duration::from_millis(health.hooks.slow_ms));
         if let Err(e) = events.try_send(Event::Text(t.into())) {
             if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
                 tracing::warn!("client too slow to drain events; cancelling");
@@ -346,15 +380,15 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
                     | EngineError::TemplateUnavailable
             );
             let code = if fatal {
-                tracing::error!("decode worker: fatal engine error: {e}");
                 ErrorCode::BackendUnavailable
             } else {
                 ErrorCode::InvalidRequest
             };
-            (
-                Event::Failed(ErrorEnvelope::new(code, e.to_string())),
-                fatal,
-            )
+            let env = ErrorEnvelope::new(code, e.to_string());
+            if fatal {
+                tracing::error!("{env}");
+            }
+            (Event::Failed(env), fatal)
         }
     };
     permit.send(event);
@@ -372,30 +406,43 @@ fn message_text(m: &golem_api::ChatMessage) -> String {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-static INJECT: AtomicU8 = AtomicU8::new(0);
-#[cfg(any(test, feature = "test-support"))]
 const INJECT_AT_START: u8 = 1;
 #[cfg(any(test, feature = "test-support"))]
 const INJECT_AFTER_TOKEN: u8 = 2;
 
+/// Fault injection for one worker.
 #[cfg(any(test, feature = "test-support"))]
-static SLOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Every emitted piece is delayed by `ms` (keeps a job in flight long enough
-/// to disconnect or shut down under it; tiny-moe EOGs within ~200 tokens).
-#[cfg(any(test, feature = "test-support"))]
-pub fn inject_slow_decode(ms: u64) {
-    SLOW_MS.store(ms, Ordering::SeqCst);
+#[derive(Debug, Default)]
+pub struct TestHooks {
+    panic: AtomicU8,
+    slow_ms: u64,
 }
 
-/// The next job panics before decoding.
 #[cfg(any(test, feature = "test-support"))]
-pub fn inject_worker_panic() {
-    INJECT.store(INJECT_AT_START, Ordering::SeqCst);
-}
+impl TestHooks {
+    /// Every emitted piece is delayed by `ms` (keeps a job in flight long
+    /// enough to disconnect or shut down under it; tiny-moe EOGs within
+    /// ~200 tokens).
+    pub fn slow_decode(ms: u64) -> Self {
+        Self {
+            slow_ms: ms,
+            ..Self::default()
+        }
+    }
 
-/// The next job panics right after emitting its first piece.
-#[cfg(any(test, feature = "test-support"))]
-pub fn inject_worker_panic_after_first_token() {
-    INJECT.store(INJECT_AFTER_TOKEN, Ordering::SeqCst);
+    /// The first job panics before decoding.
+    pub fn panic_at_start() -> Self {
+        Self {
+            panic: AtomicU8::new(INJECT_AT_START),
+            ..Self::default()
+        }
+    }
+
+    /// The first job panics right after emitting its first piece.
+    pub fn panic_after_first_token() -> Self {
+        Self {
+            panic: AtomicU8::new(INJECT_AFTER_TOKEN),
+            ..Self::default()
+        }
+    }
 }

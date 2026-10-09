@@ -38,6 +38,9 @@ pub enum ServeError {
     /// the process must exit without further teardown.
     #[error(transparent)]
     ShutdownTimeout(#[from] ShutdownTimeout),
+    /// The decode worker died (panic or fatal engine error); torn down.
+    #[error("decode worker died: {0}")]
+    WorkerDied(&'static str),
 }
 
 /// Bound on the worker join at shutdown: one non-abortable `llama_decode`
@@ -77,12 +80,15 @@ async fn serve_listener(
     let drain = health.clone();
     // The router (and its jobs sender clones) drops when this returns, so the
     // worker's `recv` sees `Disconnected` once the handle's sender drops too.
-    axum::serve(listener, router(state))
+    let served = axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
-            shutdown.await;
+            tokio::select! {
+                _ = shutdown => {}
+                _ = worker_dead(&drain) => {}
+            }
             drain.begin_drain();
         })
-        .await?;
+        .await;
     let h = health.clone();
     let joined = tokio::task::spawn_blocking(move || {
         worker.shutdown(|| h.cancel_in_flight(), WORKER_JOIN_TIMEOUT)
@@ -94,7 +100,19 @@ async fn serve_listener(
         health.set(ServeState::Fatal);
         return Err(e.into());
     }
-    Ok(())
+    served?;
+    match health.get() {
+        s @ (ServeState::Fatal | ServeState::FatalIo) => Err(ServeError::WorkerDied(s.as_str())),
+        _ => Ok(()),
+    }
+}
+
+/// Resolves once the worker is fatal; polled since `fatal` is terminal and
+/// 100 ms is noise against process teardown.
+async fn worker_dead(health: &HealthState) {
+    while !matches!(health.get(), ServeState::Fatal | ServeState::FatalIo) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Fixture config, in-process routers and fault injection for tests.
@@ -103,9 +121,7 @@ pub mod test_support {
     use super::*;
     use golem_engine::config::EngineConfig;
 
-    pub use crate::worker::{
-        inject_slow_decode, inject_worker_panic, inject_worker_panic_after_first_token,
-    };
+    pub use crate::worker::{TestHooks, spawn_worker_with_hooks};
 
     /// Non-pooled tiny-moe: pooled sessions refuse to coexist under
     /// `cargo test`; pooled paths are covered by engine tests.
@@ -129,7 +145,12 @@ pub mod test_support {
 
     /// Router over a freshly spawned worker; the worker thread is detached.
     pub async fn router_for_test(cfg: EngineConfig) -> axum::Router {
-        let w = tokio::task::spawn_blocking(move || spawn_worker(cfg))
+        router_with_hooks(cfg, TestHooks::default()).await
+    }
+
+    /// [`router_for_test`] with fault injection on its worker.
+    pub async fn router_with_hooks(cfg: EngineConfig, hooks: TestHooks) -> axum::Router {
+        let w = tokio::task::spawn_blocking(move || spawn_worker_with_hooks(cfg, hooks))
             .await
             .expect("spawn_worker task")
             .expect("tiny-moe worker loads");
@@ -144,12 +165,13 @@ pub mod test_support {
     /// task resolving to `serve`'s result.
     pub async fn serve_on_port0(
         cfg: EngineConfig,
+        hooks: TestHooks,
     ) -> (
         SocketAddr,
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<(), ServeError>>,
     ) {
-        let worker = tokio::task::spawn_blocking(move || spawn_worker(cfg))
+        let worker = tokio::task::spawn_blocking(move || spawn_worker_with_hooks(cfg, hooks))
             .await
             .expect("spawn_worker task")
             .expect("tiny-moe worker loads");

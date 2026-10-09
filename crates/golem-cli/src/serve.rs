@@ -51,6 +51,17 @@ pub fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
                     .unwrap_or_default()
             }),
     };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // Installed before the worker exists so a failure here leaks nothing.
+    let (mut term, mut int) = {
+        let _rt = rt.enter();
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
     let worker = spawn_worker(config)?;
     let cfg = ServerConfig {
         host: args.host,
@@ -58,12 +69,7 @@ pub fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
         model_name,
         api_key: None,
     };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
     rt.block_on(async {
-        let mut term = signal(SignalKind::terminate())?;
-        let mut int = signal(SignalKind::interrupt())?;
         let shutdown = async move {
             tokio::select! {
                 _ = term.recv() => {}

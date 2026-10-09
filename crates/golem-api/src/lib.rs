@@ -89,6 +89,14 @@ impl ErrorEnvelope {
     }
 }
 
+/// JSON form, for CLI output and logs (one envelope everywhere, §8.4).
+impl std::fmt::Display for ErrorEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let json = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        f.write_str(&json)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

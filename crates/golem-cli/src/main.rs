@@ -70,7 +70,12 @@ fn main() {
         Some(Command::Serve { args }) => serve::serve(&args),
     };
     if let Err(e) = status {
-        eprintln!("error: {e}");
+        let code = if e.is::<golem_server::ServeError>() {
+            golem_api::ErrorCode::BackendUnavailable
+        } else {
+            golem_api::ErrorCode::InvalidRequest
+        };
+        eprintln!("{}", golem_api::ErrorEnvelope::new(code, e.to_string()));
         // The decode worker is leaked mid-`llama_decode`: exit now, skipping
         // pool teardown (the kernel reclaims it).
         if matches!(
