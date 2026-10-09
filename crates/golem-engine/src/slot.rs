@@ -332,7 +332,10 @@ pub(crate) fn step(core: Core<'_>, emit: &mut dyn FnMut(&str)) -> Result<(), Eng
                     slot.done(FinishReason::Cancelled, emit);
                     continue;
                 }
-                session.decode(&mut a.ffi, slot.seq, slot.tok, slot.pos, n, t0)?;
+                if !session.decode(&mut a.ffi, slot.seq, slot.tok, slot.pos, n, t0)? {
+                    slot.done(FinishReason::Cancelled, emit);
+                    continue;
+                }
                 slot.pos += 1;
                 slot.tok = session.sample(&a.sampler, &a.ffi, 0, slot.parity.as_mut(), n);
                 slot.phase = Phase::Decode(a);

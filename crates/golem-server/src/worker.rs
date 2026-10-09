@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent, chat::Stop};
 use golem_engine::config::EngineConfig;
-use golem_engine::{ChatTurn, EngineError, FinishReason, SamplingParams, Session, TurnOutcome};
+use golem_engine::{
+    ChatTurn, EngineError, FinishReason, Piece, SamplingParams, Session, TurnOutcome,
+};
 use golem_llama_sys::raw::LLAMA_DEFAULT_SEED;
 
 /// Per-job event channel depth: 256 pieces ≫ one SSE write, so a live reader
@@ -25,13 +27,27 @@ pub struct Job {
     pub cancel: Arc<AtomicBool>,
     /// Text pieces, then exactly one terminal event.
     pub events: tokio::sync::mpsc::Sender<Event>,
+    /// How reasoning-marker text is delivered.
+    pub reasoning: ReasoningMode,
+}
+
+/// `--reasoning`: where text between the template's reasoning markers goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningMode {
+    /// Markers and reasoning stay in `content` (splitter bypassed).
+    Inline,
+    /// Reasoning goes to `reasoning_content`; markers are dropped.
+    #[default]
+    Separate,
 }
 
 /// Worker → handler stream for one job.
 #[derive(Debug)]
 pub enum Event {
-    /// Generated text piece.
+    /// Generated answer text piece.
     Text(String),
+    /// Generated reasoning piece (`separate` mode only).
+    Reasoning(String),
     /// Turn finished; sent after all post-turn work.
     Done(TurnOutcome),
     /// Turn failed; the envelope is the client-facing error.
@@ -101,7 +117,7 @@ pub struct HealthState {
 }
 
 impl HealthState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: AtomicU8::new(ServeState::Loading as u8),
             snapshot: Mutex::new(HealthSnapshot::default()),
@@ -339,6 +355,24 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
         .cancel(Some(job.cancel.clone()));
     let cancel = &job.cancel;
     let events = &job.events;
+    let mut splitter = match job.reasoning {
+        ReasoningMode::Separate => session.reasoning_splitter(),
+        ReasoningMode::Inline => None,
+    };
+    let send = |ev: Event| {
+        if let Err(e) = events.try_send(ev) {
+            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                tracing::warn!("client too slow to drain events; cancelling");
+            }
+            cancel.store(true, Ordering::SeqCst);
+        }
+    };
+    let mut send_piece = |p: Piece| {
+        send(match p {
+            Piece::Content(t) => Event::Text(t.into()),
+            Piece::Reasoning(t) => Event::Reasoning(t.into()),
+        })
+    };
     // One `String` per piece: ≤ ~10 tok/s cold decode on the target → ≤ 10
     // allocs/s, off the per-expert path.
     let res = session.turn(&turn, &mut |t| {
@@ -354,13 +388,14 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
         }
         #[cfg(any(test, feature = "test-support"))]
         std::thread::sleep(Duration::from_millis(health.hooks.slow_ms));
-        if let Err(e) = events.try_send(Event::Text(t.into())) {
-            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                tracing::warn!("client too slow to drain events; cancelling");
-            }
-            cancel.store(true, Ordering::SeqCst);
+        match &mut splitter {
+            Some(s) => s.push(t, &mut send_piece),
+            None => send_piece(Piece::Content(t)),
         }
     });
+    if let Some(s) = &mut splitter {
+        s.finish(&mut send_piece);
+    }
     {
         let mut snap = health.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         snap.turns += 1;

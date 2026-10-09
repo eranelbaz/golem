@@ -26,6 +26,12 @@ fn hi(max_tokens: u32) -> serde_json::Value {
     serde_json::json!({"model":"tiny-moe","messages":[{"role":"user","content":"hi"}],"max_tokens":max_tokens,"temperature":0})
 }
 
+fn hi_stream(max_tokens: u32) -> serde_json::Value {
+    let mut b = hi(max_tokens);
+    b["stream"] = true.into();
+    b
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn non_streaming_chat_models_health_and_404() {
     let app = router_for_test(golem_server::test_engine_config()).await;
@@ -68,10 +74,7 @@ async fn unsupported_field_is_400_envelope() {
     assert_eq!(r.status(), 400);
     assert_eq!(json(r).await["error"]["code"], "golem_unsupported_field");
     // Supported by policy but not wired yet: refused, never silently ignored.
-    for extra in [
-        serde_json::json!({"stream": true}),
-        serde_json::json!({"tools": [{"type":"function","function":{"name":"f"}}]}),
-    ] {
+    for extra in [serde_json::json!({"tools": [{"type":"function","function":{"name":"f"}}]})] {
         let mut body = hi(4);
         body.as_object_mut()
             .unwrap()
@@ -237,4 +240,88 @@ async fn worker_death_ends_serve_with_error() {
         "{res:?}"
     );
     assert_eq!(golem_engine::p3_glue::live_sessions(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_worker_death_ends_with_error_frame_not_done() {
+    let app = router_with_hooks(
+        golem_server::test_engine_config(),
+        TestHooks::panic_after_first_token(),
+    )
+    .await;
+    let r = app.clone().oneshot(chat(hi_stream(16))).await.unwrap();
+    assert_eq!(r.status(), 200, "headers precede the failure");
+    let body = String::from_utf8(
+        axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("golem_backend_unavailable"), "{body}");
+    assert!(!body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_disconnect_frees_slot() {
+    let (addr, stop, task) = serve_on_port0(
+        golem_server::test_engine_config(),
+        TestHooks::slow_decode(100),
+    )
+    .await;
+    let resp = tokio::task::spawn_blocking(move || {
+        let mut s = raw_post(addr, &hi_stream(4096));
+        // Wait for the first SSE frame, then disconnect mid-generation.
+        let mut buf = [0u8; 512];
+        let mut seen = String::new();
+        while !seen.contains("data: ") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "stream closed early: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        drop(s);
+        let t = Instant::now();
+        loop {
+            let resp = raw_response(raw_post(addr, &hi(2)));
+            if !resp.starts_with("HTTP/1.1 503") || t.elapsed() > Duration::from_secs(10) {
+                break (resp, t.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await
+    .unwrap();
+    assert!(resp.0.starts_with("HTTP/1.1 200"), "{}", resp.0);
+    assert!(
+        resp.1 < Duration::from_secs(10),
+        "slot freed late: {:?}",
+        resp.1
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_shutdown_ends_with_draining_error_frame() {
+    let (addr, stop, task) = serve_on_port0(
+        golem_server::test_engine_config(),
+        TestHooks::slow_decode(100),
+    )
+    .await;
+    let client =
+        tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi_stream(4096))));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("serve returns within 30 s")
+        .unwrap()
+        .unwrap();
+    let resp = client.await.unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200")
+            && resp.contains("server draining")
+            && !resp.contains("[DONE]"),
+        "{resp}"
+    );
 }

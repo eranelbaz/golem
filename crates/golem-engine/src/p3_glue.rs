@@ -287,6 +287,28 @@ struct HookState {
     /// Whether stream chunks are active (drives the routing readback's
     /// read-ahead warm); toggled per chunk by `Session`.
     stream_armed: AtomicBool,
+    /// The active turn's cancel flag (null = no turn). Stored by
+    /// [`StreamAbortGuard`] (`Release`), loaded per streamed plane by
+    /// `stream_source` on the decode thread (`Acquire`, ABI v11).
+    abort: AtomicPtr<AtomicBool>,
+    /// Test seam: absolute stream plane count at which `stream_source` sets
+    /// the turn's cancel flag (0 = off).
+    test_cancel_plane: AtomicU64,
+}
+
+/// One turn's registration of its cancel flag in `HookState.abort`.
+pub(crate) struct StreamAbortGuard {
+    state: Arc<HookState>,
+    /// Keeps the pointee alive until the pointer is nulled.
+    _cancel: Arc<AtomicBool>,
+}
+
+impl Drop for StreamAbortGuard {
+    fn drop(&mut self) {
+        self.state
+            .abort
+            .store(std::ptr::null_mut(), Ordering::Release);
+    }
 }
 
 /// Experts predicted beyond the routed top-k (§6.5): 8 + 4 = 12 per layer.
@@ -926,6 +948,29 @@ impl SessionHooks {
         }
     }
 
+    /// Points the stream-source abort check at `cancel` for one turn; the
+    /// guard nulls it on drop. Owns clones of both Arcs, so it borrows
+    /// nothing from the session.
+    pub(crate) fn stream_abort_guard(&self, cancel: &Arc<AtomicBool>) -> StreamAbortGuard {
+        self.state
+            .abort
+            .store(Arc::as_ptr(cancel).cast_mut(), Ordering::Release);
+        StreamAbortGuard {
+            state: self.state.clone(),
+            _cancel: cancel.clone(),
+        }
+    }
+
+    /// Test seam: sets the active turn's cancel flag from inside the
+    /// `n`-th `stream_source` call (1-based, counted from now), so the
+    /// abort fires mid-ubatch; `0` disables.
+    #[doc(hidden)]
+    pub fn cancel_at_stream_plane_for_test(&self, n: u64) {
+        let base = self.stream_stats().map_or(0, |s| s.planes);
+        let at = if n == 0 { 0 } else { base + n };
+        self.state.test_cancel_plane.store(at, Ordering::Relaxed);
+    }
+
     /// Drops every staging slot and pool lease the stream chunks still
     /// hold (a failed decode never reaches copy_done's backstop). Call only
     /// with no compute in flight.
@@ -933,6 +978,11 @@ impl SessionHooks {
         if let Some(s) = &self.stream {
             s.release_all();
         }
+    }
+
+    /// Leases the pool's batched step claims still hold (0 between turns).
+    pub fn pool_batch_leases(&self) -> usize {
+        self.state.pool.batch_leases()
     }
 
     /// Cumulative stream counters (test/observability seam).
@@ -1479,6 +1529,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         ),
         stream: stream.clone(),
         stream_armed: AtomicBool::new(false),
+        abort: AtomicPtr::new(std::ptr::null_mut()),
+        test_cancel_plane: AtomicU64::new(0),
     });
     if config.prefetch != PrefetchMode::Off {
         // SAFETY: FFI setter on the live ctx, before the first graph build;
@@ -1963,9 +2015,11 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
     });
 }
 
-/// The prefill-stream byte-source hook (ABI v10, design §7.6): one call per
+/// The prefill-stream byte-source hook (ABI v11, design §7.6): one call per
 /// streamed plane from the copy loop; translates the raw blk into the
 /// pool's dense-lead-adjusted layer and forwards to the stream state.
+/// Returns 1 (abort the compute) when the active turn's cancel flag is set,
+/// so a cancel lands within one plane of a streamed ubatch.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn stream_source(
     payload: *mut c_void,
@@ -1975,10 +2029,23 @@ pub extern "C" fn stream_source(
     ids: *const i32,
     n_ids: i32,
     out_ptrs: *mut *const c_void,
-) {
+) -> i32 {
     guarded("stream_source", || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
+        let flag = h.abort.load(Ordering::Acquire);
+        // SAFETY: non-null only while a `StreamAbortGuard` holds the
+        // `Arc<AtomicBool>` it points into (nulled in its `Drop`).
+        let cancel = (!flag.is_null()).then(|| unsafe { &*flag });
+        if let (Some(c), Some(s)) = (cancel, &h.stream) {
+            let at = h.test_cancel_plane.load(Ordering::Relaxed);
+            if at != 0 && s.stats().planes + 1 >= at {
+                c.store(true, Ordering::Relaxed);
+            }
+        }
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return 1;
+        }
         let Some(s) = &h.stream else {
             p3_fatal("stream_source without stream state (streaming not enabled)".into());
         };
@@ -1997,7 +2064,10 @@ pub extern "C" fn stream_source(
             )
         };
         s.source(blk - h.dense_lead as i32, kind, seq, ids, out);
-    });
+        // Re-checked after the (possibly blocking) fill: C's abort path
+        // releases this seq too, so the plane's leases never leak.
+        i32::from(cancel.is_some_and(|c| c.load(Ordering::Relaxed)))
+    })
 }
 
 /// The prefill-stream release hook (ABI v10): C drops the seq−2 plane's

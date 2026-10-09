@@ -1,6 +1,7 @@
 //! Instance process: HTTP server, slot scheduler, decode loop (tech design sections 2 and 7).
 
 mod app;
+mod sse;
 mod worker;
 
 use std::future::Future;
@@ -11,8 +12,8 @@ use std::time::Duration;
 
 pub use app::{AppState, router};
 pub use worker::{
-    Event, HealthSnapshot, HealthState, Job, ServeState, ShutdownTimeout, WorkerHandle,
-    spawn_worker,
+    Event, HealthSnapshot, HealthState, Job, ReasoningMode, ServeState, ShutdownTimeout,
+    WorkerHandle, spawn_worker,
 };
 
 /// Listener and API identity of one instance.
@@ -26,6 +27,8 @@ pub struct ServerConfig {
     pub model_name: String,
     /// When set, `/v1/*` requires `Authorization: Bearer <key>`.
     pub api_key: Option<String>,
+    /// Reasoning delivery (`--reasoning`).
+    pub reasoning: ReasoningMode,
 }
 
 /// Why [`serve`] failed.
@@ -121,6 +124,9 @@ pub mod test_support {
     use super::*;
     use golem_engine::config::EngineConfig;
 
+    pub use crate::sse_support::{
+        Logs, capture_logs, complete_once, drop_after_first_frame, normalize, sse_frames,
+    };
     pub use crate::worker::{TestHooks, spawn_worker_with_hooks};
 
     /// Non-pooled tiny-moe: pooled sessions refuse to coexist under
@@ -140,6 +146,7 @@ pub mod test_support {
             port: 0,
             model_name: "tiny-moe".into(),
             api_key: None,
+            reasoning: ReasoningMode::Separate,
         }
     }
 
@@ -194,3 +201,217 @@ pub mod test_support {
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test_support::{router_for_test, test_engine_config};
+
+/// Socket-level SSE helpers over one process-wide tiny-moe server (one
+/// worker per test binary: each `Session` loads the fixture, and helper
+/// calls in one test share it).
+#[cfg(any(test, feature = "test-support"))]
+pub mod sse_support {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use super::test_support::{TestHooks, test_engine_config, test_server_config};
+    use super::*;
+
+    /// 20 ms/piece: a 4096-token stream stays in flight for seconds, so a
+    /// disconnect after the first frame lands mid-generation.
+    const SLOW_MS: u64 = 20;
+
+    fn server() -> SocketAddr {
+        static ADDR: OnceLock<SocketAddr> = OnceLock::new();
+        *ADDR.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async move {
+                    let worker = crate::worker::spawn_worker_with_hooks(
+                        test_engine_config(),
+                        TestHooks::slow_decode(SLOW_MS),
+                    )
+                    .expect("tiny-moe worker loads");
+                    let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind");
+                    tx.send(l.local_addr().expect("addr")).expect("addr send");
+                    let _ = serve_listener(l, test_server_config(), worker, std::future::pending())
+                        .await;
+                });
+            });
+            rx.recv().expect("server started")
+        })
+    }
+
+    fn post(body: &str) -> TcpStream {
+        let mut s = TcpStream::connect(server()).expect("connect");
+        write!(
+            s,
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write");
+        s
+    }
+
+    /// Posts `body` and returns the `data:` payloads of the SSE response, in
+    /// order (keep-alive comments dropped). Retries a 503 (slot still busy
+    /// from a previous cancelled request) for up to 10 s.
+    pub async fn sse_frames(body: &str) -> Vec<String> {
+        let body = body.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            loop {
+                let mut raw = String::new();
+                post(&body).read_to_string(&mut raw).expect("read");
+                if raw.starts_with("HTTP/1.1 503") && t.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+                assert!(raw.contains("content-type: text/event-stream"), "{raw}");
+                return dechunk(raw.split_once("\r\n\r\n").map_or("", |(_, b)| b))
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .map(str::to_owned)
+                    .collect();
+            }
+        })
+        .await
+        .expect("client task")
+    }
+
+    /// HTTP/1.1 chunked transfer decoding (the SSE body is chunked).
+    fn dechunk(mut b: &str) -> String {
+        let mut out = String::new();
+        while let Some((len, rest)) = b.split_once("\r\n") {
+            let Ok(n) = usize::from_str_radix(len.trim(), 16) else {
+                break;
+            };
+            if n == 0 || rest.len() < n {
+                break;
+            }
+            out.push_str(&rest[..n]);
+            b = rest[n..].trim_start_matches("\r\n");
+        }
+        out
+    }
+
+    /// Golden form of `frames`: `id`/`created` replaced, one frame per line.
+    pub fn normalize(frames: &[String]) -> String {
+        frames
+            .iter()
+            .map(|f| match serde_json::from_str::<serde_json::Value>(f) {
+                Ok(mut v) if v.is_object() => {
+                    v["id"] = "ID".into();
+                    v["created"] = 0.into();
+                    v.to_string()
+                }
+                _ => f.clone(),
+            })
+            .map(|l| l + "\n")
+            .collect()
+    }
+
+    /// Opens a streaming request, reads until the first generated frame
+    /// (past the role chunk, which is sent before the worker starts), then
+    /// drops the connection.
+    pub async fn drop_after_first_frame(body: &str) {
+        let body = body.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut r = BufReader::new(post(&body));
+            let mut line = String::new();
+            while r.read_line(&mut line).expect("read") > 0 {
+                if line.contains("data: ") && line.contains("\"content\"") {
+                    return;
+                }
+                line.clear();
+            }
+            panic!("stream closed before the first frame");
+        })
+        .await
+        .expect("client task");
+    }
+
+    /// One short non-streaming request; `Ok` on HTTP 200 (retrying a busy
+    /// 503 for up to 10 s), else the raw response.
+    pub async fn complete_once() -> Result<(), String> {
+        tokio::task::spawn_blocking(|| {
+            let body = r#"{"model":"tiny-moe","messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#;
+            let t = Instant::now();
+            loop {
+                let mut raw = String::new();
+                post(body).read_to_string(&mut raw).map_err(|e| e.to_string())?;
+                if raw.starts_with("HTTP/1.1 200") {
+                    return Ok(());
+                }
+                if !raw.starts_with("HTTP/1.1 503") || t.elapsed() > Duration::from_secs(10) {
+                    return Err(raw);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .await
+        .expect("client task")
+    }
+
+    /// Captured `tracing` output of every thread (process-global subscriber,
+    /// installed once).
+    #[derive(Clone)]
+    pub struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl Logs {
+        /// Polls until a captured line contains `needle` or `timeout` passes.
+        pub fn wait_for(&self, needle: &str, timeout: Duration) -> bool {
+            let t = Instant::now();
+            loop {
+                if String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner()))
+                    .contains(needle)
+                {
+                    return true;
+                }
+                if t.elapsed() > timeout {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Installs (once) a global `info` subscriber writing into a buffer.
+    pub fn capture_logs() -> Logs {
+        static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+        let buf = LOGS
+            .get_or_init(|| {
+                let buf = Arc::new(Mutex::new(Vec::new()));
+                let w = buf.clone();
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_ansi(false)
+                    .with_writer(move || LogWriter(w.clone()))
+                    .init();
+                buf
+            })
+            .clone();
+        Logs(buf)
+    }
+}

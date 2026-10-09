@@ -187,7 +187,7 @@ int main() {
         printf("FAIL: abi %d != header %d\n", golem_hooks_abi_version(), GOLEM_HOOKS_ABI_VERSION);
         return 1;
     }
-    REQUIRE(GOLEM_HOOKS_ABI_VERSION == 10, "abi v10 expected");
+    REQUIRE(GOLEM_HOOKS_ABI_VERSION == 11, "abi v11 expected");
     pool_init();
 
     {   // --- leg 1: placement counters (unchanged semantics, global stats) ---

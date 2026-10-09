@@ -5,8 +5,8 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 
 use golem_llama_sys::raw;
 use golem_llama_sys::{Backend, substrate_backend};
@@ -520,6 +520,9 @@ pub(crate) struct SessionInner {
     pool_verified: bool,
     /// Prompt-prefill state snapshots (§7.1); `None` when disabled.
     snapshots: Option<SnapshotCache>,
+    /// Test seam: the turn's cancel flag is set after this many prefill
+    /// chunks decoded (0 = off).
+    test_cancel_after_chunks: u32,
 }
 
 impl Drop for Session {
@@ -650,6 +653,7 @@ impl Session {
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
                     snapshots,
+                    test_cancel_after_chunks: 0,
                 },
             }
         })
@@ -697,6 +701,7 @@ impl Session {
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
                     snapshots: None,
+                    test_cancel_after_chunks: 0,
                 },
             }
         })
@@ -851,6 +856,19 @@ impl Session {
         }
     }
 
+    /// Reasoning-marker splitter for the session's chat template (§8.1
+    /// `reasoning_content`); `None` when the template has no markers.
+    pub fn reasoning_splitter(&self) -> Option<crate::reasoning::ReasoningSplitter> {
+        crate::reasoning::ReasoningSplitter::from_template(&self.inner.template.to_string_lossy())
+    }
+
+    /// Test seam: every later turn sets its own cancel flag right after
+    /// prefill chunk `n` decodes (0 disables).
+    #[doc(hidden)]
+    pub fn cancel_after_prefill_chunks_for_test(&mut self, n: u32) {
+        self.inner.test_cancel_after_chunks = n;
+    }
+
     /// Test seam: highest position held for `seq` in the KV/recurrent memory,
     /// `-1` when the sequence is empty.
     #[doc(hidden)]
@@ -892,6 +910,10 @@ impl Session {
         emit: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, EngineError> {
         let guard = self.inner.begin(&mut self.slots[0], req)?;
+        let _abort = req
+            .cancel
+            .as_ref()
+            .map(|c| AbortCallbackGuard::new(&self.inner, c));
         let finish = loop {
             if let Some(f) = self.slots[0].finished() {
                 break f;
@@ -904,7 +926,10 @@ impl Session {
                 emit,
             )?;
         };
-        if finish != FinishReason::Cancelled {
+        if finish == FinishReason::Cancelled {
+            drop(guard);
+            tracing::info!(slot = self.slots[0].seq, "cancel: sequence removed");
+        } else {
             guard.disarm();
         }
         let s = &self.slots[0];
@@ -936,6 +961,53 @@ pub(crate) struct TurnFfi {
     n_vocab: usize,
     verify: bool,
     placement_before: ExpertPlacement,
+}
+
+/// One turn's cancel wiring into the substrate: `llama_set_abort_callback`
+/// (CPU graph segments; HIP does not export the backend setter) and the
+/// stream-source abort pointer (ABI v11, streamed HIP ubatches). Both are
+/// cleared in `Drop`.
+struct AbortCallbackGuard {
+    ctx: *mut raw::llama_context,
+    _stream: Option<p3_glue::StreamAbortGuard>,
+    _cancel: Arc<AtomicBool>,
+}
+
+/// `ggml_abort_callback` trampoline: `data` is the turn's cancel flag.
+unsafe extern "C" fn abort_requested(data: *mut std::ffi::c_void) -> bool {
+    // SAFETY: `data` is `Arc::as_ptr` of the flag an `AbortCallbackGuard`
+    // owns a clone of; the guard clears the callback before dropping it.
+    unsafe { &*(data as *const AtomicBool) }.load(Ordering::Relaxed)
+}
+
+impl AbortCallbackGuard {
+    fn new(inner: &SessionInner, cancel: &Arc<AtomicBool>) -> Self {
+        let ctx = inner.loaded.ctx().as_ptr();
+        // SAFETY: ctx is live and idle (between turns); the flag pointer
+        // stays valid while `_cancel` holds its Arc, and `Drop` resets the
+        // callback to null before that clone is released.
+        unsafe {
+            raw::llama_set_abort_callback(
+                ctx,
+                Some(abort_requested),
+                Arc::as_ptr(cancel) as *mut std::ffi::c_void,
+            )
+        };
+        Self {
+            ctx,
+            _stream: inner.p3.as_ref().map(|p| p.stream_abort_guard(cancel)),
+            _cancel: cancel.clone(),
+        }
+    }
+}
+
+impl Drop for AbortCallbackGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard is a local of `Session::drive`, which holds
+        // `&mut Session` (ctx alive) for its whole lifetime; no decode is in
+        // flight once `drive` returns.
+        unsafe { raw::llama_set_abort_callback(self.ctx, None, std::ptr::null_mut()) };
+    }
 }
 
 /// Drops sequence `seq` from the KV/recurrent memory on drop unless disarmed.
@@ -1165,6 +1237,7 @@ impl SessionInner {
         let prompt_len = ffi.prompt.len();
         let mut n_past: usize = ffi.restored;
         let mut last_chunk_len = 0;
+        let mut chunks = 0u32;
         while n_past < prompt_len {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return Ok(None);
@@ -1206,6 +1279,13 @@ impl SessionInner {
             );
             // SAFETY: ctx is a live context; batch slots 0..n_tokens fully written.
             let code = unsafe { raw::llama_decode(ctx.as_ptr(), ffi.batch.inner) };
+            if code == 2 && cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                // Aborted mid-ubatch (abort callback / stream source): the
+                // caller drops the whole sequence.
+                // SAFETY: ctx is live.
+                unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+                return Ok(None);
+            }
             if code != 0 {
                 // 1 = no KV slot left (ctx too small for the prompt); the rest fatal alike.
                 // Synchronize first: the failed decode may have launched a compute
@@ -1222,6 +1302,12 @@ impl SessionInner {
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
             n_past += len;
             last_chunk_len = len;
+            chunks += 1;
+            if chunks == self.test_cancel_after_chunks
+                && let Some(c) = cancel
+            {
+                c.store(true, Ordering::Relaxed);
+            }
         }
         drop(prefill);
         // Disarm before the generation decodes (the guard is the backstop).
@@ -1287,6 +1373,7 @@ impl SessionInner {
 
     /// Decodes generated token `tok` at `pos` for `seq`; `n` is the
     /// 1-based count of tokens generated so far (the §11 step is `n - 1`).
+    /// `Ok(false)` when the turn's abort callback aborted the compute.
     pub(crate) fn decode(
         &mut self,
         ffi: &mut TurnFfi,
@@ -1295,7 +1382,7 @@ impl SessionInner {
         pos: usize,
         n: u32,
         step_t0: std::time::Instant,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
         let ctx = self.loaded.ctx();
         {
             let b = &mut ffi.batch.inner;
@@ -1309,6 +1396,12 @@ impl SessionInner {
         );
         // SAFETY: same invariants as the prefill decode.
         let code = unsafe { raw::llama_decode(ctx.as_ptr(), ffi.batch.inner) };
+        if code == 2 {
+            // Aborted: only the turn's abort callback returns true.
+            // SAFETY: ctx is live.
+            unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+            return Ok(false);
+        }
         if code != 0 {
             // Synchronize first: see the prefill decode's error path.
             // SAFETY: ctx is live.
@@ -1342,7 +1435,7 @@ impl SessionInner {
             check_experts_on_gpu(ffi.placement_before, expert_placement())?;
             self.pool_verified = true;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn offloaded(&self) -> bool {

@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use golem_engine::gguf::read_metadata;
-use golem_server::{ServeError, ServerConfig, spawn_worker};
+use golem_server::{ReasoningMode, ServeError, ServerConfig, spawn_worker};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::run::{EngineArgs, engine_config};
@@ -29,8 +29,21 @@ pub struct ServeArgs {
     /// file stem.
     #[arg(long)]
     pub model_name: Option<String>,
+    /// Reasoning delivery: `separate` → `reasoning_content`, `inline` →
+    /// left in `content` with its markers.
+    #[arg(long, value_enum, default_value_t = Reasoning::Separate)]
+    pub reasoning: Reasoning,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+/// `--reasoning` values.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum Reasoning {
+    /// Reasoning stays in `content`.
+    Inline,
+    /// Reasoning goes to `reasoning_content`.
+    Separate,
 }
 
 /// Loads the model, serves until SIGINT/SIGTERM, then drains and tears down.
@@ -67,6 +80,10 @@ pub fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
         port: args.port,
         model_name,
         api_key: None,
+        reasoning: match args.reasoning {
+            Reasoning::Inline => ReasoningMode::Inline,
+            Reasoning::Separate => ReasoningMode::Separate,
+        },
     };
     rt.block_on(async {
         let shutdown = async move {

@@ -71,16 +71,29 @@ fn api_err(code: ErrorCode, msg: impl Into<String>) -> ApiError {
     ErrorEnvelope::new(code, msg).into()
 }
 
-fn backend_gone() -> ApiError {
-    api_err(
+pub(crate) fn backend_gone_envelope() -> ErrorEnvelope {
+    ErrorEnvelope::new(
         ErrorCode::BackendUnavailable,
         "decode worker is not running",
     )
 }
 
-/// Sets the job's cancel flag when the handler future is dropped (client
-/// gone) — independent of events, which prefill does not produce.
-struct CancelOnDrop(Arc<AtomicBool>);
+fn backend_gone() -> ApiError {
+    backend_gone_envelope().into()
+}
+
+pub(crate) fn finish_reason(f: EngineFinish) -> FinishReason {
+    match f {
+        EngineFinish::Length => FinishReason::Length,
+        EngineFinish::ToolCalls => FinishReason::ToolCalls,
+        EngineFinish::Stop | EngineFinish::Cancelled => FinishReason::Stop,
+    }
+}
+
+/// Sets the job's cancel flag when dropped with the handler future or the
+/// SSE body (client gone) — independent of events, which prefill does not
+/// produce.
+pub(crate) struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -127,13 +140,12 @@ async fn chat(
     State(st): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<ChatCompletionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize(&st.cfg, &headers)?;
     let Json(raw) = body.map_err(|e| api_err(ErrorCode::InvalidRequest, e.body_text()))?;
     let req = golem_api::policy::validate(&raw, &st.cfg.model_name)?;
-    // Not silently ignored: streaming and tool calls land with their tasks.
+    // Not silently ignored: tool calls land with their task.
     for (on, field) in [
-        (req.stream == Some(true), "stream"),
         (req.tools.is_some(), "tools"),
         (req.tool_choice.is_some(), "tool_choice"),
     ] {
@@ -149,13 +161,16 @@ async fn chat(
         ServeState::Fatal | ServeState::FatalIo => return Err(backend_gone()),
         _ => {}
     }
+    let stream = req.stream == Some(true);
+    let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let cancel = Arc::new(AtomicBool::new(false));
-    let _guard = CancelOnDrop(cancel.clone());
+    let guard = CancelOnDrop(cancel.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
     let mut job = Job {
         req,
         cancel,
         events: tx,
+        reasoning: st.cfg.reasoning,
     };
     let deadline = Instant::now() + ACCEPT_RETRY;
     loop {
@@ -171,23 +186,31 @@ async fn chat(
             }
         }
     }
-    let mut text = String::new();
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    if stream {
+        let meta = crate::sse::ChunkMeta {
+            id,
+            created: now_secs(),
+            model: st.cfg.model_name.clone(),
+            include_usage,
+        };
+        return Ok(crate::sse::response(meta, rx, guard).into_response());
+    }
+    let _guard = guard;
+    let (mut text, mut reasoning) = (String::new(), String::new());
     let outcome = loop {
         match rx.recv().await {
             Some(Event::Text(t)) => text.push_str(&t),
+            Some(Event::Reasoning(t)) => reasoning.push_str(&t),
             Some(Event::Done(o)) => break o,
             Some(Event::Failed(e)) => return Err(e.into()),
             // Worker died mid-job: never a 200 with truncated content.
             None => return Err(backend_gone()),
         }
     };
-    let finish_reason = match outcome.finish {
-        EngineFinish::Length => FinishReason::Length,
-        EngineFinish::ToolCalls => FinishReason::ToolCalls,
-        EngineFinish::Stop | EngineFinish::Cancelled => FinishReason::Stop,
-    };
+    let finish_reason = finish_reason(outcome.finish);
     Ok(Json(ChatCompletionResponse {
-        id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+        id,
         object: "chat.completion".into(),
         created: now_secs(),
         model: st.cfg.model_name.clone(),
@@ -196,7 +219,7 @@ async fn chat(
             message: ChatMessage {
                 role: "assistant".into(),
                 content: Some(MessageContent::Text(text)),
-                reasoning_content: None,
+                reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -208,7 +231,8 @@ async fn chat(
             completion_tokens: outcome.completion_tokens,
             total_tokens: outcome.prompt_tokens + outcome.completion_tokens,
         },
-    }))
+    })
+    .into_response())
 }
 
 async fn models(
@@ -246,4 +270,96 @@ async fn health(State(st): State<AppState>) -> Response {
 
 async fn not_found() -> ApiError {
     api_err(ErrorCode::NotFound, "no such route")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ReasoningMode;
+    use axum::body::Body;
+    use golem_engine::TurnOutcome;
+    use tower::ServiceExt;
+
+    /// Router over a scripted worker: every job gets `events`, then Done.
+    fn scripted(events: Vec<Event>) -> Router {
+        let (jobs, rx) = std::sync::mpsc::sync_channel::<Job>(0);
+        std::thread::spawn(move || {
+            if let Ok(job) = rx.recv() {
+                assert_eq!(job.reasoning, ReasoningMode::Separate);
+                for e in events {
+                    job.events.blocking_send(e).unwrap();
+                }
+                job.events
+                    .blocking_send(Event::Done(TurnOutcome {
+                        prompt_tokens: 3,
+                        completion_tokens: 2,
+                        finish: EngineFinish::Stop,
+                    }))
+                    .unwrap();
+            }
+        });
+        let mut cfg = crate::test_support::test_server_config();
+        cfg.reasoning = ReasoningMode::Separate;
+        let health = Arc::new(HealthState::new());
+        health.set(ServeState::Healthy);
+        router(AppState {
+            cfg: Arc::new(cfg),
+            jobs,
+            health,
+        })
+    }
+
+    async fn post(app: Router, stream: bool) -> String {
+        let body = serde_json::json!({"model":"tiny-moe","messages":[{"role":"user","content":"hi"}],"stream":stream});
+        let r = app
+            .oneshot(
+                axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        String::from_utf8(
+            axum::body::to_bytes(r.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn split_events() -> Vec<Event> {
+        vec![
+            Event::Reasoning("plan".into()),
+            Event::Text("answer".into()),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn separate_mode_fills_reasoning_content() {
+        let v: serde_json::Value =
+            serde_json::from_str(&post(scripted(split_events()), false).await).unwrap();
+        let m = &v["choices"][0]["message"];
+        assert_eq!(
+            (&m["reasoning_content"], &m["content"]),
+            (&"plan".into(), &"answer".into())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_carries_reasoning_content_deltas() {
+        let body = post(scripted(split_events()), true).await;
+        let data: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|l| *l != "[DONE]")
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(data[1]["choices"][0]["delta"]["reasoning_content"], "plan");
+        assert_eq!(data[2]["choices"][0]["delta"]["content"], "answer");
+        assert_eq!(data[3]["choices"][0]["finish_reason"], "stop");
+        assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
 }

@@ -744,6 +744,16 @@ impl ExpertPool {
         }
     }
 
+    /// Leases held by the batched step claims (released at `end_batch_step*`;
+    /// test/observability seam).
+    pub fn batch_leases(&self) -> usize {
+        self.batch_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .leases
+            .len()
+    }
+
     /// The key's outstanding pool lease count (test/observability seam).
     pub fn outstanding_leases(&self, layer: u32, expert: u32) -> u16 {
         self.residency.lease_count(layer, expert)

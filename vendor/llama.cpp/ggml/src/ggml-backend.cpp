@@ -2654,12 +2654,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             golem_stream_ids = plan.routed; // sorted copy
                         }
                         golem_stream_ptrs.assign(golem_stream_ids.size(), nullptr);
+                        int32_t src_rc;
                         {
                             golem_cb_guard cb;
-                            gctx->stream_source(gctx->payload, blk_s, kind_s, seq,
+                            src_rc = gctx->stream_source(gctx->payload, blk_s, kind_s, seq,
                                                 golem_stream_ids.data(),
                                                 (int32_t) golem_stream_ids.size(),
                                                 golem_stream_ptrs.data());
+                        }
+                        if (src_rc != 0) {
+                            // ABI v11 abort: drain this split's issued H2D,
+                            // hand back every issued seq (leases + staging),
+                            // and fail the compute; the graph never runs.
+                            golem_restore_ids();
+                            for (int i = 0; i < sched->n_backends; i++) {
+                                ggml_backend_synchronize(sched->backends[i]);
+                            }
+                            if (gctx->stream_release != NULL) {
+                                golem_cb_guard cb;
+                                gctx->stream_release(gctx->payload, seq);
+                            }
+                            gctx->stream_used_in_split[0] = false;
+                            gctx->stream_used_in_split[1] = false;
+                            if (!golem_evict_d2h.empty()) {
+                                golem_evict_abandon_unfinished();
+                            }
+                            golem_in_flight_done(gctx);
+                            return GGML_STATUS_ABORTED;
                         }
                         for (size_t i6 = 0; i6 < golem_stream_ptrs.size(); ++i6) {
                             GGML_ASSERT(golem_stream_ptrs[i6] != NULL);

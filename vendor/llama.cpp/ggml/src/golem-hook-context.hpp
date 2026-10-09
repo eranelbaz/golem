@@ -56,7 +56,7 @@ struct golem_ctx {
     golem_copy_done_fn copy_done = nullptr;
     golem_evict_batch_fn evict_batch = nullptr; // exclusive residency (ABI v8)
     golem_evict_abandon_fn evict_abandon = nullptr; // abandoned D2H (ABI v9)
-    golem_stream_source_fn stream_source = nullptr; // prefill stream (ABI v10)
+    golem_stream_source_fn stream_source = nullptr; // prefill stream (ABI v11: returns 1 = abort)
     golem_stream_release_fn stream_release = nullptr; // prefill stream (ABI v10)
     void *payload = nullptr;
     // P5 next-layer prediction (golem_set_predict; 0 = off)
