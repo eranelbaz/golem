@@ -9,6 +9,7 @@ pub mod parity;
 pub mod sanity;
 pub mod session;
 pub mod slot;
+pub mod snapshot;
 pub mod stream;
 pub mod timing;
 

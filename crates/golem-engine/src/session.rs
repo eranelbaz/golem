@@ -19,6 +19,7 @@ use crate::p3_glue;
 use crate::parity::{self, ParityStep};
 use crate::sanity;
 use crate::slot::{self, FinishReason, SamplingParams, SlotState, TurnOutcome, TurnRequest};
+use crate::snapshot::{SnapshotCache, SnapshotStats};
 
 /// Owned `llama_model` handle; `Drop` calls `llama_model_free`.
 pub(crate) struct Model {
@@ -239,6 +240,8 @@ pub(crate) fn load_with_hooks(
     // SAFETY: returns llama.cpp's default context params by value.
     let mut params = unsafe { raw::llama_context_default_params() };
     params.n_ctx = config.n_ctx;
+    // One seq per slot; n_ctx stays ×1 while `parallel == 1` (Session::new).
+    params.n_seq_max = config.parallel;
     params.n_batch = n_batch.max(n_ubatch);
     params.n_ubatch = n_ubatch;
     params.n_threads = config.threads as i32;
@@ -483,7 +486,8 @@ fn ffi_messages(messages: &[ChatTurn<'_>]) -> Result<Vec<ChatMessageFFI>, Engine
 }
 
 /// A loaded model bound to its resolved chat template, driving its decode
-/// slots (stateless per turn — every turn re-prefills the full transcript).
+/// slots; a turn restores the previous prompt's state snapshot when enabled
+/// (§7.1), else re-prefills the full transcript.
 /// Field order is load-bearing: `slots` (sampler chains) drop BEFORE the
 /// llama ctx inside `inner`.
 pub struct Session {
@@ -514,6 +518,8 @@ pub(crate) struct SessionInner {
     /// [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first
     /// decode step passed [`check_experts_on_gpu`].
     pool_verified: bool,
+    /// Prompt-prefill state snapshots (§7.1); `None` when disabled.
+    snapshots: Option<SnapshotCache>,
 }
 
 impl Drop for Session {
@@ -624,7 +630,7 @@ impl Session {
             return Err(EngineError::TemplateUnavailable);
         }
 
-        // P3 guards came from `enable` above; nothing to build here.
+        let snapshots = snapshot_cache(config, &loaded)?;
 
         Ok({
             p3_glue::session_opened();
@@ -643,6 +649,7 @@ impl Session {
                         .as_ref()
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
+                    snapshots,
                 },
             }
         })
@@ -689,6 +696,7 @@ impl Session {
                         .as_ref()
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
+                    snapshots: None,
                 },
             }
         })
@@ -824,6 +832,25 @@ impl Session {
         Ok(out?.completion_tokens)
     }
 
+    /// Snapshot restores attempted (a prefix hit); 0 when snapshots are off.
+    pub fn snapshot_hits(&self) -> u64 {
+        self.snapshot_stats().map_or(0, |s| s.hits)
+    }
+
+    /// Snapshot cache counters; `None` when snapshots are off.
+    pub fn snapshot_stats(&self) -> Option<SnapshotStats> {
+        self.inner.snapshots.as_ref().map(SnapshotCache::stats)
+    }
+
+    /// Test seam: truncates every stored snapshot so its next restore is
+    /// rejected by `llama_state_seq_set_data`.
+    #[doc(hidden)]
+    pub fn corrupt_snapshots_for_test(&mut self) {
+        if let Some(c) = self.inner.snapshots.as_mut() {
+            c.truncate_all_for_test();
+        }
+    }
+
     /// Test seam: highest position held for `seq` in the KV/recurrent memory,
     /// `-1` when the sequence is empty.
     #[doc(hidden)]
@@ -838,8 +865,9 @@ impl Session {
         }
     }
 
-    /// Runs one turn on slot 0: renders `req.messages`, clears the KV cache,
-    /// re-prefills the full transcript in chunks, then samples per
+    /// Runs one turn on slot 0: renders `req.messages`, drops the slot's
+    /// sequence, restores the longest snapshotted prompt prefix (§7.1) and
+    /// prefills the rest in chunks, then samples per
     /// `req.sampling` until EOG, a stop string, `max_tokens` (default
     /// `config.n_predict`, clamped to the context left after the prompt),
     /// `n_ctx_seq - 1` positions, or cancel. Every `Err`/`Cancelled` exit
@@ -900,6 +928,8 @@ pub(crate) struct Core<'s> {
 pub(crate) struct TurnFfi {
     batch: Batch,
     prompt: Vec<raw::llama_token>,
+    /// Prompt tokens already in the sequence (restored snapshot prefix).
+    restored: usize,
     chunk_cap: usize,
     n_ubatch: usize,
     streaming: bool,
@@ -935,7 +965,8 @@ impl Drop for SeqResetGuard {
 }
 
 impl SessionInner {
-    /// Tokenizes `req`, clears memory (stateless per turn), applies the
+    /// Tokenizes `req`, drops the slot's sequence (never the whole memory —
+    /// other slots live there), restores a snapshot prefix, applies the
     /// context guard, builds the slot's sampler and arms it for `step`.
     fn begin(
         &mut self,
@@ -947,11 +978,10 @@ impl SessionInner {
         let rendered = unsafe { apply_template(&self.template, &msgs, true)? };
 
         let ctx = self.loaded.ctx();
-        // SAFETY: ctx is live; the context is idle between turns, the
-        // documented llama_memory_clear use.
+        // SAFETY: ctx is live; the context is idle between turns.
         let mem = unsafe { raw::llama_get_memory(ctx.as_ptr()) };
-        // SAFETY: as above.
-        unsafe { raw::llama_memory_clear(mem, true) };
+        // SAFETY: as above; removes only this slot's sequence.
+        unsafe { raw::llama_memory_seq_rm(mem, slot.seq, -1, -1) };
         let guard = SeqResetGuard {
             mem,
             seq: slot.seq,
@@ -967,6 +997,8 @@ impl SessionInner {
             return Err(EngineError::Tokenize(0));
         }
         self.last_prompt_tokens.clone_from(&prompt);
+        let restored = self.restore_prefix(mem, slot.seq, &prompt);
+        let ctx = self.loaded.ctx();
         let prompt_len = prompt.len() as u32;
         let n_ctx_seq = self.n_ctx_seq();
         if prompt_len >= n_ctx_seq {
@@ -1010,6 +1042,7 @@ impl SessionInner {
             ffi: TurnFfi {
                 batch: Batch::init(batch_cap as i32, 0, 1),
                 prompt,
+                restored,
                 chunk_cap,
                 n_ubatch,
                 streaming,
@@ -1020,6 +1053,61 @@ impl SessionInner {
         };
         slot.start(req, prompt_len, limit, armed);
         Ok(guard)
+    }
+
+    /// Restores the longest snapshotted strict prefix of `prompt` into `seq`
+    /// (§7.1); returns how many prompt tokens it covers (0 on miss). A
+    /// rejected restore drops the seq and the entry and falls back to a full
+    /// prefill — a delta is never decoded on top of a failed restore.
+    fn restore_prefix(
+        &mut self,
+        mem: raw::llama_memory_t,
+        seq: raw::llama_seq_id,
+        prompt: &[raw::llama_token],
+    ) -> usize {
+        let Some(cache) = self.snapshots.as_mut() else {
+            return 0;
+        };
+        let Some((n, bytes)) = cache.longest_prefix(prompt) else {
+            return 0;
+        };
+        let ctx = self.loaded.ctx().as_ptr();
+        // SAFETY: ctx is live and idle; `bytes` is a live arena range of
+        // exactly `bytes.len()` bytes produced by `llama_state_seq_get_data`
+        // on this model + context shape.
+        let read = unsafe { raw::llama_state_seq_set_data(ctx, bytes.as_ptr(), bytes.len(), seq) };
+        if read != 0 && read == bytes.len() {
+            return n;
+        }
+        tracing::warn!(
+            read,
+            expected = bytes.len(),
+            "snapshot restore rejected; full prefill"
+        );
+        // SAFETY: as in `begin`; clears whatever the failed read left.
+        unsafe { raw::llama_memory_seq_rm(mem, seq, -1, -1) };
+        cache.invalidate(n, prompt);
+        0
+    }
+
+    /// Snapshots `seq` right after a clean prompt prefill, keyed by the
+    /// prompt tokens (§7.1: the next turn's render shares exactly this
+    /// prefix). Once per turn, off the per-token path.
+    pub(crate) fn snapshot_prompt(&mut self, ffi: &TurnFfi, seq: raw::llama_seq_id) {
+        let Some(cache) = self.snapshots.as_mut() else {
+            return;
+        };
+        let ctx = self.loaded.ctx().as_ptr();
+        // SAFETY: ctx is live; the prefill synchronized before returning.
+        let size = unsafe { raw::llama_state_seq_get_size(ctx, seq) };
+        let Some(dst) = cache.reserve(&ffi.prompt, size) else {
+            return;
+        };
+        // SAFETY: `dst` is an exclusive arena range of exactly `size` bytes.
+        let wrote = unsafe { raw::llama_state_seq_get_data(ctx, dst.as_mut_ptr(), size, seq) };
+        if wrote == size {
+            cache.commit();
+        }
     }
 
     /// Context window per sequence as llama.cpp sized it (padded/trimmed —
@@ -1073,7 +1161,7 @@ impl SessionInner {
         let _stream_guard = self.p3.as_ref().map(StreamGuard);
         let stream_min = self.config.prefill_stream_min as usize;
         let prompt_len = ffi.prompt.len();
-        let mut n_past: usize = 0;
+        let mut n_past: usize = ffi.restored;
         let mut last_chunk_len = 0;
         while n_past < prompt_len {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -1650,6 +1738,51 @@ fn skip_ratio(bytes_copied: u64, bytes_skipped: u64) -> f64 {
     } else {
         bytes_skipped as f64 / total as f64
     }
+}
+
+/// Builds the snapshot cache (§7.1) per `config.snapshot_ram_bytes`.
+/// Floor = `parallel × snapshot_bytes(n_ctx)`: one full-context snapshot per
+/// slot — below it long chats silently lose reuse, so smaller budgets are
+/// refused. Target: 145.56 MiB + 19,712 B × 100k ≈ 2.0 GiB at parallel 1.
+fn snapshot_cache(
+    config: &EngineConfig,
+    loaded: &LoadedModel,
+) -> Result<Option<SnapshotCache>, EngineError> {
+    if config.snapshot_ram_bytes == Some(0) {
+        return Ok(None);
+    }
+    let facts = golem_plan::ModelFacts::from_gguf(&config.model_path)
+        .map_err(|e| EngineError::InvalidModel(format!("snapshot sizing: {e}")))?;
+    let floor = u64::from(config.parallel).saturating_mul(golem_plan::snapshot_bytes(
+        facts.rs_bytes,
+        facts.kv_per_token,
+        u64::from(config.n_ctx),
+    ));
+    let bytes = match config.snapshot_ram_bytes {
+        None => (2u64 << 30).max(floor.saturating_mul(2)),
+        Some(n) if n < floor => {
+            return Err(EngineError::InvalidConfig(format!(
+                "snapshot_ram_bytes {n} < floor {floor} (parallel {} × one {}-token snapshot)",
+                config.parallel, config.n_ctx
+            )));
+        }
+        Some(n) => n,
+    };
+    let len = usize::try_from(bytes)
+        .map_err(|_| EngineError::InvalidConfig("snapshot_ram_bytes > usize".into()))?;
+    let model_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        config.model_path.hash(&mut h);
+        config.n_ctx.hash(&mut h);
+        // SAFETY: ctx is live.
+        unsafe { raw::llama_n_ubatch(loaded.ctx().as_ptr()) }.hash(&mut h);
+        h.finish()
+    };
+    Ok(Some(
+        SnapshotCache::new(p3_glue::PinnedArena::new(len)?, model_key)
+            .with_max_tokens(config.n_ctx as usize),
+    ))
 }
 
 /// Prefill chunk length in tokens. Base cap `min(batch_tokens, n_ctx - 1)`:

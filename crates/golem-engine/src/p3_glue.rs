@@ -1686,6 +1686,104 @@ fn kind_from_code(code: i32) -> Option<ExpertKind> {
     }
 }
 
+/// The state-snapshot byte store (§7.1): one mlocked [`golem_placement::pool::Arena`],
+/// GPU-registered on HIP builds (§3.5 — pageable H2D is a bug), unregistered
+/// in `Drop` before the arena unmaps.
+pub struct PinnedArena {
+    mem: PinnedMem,
+}
+
+enum PinnedMem {
+    Locked(golem_placement::pool::Arena),
+    #[cfg(any(test, feature = "test-support"))]
+    Heap(Vec<u8>),
+}
+
+impl PinnedArena {
+    /// Maps, locks and (HIP) registers `len` bytes; any failure refuses the
+    /// load rather than degrading to pageable memory.
+    pub fn new(len: usize) -> Result<Self, EngineError> {
+        let arena = golem_placement::pool::Arena::new_bytes(len)
+            .map_err(|e| EngineError::PoolInit(format!("snapshot arena: {e}")))?;
+        #[cfg(golem_backend_hip)]
+        {
+            let (ptr, len) = arena.as_ptr_range();
+            // SAFETY: the arena is a live, page-aligned, solely-owned mapping
+            // of exactly `len` bytes, not yet registered; unregister runs in
+            // `Drop` before the arena unmaps.
+            if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
+                return Err(EngineError::PoolInit(format!(
+                    "hipHostRegister failed on the {len}-byte snapshot arena (HIP result {r})"
+                )));
+            }
+        }
+        Ok(Self {
+            mem: PinnedMem::Locked(arena),
+        })
+    }
+
+    /// Unpinned heap bytes for cache-logic unit tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn heap_for_test(len: usize) -> Self {
+        Self {
+            mem: PinnedMem::Heap(vec![0; len]),
+        }
+    }
+
+    /// Usable bytes.
+    pub fn len(&self) -> usize {
+        match &self.mem {
+            PinnedMem::Locked(a) => a.as_ptr_range().1,
+            #[cfg(any(test, feature = "test-support"))]
+            PinnedMem::Heap(v) => v.len(),
+        }
+    }
+
+    /// True when the arena holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Shared view of the whole arena.
+    pub fn bytes(&self) -> &[u8] {
+        match &self.mem {
+            PinnedMem::Locked(a) => {
+                let (ptr, len) = a.as_ptr_range();
+                // SAFETY: the arena owns `[ptr, ptr+len)` for its lifetime and
+                // hands out no other view; `&self` excludes `bytes_mut`.
+                unsafe { std::slice::from_raw_parts(ptr, len) }
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            PinnedMem::Heap(v) => v,
+        }
+    }
+
+    /// Exclusive view of the whole arena.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.mem {
+            PinnedMem::Locked(a) => {
+                let (ptr, len) = a.as_ptr_range();
+                // SAFETY: as `bytes`; `&mut self` makes this the only view.
+                unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            PinnedMem::Heap(v) => v,
+        }
+    }
+}
+
+impl Drop for PinnedArena {
+    fn drop(&mut self) {
+        #[cfg(golem_backend_hip)]
+        #[allow(irrefutable_let_patterns)] // `Heap` exists only in test builds
+        if let PinnedMem::Locked(a) = &self.mem {
+            // SAFETY: the exact pointer registered in `new`; no view outlives
+            // `&mut self`, and every restore H2D synchronized before returning.
+            let _ = unsafe { golem_llama_sys::pinned::hip_host_unregister(a.as_ptr_range().0) };
+        }
+    }
+}
+
 /// Loud terminal state for FFI-adjacent contract violations (the void ABI
 /// leaves no non-silent failure path; corrupt-weight
 /// decode is worse than a dead process — documented, deliberate).

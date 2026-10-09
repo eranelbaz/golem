@@ -72,6 +72,8 @@ fn main() {
     if let Err(e) = status {
         let code = if e.is::<golem_server::ServeError>() {
             golem_api::ErrorCode::BackendUnavailable
+        } else if e.is::<run::PlanInfeasible>() {
+            golem_api::ErrorCode::PlanInfeasible
         } else {
             golem_api::ErrorCode::InvalidRequest
         };

@@ -92,6 +92,11 @@ pub struct EngineConfig {
     /// of the ubatch's routed experts a plane streams whole instead of
     /// routed-only (BMoE's 0.85; Golem measures its own crossover).
     pub prefill_stream_routed_max: f32,
+    /// State-snapshot arena bytes (§7.1): `Some(0)` disables snapshots (and
+    /// the floor rule); `None` = planner default `max(2 GiB, 2 × floor)`;
+    /// any other value must be ≥ the floor `parallel × snapshot_bytes(n_ctx)`
+    /// (one full-context snapshot per slot) or the load is refused.
+    pub snapshot_ram_bytes: Option<u64>,
 }
 
 /// RAM/VRAM expert residency policy (§6.3 O10, `--residency`).
@@ -155,6 +160,8 @@ impl Default for EngineConfig {
             prefill_ubatch: 2048,
             prefill_stream_min: 256,
             prefill_stream_routed_max: 0.85,
+            // Off by default: only the CLI asks for the planner-sized arena.
+            snapshot_ram_bytes: Some(0),
         }
     }
 }

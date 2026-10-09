@@ -37,8 +37,7 @@ pub struct ServeArgs {
 /// `Err(ServeError::ShutdownTimeout)` means the worker is still running:
 /// the caller must exit the process without further teardown.
 pub fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
-    let mut config = engine_config(&args.engine, &args.model)?;
-    config.parallel = args.parallel;
+    let config = engine_config(&args.engine, &args.model, args.parallel)?;
     let model_name = match &args.model_name {
         Some(n) => n.clone(),
         None => read_metadata(&args.model)?

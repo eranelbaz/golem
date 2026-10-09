@@ -21,6 +21,7 @@ sha2.workspace = true
 
 [features]
 hip-tests = []
+test-support = []
 
 [dev-dependencies]
 xtask = { path = "../../xtask" }

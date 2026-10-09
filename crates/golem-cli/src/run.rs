@@ -150,6 +150,13 @@ pub struct EngineArgs {
     /// of routed-only (hidden measurement knob).
     #[arg(long, hide = true, default_value_t = 0.85)]
     pub prefill_stream_routed_max: f32,
+    /// State-snapshot arena in GiB (§7.1: turn N+1 restores turn N's prompt
+    /// state and prefills only the delta). 0 disables snapshots; omitted =
+    /// `max(2 GiB, 2 × floor)`, shrunk toward the floor (one full-context
+    /// snapshot per slot) when RAM is short. Below the floor the load is
+    /// refused (`golem_plan_infeasible`).
+    #[arg(long, value_name = "GIB")]
+    pub snapshot_ram_gib: Option<f64>,
 }
 
 fn parse_residency(s: &str) -> Result<Residency, String> {
@@ -209,15 +216,37 @@ impl EngineArgs {
             prefill_ubatch: self.prefill_ubatch,
             prefill_stream_min: self.prefill_stream_min,
             prefill_stream_routed_max: self.prefill_stream_routed_max,
+            snapshot_ram_bytes: self
+                .snapshot_ram_gib
+                .map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
             ..default
         }
     }
 }
 
+/// A configuration the §10 RAM arithmetic cannot fit; surfaced as
+/// `golem_plan_infeasible`.
+#[derive(Debug)]
+pub struct PlanInfeasible(pub String);
+
+impl std::fmt::Display for PlanInfeasible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for PlanInfeasible {}
+
 /// Resolves the engine flags for `model`: §9 inference (printed), flag
-/// cross-checks, and the RAM pool preflight — shared by `run` and `serve`.
-pub fn engine_config(engine: &EngineArgs, model: &Path) -> Result<EngineConfig, Box<dyn Error>> {
+/// cross-checks, the §10 RAM fit and the mlock preflight — shared by `run`
+/// and `serve` (`parallel` = decode slots, sizing the snapshot floor).
+pub fn engine_config(
+    engine: &EngineArgs,
+    model: &Path,
+    parallel: u32,
+) -> Result<EngineConfig, Box<dyn Error>> {
     let mut config = engine.to_config(model.to_path_buf());
+    config.parallel = parallel;
     // §9 inference: explicit flags already won in `to_config`; fill the rest
     // from the model folder and the compiled backend.
     let inferred = infer_defaults(&mut config, engine.n_gpu_layers);
@@ -266,14 +295,101 @@ pub fn engine_config(engine: &EngineArgs, model: &Path) -> Result<EngineConfig, 
                 .into(),
         );
     }
-    if config.ram_experts_gib > 0 {
-        preflight_ram_pool(
-            model,
-            config.manifest_path.as_deref(),
-            config.ram_experts_gib,
-        )?;
+    let facts = golem_plan::ModelFacts::from_gguf(model)?;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let (snap, pool) = fit_ram(&facts, sys.available_memory(), &config)?;
+    if pool != config.ram_experts_gib {
+        eprintln!(
+            "golem: RAM short: expert pool shrunk {} -> {pool} GiB to keep {snap} B of state snapshots",
+            config.ram_experts_gib
+        );
+        config.ram_experts_gib = pool;
     }
+    config.snapshot_ram_bytes = Some(snap);
+    preflight_mlock(
+        model,
+        config.manifest_path.as_deref(),
+        config.ram_experts_gib,
+        snap,
+    )?;
     Ok(config)
+}
+
+/// §10 RAM admission, one rule: `ram_pool + snapshots + host_overhead +
+/// staging_ring ≤ ram_free − 4 GiB`. Returns `(snapshot bytes, pool GiB)`.
+/// Default snapshots `max(2 GiB, 2 × floor)` shrink to the floor first, then
+/// the pool shrinks; below the floor the plan is infeasible (never clamped).
+/// Target: 83 − 4 = 79 GiB; pool 63 + staging 3.7 + host 2 = 68.7 → 10.3 GiB
+/// left ≥ default 4.0 GiB (floor 2.0 GiB at 100k ctx, parallel 1).
+fn fit_ram(
+    facts: &golem_plan::ModelFacts,
+    ram_free: u64,
+    config: &EngineConfig,
+) -> Result<(u64, u64), PlanInfeasible> {
+    const GIB: u64 = 1 << 30;
+    let budget = ram_free.saturating_sub(4 * GIB);
+    let input = golem_plan::PlanInput {
+        ctx: config.n_ctx,
+        parallel: config.parallel,
+        prefill_stream: config.prefill_stream,
+        ram_experts: config.ram_experts_gib * GIB,
+        ..Default::default()
+    };
+    let mach = golem_plan::Machine {
+        vram_total: 0,
+        ram_total: 0,
+        ram_free,
+        rocm_overhead: 0,
+    };
+    // Everything but the pool and snapshots (host overhead, staging ring).
+    let fixed: u64 = golem_plan::ram_terms(facts, &mach, &input)
+        .iter()
+        .filter(|t| t.name != "ram_pool" && t.name != "state_snapshots")
+        .map(|t| t.bytes)
+        .sum();
+    let pool = config.ram_experts_gib * GIB;
+    let floor = u64::from(config.parallel).saturating_mul(golem_plan::snapshot_bytes(
+        facts.rs_bytes,
+        facts.kv_per_token,
+        u64::from(config.n_ctx),
+    ));
+    let fits = |snap: u64, pool: u64| fixed + pool + snap <= budget;
+    let want = match config.snapshot_ram_bytes {
+        Some(n) if n > 0 && n < floor => {
+            return Err(PlanInfeasible(format!(
+                "--snapshot-ram-gib is {n} B, below the floor {floor} B (parallel {} × one \
+                 {}-token snapshot); raise it or pass 0 to disable snapshots",
+                config.parallel, config.n_ctx
+            )));
+        }
+        Some(n) => n,
+        None => (2 * GIB).max(floor.saturating_mul(2)),
+    };
+    if fits(want, pool) {
+        return Ok((want, config.ram_experts_gib));
+    }
+    // Only the planner default shrinks (toward the floor); an explicit size
+    // is the user's call. Then the pool gives way.
+    let snap = if config.snapshot_ram_bytes.is_none() {
+        if fits(floor, pool) {
+            return Ok((budget - fixed - pool, config.ram_experts_gib));
+        }
+        floor
+    } else {
+        want
+    };
+    let pool_room = budget.saturating_sub(fixed + snap) / GIB;
+    if config.ram_experts_gib > 0 && pool_room >= 1 {
+        return Ok((snap, pool_room.min(config.ram_experts_gib)));
+    }
+    let per_slot = budget.saturating_sub(fixed + pool) / u64::from(config.parallel.max(1));
+    let max_ctx = per_slot.saturating_sub(facts.rs_bytes) / facts.kv_per_token.max(1);
+    Err(PlanInfeasible(format!(
+        "RAM: {snap} B of state snapshots + {pool} B expert pool + {fixed} B host/staging \
+         exceed {budget} B (available {ram_free} B − 4 GiB headroom); largest --ctx that \
+         fits: {max_ctx} (or shrink --ram-experts-gib)"
+    )))
 }
 
 /// Runs one greedy `run` invocation: loads the model, then either prints a
@@ -287,7 +403,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         // No model: main() already printed the run help.
         None => return Ok(()),
     };
-    let config = engine_config(&args.engine, &model)?;
+    let config = engine_config(&args.engine, &model, 1)?;
     // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
     let mut timing_out = match &config.timing_csv {
         Some(path) => {
@@ -421,50 +537,31 @@ fn memlock_limit() -> Option<u64> {
     (rl.rlim_cur != libc::RLIM_INFINITY).then_some(rl.rlim_cur)
 }
 
-/// P3 pool preflight, before any weights load: refuse to start when the
-/// requested pool cannot be locked (`RLIMIT_MEMLOCK` too low) or would exceed
-/// 75% of free RAM, each with an actionable `min(75% free RAM, expert bytes)`
-/// suggestion (§5.4: mlock is a correctness feature — never fall back).
-fn preflight_ram_pool(
+/// mlock preflight, before any weights load: refuse to start when the expert
+/// pool plus the snapshot arena cannot be locked (`RLIMIT_MEMLOCK` too low),
+/// with an actionable suggestion (§5.4: mlock is a correctness feature —
+/// never fall back). RAM fit is `fit_ram`'s single rule.
+fn preflight_mlock(
     model: &Path,
     manifest: Option<&Path>,
     gib: u64,
+    snapshot_bytes: u64,
 ) -> Result<(), Box<dyn Error>> {
     let want_bytes = gib
         .checked_mul(1 << 30)
+        .and_then(|b| b.checked_add(snapshot_bytes))
         .ok_or("--ram-experts-gib overflows")?;
-
-    // Expert bytes from the GGUF tensor table (header walk only).
-    let expert_bytes = expert_plane_bytes(model, manifest).unwrap_or_else(|e| {
-        eprintln!("warning: cannot pre-scan expert tensors from {model:?}: {e}");
-        0
-    });
-
-    // Available-RAM suggestion: min(75% of available, RLIMIT_MEMLOCK, what
-    // the experts actually need).
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let free = sys.available_memory();
-    // .max(1): a sub-GiB suggestion would print `--ram-experts-gib 0`, which
-    // disables the pool entirely — suggest the smallest workable pool instead.
-    let suggest_gib =
-        suggest_pool_gib(model, manifest).unwrap_or((free * 3 / 4 / (1 << 30)).max(1));
-
     if let Some(limit) = memlock_limit()
         && want_bytes > limit
     {
+        // .max(1): a sub-GiB suggestion would print `--ram-experts-gib 0`,
+        // which disables the pool — suggest the smallest workable pool.
+        let suggest_gib = suggest_pool_gib(model, manifest).unwrap_or(1).max(1);
         return Err(format!(
-            "--ram-experts-gib {gib} needs {want_bytes} B locked but RLIMIT_MEMLOCK \
-                 is {limit} B.\nRaise it: `ulimit -l unlimited` (or systemd `LimitMEMLOCK=\
-                 infinity`), or size the pool down, e.g. --ram-experts-gib {suggest_gib}"
-        )
-        .into());
-    }
-    if want_bytes > free * 3 / 4 {
-        return Err(format!(
-            "--ram-experts-gib {gib} wants {want_bytes} B but only {free} B is available \
-             (cap: 75% of available RAM).\nSuggested size: --ram-experts-gib {suggest_gib} \
-             (expert bytes: {expert_bytes} B)"
+            "--ram-experts-gib {gib} + {snapshot_bytes} B of state snapshots need \
+                 {want_bytes} B locked but RLIMIT_MEMLOCK is {limit} B.\nRaise it: \
+                 `ulimit -l unlimited` (or systemd `LimitMEMLOCK=infinity`), or size down, \
+                 e.g. --ram-experts-gib {suggest_gib} / --snapshot-ram-gib 0"
         )
         .into());
     }
@@ -690,9 +787,9 @@ fn model_identity(path: &Path) -> std::io::Result<(String, u64)> {
     Ok((hex, total))
 }
 
-/// Stdin chat REPL. Each turn re-sends the whole conversation: the engine
-/// clears the KV cache per turn, so history only survives by being replayed
-/// in the prompt. `/reset` drops it, `/exit` ends the session.
+/// Stdin chat REPL. Each turn re-sends the whole conversation; the engine
+/// restores the previous prompt's state snapshot (§7.1) and prefills only
+/// the delta. `/reset` drops it, `/exit` ends the session.
 fn repl(
     session: &mut Session,
     timing_out: &mut Option<std::fs::File>,
@@ -766,6 +863,60 @@ mod tests {
     use super::*;
     use clap::{Args as _, FromArgMatches as _};
     use golem_engine::ParityStep;
+
+    const GIB: u64 = 1 << 30;
+
+    /// Real target facts (golem-plan's GLM-5.3-Flash fixture numbers).
+    fn glm() -> golem_plan::ModelFacts {
+        golem_plan::ModelFacts {
+            t_ne: 8 << 30,
+            shexp: 1 << 30,
+            n_expert: 288,
+            expert_layers: 42,
+            max_plane_stride: 6_881_280,
+            expert_bytes_total: 42 * 288 * 3 * 4_718_592,
+            kv_per_token: 19_712,
+            rs_bytes: 152_630_000,
+            sparse_attn_layers: 11,
+        }
+    }
+
+    fn cfg(ctx: u32, pool_gib: u64, snap: Option<u64>) -> EngineConfig {
+        EngineConfig {
+            n_ctx: ctx,
+            ram_experts_gib: pool_gib,
+            prefill_stream: true,
+            snapshot_ram_bytes: snap,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn fit_ram_real_target_keeps_default_snapshots() {
+        // 83 GiB free − 4 = 79; pool 63 + staging 3.7 + host 2 = 68.7 → 10.3 left.
+        let floor = golem_plan::snapshot_bytes(152_630_000, 19_712, 100_000);
+        let (snap, pool) = fit_ram(&glm(), 83 * GIB, &cfg(100_000, 63, None)).unwrap();
+        assert_eq!((snap, pool), ((2 * GIB).max(2 * floor), 63));
+    }
+
+    #[test]
+    fn fit_ram_shrinks_snapshots_then_pool_and_refuses_below_floor() {
+        let floor = golem_plan::snapshot_bytes(152_630_000, 19_712, 100_000);
+        // 70 GiB free: 66 budget − 68.7 fixed+pool → default can't fit; pool gives way.
+        let (snap, pool) = fit_ram(&glm(), 70 * GIB, &cfg(100_000, 63, None)).unwrap();
+        assert_eq!(snap, floor);
+        assert!((1..63).contains(&pool));
+        // Explicit size below the floor: refused, never clamped.
+        assert!(fit_ram(&glm(), 83 * GIB, &cfg(100_000, 63, Some(floor - 1))).is_err());
+        // No pool to shrink and no room for the floor: infeasible, suggests a ctx.
+        let e = fit_ram(&glm(), 8 * GIB, &cfg(100_000, 0, None)).unwrap_err();
+        assert!(e.0.contains("largest --ctx"), "{}", e.0);
+        // Disabled snapshots need no floor.
+        assert_eq!(
+            fit_ram(&glm(), 83 * GIB, &cfg(100_000, 63, Some(0))).unwrap(),
+            (0, 63)
+        );
+    }
 
     /// Known digest of `b"hello parity\n"` (computed with python3 hashlib).
     const SHA_SMALL: &str = "aec52f3eb3180f83512a00206ccd475a49683fc37607961437ae5cdf9f0dd985";
@@ -1145,9 +1296,9 @@ mod tests {
 
     #[test]
     fn preflight_refuses_an_impossible_pool_with_err_not_exit() {
-        // 2^60 GiB-bytes exceeds both RLIMIT_MEMLOCK and available RAM; the
-        // preflight must return Err (a process::exit would kill this test).
-        let err = preflight_ram_pool(Path::new("/nonexistent.gguf"), None, 1 << 30).unwrap_err();
+        // An overflowing lock request must return Err (a process::exit would
+        // kill this test); the RAM fit itself is `fit_ram`'s.
+        let err = preflight_mlock(Path::new("/nonexistent.gguf"), None, u64::MAX, 1).unwrap_err();
         assert!(err.to_string().contains("--ram-experts-gib"), "{err}");
     }
 

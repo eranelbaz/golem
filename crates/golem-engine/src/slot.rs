@@ -292,6 +292,7 @@ pub(crate) fn step(core: Core<'_>, emit: &mut dyn FnMut(&str)) -> Result<(), Eng
                     None => slot.done(FinishReason::Cancelled, emit),
                     Some(_) if slot.limit == 0 => slot.done(FinishReason::Length, emit),
                     Some(last) => {
+                        session.snapshot_prompt(&a.ffi, slot.seq);
                         slot.pos = slot.prompt_tokens as usize;
                         session.start_decode()?;
                         slot.tok = session.sample(
