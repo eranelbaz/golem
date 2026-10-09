@@ -1,6 +1,5 @@
 //! Per-turn slot API: sampling, max_tokens, cancel, stop, context guard.
 mod common;
-use golem_engine::config::EngineConfig;
 use golem_engine::{ChatTurn, FinishReason, SamplingParams, Session, TurnRequest};
 use std::sync::{
     Arc,
@@ -119,17 +118,5 @@ fn prompt_over_ctx_is_typed_error() {
     assert!(matches!(
         e,
         golem_engine::EngineError::ContextOverflow { .. }
-    ));
-}
-
-#[test]
-fn parallel_above_one_is_rejected_until_scheduler() {
-    let cfg = EngineConfig {
-        parallel: 2,
-        ..common::tiny_moe_config()
-    };
-    assert!(matches!(
-        Session::new(&cfg),
-        Err(golem_engine::EngineError::InvalidConfig(_))
     ));
 }

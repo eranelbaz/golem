@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::EngineError;
 use crate::parity::ParityStep;
-use crate::session::{ChatTurn, Core, Sampler, TurnFfi, emit_valid_prefix, flush_utf8_tail};
+use crate::session::{
+    ChatTurn, Core, Sampler, SessionInner, TurnFfi, emit_valid_prefix, flush_utf8_tail,
+};
 
 /// Per-request sampling knobs (OpenAI semantics). `temperature <= 0` is greedy.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -226,7 +228,17 @@ enum Phase {
     Prefill(Armed),
     Decode(Armed),
     Done(FinishReason),
+    Failed(EngineError),
 }
+
+/// Decode steps a generating slot runs between two streamed prefill chunks
+/// of a joiner (§7.6). A streamed chunk stalls every generating slot for its
+/// whole duration: measured ≈ 91 s cold for one 512-token chunk on the
+/// target (`docs/baselines/m3.6-prefill-stream.md`, on512 mean 104 s wall
+/// incl. ≈ 10 s load → ≈ 5.6 prompt tok/s). 32 steps bounds that stall to
+/// at most 1 in 33 inter-token gaps; the `parallel ∈ {1,2,4}` HW leg
+/// (`docs/baselines/m4.4-batching.md`) re-derives it from measured ITL p99.
+pub(crate) const STREAM_EVERY: u32 = 32;
 
 /// One decode slot, allocated once at `Session::new` and reused per turn.
 pub struct SlotState {
@@ -241,6 +253,15 @@ pub struct SlotState {
     limit: u32,
     pub(crate) prompt_tokens: u32,
     cancel: Option<Arc<AtomicBool>>,
+    /// Greedy without penalties: a failed batch can be replayed exactly.
+    replayable: bool,
+    /// Failed batches survived this turn (a second one fails the slot).
+    failures: u8,
+    /// Participates in the step being built: its logits row (`-1` = no
+    /// logits) and its prefill chunk length (0 = a generation token).
+    in_batch: bool,
+    row: i32,
+    chunk: usize,
     pub(crate) parity: Option<Vec<ParityStep>>,
 }
 
@@ -258,6 +279,11 @@ impl SlotState {
             limit: 0,
             prompt_tokens: 0,
             cancel: None,
+            replayable: true,
+            failures: 0,
+            in_batch: false,
+            row: -1,
+            chunk: 0,
             parity: None,
         }
     }
@@ -266,13 +292,15 @@ impl SlotState {
     /// tokenized and whose sampler is built; `limit` is the clamped token cap.
     pub(crate) fn start(
         &mut self,
-        req: &TurnRequest<'_>,
+        stop: &[String],
+        cancel: Option<Arc<AtomicBool>>,
+        sampling: &SamplingParams,
         prompt_tokens: u32,
         limit: u32,
         armed: Armed,
     ) {
         self.phase = Phase::Prefill(armed);
-        self.stop.reset(req.stop);
+        self.stop.reset(stop);
         self.pending.clear();
         self.scratch.clear();
         self.pos = 0;
@@ -281,7 +309,12 @@ impl SlotState {
         self.generated.reserve(limit as usize);
         self.limit = limit;
         self.prompt_tokens = prompt_tokens;
-        self.cancel = req.cancel.clone();
+        self.cancel = cancel;
+        self.replayable = sampling.temperature <= 0.0
+            && sampling.frequency_penalty == 0.0
+            && sampling.presence_penalty == 0.0;
+        self.failures = 0;
+        self.in_batch = false;
     }
 
     pub(crate) fn finished(&self) -> Option<FinishReason> {
@@ -289,6 +322,32 @@ impl SlotState {
             Phase::Done(f) => Some(*f),
             _ => None,
         }
+    }
+
+    /// No turn armed: the scheduler may admit a job here.
+    pub(crate) fn is_free(&self) -> bool {
+        matches!(self.phase, Phase::Idle)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.phase, Phase::Prefill(_) | Phase::Decode(_))
+    }
+
+    /// Takes a finished slot's result and frees it.
+    pub(crate) fn take_result(&mut self) -> Option<Result<TurnOutcome, EngineError>> {
+        let r = match std::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Done(finish) => Ok(TurnOutcome {
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens: self.generated.len() as u32,
+                finish,
+            }),
+            Phase::Failed(e) => Err(e),
+            p => {
+                self.phase = p;
+                return None;
+            }
+        };
+        Some(r)
     }
 
     fn cancelled(&self) -> bool {
@@ -300,6 +359,11 @@ impl SlotState {
     fn done(&mut self, f: FinishReason, emit: &mut dyn FnMut(&str)) {
         self.flush_text(emit);
         self.phase = Phase::Done(f);
+    }
+
+    /// Ends an armed-but-failed admission with `e` (reported on next step).
+    pub(crate) fn fail(&mut self, e: EngineError) {
+        self.phase = Phase::Failed(e);
     }
 
     /// Drops any active phase (sampler, batch) after an `Err` exit.
@@ -317,76 +381,253 @@ impl SlotState {
             self.stop.flush(emit);
         }
     }
+
+    /// Emits the sampled-but-undecoded token and runs the finish checks;
+    /// `true` when it still has to be decoded (the slot generates on).
+    fn emit_pending(&mut self, session: &SessionInner, emit: &mut dyn FnMut(&str)) -> bool {
+        if session.is_eog(self.tok) {
+            self.done(FinishReason::Stop, emit);
+            return false;
+        }
+        let piece = session.piece(self.tok);
+        emit_valid_prefix(&mut self.pending, &mut self.scratch, &piece);
+        let hit = self.stop.push(&self.scratch, emit);
+        self.scratch.clear();
+        self.generated.push(self.tok);
+        if hit {
+            self.pending.clear();
+            self.phase = Phase::Done(FinishReason::Stop);
+            return false;
+        }
+        // One KV slot stays free: never decode at pos >= n_ctx_seq - 1.
+        let n = self.generated.len() as u32;
+        if n >= self.limit || self.pos + 1 >= session.n_ctx_seq() as usize {
+            self.done(FinishReason::Length, emit);
+            return false;
+        }
+        if self.cancelled() {
+            self.done(FinishReason::Cancelled, emit);
+            return false;
+        }
+        true
+    }
 }
 
-/// Advances every active slot by one unit of work: a slot in `Prefill` runs its
-/// chunked prefill and samples the bootstrap token; a slot in `Decode` emits
-/// its pending token and decodes it. Cancel is checked before every
-/// `llama_decode`.
-pub(crate) fn step(core: Core<'_>, emit: &mut dyn FnMut(&str)) -> Result<(), EngineError> {
+/// Advances the active slots by exactly one `llama_decode` (the batching
+/// invariant): either (a) every generating slot's next token plus at most one
+/// joiner's prefill chunk below `--prefill-stream-min` (routed-only fill), or
+/// (b) one streamed joiner chunk alone — never a streamed ubatch carrying
+/// decode tokens. (b) runs only when no slot is generating or after
+/// [`STREAM_EVERY`] decode steps. Joiners rotate round-robin. Cancel is
+/// checked before every decode; a cancelled slot's sequence is dropped.
+///
+/// `recover`: a failed batch (other than abort) resets every participant's
+/// sequence; greedy slots re-prefill `prompt ++ generated` and continue
+/// exactly, sampled ones end `Failed`. Without it the error is returned
+/// (single-turn callers own their recovery).
+pub(crate) fn step(
+    core: Core<'_>,
+    emit: &mut dyn FnMut(usize, &str),
+    recover: bool,
+) -> Result<(), EngineError> {
     let Core { session, slots } = core;
-    for slot in slots.iter_mut() {
-        // Move the phase out so the armed state is owned here; every arm
-        // writes the next phase back (no allocation: a stack move).
-        match std::mem::replace(&mut slot.phase, Phase::Idle) {
-            p @ (Phase::Idle | Phase::Done(_)) => slot.phase = p,
-            Phase::Prefill(mut a) => {
-                let cancel = slot.cancel.clone();
-                match session.prefill(&mut a.ffi, slot.seq, cancel.as_deref())? {
-                    None => slot.done(FinishReason::Cancelled, emit),
-                    Some(_) if slot.limit == 0 => slot.done(FinishReason::Length, emit),
-                    Some(last) => {
-                        session.snapshot_prompt(&a.ffi, slot.seq);
-                        slot.pos = slot.prompt_tokens as usize;
-                        session.start_decode()?;
-                        slot.tok = session.sample(
-                            &a.sampler,
-                            &a.ffi,
-                            last as i32 - 1,
-                            slot.parity.as_mut(),
-                            0,
-                        );
-                        slot.phase = Phase::Decode(a);
-                    }
-                }
+    let n = slots.len();
+    for s in slots.iter_mut() {
+        s.in_batch = false;
+    }
+
+    // Cancelled prefills end before any decode.
+    for (i, s) in slots.iter_mut().enumerate() {
+        if matches!(s.phase, Phase::Prefill(_)) && s.cancelled() {
+            session.seq_rm(s.seq);
+            s.done(FinishReason::Cancelled, &mut |t| emit(i, t));
+        }
+    }
+
+    // The joiner: first prefilling slot from the round-robin cursor.
+    let joiner = (0..n)
+        .map(|k| (session.rr + k) % n)
+        .find(|&i| matches!(slots[i].phase, Phase::Prefill(_)));
+    let n_dec = slots
+        .iter()
+        .filter(|s| matches!(s.phase, Phase::Decode(_)))
+        .count();
+    let joiner_streams = joiner.is_some_and(|j| match &slots[j].phase {
+        Phase::Prefill(a) => session.next_chunk(&a.ffi, 0).1,
+        _ => false,
+    });
+    let stream_mode = joiner_streams && (n_dec == 0 || session.decode_since_stream >= STREAM_EVERY);
+
+    session.batch_clear();
+    let mut n_gen = 0u32;
+    if !stream_mode {
+        for (i, s) in slots.iter_mut().enumerate() {
+            if !matches!(s.phase, Phase::Decode(_)) {
+                continue;
             }
-            Phase::Decode(mut a) => {
-                let t0 = std::time::Instant::now();
-                if session.is_eog(slot.tok) {
-                    slot.done(FinishReason::Stop, emit);
-                    continue;
+            if !s.emit_pending(session, &mut |t| emit(i, t)) {
+                if s.finished() == Some(FinishReason::Cancelled) {
+                    session.seq_rm(s.seq);
                 }
-                let piece = session.piece(slot.tok);
-                emit_valid_prefix(&mut slot.pending, &mut slot.scratch, &piece);
-                let hit = slot.stop.push(&slot.scratch, emit);
-                slot.scratch.clear();
-                slot.generated.push(slot.tok);
-                if hit {
-                    slot.pending.clear();
-                    slot.phase = Phase::Done(FinishReason::Stop);
-                    continue;
+                continue;
+            }
+            s.row = session.batch_push(s.tok, s.pos, s.seq, true)?;
+            s.chunk = 0;
+            s.in_batch = true;
+            n_gen += 1;
+        }
+    }
+    let mut stream_cancel = None;
+    if let Some(j) = joiner
+        && (stream_mode || !joiner_streams)
+    {
+        let s = &mut slots[j];
+        if let Phase::Prefill(a) = &mut s.phase {
+            let (len, stream) = session.next_chunk(&a.ffi, n_gen as usize);
+            if len > 0 {
+                if a.ffi.chunks == 0 {
+                    session.prefill_begin(&mut a.ffi);
                 }
-                // One KV slot stays free: never decode at pos >= n_ctx_seq - 1.
-                let n = slot.generated.len() as u32;
-                if n >= slot.limit || slot.pos + 1 >= session.n_ctx_seq() as usize {
-                    slot.done(FinishReason::Length, emit);
-                    continue;
+                s.row = session.push_chunk(&a.ffi, s.seq, len)?;
+                s.chunk = len;
+                s.in_batch = true;
+                session.rr = (j + 1) % n;
+                if stream {
+                    stream_cancel = s.cancel.clone();
                 }
-                if slot.cancelled() {
-                    slot.done(FinishReason::Cancelled, emit);
-                    continue;
-                }
-                if !session.decode(&mut a.ffi, slot.seq, slot.tok, slot.pos, n, t0)? {
-                    slot.done(FinishReason::Cancelled, emit);
-                    continue;
-                }
-                slot.pos += 1;
-                slot.tok = session.sample(&a.sampler, &a.ffi, 0, slot.parity.as_mut(), n);
-                slot.phase = Phase::Decode(a);
             }
         }
     }
+    if !slots.iter().any(|s| s.in_batch) {
+        return Ok(());
+    }
+
+    let t0 = std::time::Instant::now();
+    let step_no = slots
+        .iter()
+        .filter(|s| s.in_batch && s.chunk == 0)
+        .map(|s| s.generated.len() as u64)
+        .max()
+        .unwrap_or(1)
+        .saturating_sub(1);
+    session.abort.arm(
+        slots
+            .iter()
+            .filter(|s| s.in_batch)
+            .map(|s| s.cancel.as_ref()),
+    );
+    let res = session.run_batch(stream_cancel.as_ref(), n_gen, step_no, t0);
+    session.abort.clear();
+    if stream_mode {
+        session.decode_since_stream = 0;
+    } else if n_gen > 0 {
+        session.decode_since_stream = session.decode_since_stream.saturating_add(1);
+    }
+
+    match res {
+        Ok(true) => {}
+        Ok(false) => {
+            // Aborted: every participant was cancelled.
+            for (i, s) in slots.iter_mut().enumerate().filter(|(_, s)| s.in_batch) {
+                session.seq_rm(s.seq);
+                s.done(FinishReason::Cancelled, &mut |t| emit(i, t));
+            }
+            return Ok(());
+        }
+        Err(e) if !recover => return Err(e),
+        Err(e) => {
+            let e = session.recover_slab(e);
+            tracing::warn!(error = %e, "batch decode failed: resetting its sequences");
+            for (i, s) in slots.iter_mut().enumerate().filter(|(_, s)| s.in_batch) {
+                recover_slot(session, s, &e, &mut |t| emit(i, t));
+            }
+            return Ok(());
+        }
+    }
+
+    for s in slots.iter_mut().filter(|s| s.in_batch) {
+        let (Phase::Prefill(a) | Phase::Decode(a)) = &mut s.phase else {
+            continue;
+        };
+        if s.chunk == 0 {
+            s.pos += 1;
+            let n = s.generated.len() as u32;
+            s.tok = session.sample(&a.sampler, &a.ffi, s.row, s.parity.as_mut(), n);
+            session.verify_decode(&a.ffi)?;
+            continue;
+        }
+        a.ffi.n_past += s.chunk;
+        a.ffi.chunks += 1;
+        if a.ffi.chunks == session.test_cancel_after_chunks
+            && let Some(c) = &s.cancel
+        {
+            c.store(true, Ordering::Relaxed);
+        }
+        if a.ffi.n_past < a.ffi.prompt.len() {
+            continue;
+        }
+        session.prefill_end(&a.ffi)?;
+        if !a.ffi.replay {
+            session.snapshot_prompt(&a.ffi, s.seq);
+        }
+        if s.limit == 0 {
+            s.phase = Phase::Done(FinishReason::Length);
+            continue;
+        }
+        s.pos = a.ffi.prompt.len();
+        if n_dec == 0 && n_gen == 0 {
+            session.start_decode()?;
+        }
+        let n = s.generated.len() as u32;
+        s.tok = session.sample(&a.sampler, &a.ffi, s.row, s.parity.as_mut(), n);
+        let Phase::Prefill(a) = std::mem::replace(&mut s.phase, Phase::Idle) else {
+            unreachable!("matched Prefill above");
+        };
+        s.phase = Phase::Decode(a);
+    }
     Ok(())
+}
+
+/// One participant of a failed batch: its sequence is gone. A prefilling
+/// slot restarts its prefill; a greedy generating slot re-prefills
+/// `prompt ++ generated` (already-sent text is never re-emitted); a sampled
+/// one cannot replay its RNG/penalty state and fails.
+fn recover_slot(
+    session: &mut SessionInner,
+    s: &mut SlotState,
+    e: &EngineError,
+    emit: &mut dyn FnMut(&str),
+) {
+    session.seq_rm(s.seq);
+    s.failures += 1;
+    let fail = |s: &mut SlotState, emit: &mut dyn FnMut(&str), msg: String| {
+        s.flush_text(emit);
+        s.phase = Phase::Failed(EngineError::BackendUnavailable(msg));
+    };
+    if s.failures > 1 {
+        fail(s, emit, format!("decode failed twice: {e}"));
+        return;
+    }
+    match std::mem::replace(&mut s.phase, Phase::Idle) {
+        Phase::Prefill(mut a) => {
+            a.ffi.n_past = session.restore_into(s.seq, &a.ffi.prompt);
+            a.ffi.chunks = 0;
+            s.phase = Phase::Prefill(a);
+        }
+        Phase::Decode(mut a) if s.replayable => {
+            a.ffi.prompt.extend_from_slice(&s.generated);
+            a.ffi.n_past = session.restore_into(s.seq, &a.ffi.prompt);
+            a.ffi.chunks = 0;
+            a.ffi.replay = true;
+            s.phase = Phase::Prefill(a);
+        }
+        Phase::Decode(_) => fail(
+            s,
+            emit,
+            "decode failed, sampled output cannot be resumed".into(),
+        ),
+        p => s.phase = p,
+    }
 }
 
 #[cfg(test)]
