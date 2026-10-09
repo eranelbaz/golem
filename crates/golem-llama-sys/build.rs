@@ -90,13 +90,13 @@ fn main() {
     let pin_skipped = run_pin_gate(&repo_root);
     let binary_dir = build_substrate(&repo_root, resolved, &out_dir, pin_skipped);
 
-    if !pin_skipped {
-        if let Err(e) = pin_gate::verify_pin(
+    if !pin_skipped
+        && let Err(e) = pin_gate::verify_pin(
             &repo_root.join("vendor/llama.cpp"),
             &repo_root.join("vendor/VENDOR_SHA"),
-        ) {
-            panic!("pin gate RE-CHECK after the cmake build failed: {e}");
-        }
+        )
+    {
+        panic!("pin gate RE-CHECK after the cmake build failed: {e}");
     }
 
     println!(

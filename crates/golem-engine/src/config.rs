@@ -11,8 +11,12 @@ pub struct EngineConfig {
     pub n_ctx: u32,
     /// Maximum tokens per llama_decode batch.
     pub batch_tokens: u32,
-    /// Maximum tokens to generate per completion.
+    /// Maximum tokens to generate per completion (a request's `max_tokens`
+    /// overrides it).
     pub n_predict: u32,
+    /// Decode slots (concurrent sequences). Only 1 is accepted until the
+    /// multi-slot scheduler lands.
+    pub parallel: u32,
     /// Decode threads (§7.2 as amended: logical CPUs / 2, min 1 — CPU-side
     /// ops still run on these: sampling, the non-offloaded tail, tokenizer,
     /// ids readback).
@@ -130,6 +134,7 @@ impl Default for EngineConfig {
             n_ctx: 256,
             batch_tokens: 512,
             n_predict: 64,
+            parallel: 1,
             threads: std::thread::available_parallelism()
                 .map(|n| (n.get() / 2).max(1) as u32)
                 .unwrap_or(1),

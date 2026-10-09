@@ -134,12 +134,12 @@ fn run_trace(seed: u64, misbehave: bool) -> (Vec<String>, usize, usize) {
         let out = p.pass(step);
         // property 1: the top of the previous pass's VRAM order is still
         // resident (no thrash at the head of the ranking)
-        if step > WARMUP {
-            if let Some(top) = &prev_top {
-                for &k in top {
-                    if !p.residency(k, Tier::Vram) {
-                        violations.push(format!("step {step}: vram top key {k} lost residency"));
-                    }
+        if step > WARMUP
+            && let Some(top) = &prev_top
+        {
+            for &k in top {
+                if !p.residency(k, Tier::Vram) {
+                    violations.push(format!("step {step}: vram top key {k} lost residency"));
                 }
             }
         }

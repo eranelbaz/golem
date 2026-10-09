@@ -174,36 +174,37 @@ impl ReplicaSlot {
     /// a one-way fallback to buffered + `DONTNEED` — never a degrade. The
     /// buffered fallback never populates the page cache.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        let aligned = offset % DIRECT_ALIGN == 0
-            && buf.len() as u64 % DIRECT_ALIGN == 0
-            && buf.as_ptr() as u64 % DIRECT_ALIGN == 0;
-        if aligned && self.direct_ok() {
-            if let Some(d) = &self.direct {
-                if let Err(e) = d.read_full(offset, buf) {
-                    if self.direct_ok.swap(false, Ordering::Relaxed) {
-                        tracing::warn!(
-                            path = %self.path.display(),
-                            error = %e,
-                            "O_DIRECT replica read failed; slot falls back to buffered + DONTNEED"
-                        );
-                    }
-                } else {
-                    self.served_chunks.fetch_add(1, Ordering::Relaxed);
-                    self.served_direct.fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
+        let aligned = offset.is_multiple_of(DIRECT_ALIGN)
+            && (buf.len() as u64).is_multiple_of(DIRECT_ALIGN)
+            && (buf.as_ptr() as u64).is_multiple_of(DIRECT_ALIGN);
+        if aligned
+            && self.direct_ok()
+            && let Some(d) = &self.direct
+        {
+            if let Err(e) = d.read_full(offset, buf) {
+                if self.direct_ok.swap(false, Ordering::Relaxed) {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %e,
+                        "O_DIRECT replica read failed; slot falls back to buffered + DONTNEED"
+                    );
                 }
+            } else {
+                self.served_chunks.fetch_add(1, Ordering::Relaxed);
+                self.served_direct.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
             }
         }
         self.buffered.read_full(offset, buf)?;
         self.served_chunks.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self.buffered.drop_cache(offset, buf.len()) {
-            if self.warned_dontneed.swap(false, Ordering::Relaxed) {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "POSIX_FADV_DONTNEED failed; page-cache pressure only"
-                );
-            }
+        if let Err(e) = self.buffered.drop_cache(offset, buf.len())
+            && self.warned_dontneed.swap(false, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "POSIX_FADV_DONTNEED failed; page-cache pressure only"
+            );
         }
         Ok(())
     }
@@ -393,14 +394,13 @@ pub fn parent_device_name(partition: &str) -> Option<String> {
         return Some(partition.to_owned());
     }
     // nvme/mmcblk namespace partitions carry `p<N>` after a device index.
-    if let Some((head, tail)) = partition.rsplit_once('p') {
-        if !head.is_empty()
-            && !tail.is_empty()
-            && tail.bytes().all(|b| b.is_ascii_digit())
-            && head.bytes().any(|b| b.is_ascii_digit())
-        {
-            return Some(head.to_owned());
-        }
+    if let Some((head, tail)) = partition.rsplit_once('p')
+        && !head.is_empty()
+        && !tail.is_empty()
+        && tail.bytes().all(|b| b.is_ascii_digit())
+        && head.bytes().any(|b| b.is_ascii_digit())
+    {
+        return Some(head.to_owned());
     }
     let base = partition.trim_end_matches(|b: char| b.is_ascii_digit());
     if base.is_empty() || !base.bytes().any(|b| b.is_ascii_alphabetic()) {

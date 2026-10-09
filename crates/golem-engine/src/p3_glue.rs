@@ -2142,10 +2142,10 @@ pub extern "C" fn routing(
         }
         // Prefill-stream read-ahead (§7.6.3): this layer's ids are known —
         // warm its up/down planes and the next layer's whole gate plane.
-        if h.stream_armed.load(Ordering::Relaxed) {
-            if let Some(s) = &h.stream {
-                s.warm(layer as u32, ids);
-            }
+        if h.stream_armed.load(Ordering::Relaxed)
+            && let Some(s) = &h.stream
+        {
+            s.warm(layer as u32, ids);
         }
     })
 }

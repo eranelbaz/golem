@@ -504,13 +504,13 @@ impl<'g> Sim<'g> {
                     .decayed(a, now)
                     .total_cmp(&self.vram.decayed(b, now))
             });
-            if let Some(w) = weakest {
-                if self.vram.members[layer].len() as u64 >= self.vram.cap[layer] {
-                    if score < SWAP_MARGIN * self.vram.decayed(w, now) {
-                        continue;
-                    }
-                    self.vram.remove(w);
+            if let Some(w) = weakest
+                && self.vram.members[layer].len() as u64 >= self.vram.cap[layer]
+            {
+                if score < SWAP_MARGIN * self.vram.decayed(w, now) {
+                    continue;
                 }
+                self.vram.remove(w);
             }
             self.vram.insert(k, now);
             done += 1;

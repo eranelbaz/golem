@@ -543,12 +543,12 @@ pub fn compare_t2(
     threshold_pct: f64,
     gpu_dev_bound: Option<f64>,
 ) -> Result<T2Report, CompareError> {
-    if let Some(b) = gpu_dev_bound {
-        if !b.is_finite() || b < 0.0 {
-            return Err(CompareError::Usage(format!(
-                "gpu-dev-bound must be finite and >= 0, got {b}"
-            )));
-        }
+    if let Some(b) = gpu_dev_bound
+        && (!b.is_finite() || b < 0.0)
+    {
+        return Err(CompareError::Usage(format!(
+            "gpu-dev-bound must be finite and >= 0, got {b}"
+        )));
     }
     if !epsilon.is_finite() || epsilon < 0.0 {
         return Err(CompareError::Usage(format!(

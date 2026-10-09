@@ -500,7 +500,7 @@ impl ExpertSource for StoreExpertSource {
         // no copy.
         if head == logical_at
             && into.len() >= covering
-            && into.as_ptr() as usize % DIRECT_ALIGN as usize == 0
+            && (into.as_ptr() as usize).is_multiple_of(DIRECT_ALIGN as usize)
         {
             return self.drain(p.shard, offset, stride, expected, &mut into[..covering]);
         }
@@ -576,8 +576,8 @@ impl ExpertSource for StoreExpertSource {
                 let logical_at = (offset % DIRECT_ALIGN) as usize;
                 let in_place = (*head == logical_at
                     && into.len() >= covering
-                    && into.as_ptr() as usize % page == 0)
-                    .then_some(i);
+                    && (into.as_ptr() as usize).is_multiple_of(page))
+                .then_some(i);
                 if in_place.is_none() {
                     scratch_planes.push(i);
                 }

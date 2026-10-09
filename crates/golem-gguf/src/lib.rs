@@ -238,7 +238,7 @@ pub fn ggml_type_block(ggml_type: u32) -> Option<(u64, u64)> {
 #[must_use]
 pub fn ggml_row_bytes(ggml_type: u32, ne0: u64) -> Option<u64> {
     let (blck, size) = ggml_type_block(ggml_type)?;
-    if ne0 % blck != 0 {
+    if !ne0.is_multiple_of(blck) {
         return None;
     }
     (ne0 / blck).checked_mul(size)
@@ -304,10 +304,10 @@ impl ExpertKind {
         }
         let base = name.strip_suffix(".weight").unwrap_or(name);
         for kind in Self::ALL {
-            if let Some(prefix) = base.strip_suffix(kind.stem()) {
-                if prefix.is_empty() || prefix.ends_with('.') {
-                    return Some(kind);
-                }
+            if let Some(prefix) = base.strip_suffix(kind.stem())
+                && (prefix.is_empty() || prefix.ends_with('.'))
+            {
+                return Some(kind);
             }
         }
         None

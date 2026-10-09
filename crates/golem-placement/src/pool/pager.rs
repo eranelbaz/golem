@@ -1096,11 +1096,11 @@ mod tests {
         ) -> io::Result<()> {
             let k = key(4, N_EXPERTS, layer, expert).unwrap();
             let mut errors = self.errors.lock().unwrap();
-            if let Some(n) = errors.get_mut(&k) {
-                if *n > 0 {
-                    *n -= 1;
-                    return Err(io::Error::other("injected source failure"));
-                }
+            if let Some(n) = errors.get_mut(&k)
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(io::Error::other("injected source failure"));
             }
             drop(errors);
             assert_eq!(into.len() - head, self.stride);

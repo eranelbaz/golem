@@ -117,18 +117,17 @@ pub fn validate(
             .and_then(|n| n.as_str())
             .map(str::to_owned)
     };
-    if let Some(name) = req.tool_choice.as_ref().and_then(fn_name) {
-        if !req
+    if let Some(name) = req.tool_choice.as_ref().and_then(fn_name)
+        && !req
             .tools
             .iter()
             .flatten()
             .any(|t| fn_name(t).as_deref() == Some(name.as_str()))
-        {
-            return Err(err(
-                ErrorCode::InvalidRequest,
-                format!("tool_choice names `{name}`, which is not in `tools`"),
-            ));
-        }
+    {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            format!("tool_choice names `{name}`, which is not in `tools`"),
+        ));
     }
     if req.messages.iter().any(|m| matches!(m.content, Some(MessageContent::Parts(ref p)) if p.iter().any(|p| p.kind != "text"))) {
         return Err(err(ErrorCode::MultimodalUnsupported, "only text content parts are supported".into()));

@@ -33,6 +33,17 @@ pub enum EngineError {
     /// llama_decode returned nonzero (positive: no KV slot / aborted; negative: fatal).
     #[error("llama_decode failed with code {0}")]
     Decode(i32),
+    /// Prompt does not fit the per-sequence context (`llama_n_ctx_seq`).
+    #[error("prompt is {prompt} tokens; context holds {n_ctx}")]
+    ContextOverflow {
+        /// Prompt length in tokens.
+        prompt: u32,
+        /// `llama_n_ctx_seq` of the live context.
+        n_ctx: u32,
+    },
+    /// llama_sampler_chain_init returned null.
+    #[error("llama_sampler_chain_init returned null")]
+    SamplerInit,
     /// llama_get_logits_ith returned null after a successful decode — the
     /// substrate broke the logits-output FFI contract.
     #[error("llama_get_logits_ith returned null after a successful decode")]

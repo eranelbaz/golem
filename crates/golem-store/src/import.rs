@@ -330,13 +330,13 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
         }
     }
 
-    if let Some(want) = want_tensors {
-        if total_tensors != want {
-            return Err(source(
-                &first_path,
-                format!("split.tensors.count {want} != {total_tensors} tensors across shards"),
-            ));
-        }
+    if let Some(want) = want_tensors
+        && total_tensors != want
+    {
+        return Err(source(
+            &first_path,
+            format!("split.tensors.count {want} != {total_tensors} tensors across shards"),
+        ));
     }
     planes.sort_by(|a, b| (&a.layer, &a.tensor).cmp(&(&b.layer, &b.tensor)));
     if let Some(dup) = planes.windows(2).find(|w| w[0].tensor == w[1].tensor) {

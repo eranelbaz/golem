@@ -990,24 +990,24 @@ mod tests {
             if let Some(flag) = &self.wait_for_pair {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-                    if let Some(c) = &self.conc {
-                        if c.active.load(Ordering::SeqCst) >= 2 {
-                            flag.store(true, Ordering::SeqCst);
-                            break;
-                        }
+                    if let Some(c) = &self.conc
+                        && c.active.load(Ordering::SeqCst) >= 2
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
-            if let Some(g) = &self.gate {
-                if let Some(w) = g.wait_until {
-                    while g.done.load(Ordering::SeqCst) < w {
-                        assert!(
-                            start.elapsed() < std::time::Duration::from_secs(30),
-                            "gate deadline exceeded: fast replica stalled"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
+            if let Some(g) = &self.gate
+                && let Some(w) = g.wait_until
+            {
+                while g.done.load(Ordering::SeqCst) < w {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(30),
+                        "gate deadline exceeded: fast replica stalled"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
             // usize::MAX = always fail (never decremented).
@@ -1018,10 +1018,10 @@ mod tests {
             }
             self.fail_nth.fetch_sub(1, Ordering::SeqCst);
             self.inner.read_at(offset, buf)?;
-            if let Some(g) = &self.gate {
-                if g.bump {
-                    g.done.fetch_add(1, Ordering::SeqCst);
-                }
+            if let Some(g) = &self.gate
+                && g.bump
+            {
+                g.done.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
         }

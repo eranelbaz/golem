@@ -19,11 +19,11 @@ fn fixture_name() -> String {
 static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn fixture() -> PathBuf {
-    if let Some(path) = FIXTURE.get() {
-        if let Some(sha) = verify_memoized_hash(path) {
-            println!("fixture-ok: {sha} {}", path.display());
-            return path.clone();
-        }
+    if let Some(path) = FIXTURE.get()
+        && let Some(sha) = verify_memoized_hash(path)
+    {
+        println!("fixture-ok: {sha} {}", path.display());
+        return path.clone();
     }
     let path = resolve();
     let _ = FIXTURE.set(path.clone());

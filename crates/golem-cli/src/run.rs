@@ -335,13 +335,13 @@ fn infer_defaults(
     explicit_gpu_layers: Option<u32>,
 ) -> Vec<&'static str> {
     let mut inferred = Vec::new();
-    if config.manifest_path.is_none() {
-        if let Some(dir) = config.model_path.parent() {
-            let m = dir.join("manifest.json");
-            if m.is_file() {
-                config.manifest_path = Some(m);
-                inferred.push("manifest");
-            }
+    if config.manifest_path.is_none()
+        && let Some(dir) = config.model_path.parent()
+    {
+        let m = dir.join("manifest.json");
+        if m.is_file() {
+            config.manifest_path = Some(m);
+            inferred.push("manifest");
         }
     }
     if explicit_gpu_layers.is_none()
@@ -436,15 +436,15 @@ fn preflight_ram_pool(
     let suggest_gib =
         suggest_pool_gib(model, manifest).unwrap_or((free * 3 / 4 / (1 << 30)).max(1));
 
-    if let Some(limit) = memlock_limit() {
-        if want_bytes > limit {
-            return Err(format!(
-                "--ram-experts-gib {gib} needs {want_bytes} B locked but RLIMIT_MEMLOCK \
+    if let Some(limit) = memlock_limit()
+        && want_bytes > limit
+    {
+        return Err(format!(
+            "--ram-experts-gib {gib} needs {want_bytes} B locked but RLIMIT_MEMLOCK \
                  is {limit} B.\nRaise it: `ulimit -l unlimited` (or systemd `LimitMEMLOCK=\
                  infinity`), or size the pool down, e.g. --ram-experts-gib {suggest_gib}"
-            )
-            .into());
-        }
+        )
+        .into());
     }
     if want_bytes > free * 3 / 4 {
         return Err(format!(

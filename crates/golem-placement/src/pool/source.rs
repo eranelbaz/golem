@@ -309,7 +309,9 @@ impl Plane {
     /// differ, so the plane always takes the buffered path). Real targets
     /// qualify: GLM-5.3-Flash expert planes are whole multiples of 4096 B.
     fn head(&self) -> Option<u64> {
-        (self.stride % DIRECT_ALIGN == 0).then_some(self.base % DIRECT_ALIGN)
+        self.stride
+            .is_multiple_of(DIRECT_ALIGN)
+            .then_some(self.base % DIRECT_ALIGN)
     }
 }
 
@@ -462,10 +464,10 @@ impl GgufPreadSource {
                 if blk < n_dense_lead {
                     continue; // dense lead carries no expert tensors
                 }
-                if let Some(mtp_from) = mtp_from {
-                    if u64::from(blk) >= mtp_from {
-                        continue; // MTP/NextN block: skipped at load
-                    }
+                if let Some(mtp_from) = mtp_from
+                    && u64::from(blk) >= mtp_from
+                {
+                    continue; // MTP/NextN block: skipped at load
                 }
                 if blk > MAX_BLOCKS {
                     return Err(SourceError::BlockOutOfRange { name: e.name });
@@ -584,7 +586,9 @@ impl GgufPreadSource {
         let file_start = start - plane_head;
         let len = (plane_head + p.stride).next_multiple_of(DIRECT_ALIGN);
         let buf = into.get_mut(..usize::try_from(len).ok()?)?;
-        if buf.as_ptr() as u64 % DIRECT_ALIGN != 0 || file_start % DIRECT_ALIGN != 0 {
+        if !(buf.as_ptr() as u64).is_multiple_of(DIRECT_ALIGN)
+            || !file_start.is_multiple_of(DIRECT_ALIGN)
+        {
             return None;
         }
         let want = head + p.stride as usize; // bytes that must arrive
@@ -644,7 +648,7 @@ fn read_full(
         if done >= want {
             return Ok(Fill::Done);
         }
-        if off % align != 0 {
+        if !off.is_multiple_of(align) {
             return Ok(Fill::Unaligned);
         }
     }
