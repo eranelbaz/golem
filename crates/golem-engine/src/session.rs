@@ -901,14 +901,17 @@ impl Session {
         emit: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, EngineError> {
         let mut res = self.drive(req, emit);
+        // Every decode of a live session (prefill chunks, generation steps)
+        // runs inside `drive`, so this is the one slab-failure recovery site;
+        // load's self-check decode fails the load instead.
         if let Err(EngineError::Decode(-2)) = res
-            && let Some(k) = self
-                .inner
-                .p3
-                .as_mut()
-                .and_then(|p| p.shrink_after_slab_failure())
+            && let Some(p) = self.inner.p3.as_mut()
         {
-            res = Err(EngineError::DeviceCacheDegraded(k));
+            match p.shrink_after_slab_failure() {
+                Ok(Some(k)) => res = Err(EngineError::DeviceCacheDegraded(k)),
+                Ok(None) => {}
+                Err(e) => res = Err(e),
+            }
         }
         if res.is_err() {
             self.slots[0].flush_text(emit);

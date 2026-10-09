@@ -53,3 +53,27 @@ fn slab_alloc_failure_degrades_and_keeps_serving() {
     let after = expert_placement();
     assert_eq!(after.on_cpu, before.on_cpu, "expert math left the GPU");
 }
+
+#[test]
+fn slab_alloc_failure_at_top_k_floor_is_fatal() {
+    let mut cfg = common::offload::offload_config();
+    cfg.ram_experts_gib = 1;
+    cfg.device_cache_experts = N_EXPERT_USED;
+    cfg.n_predict = 8;
+    let mut s = Session::new(&cfg).expect("pooled offload session");
+    assert_eq!(s.p3_hooks().unwrap().device_cache_experts, N_EXPERT_USED);
+    let msgs = [ChatTurn {
+        role: "user",
+        content: "hello",
+    }];
+    let ctx = s.p3_ctx_ptr().expect("pooled ⇒ live ctx");
+    // SAFETY: as above — between turns, on the session's live ctx.
+    unsafe {
+        golem_llama_sys::raw::golem_reset_device_cache(ctx);
+        golem_llama_sys::raw::golem_inject_slab_alloc_failure(ctx, 1);
+    }
+    let err = s
+        .turn(&TurnRequest::new(&msgs), &mut |_| {})
+        .expect_err("injected slab failure must fail the turn");
+    assert!(matches!(err, EngineError::BackendUnavailable(_)), "{err}");
+}

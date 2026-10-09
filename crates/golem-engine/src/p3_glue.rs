@@ -924,19 +924,27 @@ impl SessionHooks {
     /// After a `llama_decode` −2: when C reports a new device-slab allocation
     /// failure (ABI v12), frees every slab, halves K (never below top-k) and
     /// returns it; `None` when the −2 was not a slab failure. The next compute
-    /// reallocates the smaller slabs; the session serves degraded.
-    pub(crate) fn shrink_after_slab_failure(&mut self) -> Option<u32> {
+    /// reallocates the smaller slabs; the session serves degraded. A failure
+    /// with K already at top-k cannot shrink further → `BackendUnavailable`
+    /// (fatal: one routed layer no longer fits on the device).
+    pub(crate) fn shrink_after_slab_failure(&mut self) -> Result<Option<u32>, EngineError> {
         let ctx = self.ctx_ptr();
         // SAFETY: FFI counter read on the live ctx.
         let failures = unsafe { raw::golem_slab_alloc_failures(ctx) };
         if failures == self.slab_failures_seen {
-            return None;
+            return Ok(None);
         }
         self.slab_failures_seen = failures;
         // SAFETY: FFI on the live ctx between computes (the failed decode
         // was synchronized; no slab in flight).
         unsafe { raw::golem_reset_device_cache(ctx) };
         self.device_cache_reset();
+        if self.device_cache_experts <= self.top_k {
+            return Err(EngineError::BackendUnavailable(format!(
+                "device expert-cache slab allocation failed at the K = top-k = {} floor",
+                self.top_k
+            )));
+        }
         let k = (self.device_cache_experts / 2).max(self.top_k);
         // SAFETY: FFI setter on the live ctx between computes.
         unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
@@ -947,7 +955,7 @@ impl SessionHooks {
              cache reset and shrunk, serving degraded"
         );
         self.device_cache_experts = k;
-        Some(k)
+        Ok(Some(k))
     }
 
     /// Whether prefill streaming is enabled for this session.

@@ -2377,7 +2377,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     node2->src[2]->ne[0], node2->src[2]->ne[1]);
                                 GGML_ASSERT(st.ids_dev != nullptr);
                                 st.ids_buf = ggml_backend_alloc_ctx_tensors(st.ids_ctx, split_backend);
-                                GGML_ASSERT(st.ids_buf != nullptr);
+                                if (st.ids_buf == nullptr) {
+                                    // Same ABI v12 path as the slab: fail the compute.
+                                    ggml_free(st.ids_ctx);
+                                    st.ids_ctx = nullptr;
+                                    st.ids_dev = nullptr;
+                                    st.ids_ne0 = st.ids_ne1 = 0;
+                                    gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+                                    golem_slab_failed = true;
+                                    break;
+                                }
                                 st.ids_ne0 = node2->src[2]->ne[0];
                                 st.ids_ne1 = node2->src[2]->ne[1];
                                 // Pinned staging for the H2D below: (re)allocated
