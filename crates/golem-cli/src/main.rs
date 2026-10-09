@@ -1,4 +1,4 @@
-//! `golem` CLI entry point (tech design §9): run.
+//! `golem` CLI entry point (tech design §9): run, serve.
 //! Bare `golem` (no subcommand) prints the version.
 //! Future: `golem import` (§5.5 store intake: hash + CRC + mirror a shard
 //! set into `$GOLEM_DATA_DIR`; `golem_store::import` already implements it).
@@ -6,9 +6,10 @@
 use clap::{Parser, Subcommand};
 
 mod run;
+mod serve;
 
 #[derive(Parser)]
-#[command(name = "golem", version, about = "golem CLI: run")]
+#[command(name = "golem", version, about = "golem CLI: run, serve")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -26,6 +27,12 @@ enum Command {
         greedy: bool,
         #[command(flatten)]
         args: run::RunArgs,
+    },
+    /// Serve a local GGUF model over the OpenAI-compatible HTTP API until
+    /// SIGINT/SIGTERM.
+    Serve {
+        #[command(flatten)]
+        args: serve::ServeArgs,
     },
 }
 
@@ -60,9 +67,18 @@ fn main() {
             }
             run::run(&args)
         }
+        Some(Command::Serve { args }) => serve::serve(&args),
     };
     if let Err(e) = status {
         eprintln!("error: {e}");
+        // The decode worker is leaked mid-`llama_decode`: exit now, skipping
+        // pool teardown (the kernel reclaims it).
+        if matches!(
+            e.downcast_ref::<golem_server::ServeError>(),
+            Some(golem_server::ServeError::ShutdownTimeout(_))
+        ) {
+            std::process::exit(3);
+        }
         std::process::exit(1);
     }
 }

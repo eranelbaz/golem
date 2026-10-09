@@ -30,6 +30,19 @@ pub struct RunArgs {
     /// One-shot prompt text; when omitted, the stdin chat REPL runs instead.
     #[arg(long)]
     pub prompt: Option<String>,
+    /// Write a T2 parity dump (JSONL: line-1 header, then one record per
+    /// generation step) to this file instead of streaming the completion;
+    /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
+    /// never a path.
+    #[arg(long, value_name = "FILE")]
+    pub parity_dump: Option<PathBuf>,
+    #[command(flatten)]
+    pub engine: EngineArgs,
+}
+
+/// Engine flags shared by `run` and `serve`.
+#[derive(Debug, clap::Args)]
+pub struct EngineArgs {
     /// Maximum tokens to generate per completion (engine §7.2 default: 64).
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
     pub n_predict: u32,
@@ -84,12 +97,6 @@ pub struct RunArgs {
     /// `manifest.json` next to the model file, when present.
     #[arg(long, value_name = "PATH")]
     pub manifest: Option<PathBuf>,
-    /// Write a T2 parity dump (JSONL: line-1 header, then one record per
-    /// generation step) to this file instead of streaming the completion;
-    /// requires `--prompt`. Model identity in the dump is sha256 + byte size,
-    /// never a path.
-    #[arg(long, value_name = "FILE")]
-    pub parity_dump: Option<PathBuf>,
     /// §11 per-step timing CSV destination: opened/truncated with a header
     /// (engine version, fork commit, resolved config), then one row per
     /// generation decode step, flushed at each turn end. H2D columns are
@@ -170,7 +177,7 @@ fn parse_vram_order(s: &str) -> Result<VramOrder, String> {
     }
 }
 
-impl RunArgs {
+impl EngineArgs {
     /// Maps the CLI surface onto `EngineConfig` (flag name ↔ config field):
     /// `--ctx` → `n_ctx`, `--threads` → `threads`, `--n-gpu-layers` →
     /// `n_gpu_layers`, `--flash-attn` → `flash_attn_on`, `--cpu-moe-layers`
@@ -207,21 +214,13 @@ impl RunArgs {
     }
 }
 
-/// Runs one greedy `run` invocation: loads the model, then either prints a
-/// single completion (`--prompt`) or serves a multi-turn chat REPL
-/// on stdin until EOF. Returns `Err` for load/init failures and one-shot
-/// decode errors (process unusable); per-turn REPL errors are printed and the
-/// loop continues.
-pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
-    let model = match args.model.clone() {
-        Some(m) => m,
-        // No model: main() already printed the run help.
-        None => return Ok(()),
-    };
-    let mut config = args.to_config(model.clone());
+/// Resolves the engine flags for `model`: §9 inference (printed), flag
+/// cross-checks, and the RAM pool preflight — shared by `run` and `serve`.
+pub fn engine_config(engine: &EngineArgs, model: &Path) -> Result<EngineConfig, Box<dyn Error>> {
+    let mut config = engine.to_config(model.to_path_buf());
     // §9 inference: explicit flags already won in `to_config`; fill the rest
     // from the model folder and the compiled backend.
-    let inferred = infer_defaults(&mut config, args.n_gpu_layers);
+    let inferred = infer_defaults(&mut config, engine.n_gpu_layers);
     if !inferred.is_empty() {
         eprintln!(
             "golem: inferred {}",
@@ -243,26 +242,6 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
                 .join(", ")
         );
     }
-    // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
-    let mut timing_out = match &config.timing_csv {
-        Some(path) => {
-            let mut f = std::fs::File::create(path)?;
-            TimingRecorder::header(
-                &mut f,
-                env!("CARGO_PKG_VERSION"),
-                &fork_commit(),
-                &resolved_config_line(&config),
-            )?;
-            f.flush()?;
-            Some(f)
-        }
-        None => None,
-    };
-    // Routing trace (§2.3 step 4): same turn-end flush lifecycle as the CSV.
-    let mut trace_out = match &config.routing_trace {
-        Some(path) => Some(std::fs::File::create(path)?),
-        None => None,
-    };
     // §3.4 P3: the store path only exists behind the RAM expert pool; a
     // --manifest without the pool would silently decode off the plain GGUF
     // path while the user believes replicas are serving experts.
@@ -289,11 +268,46 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     }
     if config.ram_experts_gib > 0 {
         preflight_ram_pool(
-            &model,
+            model,
             config.manifest_path.as_deref(),
             config.ram_experts_gib,
         )?;
     }
+    Ok(config)
+}
+
+/// Runs one greedy `run` invocation: loads the model, then either prints a
+/// single completion (`--prompt`) or serves a multi-turn chat REPL
+/// on stdin until EOF. Returns `Err` for load/init failures and one-shot
+/// decode errors (process unusable); per-turn REPL errors are printed and the
+/// loop continues.
+pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
+    let model = match args.model.clone() {
+        Some(m) => m,
+        // No model: main() already printed the run help.
+        None => return Ok(()),
+    };
+    let config = engine_config(&args.engine, &model)?;
+    // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
+    let mut timing_out = match &config.timing_csv {
+        Some(path) => {
+            let mut f = std::fs::File::create(path)?;
+            TimingRecorder::header(
+                &mut f,
+                env!("CARGO_PKG_VERSION"),
+                &fork_commit(),
+                &resolved_config_line(&config),
+            )?;
+            f.flush()?;
+            Some(f)
+        }
+        None => None,
+    };
+    // Routing trace (§2.3 step 4): same turn-end flush lifecycle as the CSV.
+    let mut trace_out = match &config.routing_trace {
+        Some(path) => Some(std::fs::File::create(path)?),
+        None => None,
+    };
     let mut session = Session::new(&config)?;
     if let Some(k) = session.device_cache_experts() {
         eprintln!("golem: device cache {k} expert slots per layer");
@@ -301,7 +315,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
 
     let result = match (&args.prompt, &args.parity_dump) {
         (Some(prompt), Some(dump)) => {
-            one_shot_parity(&mut session, &model, prompt, dump, args.n_predict)
+            one_shot_parity(&mut session, &model, prompt, dump, args.engine.n_predict)
         }
         (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out, &mut trace_out),
         // The dump records exactly one prompt (header `prompt_tokens`), so a
@@ -959,7 +973,9 @@ mod tests {
         // Bare args: manifest found next to the model, then rolled back — a
         // junk manifest carries no expert bytes, so no pool size can be
         // inferred and keeping the manifest would hard-error the run.
-        let mut config = parse_run_args(&["run", "model.gguf"]).to_config("model.gguf".into());
+        let mut config = parse_run_args(&["run", "model.gguf"])
+            .engine
+            .to_config("model.gguf".into());
         config.model_path = model.clone();
         let inferred = infer_defaults(&mut config, None);
         assert_eq!(
@@ -984,6 +1000,7 @@ mod tests {
         // Explicit `--n-gpu-layers 0` keeps the run CPU-only even on HIP
         // builds — the CPU-leg repro on GPU hardware must stay reachable.
         let mut config = parse_run_args(&["run", "--n-gpu-layers", "0", "model.gguf"])
+            .engine
             .to_config("model.gguf".into());
         config.model_path = model.clone();
         infer_defaults(&mut config, Some(0));
@@ -1000,6 +1017,7 @@ mod tests {
             "/elsewhere/manifest.json",
             "model.gguf",
         ])
+        .engine
         .to_config("model.gguf".into());
         config.model_path = model;
         infer_defaults(&mut config, Some(7));
@@ -1014,7 +1032,9 @@ mod tests {
 
     #[test]
     fn run_args_default_to_the_cpu_only_config() {
-        let config = parse_run_args(&["run", "model.gguf"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "model.gguf"])
+            .engine
+            .to_config("model.gguf".into());
         assert_eq!(config.model_path, PathBuf::from("model.gguf"));
         assert_eq!(config.n_ctx, 256);
         assert_eq!(config.n_predict, 64);
@@ -1040,28 +1060,36 @@ mod tests {
     #[test]
     fn run_args_map_ram_experts_gib_flag_into_config() {
         let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2"])
+            .engine
             .to_config("model.gguf".into());
         assert_eq!(config.ram_experts_gib, 2);
         // Fractional GiB floor to the engine's whole-GiB unit.
         let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2.75"])
+            .engine
             .to_config("model.gguf".into());
         assert_eq!(config.ram_experts_gib, 2);
     }
 
     #[test]
     fn run_args_map_device_cache_experts_flag_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "m.gguf"])
+            .engine
+            .to_config("model.gguf".into());
         assert_eq!(config.device_cache_experts, 0, "unset = derive from VRAM");
         let config = parse_run_args(&["run", "m.gguf", "--device-cache-experts", "9"])
+            .engine
             .to_config("model.gguf".into());
         assert_eq!(config.device_cache_experts, 9);
     }
 
     #[test]
     fn run_args_map_vram_order_flag_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "m.gguf"])
+            .engine
+            .to_config("model.gguf".into());
         assert_eq!(config.vram_order, VramOrder::Score);
         let config = parse_run_args(&["run", "m.gguf", "--vram-order", "recency"])
+            .engine
             .to_config("model.gguf".into());
         assert_eq!(config.vram_order, VramOrder::Recency);
         let bad = RunArgs::augment_args(clap::Command::new("run")).try_get_matches_from([
@@ -1075,7 +1103,9 @@ mod tests {
 
     #[test]
     fn run_args_map_prefetch_flags_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "m.gguf"])
+            .engine
+            .to_config("model.gguf".into());
         assert_eq!(
             (config.prefetch, config.prefetch_lookahead),
             (PrefetchMode::Off, 1)
@@ -1088,6 +1118,7 @@ mod tests {
             "--prefetch-lookahead",
             "2",
         ])
+        .engine
         .to_config("model.gguf".into());
         assert_eq!(
             (config.prefetch, config.prefetch_lookahead),
@@ -1102,10 +1133,13 @@ mod tests {
 
     #[test]
     fn run_args_map_io_threads_flag_into_config() {
-        let config = parse_run_args(&["run", "m.gguf"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "m.gguf"])
+            .engine
+            .to_config("model.gguf".into());
         assert_eq!(config.io_threads, None, "unset = derived per-drive count");
-        let config =
-            parse_run_args(&["run", "m.gguf", "--io-threads", "4"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "m.gguf", "--io-threads", "4"])
+            .engine
+            .to_config("model.gguf".into());
         assert_eq!(config.io_threads, Some(4));
     }
 
@@ -1131,8 +1165,8 @@ mod tests {
             "--cpu-moe-layers",
             "45",
         ]);
-        assert_eq!(args.n_predict, 64, "n_predict default untouched");
-        let config = args.to_config("model.gguf".into());
+        assert_eq!(args.engine.n_predict, 64, "n_predict default untouched");
+        let config = args.engine.to_config("model.gguf".into());
         assert_eq!(config.threads, 16);
         assert_eq!(config.n_gpu_layers, 99);
         assert!(config.flash_attn_on);
@@ -1143,22 +1177,25 @@ mod tests {
     fn run_args_flags_are_independent() {
         // Each knob maps on its own — e.g. the t16-vs-t4 calibration legs
         // change only threads, the mislabeled-leg probe changes only layers.
-        let config =
-            parse_run_args(&["run", "m.gguf", "--threads", "4"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "m.gguf", "--threads", "4"])
+            .engine
+            .to_config("model.gguf".into());
         assert_eq!(config.threads, 4);
         assert_eq!(config.n_gpu_layers, 0);
         assert!(!config.flash_attn_on);
         assert_eq!(config.cpu_moe_layers, None);
 
         let config = parse_run_args(&["run", "m.gguf", "--n-gpu-layers", "7"])
+            .engine
             .to_config("model.gguf".into());
         assert_eq!(config.threads, EngineConfig::default().threads);
         assert_eq!(config.n_gpu_layers, 7);
         assert!(!config.flash_attn_on);
         assert_eq!(config.cpu_moe_layers, None);
 
-        let config =
-            parse_run_args(&["run", "m.gguf", "--flash-attn"]).to_config("model.gguf".into());
+        let config = parse_run_args(&["run", "m.gguf", "--flash-attn"])
+            .engine
+            .to_config("model.gguf".into());
         assert!(config.flash_attn_on);
         assert_eq!(config.n_gpu_layers, 0);
         assert_eq!(config.cpu_moe_layers, None);

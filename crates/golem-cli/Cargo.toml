@@ -1,6 +1,6 @@
 [package]
 name = "golem-cli"
-description = "golem CLI: run (tech design section 9)"
+description = "golem CLI: run, serve (tech design section 9)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,15 +19,18 @@ hip-tests = []
 
 [dependencies]
 clap = { workspace = true }
+golem-api = { path = "../golem-api" }
 golem-engine = { path = "../golem-engine" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 golem-placement = { path = "../golem-placement" }
+golem-server = { path = "../golem-server" }
 golem-store = { path = "../golem-store" }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sysinfo = { workspace = true }
+tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]

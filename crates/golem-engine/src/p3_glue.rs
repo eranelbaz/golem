@@ -631,6 +631,12 @@ pub(crate) fn session_opened() {
     LIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Live `Session` count in this process (teardown observability: a server
+/// shutdown must leave 0).
+pub fn live_sessions() -> usize {
+    LIVE_SESSIONS.load(Ordering::SeqCst)
+}
+
 /// Marks a dropped session (called by `Session::drop`).
 pub(crate) fn session_closed() {
     let prev = LIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst);

@@ -9,3 +9,25 @@ publish = false
 
 [lints]
 workspace = true
+
+[features]
+# Fixture path + fault injection for the integration tests.
+test-support = ["dep:xtask"]
+
+[dependencies]
+axum = { workspace = true }
+golem-api = { path = "../golem-api" }
+golem-engine = { path = "../golem-engine" }
+golem-llama-sys = { path = "../golem-llama-sys" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+xtask = { path = "../../xtask", optional = true }
+
+[dev-dependencies]
+golem-server = { path = ".", features = ["test-support"] }
+http = { workspace = true }
+tower = { workspace = true }
