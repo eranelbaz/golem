@@ -26,8 +26,10 @@ pub struct ServeArgs {
     /// Bind port; 0 picks a free one (printed as `listening on ADDR`).
     #[arg(long, default_value_t = 0)]
     pub port: u16,
-    /// Decode slots; only 1 is supported.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1))]
+    /// Decode slots batched by the scheduler. Values > 1 are refused until
+    /// the `parallel ∈ {2,4}` HW leg passes (`docs/baselines/m4.4-batching.md`,
+    /// `m4.6-plan-t8.md`); `GOLEM_ALLOW_PARALLEL=1` lifts that for testing.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub parallel: u32,
     /// Model id served on the API; default GGUF `general.name`, else the
     /// file stem.
@@ -147,6 +149,19 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
 }
 
+/// `--parallel > 1` is gated on the target HW leg (4 slots ≈ 30.7 unique
+/// experts/layer/step vs 8 solo → up to ≈ 3.8× bytes/step on misses, so
+/// aggregate tok/s may fall below solo); recommended only once measured.
+fn check_parallel(parallel: u32, allowed: bool) -> Result<(), String> {
+    if parallel > 1 && !allowed {
+        return Err(format!(
+            "--parallel {parallel}: batching > 1 awaits its HW leg \
+             (docs/baselines/m4.4-batching.md); set GOLEM_ALLOW_PARALLEL=1 to override"
+        ));
+    }
+    Ok(())
+}
+
 /// Loads the model, serves until SIGINT/SIGTERM or a control-socket `stop`,
 /// then drains and tears down. The instance is registered in `reg` as `id`
 /// for its whole life; `ready` gets the endpoint once it serves.
@@ -158,6 +173,10 @@ pub fn serve(
     id: String,
     ready: impl FnOnce(&str) + Send,
 ) -> Result<(), Box<dyn Error>> {
+    check_parallel(
+        args.parallel,
+        std::env::var_os("GOLEM_ALLOW_PARALLEL").is_some(),
+    )?;
     let config = engine_config(&args.engine, &args.model, args.parallel)?;
     let model_name = match &args.model_name {
         Some(n) => n.clone(),
@@ -233,4 +252,14 @@ pub fn log_path(id: &str) -> Option<PathBuf> {
     let root = golem_store::data_dir()
         .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share/golem")))?;
     Some(root.join("logs").join(format!("{id}.log")))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parallel_above_one_needs_the_override() {
+        assert!(super::check_parallel(1, false).is_ok());
+        assert!(super::check_parallel(4, false).is_err());
+        assert!(super::check_parallel(4, true).is_ok());
+    }
 }

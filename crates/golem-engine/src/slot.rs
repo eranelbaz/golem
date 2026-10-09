@@ -439,7 +439,7 @@ pub(crate) fn step(
     // Cancelled prefills end before any decode.
     for (i, s) in slots.iter_mut().enumerate() {
         if matches!(s.phase, Phase::Prefill(_)) && s.cancelled() {
-            session.seq_rm(s.seq);
+            cancel_seq(session, s.seq);
             s.done(FinishReason::Cancelled, &mut |t| emit(i, t));
         }
     }
@@ -467,7 +467,7 @@ pub(crate) fn step(
             }
             if !s.emit_pending(session, &mut |t| emit(i, t)) {
                 if s.finished() == Some(FinishReason::Cancelled) {
-                    session.seq_rm(s.seq);
+                    cancel_seq(session, s.seq);
                 }
                 continue;
             }
@@ -477,13 +477,13 @@ pub(crate) fn step(
             n_gen += 1;
         }
     }
-    let mut stream_cancel = None;
+    let mut stream: Option<Option<Arc<AtomicBool>>> = None;
     if let Some(j) = joiner
         && (stream_mode || !joiner_streams)
     {
         let s = &mut slots[j];
         if let Phase::Prefill(a) = &mut s.phase {
-            let (len, stream) = session.next_chunk(&a.ffi, n_gen as usize);
+            let (len, streams) = session.next_chunk(&a.ffi, n_gen as usize);
             if len > 0 {
                 if a.ffi.chunks == 0 {
                     session.prefill_begin(&mut a.ffi);
@@ -492,8 +492,8 @@ pub(crate) fn step(
                 s.chunk = len;
                 s.in_batch = true;
                 session.rr = (j + 1) % n;
-                if stream {
-                    stream_cancel = s.cancel.clone();
+                if streams {
+                    stream = Some(s.cancel.clone());
                 }
             }
         }
@@ -516,7 +516,7 @@ pub(crate) fn step(
             .filter(|s| s.in_batch)
             .map(|s| s.cancel.as_ref()),
     );
-    let res = session.run_batch(stream_cancel.as_ref(), n_gen, step_no, t0);
+    let res = session.run_batch(stream.as_ref().map(Option::as_ref), n_gen, step_no, t0);
     session.abort.clear();
     if stream_mode {
         session.decode_since_stream = 0;
@@ -529,7 +529,7 @@ pub(crate) fn step(
         Ok(false) => {
             // Aborted: every participant was cancelled.
             for (i, s) in slots.iter_mut().enumerate().filter(|(_, s)| s.in_batch) {
-                session.seq_rm(s.seq);
+                cancel_seq(session, s.seq);
                 s.done(FinishReason::Cancelled, &mut |t| emit(i, t));
             }
             return Ok(());
@@ -586,6 +586,11 @@ pub(crate) fn step(
         s.phase = Phase::Decode(a);
     }
     Ok(())
+}
+
+fn cancel_seq(session: &SessionInner, seq: i32) {
+    session.seq_rm(seq);
+    tracing::info!(slot = seq, "cancel: sequence removed");
 }
 
 /// One participant of a failed batch: its sequence is gone. A prefilling

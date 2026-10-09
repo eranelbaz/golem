@@ -1,5 +1,6 @@
-//! Decode worker: owns the `!Send` `Session` on one std thread and serves
-//! jobs handed over a rendezvous channel (slot scheduler v0, `parallel` = 1).
+//! Decode worker: owns the `!Send` `Session` (inside a `Scheduler`) on one
+//! std thread and batches up to `parallel` jobs across its slots; jobs queue
+//! on a `sync_channel(parallel − 1)`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -11,7 +12,8 @@ use golem_api::chat::{FunctionCall, Stop, ToolCall};
 use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent};
 use golem_engine::config::EngineConfig;
 use golem_engine::{
-    ChatTurn, EngineError, FinishReason, OutputParser, Piece, SamplingParams, Session, TurnOutcome,
+    ChatTurn, EngineError, FinishReason, OutputParser, Piece, ReasoningSplitter, SamplingParams,
+    Scheduler, Session, SlotEvent, SlotJob, TurnOutcome,
 };
 use golem_llama_sys::raw::LLAMA_DEFAULT_SEED;
 
@@ -115,7 +117,8 @@ pub struct HealthSnapshot {
 pub struct HealthState {
     state: AtomicU8,
     snapshot: Mutex<HealthSnapshot>,
-    in_flight: Mutex<Option<Arc<AtomicBool>>>,
+    /// Cancel flags of the jobs on the worker (one per busy slot).
+    in_flight: Mutex<Vec<Arc<AtomicBool>>>,
     #[cfg(any(test, feature = "test-support"))]
     hooks: TestHooks,
 }
@@ -125,7 +128,7 @@ impl HealthState {
         Self {
             state: AtomicU8::new(ServeState::Loading as u8),
             snapshot: Mutex::new(HealthSnapshot::default()),
-            in_flight: Mutex::new(None),
+            in_flight: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             hooks: TestHooks::default(),
         }
@@ -160,23 +163,39 @@ impl HealthState {
         self.cancel_in_flight();
     }
 
-    /// Sets the cancel flag of the job currently on the worker, if any.
+    /// Sets the cancel flag of every job currently on the worker.
     pub fn cancel_in_flight(&self) {
-        if let Some(c) = &*self.in_flight.lock().unwrap_or_else(|p| p.into_inner()) {
+        for c in self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             c.store(true, Ordering::SeqCst);
         }
     }
 
-    /// A job is on the worker.
+    /// At least one job is on the worker.
     pub fn busy(&self) -> bool {
-        self.in_flight
+        !self
+            .in_flight
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .is_some()
+            .is_empty()
     }
 
-    fn set_in_flight(&self, c: Option<Arc<AtomicBool>>) {
-        *self.in_flight.lock().unwrap_or_else(|p| p.into_inner()) = c;
+    /// Republishes the busy slots' flags; a job admitted while Draining is
+    /// cancelled here, so `begin_drain` never misses one. Once per step:
+    /// one mutex per decode step, not per routed expert.
+    fn publish_in_flight(&self, flags: impl Iterator<Item = Arc<AtomicBool>>) {
+        let mut v = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        v.clear();
+        v.extend(flags);
+        if self.get() == ServeState::Draining {
+            for c in v.iter() {
+                c.store(true, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -187,7 +206,7 @@ pub struct ShutdownTimeout(pub Duration);
 
 /// Owner side of the worker thread.
 pub struct WorkerHandle {
-    /// Rendezvous job queue: `try_send` succeeds only while the worker idles.
+    /// Job queue (`parallel − 1` deep): `try_send` fails → 503 `golem_busy`.
     pub jobs: SyncSender<Job>,
     /// Shared health.
     pub health: Arc<HealthState>,
@@ -240,20 +259,17 @@ pub fn spawn_worker_with_hooks(
 }
 
 fn spawn(cfg: EngineConfig, health: HealthState) -> Result<WorkerHandle, EngineError> {
-    if cfg.parallel != 1 {
-        return Err(EngineError::InvalidConfig(format!(
-            "parallel = {} unsupported: the v0 scheduler serves one slot",
-            cfg.parallel
-        )));
-    }
     let health = Arc::new(health);
-    let (jobs, rx) = sync_channel::<Job>(0);
+    // parallel − 1 queued jobs: with every slot busy the handler's
+    // `try_send` fills this, then 503s — never more queued than can start
+    // once one slot frees (parallel 1 keeps the rendezvous).
+    let (jobs, rx) = sync_channel::<Job>(cfg.parallel.saturating_sub(1) as usize);
     let (loaded_tx, loaded_rx) = sync_channel::<Result<(), EngineError>>(0);
     let h = health.clone();
     let join = std::thread::Builder::new()
         .name("golem-decode".into())
         .spawn(move || {
-            let mut session = match Session::new(&cfg) {
+            let mut sch = match Session::new(&cfg).and_then(Scheduler::new) {
                 Ok(s) => s,
                 Err(e) => {
                     h.set(ServeState::Fatal);
@@ -263,7 +279,7 @@ fn spawn(cfg: EngineConfig, health: HealthState) -> Result<WorkerHandle, EngineE
             };
             h.set(ServeState::Healthy);
             let _ = loaded_tx.send(Ok(()));
-            run(&mut session, &rx, &h);
+            run(&mut sch, &rx, &h);
         })?;
     match loaded_rx.recv() {
         Ok(Ok(())) => Ok(WorkerHandle { jobs, health, join }),
@@ -280,39 +296,126 @@ fn spawn(cfg: EngineConfig, health: HealthState) -> Result<WorkerHandle, EngineE
     }
 }
 
-fn run(session: &mut Session, rx: &Receiver<Job>, health: &HealthState) {
-    while let Ok(job) = rx.recv() {
-        // Published before the drain check: `begin_drain` sets Draining then
-        // cancels, so either we see Draining or it sees this job.
-        health.set_in_flight(Some(job.cancel.clone()));
-        if health.get() == ServeState::Draining {
-            health.set_in_flight(None);
-            let _ = job.events.try_send(Event::Failed(draining()));
+/// One admitted job's per-slot delivery state.
+struct SlotRun {
+    job: Job,
+    /// Reserved before any text so the terminal event is never dropped.
+    permit: tokio::sync::mpsc::OwnedPermit<Event>,
+    splitter: Option<ReasoningSplitter>,
+    tools: Option<ToolStream>,
+}
+
+impl SlotRun {
+    #[cfg(any(test, feature = "test-support"))]
+    fn send(&self, ev: Event) {
+        if let Err(e) = self.job.events.try_send(ev) {
+            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                tracing::warn!("client too slow to drain events; cancelling");
+            }
+            self.job.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn piece(&mut self, parser: Option<&OutputParser>, t: &str) {
+        let (job, splitter, tools) = (&self.job, &mut self.splitter, &mut self.tools);
+        let send = |ev: Event| {
+            if let Err(e) = job.events.try_send(ev) {
+                if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    tracing::warn!("client too slow to drain events; cancelling");
+                }
+                job.cancel.store(true, Ordering::SeqCst);
+            }
+        };
+        if let (Some(ts), Some(p)) = (tools.as_mut(), parser) {
+            ts.push(p, t, true, &send);
+            return;
+        }
+        let mut send_piece = |p: Piece| {
+            send(match p {
+                Piece::Content(t) => Event::Text(t.into()),
+                Piece::Reasoning(t) => Event::Reasoning(t.into()),
+            })
+        };
+        match splitter {
+            Some(s) => s.push(t, &mut send_piece),
+            None => send_piece(Piece::Content(t)),
+        }
+    }
+}
+
+/// The decode loop: admits jobs into free slots (never dequeuing one it
+/// cannot admit), steps every active slot through one batched decode, and
+/// answers each finished slot on its own event stream.
+fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
+    let n = sch.free_slots();
+    let mut runs: Vec<Option<SlotRun>> = (0..n).map(|_| None).collect();
+    loop {
+        // Block only when every slot is free; else poll between steps.
+        let idle = runs.iter().all(Option::is_none);
+        while sch.free_slots() > 0 {
+            let job = if idle && runs.iter().all(Option::is_none) {
+                match rx.recv() {
+                    Ok(j) => j,
+                    Err(_) => return,
+                }
+            } else {
+                match rx.try_recv() {
+                    Ok(j) => j,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if runs.iter().all(Option::is_none) {
+                            return;
+                        }
+                        break;
+                    }
+                }
+            };
+            if let Err(true) = admit(sch, &mut runs, job, health) {
+                fail_all(&mut runs, health);
+                return;
+            }
+        }
+        health.publish_in_flight(runs.iter().flatten().map(|r| r.job.cancel.clone()));
+        if runs.iter().all(Option::is_none) {
             continue;
         }
-        let fatal = match catch_unwind(AssertUnwindSafe(|| run_job(session, &job, health))) {
-            Ok(fatal) => fatal,
+        let stepped = catch_unwind(AssertUnwindSafe(|| step(sch, &mut runs, health)));
+        let fatal = match stepped {
+            Ok(Ok(())) => false,
+            Ok(Err(e)) => {
+                tracing::error!("decode worker: {e}");
+                true
+            }
             Err(p) => {
                 let msg = p
                     .downcast_ref::<&str>()
                     .map(|s| s.to_string())
                     .or_else(|| p.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
-                let env = ErrorEnvelope::new(
-                    ErrorCode::BackendUnavailable,
-                    format!("decode worker panicked: {msg}"),
+                tracing::error!(
+                    "{}",
+                    ErrorEnvelope::new(
+                        ErrorCode::BackendUnavailable,
+                        format!("decode worker panicked: {msg}"),
+                    )
                 );
-                tracing::error!("{env}");
                 true
             }
         };
-        health.set_in_flight(None);
         if fatal {
-            health.set(ServeState::Fatal);
-            // Dropping `job` here (and `rx` on return) closes the handler's
-            // stream before a terminal event → 500, then `Disconnected`.
+            fail_all(&mut runs, health);
             return;
         }
+    }
+}
+
+/// Fatal worker: drops every in-flight job (its stream closes before a
+/// terminal event → 500), then `Disconnected` for new ones.
+fn fail_all(runs: &mut [Option<SlotRun>], health: &HealthState) {
+    health.set(ServeState::Fatal);
+    health.publish_in_flight(std::iter::empty());
+    for r in runs.iter_mut() {
+        *r = None;
     }
 }
 
@@ -320,8 +423,24 @@ fn draining() -> ErrorEnvelope {
     ErrorEnvelope::new(ErrorCode::Busy, "server draining")
 }
 
-/// Runs one job; returns `true` when the session is no longer usable.
-fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
+/// Renders, tokenizes and admits one job. `Err(true)`: the worker is no
+/// longer usable; `Err(false)`: the job was answered and dropped.
+fn admit(
+    sch: &mut Scheduler,
+    runs: &mut [Option<SlotRun>],
+    job: Job,
+    health: &HealthState,
+) -> Result<(), bool> {
+    // Dropped while queued (client left): never run.
+    if job.cancel.load(Ordering::SeqCst) {
+        return Err(false);
+    }
+    // `begin_drain` sets Draining then cancels the published flags; a job
+    // dequeued after that is answered busy here.
+    if health.get() == ServeState::Draining {
+        let _ = job.events.try_send(Event::Failed(draining()));
+        return Err(false);
+    }
     #[cfg(any(test, feature = "test-support"))]
     if health
         .hooks
@@ -329,11 +448,11 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
         .compare_exchange(INJECT_AT_START, 0, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        panic!("injected worker panic");
+        tracing::error!("decode worker panicked: injected worker panic");
+        return Err(true);
     }
-    // Reserved before any text so the terminal event is never dropped.
-    let Ok(permit) = job.events.try_reserve() else {
-        return false;
+    let Ok(permit) = job.events.clone().try_reserve_owned() else {
+        return Err(false);
     };
     let req = &job.req;
     let texts: Vec<String> = req.messages.iter().map(message_text).collect();
@@ -375,53 +494,67 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
         .tools(tools_json.as_deref(), tool_choice.as_deref())
         .reasoning_inline(job.reasoning == ReasoningMode::Inline);
     let tool_mode = tools_json.is_some() && req.tool_choice != Some("none".into());
-    let rendered = if tool_mode {
-        match session.render(&base) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                permit.send(Event::Failed(ErrorEnvelope::new(
-                    ErrorCode::InvalidRequest,
-                    e.to_string(),
-                )));
-                return false;
-            }
-        }
-    } else {
-        None
+    let invalid = |e: EngineError| {
+        Event::Failed(ErrorEnvelope::new(ErrorCode::InvalidRequest, e.to_string()))
     };
-    let mut turn = base
-        .sampling(sampling)
-        .max_tokens(req.max_tokens)
-        .stop(&stop)
-        .cancel(Some(job.cancel.clone()));
-    if let Some(r) = &rendered {
-        turn = turn.rendered(r);
-    }
-    let cancel = &job.cancel;
-    let events = &job.events;
-    let mut splitter = match job.reasoning {
-        ReasoningMode::Separate if rendered.is_none() => session.reasoning_splitter(),
+    let rendered = match sch.session().render(&base) {
+        Ok(r) => r,
+        Err(e) => {
+            permit.send(invalid(e));
+            return Err(false);
+        }
+    };
+    let tokens = match sch.tokenize(&rendered.prompt) {
+        Ok(t) => t,
+        Err(e) => {
+            permit.send(invalid(e));
+            return Err(false);
+        }
+    };
+    let splitter = match job.reasoning {
+        ReasoningMode::Separate if !tool_mode => sch.session().reasoning_splitter(),
         _ => None,
     };
-    let mut tools = rendered.as_ref().map(|r| ToolStream::new(&r.parser));
-    let send = |ev: Event| {
-        if let Err(e) = events.try_send(ev) {
-            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                tracing::warn!("client too slow to drain events; cancelling");
-            }
-            cancel.store(true, Ordering::SeqCst);
-        }
+    let slot_job = SlotJob {
+        tokens,
+        sampling,
+        max_tokens: req.max_tokens,
+        stop,
+        cancel: job.cancel.clone(),
+        // Only tool-mode renders carry a grammar the sampler must apply.
+        rendered: tool_mode.then_some(rendered),
     };
-    let send = &send;
-    let mut send_piece = |p: Piece| {
-        send(match p {
-            Piece::Content(t) => Event::Text(t.into()),
-            Piece::Reasoning(t) => Event::Reasoning(t.into()),
-        })
+    let Ok(id) = sch.admit(slot_job) else {
+        unreachable!("admit runs only while a slot is free");
     };
-    // One `String` per piece: ≤ ~10 tok/s cold decode on the target → ≤ 10
-    // allocs/s, off the per-expert path.
-    let res = session.turn(&turn, &mut |t| {
+    runs[id] = Some(SlotRun {
+        job,
+        permit,
+        splitter,
+        tools: tool_mode.then(ToolStream::new),
+    });
+    Ok(())
+}
+
+/// One scheduler step; delivers each slot's pieces and terminal events.
+fn step(
+    sch: &mut Scheduler,
+    runs: &mut [Option<SlotRun>],
+    health: &HealthState,
+) -> Result<(), EngineError> {
+    let mut ended: Vec<(usize, Result<TurnOutcome, EngineError>)> = Vec::new();
+    // `parser` borrows `sch`, so text is buffered per step and delivered
+    // after: ≤ one piece per slot per step (the Task 3 `String` budget).
+    let mut pieces: Vec<(usize, String)> = Vec::with_capacity(runs.len());
+    sch.step(&mut |i, e| match e {
+        SlotEvent::Text(t) => pieces.push((i, t)),
+        SlotEvent::Done(o) => ended.push((i, Ok(o))),
+        SlotEvent::Failed(e) => ended.push((i, Err(e))),
+    })?;
+    for (i, t) in pieces {
+        let Some(run) = runs[i].as_mut() else {
+            continue;
+        };
         #[cfg(any(test, feature = "test-support"))]
         if health
             .hooks
@@ -429,29 +562,53 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
             .compare_exchange(INJECT_AFTER_TOKEN, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let _ = events.try_send(Event::Text(t.into()));
+            run.send(Event::Text(t));
             panic!("injected worker panic after first token");
         }
         #[cfg(any(test, feature = "test-support"))]
         std::thread::sleep(Duration::from_millis(health.hooks.slow_ms));
-        if let Some(ts) = &mut tools {
-            ts.push(t, true, send);
-            return;
-        }
-        match &mut splitter {
-            Some(s) => s.push(t, &mut send_piece),
-            None => send_piece(Piece::Content(t)),
-        }
-    });
-    if let Some(s) = &mut splitter {
-        s.finish(&mut send_piece);
+        run.piece(sch.parser(i), &t);
     }
-    let called = match &mut tools {
-        Some(ts) => {
-            ts.push("", false, send);
+    for (i, res) in ended {
+        let Some(run) = runs[i].take() else { continue };
+        finish(sch, run, i, res, health);
+    }
+    Ok(())
+}
+
+/// Final flushes and the slot's one terminal event.
+fn finish(
+    sch: &mut Scheduler,
+    mut run: SlotRun,
+    id: usize,
+    res: Result<TurnOutcome, EngineError>,
+    health: &HealthState,
+) {
+    let SlotRun {
+        job,
+        splitter,
+        tools,
+        ..
+    } = &mut run;
+    let send = |ev: Event| {
+        if job.events.try_send(ev).is_err() {
+            job.cancel.store(true, Ordering::SeqCst);
+        }
+    };
+    if let Some(s) = splitter {
+        s.finish(&mut |p: Piece| {
+            send(match p {
+                Piece::Content(t) => Event::Text(t.into()),
+                Piece::Reasoning(t) => Event::Reasoning(t.into()),
+            })
+        });
+    }
+    let called = match (tools.as_mut(), sch.parser(id)) {
+        (Some(ts), Some(p)) => {
+            ts.push(p, "", false, &send);
             ts.calls > 0
         }
-        None => false,
+        _ => false,
     };
     let res = res.map(|o| match o.finish {
         FinishReason::Stop if called => TurnOutcome {
@@ -463,57 +620,47 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
     {
         let mut snap = health.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         snap.turns += 1;
-        snap.device_cache_skip_ratio = session.device_cache_stats().map(|s| s.skip_ratio);
+        snap.device_cache_skip_ratio = sch.session().device_cache_stats().map(|s| s.skip_ratio);
     }
-    let (event, fatal) = match res {
+    let event = match res {
         Ok(o) if o.finish == FinishReason::Cancelled && health.get() == ServeState::Draining => {
-            (Event::Failed(draining()), false)
+            Event::Failed(draining())
         }
-        Ok(o) => (Event::Done(o), false),
+        Ok(o) => Event::Done(o),
         Err(e @ EngineError::DeviceCacheDegraded(_)) => {
             tracing::warn!("{e}");
             if health.get() == ServeState::Healthy {
                 health.set(ServeState::Degraded);
             }
-            (
-                Event::Failed(ErrorEnvelope::new(
-                    ErrorCode::BackendUnavailable,
-                    e.to_string(),
-                )),
-                false,
-            )
+            Event::Failed(ErrorEnvelope::new(
+                ErrorCode::BackendUnavailable,
+                e.to_string(),
+            ))
         }
+        Err(
+            e @ (EngineError::ContextOverflow { .. }
+            | EngineError::ChatTemplate(_)
+            | EngineError::Tokenize(_)
+            | EngineError::TemplateApply(_)
+            | EngineError::TemplateUnavailable),
+        ) => Event::Failed(ErrorEnvelope::new(ErrorCode::InvalidRequest, e.to_string())),
+        // A failed batch fails only its unrecoverable slots (the session
+        // stays usable): 500 golem_backend_unavailable.
         Err(e) => {
-            let fatal = !matches!(
-                e,
-                EngineError::ContextOverflow { .. }
-                    | EngineError::ChatTemplate(_)
-                    | EngineError::Tokenize(_)
-                    | EngineError::TemplateApply(_)
-                    | EngineError::TemplateUnavailable
-            );
-            let code = if fatal {
-                ErrorCode::BackendUnavailable
-            } else {
-                ErrorCode::InvalidRequest
-            };
-            let env = ErrorEnvelope::new(code, e.to_string());
-            if fatal {
-                tracing::error!("{env}");
-            }
-            (Event::Failed(env), fatal)
+            let env = ErrorEnvelope::new(ErrorCode::BackendUnavailable, e.to_string());
+            tracing::error!("{env}");
+            Event::Failed(env)
         }
     };
+    let SlotRun { permit, .. } = run;
     permit.send(event);
-    fatal
 }
 
 /// Turns the growing generated text into OpenAI deltas by re-parsing it with
 /// the request's chat-layer parser (`partial` until the turn ends) and
 /// emitting what each parse added. Re-parsing is O(text) per piece — one
 /// parse per token at ≤ ~10 tok/s on the target, off the per-expert path.
-struct ToolStream<'p> {
-    parser: &'p OutputParser,
+struct ToolStream {
     text: String,
     content: String,
     reasoning: String,
@@ -522,10 +669,9 @@ struct ToolStream<'p> {
     calls: usize,
 }
 
-impl<'p> ToolStream<'p> {
-    fn new(parser: &'p OutputParser) -> Self {
+impl ToolStream {
+    fn new() -> Self {
         Self {
-            parser,
             text: String::new(),
             content: String::new(),
             reasoning: String::new(),
@@ -534,9 +680,9 @@ impl<'p> ToolStream<'p> {
         }
     }
 
-    fn push(&mut self, piece: &str, partial: bool, send: &dyn Fn(Event)) {
+    fn push(&mut self, parser: &OutputParser, piece: &str, partial: bool, send: &dyn Fn(Event)) {
         self.text.push_str(piece);
-        let msg = match self.parser.parse(&self.text, partial) {
+        let msg = match parser.parse(&self.text, partial) {
             Ok(msg) => msg,
             Err(_) if partial => return,
             // Unparseable final text is still the model's answer: emit what
@@ -630,6 +776,53 @@ mod tests {
 
     const GLM: &str = include_str!("../../golem-engine/tests/fixtures/glm-5.3-flash.jinja");
 
+    fn job(content: &str, max_tokens: u32) -> (Job, tokio::sync::mpsc::Receiver<Event>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny-moe",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        }))
+        .unwrap();
+        let job = Job {
+            req,
+            cancel: Arc::new(AtomicBool::new(false)),
+            events: tx,
+            reasoning: ReasoningMode::Inline,
+        };
+        (job, rx)
+    }
+
+    /// `--parallel 2`: a job sent while slot 0 generates starts (first piece)
+    /// before slot 0's turn ends; a job whose client left while queued
+    /// never runs.
+    #[test]
+    fn job_sent_while_slot_0_generates_starts_before_it_finishes() {
+        let cfg = EngineConfig {
+            parallel: 2,
+            ..crate::test_engine_config()
+        };
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let (a, mut ra) = job("count to ten", 64);
+        assert!(w.jobs.try_send(a).is_ok(), "slot 0");
+        assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
+        let (gone, mut rg) = job("x", 4);
+        gone.cancel.store(true, Ordering::SeqCst);
+        assert!(w.jobs.try_send(gone).is_ok(), "queued");
+        let (b, mut rb) = job("hello", 4);
+        assert!(w.jobs.send(b).is_ok(), "slot 1");
+        assert!(
+            matches!(rb.blocking_recv(), Some(Event::Text(_))),
+            "slot 1 started"
+        );
+        let a_done = std::iter::from_fn(|| ra.try_recv().ok())
+            .any(|e| matches!(e, Event::Done(_) | Event::Failed(_)));
+        assert!(!a_done, "slot 0 already finished when slot 1 started");
+        assert!(rg.blocking_recv().is_none(), "cancelled queued job ran");
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
     /// A final parse failure (here: NUL in the text) still delivers the
     /// generated text as content instead of finishing empty.
     #[test]
@@ -648,11 +841,11 @@ mod tests {
             Event::Text(t) => out.borrow_mut().push_str(&t),
             other => panic!("unexpected {other:?}"),
         };
-        let mut ts = ToolStream::new(&r.parser);
-        ts.push("bad\0", true, &send);
-        ts.push("text", true, &send);
+        let mut ts = ToolStream::new();
+        ts.push(&r.parser, "bad\0", true, &send);
+        ts.push(&r.parser, "text", true, &send);
         assert!(out.borrow().is_empty(), "partial failures are held");
-        ts.push("", false, &send);
+        ts.push(&r.parser, "", false, &send);
         assert_eq!(*out.borrow(), "bad\0text");
         assert_eq!(ts.calls, 0);
     }

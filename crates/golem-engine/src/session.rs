@@ -1421,14 +1421,15 @@ impl SessionInner {
 
     /// One `llama_decode` of the filled batch (one ubatch, the lease-release
     /// contract §2.4). `stream`: the batch is one streamed prefill chunk,
-    /// alone (§7.6), whose source abort points at `cancel`. `gen` generation
+    /// alone (§7.6), whose source abort points at its slot's cancel flag
+    /// (`Some(None)`: a streamed chunk without one). `gen` generation
     /// tokens make it a policy step with a §11 timing row (`step` 0-based);
     /// a pure prefill batch is not (§6.2: it routes nearly every expert).
     /// `Ok(false)` when the abort callback aborted the compute (every
     /// participant cancelled).
     pub(crate) fn run_batch(
         &mut self,
-        stream: Option<&Arc<AtomicBool>>,
+        stream: Option<Option<&Arc<AtomicBool>>>,
         n_gen: u32,
         step: u64,
         t0: std::time::Instant,
@@ -1460,7 +1461,10 @@ impl SessionInner {
         let (_stream_guard, _stream_abort) = match (stream, self.p3.as_ref()) {
             (Some(cancel), Some(p3)) => {
                 p3.set_prefill_stream(true);
-                (Some(StreamGuard(p3)), Some(p3.stream_abort_guard(cancel)))
+                (
+                    Some(StreamGuard(p3)),
+                    cancel.map(|c| p3.stream_abort_guard(c)),
+                )
             }
             _ => (None, None),
         };
