@@ -441,6 +441,7 @@ dependencies = [
  "golem-llama-sys",
  "golem-placement",
  "golem-plan",
+ "golem-registry",
  "golem-server",
  "golem-store",
  "libc",
@@ -450,6 +451,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tracing-subscriber",
+ "uuid",
  "xtask",
 ]
 
@@ -517,6 +519,16 @@ dependencies = [
 [[package]]
 name = "golem-registry"
 version = "0.1.0"
+dependencies = [
+ "golem-api",
+ "golem-plan",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "golem-server"
@@ -526,6 +538,7 @@ dependencies = [
  "golem-api",
  "golem-engine",
  "golem-llama-sys",
+ "golem-registry",
  "golem-server",
  "http",
  "serde_json",

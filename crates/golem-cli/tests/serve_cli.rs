@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn sigterm_during_stream_exits_cleanly() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_golem"))
+    let mut child = common::golem_isolated()
         .arg("serve")
         .arg(common::tiny_moe_path())
         .args(["--port", "0", "--ctx", "4096"])

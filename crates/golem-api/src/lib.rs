@@ -97,6 +97,8 @@ impl std::fmt::Display for ErrorEnvelope {
     }
 }
 
+impl std::error::Error for ErrorEnvelope {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,7 +17,7 @@ fn run_greedy(ram_experts_gib: &str) -> std::process::Output {
 
 fn run_greedy_args(ram_experts_gib: &str, extra: &[&str]) -> std::process::Output {
     let model = common::tiny_moe_path();
-    std::process::Command::new(env!("CARGO_BIN_EXE_golem"))
+    common::golem_isolated()
         .args([
             "run",
             "--greedy",

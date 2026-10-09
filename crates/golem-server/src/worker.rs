@@ -167,6 +167,14 @@ impl HealthState {
         }
     }
 
+    /// A job is on the worker.
+    pub fn busy(&self) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
     fn set_in_flight(&self, c: Option<Arc<AtomicBool>>) {
         *self.in_flight.lock().unwrap_or_else(|p| p.into_inner()) = c;
     }

@@ -24,11 +24,13 @@ golem-engine = { path = "../golem-engine" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 golem-plan = { path = "../golem-plan" }
 golem-placement = { path = "../golem-placement" }
+golem-registry = { path = "../golem-registry" }
 golem-server = { path = "../golem-server" }
 golem-store = { path = "../golem-store" }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 sha2 = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { workspace = true }

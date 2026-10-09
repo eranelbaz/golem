@@ -36,6 +36,16 @@ pub struct RunArgs {
     /// never a path.
     #[arg(long, value_name = "FILE")]
     pub parity_dump: Option<PathBuf>,
+    /// With no compatible instance running, start a detached `serve` and
+    /// attach to it; it keeps running after this session ends.
+    #[arg(long, conflicts_with = "new")]
+    pub keep: bool,
+    /// Load in-process even when a running instance could serve this.
+    #[arg(long)]
+    pub new: bool,
+    /// Skip the O5 admission check against running instances.
+    #[arg(long)]
+    pub allow_overcommit: bool,
     #[command(flatten)]
     pub engine: EngineArgs,
 }
@@ -409,6 +419,33 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         None => return Ok(()),
     };
     let config = engine_config(&args.engine, &model, 1)?;
+    let eff = crate::serve::effective(&config, args.engine.snapshot_ram_gib)?;
+    let reg = golem_registry::Registry::open()?;
+    if !args.new && args.parity_dump.is_none() {
+        if let Some(i) = attachable(&reg, &eff)? {
+            eprintln!("golem: attached to instance {} ({})", i.id, i.endpoint);
+            return attach(&i, args.prompt.as_deref(), args.engine.n_predict);
+        }
+        if args.keep {
+            let (id, endpoint) = start_detached()?;
+            eprintln!("golem: started instance {id} ({endpoint})");
+            let i = reg.find(&id)?;
+            return attach(&i, args.prompt.as_deref(), args.engine.n_predict);
+        }
+    }
+    let model_name = model
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let guard = crate::serve::register(
+        &reg,
+        crate::serve::new_id(),
+        "run",
+        model_name,
+        &config,
+        &eff,
+        args.allow_overcommit,
+    )?;
     // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
     let mut timing_out = match &config.timing_csv {
         Some(path) => {
@@ -430,6 +467,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         None => None,
     };
     let mut session = Session::new(&config)?;
+    guard.update(|i| i.health = "healthy".into());
     if let Some(k) = session.device_cache_experts() {
         eprintln!("golem: device cache {k} expert slots per layer");
     }
@@ -856,6 +894,159 @@ fn repl(
             }
         }
     }
+}
+
+/// A live serving instance this run can attach to (§9.4): `config_hash`
+/// fast path, else the [`golem_registry::compatible`] check; a same-model
+/// conflict is printed with the `--new` hint.
+fn attachable(
+    reg: &golem_registry::Registry,
+    want: &golem_registry::EffectiveConfig,
+) -> Result<Option<golem_registry::Instance>, Box<dyn Error>> {
+    if let Some(i) = reg.find_compatible(&want.hash())? {
+        return Ok(Some(i));
+    }
+    for i in reg.list_live()? {
+        let Some(running) = &i.config else { continue };
+        if i.kind != "serve" || !matches!(i.health.as_str(), "healthy" | "degraded") {
+            continue;
+        }
+        match golem_registry::compatible(running, want) {
+            Ok(()) => return Ok(Some(i)),
+            Err(why) if running.model_path == want.model_path => eprintln!(
+                "golem: instance {} serves this model but cannot attach: {why}; \
+                 starting in-process (pass --new to skip this check)",
+                i.id
+            ),
+            Err(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+/// `golem serve --detach` with this run's model and engine flags (run-only
+/// flags dropped); returns `(id, endpoint)` from its ready line.
+fn start_detached() -> Result<(String, String), Box<dyn Error>> {
+    const RUN_ONLY: [&str; 4] = ["--keep", "--new", "--greedy", "--allow-overcommit"];
+    const RUN_ONLY_VALUE: [&str; 2] = ["--prompt", "--parity-dump"];
+    let mut argv = std::env::args().skip(1).peekable();
+    let mut fwd = Vec::new();
+    while let Some(a) = argv.next() {
+        let name = a.split('=').next().unwrap_or_default();
+        if fwd.is_empty() && a == "run" {
+            fwd.extend(["serve".to_owned(), "--detach".to_owned()]);
+        } else if RUN_ONLY_VALUE.contains(&name) {
+            if !a.contains('=') {
+                argv.next();
+            }
+        } else if !RUN_ONLY.contains(&name) {
+            fwd.push(a);
+        }
+    }
+    let out = std::process::Command::new(std::env::current_exe()?)
+        .args(&fwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    if !out.status.success() {
+        return Err("detached server failed to start".into());
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let mut w = line.split_whitespace();
+    match (w.next(), w.next()) {
+        (Some(id), Some(ep)) => Ok((id.to_owned(), ep.to_owned())),
+        _ => Err(format!("unexpected serve --detach output: {line}").into()),
+    }
+}
+
+/// Chat client over a running instance: `--prompt` one-shot, else the stdin
+/// REPL, streaming each reply from the SSE endpoint.
+fn attach(
+    i: &golem_registry::Instance,
+    prompt: Option<&str>,
+    n_predict: u32,
+) -> Result<(), Box<dyn Error>> {
+    let addr = i
+        .endpoint
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("instance {} has no HTTP endpoint", i.id))?;
+    let mut history: Vec<serde_json::Value> = Vec::new();
+    let turn = |history: &mut Vec<serde_json::Value>, text: String| {
+        history.push(serde_json::json!({"role": "user", "content": text}));
+        let reply = stream_chat(addr, &i.model, history, n_predict)?;
+        history.push(serde_json::json!({"role": "assistant", "content": reply}));
+        println!();
+        Ok::<_, Box<dyn Error>>(())
+    };
+    if let Some(p) = prompt {
+        return turn(&mut history, p.to_owned());
+    }
+    eprintln!("golem: multi-turn chat; /reset clears history, /exit quits");
+    for line in std::io::stdin().lock().lines() {
+        let line = line?;
+        match line.trim() {
+            "" => continue,
+            "/exit" | "/quit" => break,
+            "/reset" => {
+                history.clear();
+                eprintln!("golem: history cleared");
+            }
+            _ => {
+                if let Err(e) = turn(&mut history, line) {
+                    history.pop();
+                    eprintln!("error: {e}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One streamed chat completion; prints content deltas as they arrive and
+/// returns the full reply. HTTP/1.0 keeps the body un-chunked and
+/// close-delimited, so SSE lines arrive intact.
+fn stream_chat(
+    addr: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    n_predict: u32,
+) -> Result<String, Box<dyn Error>> {
+    let body = serde_json::json!({
+        "model": model, "messages": messages, "stream": true, "max_tokens": n_predict,
+    })
+    .to_string();
+    let mut s = std::net::TcpStream::connect(addr)?;
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.0\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut lines = std::io::BufReader::new(s).lines();
+    let status = lines.next().transpose()?.unwrap_or_default();
+    if !status.contains(" 200 ") {
+        let rest: Vec<String> = lines.map_while(Result::ok).collect();
+        return Err(rest.last().cloned().unwrap_or(status).into());
+    }
+    let mut reply = String::new();
+    for line in lines {
+        let line = line?;
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let v: serde_json::Value = serde_json::from_str(data)?;
+        if v.get("error").is_some() {
+            return Err(data.into());
+        }
+        if let Some(piece) = v["choices"][0]["delta"]["content"].as_str() {
+            reply.push_str(piece);
+            emit_stdout(piece);
+        }
+    }
+    Ok(reply)
 }
 
 fn emit_stdout(piece: &str) {

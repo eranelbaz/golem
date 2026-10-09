@@ -5,8 +5,7 @@ mod common; // path resolution copy: engine tests/ modules aren't importable acr
 #[test]
 fn run_greedy_one_shot_completes() {
     let model = common::tiny_moe_path();
-    let bin = env!("CARGO_BIN_EXE_golem");
-    let out = std::process::Command::new(bin)
+    let out = common::golem_isolated()
         .args(["run", "--greedy"])
         .arg(&model)
         .args(["--prompt", "hello", "--n-predict", "8"])
@@ -27,8 +26,7 @@ fn run_greedy_one_shot_completes() {
 fn repl_accumulates_history_until_reset() {
     use std::io::Write as _;
     let model = common::tiny_moe_path();
-    let bin = env!("CARGO_BIN_EXE_golem");
-    let mut child = std::process::Command::new(bin)
+    let mut child = common::golem_isolated()
         .args(["run", "--greedy"])
         .arg(&model)
         .args(["--n-predict", "4", "--timing-csv", "/dev/stdout"])
@@ -54,8 +52,7 @@ fn repl_accumulates_history_until_reset() {
 
 #[test]
 fn run_missing_model_errors_with_code_1() {
-    let bin = env!("CARGO_BIN_EXE_golem");
-    let out = std::process::Command::new(bin)
+    let out = common::golem_isolated()
         .args(["run", "--greedy", "/nonexistent/model.gguf"])
         .args(["--prompt", "hi"])
         .output()

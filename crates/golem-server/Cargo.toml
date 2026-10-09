@@ -19,6 +19,7 @@ axum = { workspace = true }
 golem-api = { path = "../golem-api" }
 golem-engine = { path = "../golem-engine" }
 golem-llama-sys = { path = "../golem-llama-sys" }
+golem-registry = { path = "../golem-registry" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

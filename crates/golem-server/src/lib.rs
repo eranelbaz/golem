@@ -68,6 +68,117 @@ pub async fn serve(
     Ok(addr)
 }
 
+/// Graceful `stop` drain bound (§9.2): the in-flight request may finish.
+const STOP_DRAIN: Duration = Duration::from_secs(30);
+
+/// [`serve`] for a registered instance: writes the bound endpoint and
+/// health transitions into `guard`, and answers the control socket next to
+/// the entry (`status`, `stop`) until shutdown. `ready` receives the bound
+/// address once the socket is listening.
+pub async fn serve_registered(
+    cfg: ServerConfig,
+    worker: WorkerHandle,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    guard: Arc<golem_registry::Guard>,
+    ready: impl FnOnce(SocketAddr) + Send,
+) -> Result<SocketAddr, ServeError> {
+    let listener = tokio::net::TcpListener::bind((cfg.host, cfg.port)).await?;
+    let addr = listener.local_addr()?;
+    eprintln!("listening on {addr}");
+    let sock = guard.sock_path();
+    let _ = std::fs::remove_file(&sock);
+    let control = tokio::net::UnixListener::bind(&sock)?;
+    let health = worker.health.clone();
+    guard.update(|i| {
+        i.endpoint = format!("http://{addr}");
+        i.health = health.get().as_str().into();
+    });
+    ready(addr);
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let ctl = tokio::spawn(control_loop(control, health.clone(), stop_tx));
+    let (h, g) = (health.clone(), guard.clone());
+    let sync = tokio::spawn(async move {
+        loop {
+            let s = h.get().as_str();
+            if g.instance().health != s {
+                g.update(|i| i.health = s.into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+    let res = serve_listener(listener, cfg, worker, async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = stop_rx.recv() => {}
+        }
+    })
+    .await;
+    ctl.abort();
+    sync.abort();
+    res.map(|()| addr)
+}
+
+async fn control_loop(
+    l: tokio::net::UnixListener,
+    health: Arc<HealthState>,
+    stop: tokio::sync::mpsc::Sender<()>,
+) {
+    while let Ok((s, _)) = l.accept().await {
+        let Ok(s) = s
+            .into_std()
+            .and_then(|s| s.set_nonblocking(false).map(|()| s))
+        else {
+            continue;
+        };
+        let (h, st) = (health.clone(), stop.clone());
+        tokio::task::spawn_blocking(move || control_conn(s, h, st));
+    }
+}
+
+/// One control exchange; blocking std I/O on a blocking-pool thread (the
+/// graceful stop waits out the drain).
+fn control_conn(
+    s: std::os::unix::net::UnixStream,
+    health: Arc<HealthState>,
+    stop: tokio::sync::mpsc::Sender<()>,
+) {
+    use golem_registry::{ControlRequest, StopMode};
+    use std::io::{BufRead, Write};
+    let mut line = String::new();
+    let Ok(r) = s.try_clone() else { return };
+    if std::io::BufReader::new(r).read_line(&mut line).is_err() {
+        return;
+    }
+    let reply = match serde_json::from_str::<ControlRequest>(&line) {
+        Ok(ControlRequest::Status) => {
+            let snap = health.snapshot();
+            serde_json::json!({
+                "ok": true,
+                "health": health.get().as_str(),
+                "turns": snap.turns,
+                "device_cache_skip_ratio": snap.device_cache_skip_ratio,
+            })
+        }
+        Ok(ControlRequest::Stop { mode }) => {
+            if mode == StopMode::Graceful {
+                health.set(ServeState::Draining);
+                let t = std::time::Instant::now();
+                while health.busy() && t.elapsed() < STOP_DRAIN {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            let _ = stop.try_send(());
+            serde_json::json!({ "ok": true })
+        }
+        Err(e) => serde_json::to_value(golem_api::ErrorEnvelope::new(
+            golem_api::ErrorCode::InvalidRequest,
+            format!("control request: {e}"),
+        ))
+        .unwrap_or_default(),
+    };
+    let _ = (&s).write_all(format!("{reply}\n").as_bytes());
+}
+
 async fn serve_listener(
     listener: tokio::net::TcpListener,
     cfg: ServerConfig,

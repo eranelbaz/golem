@@ -98,22 +98,26 @@ fn table(tier: &str, terms: &[Term], cap: u64) -> String {
     s
 }
 
-/// Runs `golem plan`; returns the process exit code (0 fits, 2 infeasible).
-pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
-    let m = ModelFacts::from_gguf(&args.model)?;
+/// This machine; `vram_gib` overrides the device total (HIP builds read it,
+/// else 24 GiB).
+pub fn machine(vram_gib: Option<f64>) -> Machine {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    let vram_total = args
-        .vram_gib
-        .map(|g| bytes(Some(g)))
-        .or_else(|| golem_engine::session::device_vram().map(|(_, t)| t))
-        .unwrap_or(24 << 30);
-    let mach = Machine {
-        vram_total,
+    Machine {
+        vram_total: vram_gib
+            .map(|g| bytes(Some(g)))
+            .or_else(|| golem_engine::session::device_vram().map(|(_, t)| t))
+            .unwrap_or(24 << 30),
         ram_total: sys.total_memory(),
         ram_free: sys.available_memory(),
         rocm_overhead: golem_plan::ROCM_OVERHEAD,
-    };
+    }
+}
+
+/// Runs `golem plan`; returns the process exit code (0 fits, 2 infeasible).
+pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
+    let m = ModelFacts::from_gguf(&args.model)?;
+    let mach = machine(args.vram_gib);
     let snapshot_ram = match args.snapshot_ram_gib {
         Some(g) => bytes(Some(g)),
         None => golem_plan::snapshot_arena(&m, args.parallel, args.ctx).1,
