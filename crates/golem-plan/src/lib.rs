@@ -134,7 +134,7 @@ impl ModelFacts {
         let v_len = if opt("attention.key_length_mla") > 0 {
             0
         } else {
-            opt("attention.value_length").max(k_len)
+            arch_kv_int(kvs, "attention.value_length").unwrap_or(k_len)
         };
         let idx_heads = if opt("attention.indexer.kpool") > 0 {
             3
@@ -145,6 +145,11 @@ impl ModelFacts {
         let d_inner = opt("attention.head_count") * opt("kda.head_dim");
         let conv = 3 * opt("ssm.conv_kernel").saturating_sub(1) * d_inner;
         let ssm = opt("kda.head_dim") * d_inner;
+        if d_inner == 0 && heads_kv.contains(&0) {
+            return Err(PlanError::Invalid(
+                "recurrent layers without kda.head_dim".into(),
+            ));
+        }
         for &h in &heads_kv {
             if h == 0 {
                 self.rs_bytes += (conv + ssm) * RS_ELEM;
@@ -152,11 +157,6 @@ impl ModelFacts {
                 self.sparse_attn_layers += 1;
                 self.kv_per_token += (h * (k_len + v_len) + idx) * KV_ELEM;
             }
-        }
-        if self.rs_bytes > 0 && d_inner == 0 {
-            return Err(PlanError::Invalid(
-                "recurrent layers without kda.head_dim".into(),
-            ));
         }
         Ok(())
     }
@@ -333,6 +333,46 @@ mod tests {
         let t = ram_terms(&glm(), &box24(), &set);
         assert_eq!(get(&t, "ram_pool"), 40 << 30);
         assert_eq!(get(&t, "state_snapshots"), 3 << 30);
+    }
+
+    fn kvs(extra: &[(&str, KvVal)]) -> Vec<(String, KvVal)> {
+        let mut v = vec![("general.architecture".to_string(), KvVal::Str("a".into()))];
+        v.extend(extra.iter().map(|(k, x)| (format!("a.{k}"), x.clone())));
+        v
+    }
+    fn facts(kvs: &[(String, KvVal)], n: usize) -> Result<ModelFacts, PlanError> {
+        let mut m = ModelFacts {
+            kv_per_token: 0,
+            rs_bytes: 0,
+            sparse_attn_layers: 0,
+            ..glm()
+        };
+        m.state_terms(kvs, n).map(|()| m)
+    }
+
+    #[test]
+    fn recurrent_layers_need_kda_dims() {
+        let k = kvs(&[
+            ("attention.head_count_kv", KvVal::IntArr(vec![0, 4])),
+            ("attention.key_length", KvVal::Int(128)),
+        ]);
+        assert!(matches!(facts(&k, 2), Err(PlanError::Invalid(_))));
+    }
+
+    #[test]
+    fn value_length_used_as_is_when_present() {
+        let k = kvs(&[
+            ("attention.head_count_kv", KvVal::Int(1)),
+            ("attention.key_length", KvVal::Int(192)),
+            ("attention.value_length", KvVal::Int(128)),
+        ]);
+        // 1 head × (192 + 128) × 2 B = 640 B/token.
+        assert_eq!(facts(&k, 1).unwrap().kv_per_token, 640);
+        let k = kvs(&[
+            ("attention.head_count_kv", KvVal::Int(1)),
+            ("attention.key_length", KvVal::Int(192)),
+        ]);
+        assert_eq!(facts(&k, 1).unwrap().kv_per_token, 768);
     }
 
     #[test]

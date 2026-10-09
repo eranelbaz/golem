@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use golem_gguf::{ggml_row_bytes, tensor_entries};
+use golem_gguf::{ggml_row_bytes, kv_int, read_kvs, shard_path, tensor_entries};
 use golem_plan::ModelFacts;
 
 fn table_bytes(path: &Path) -> u64 {
@@ -41,9 +41,13 @@ fn tiny_hybrid_facts() {
     use xtask::tiny_hybrid::dims;
     let first = xtask::tiny_hybrid::cached_fixture();
     let m = ModelFacts::from_gguf(&first).unwrap();
-    let shards: u64 = std::fs::read_dir(first.parent().unwrap())
-        .unwrap()
-        .map(|e| table_bytes(&e.unwrap().path()))
+    let count = kv_int(
+        &read_kvs(&mut File::open(&first).unwrap()).unwrap(),
+        "split.count",
+    )
+    .unwrap();
+    let shards: u64 = (0..count)
+        .map(|i| table_bytes(&shard_path(&first, i, count).unwrap()))
         .sum();
     assert_eq!(m.t_ne + m.expert_bytes_total, shards);
     assert_eq!(m.n_expert, dims::N_EXPERT);
