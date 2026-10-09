@@ -47,7 +47,7 @@ pub fn cached_fixture() -> PathBuf {
     p
 }
 
-fn repo_root() -> PathBuf {
+pub(crate) fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .canonicalize()
@@ -58,22 +58,22 @@ fn n_embd_k_gqa() -> u32 {
     dims::HEAD_DIM * dims::N_HEAD_KV
 }
 
-fn d(v: &[u32]) -> Vec<u64> {
+pub(crate) fn d(v: &[u32]) -> Vec<u64> {
     v.iter().map(|&x| u64::from(x)).collect()
 }
 
 /// splitmix64 premix keeps seed 0 valid and adjacent seeds distinct.
-struct Xorshift(u64);
+pub(crate) struct Xorshift(u64);
 
 impl Xorshift {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         Xorshift((z ^ (z >> 31)) | 1)
     }
 
-    fn next_f32(&mut self) -> f32 {
+    pub(crate) fn next_f32(&mut self) -> f32 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -130,7 +130,7 @@ pub fn is_expert_tensor(name: &str) -> bool {
         .is_match(name)
 }
 
-fn token_table() -> Vec<(String, i32, f32)> {
+pub(crate) fn token_table() -> Vec<(String, i32, f32)> {
     let mut texts: Vec<String> = ["<unk>", "<s>", "</s>", "▁hello", "▁world", "<eoln>"]
         .iter()
         .map(|s| (*s).to_owned())
@@ -323,7 +323,7 @@ enum Fill {
     Random,
 }
 
-fn kv(key: &str, value: GgufValue) -> GgufKv {
+pub(crate) fn kv(key: &str, value: GgufValue) -> GgufKv {
     GgufKv {
         key: key.to_owned(),
         value,
