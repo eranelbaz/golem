@@ -226,6 +226,20 @@ pub fn snapshot_bytes(rs_bytes: u64, kv_per_token: u64, n_tokens: u64) -> u64 {
     rs_bytes.saturating_add(kv_per_token.saturating_mul(n_tokens))
 }
 
+/// Snapshot arena `(floor, default)` (§7.1): floor = `parallel ×
+/// snapshot_bytes(ctx)`, one full-context snapshot per slot; default =
+/// `max(2 GiB, 2 × floor)`. Target: 145.56 MiB + 19,712 B × 100k ≈ 2.0 GiB
+/// floor → 4.0 GiB default at parallel 1.
+#[must_use]
+pub fn snapshot_arena(m: &ModelFacts, parallel: u32, ctx: u32) -> (u64, u64) {
+    let floor = u64::from(parallel).saturating_mul(snapshot_bytes(
+        m.rs_bytes,
+        m.kv_per_token,
+        u64::from(ctx),
+    ));
+    (floor, (2u64 << 30).max(floor.saturating_mul(2)))
+}
+
 /// Double-buffered per-layer expert slabs for prefill streaming (§7.6).
 /// Target: 2 × 288 × 6,881,280 = 3,963,617,280 B (3.69 GiB).
 fn stream_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {

@@ -155,7 +155,7 @@ pub struct EngineArgs {
     /// `max(2 GiB, 2 × floor)`, shrunk toward the floor (one full-context
     /// snapshot per slot) when RAM is short. Below the floor the load is
     /// refused (`golem_plan_infeasible`).
-    #[arg(long, value_name = "GIB")]
+    #[arg(long, value_name = "GIB", value_parser = parse_gib)]
     pub snapshot_ram_gib: Option<f64>,
 }
 
@@ -218,7 +218,7 @@ impl EngineArgs {
             prefill_stream_routed_max: self.prefill_stream_routed_max,
             snapshot_ram_bytes: self
                 .snapshot_ram_gib
-                .map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
+                .map(|g| (g * (1u64 << 30) as f64) as u64),
             ..default
         }
     }
@@ -307,6 +307,7 @@ pub fn engine_config(
         config.ram_experts_gib = pool;
     }
     config.snapshot_ram_bytes = Some(snap);
+    config.model_facts = Some(facts);
     preflight_mlock(
         model,
         config.manifest_path.as_deref(),
@@ -349,11 +350,7 @@ fn fit_ram(
         .map(|t| t.bytes)
         .sum();
     let pool = config.ram_experts_gib * GIB;
-    let floor = u64::from(config.parallel).saturating_mul(golem_plan::snapshot_bytes(
-        facts.rs_bytes,
-        facts.kv_per_token,
-        u64::from(config.n_ctx),
-    ));
+    let (floor, default) = golem_plan::snapshot_arena(facts, config.parallel, config.n_ctx);
     let fits = |snap: u64, pool: u64| fixed + pool + snap <= budget;
     let want = match config.snapshot_ram_bytes {
         Some(n) if n > 0 && n < floor => {
@@ -364,7 +361,7 @@ fn fit_ram(
             )));
         }
         Some(n) => n,
-        None => (2 * GIB).max(floor.saturating_mul(2)),
+        None => default,
     };
     if fits(want, pool) {
         return Ok((want, config.ram_experts_gib));
@@ -390,6 +387,14 @@ fn fit_ram(
          exceed {budget} B (available {ram_free} B − 4 GiB headroom); largest --ctx that \
          fits: {max_ctx} (or shrink --ram-experts-gib)"
     )))
+}
+
+/// Finite, non-negative GiB (clap parser).
+fn parse_gib(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(g) if g.is_finite() && g >= 0.0 => Ok(g),
+        _ => Err(format!("expected a finite GiB value >= 0, got {s:?}")),
+    }
 }
 
 /// Runs one greedy `run` invocation: loads the model, then either prints a

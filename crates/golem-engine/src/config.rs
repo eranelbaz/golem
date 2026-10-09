@@ -97,6 +97,9 @@ pub struct EngineConfig {
     /// any other value must be ≥ the floor `parallel × snapshot_bytes(n_ctx)`
     /// (one full-context snapshot per slot) or the load is refused.
     pub snapshot_ram_bytes: Option<u64>,
+    /// Header facts the caller already parsed (snapshot floor sizing);
+    /// `None` = the engine reads them from `model_path`.
+    pub model_facts: Option<golem_plan::ModelFacts>,
 }
 
 /// RAM/VRAM expert residency policy (§6.3 O10, `--residency`).
@@ -162,6 +165,7 @@ impl Default for EngineConfig {
             prefill_stream_routed_max: 0.85,
             // Off by default: only the CLI asks for the planner-sized arena.
             snapshot_ram_bytes: Some(0),
+            model_facts: None,
         }
     }
 }

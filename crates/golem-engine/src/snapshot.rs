@@ -17,9 +17,6 @@ use crate::p3_glue::PinnedArena;
 /// snapshot) ≈ 35 entries, so 64 never binds before the byte budget does.
 pub const MAX_ENTRIES: usize = 64;
 
-/// Key length bound of [`SnapshotCache::new`] (the engine's default `n_ctx`).
-pub const DEFAULT_MAX_TOKENS: usize = 256;
-
 /// Cache counters.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotStats {
@@ -33,6 +30,8 @@ pub struct SnapshotStats {
     pub evictions: u64,
     /// Snapshots larger than the whole arena, never stored.
     pub dropped_oversize: u64,
+    /// `llama_state_seq_get_data` wrote fewer bytes than sized; not stored.
+    pub short_writes: u64,
     /// Bytes held by live entries.
     pub used_bytes: u64,
 }
@@ -57,27 +56,19 @@ pub struct SnapshotCache {
 
 impl SnapshotCache {
     /// Empty cache over `arena`; `model_key` names the model identity +
-    /// `n_ctx` + `n_ubatch` the stored states belong to. Keys up to
-    /// [`DEFAULT_MAX_TOKENS`]; see [`Self::with_max_tokens`].
-    pub fn new(arena: PinnedArena, model_key: u64) -> Self {
+    /// `n_ctx` + `n_ubatch` the stored states belong to. The key arena holds
+    /// `MAX_ENTRIES × max_tokens` tokens (the session passes `n_ctx`), allocated
+    /// once. Target: 64 × 100k × 4 B = 25.6 MB at 100k ctx.
+    pub fn new(arena: PinnedArena, model_key: u64, max_tokens: usize) -> Self {
         Self {
             arena,
-            keys: vec![0; MAX_ENTRIES * DEFAULT_MAX_TOKENS],
+            keys: vec![0; MAX_ENTRIES * max_tokens],
             entries: Vec::with_capacity(MAX_ENTRIES),
             pending: None,
             model_key,
             tick: 0,
             stats: SnapshotStats::default(),
         }
-    }
-
-    /// Resizes the key arena to `MAX_ENTRIES × max_tokens` (the session
-    /// passes `n_ctx`, once at load); drops every entry.
-    pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
-        self.entries.clear();
-        self.stats.used_bytes = 0;
-        self.keys = vec![0; MAX_ENTRIES * max_tokens];
-        self
     }
 
     /// Identity the stored states belong to.
@@ -118,13 +109,6 @@ impl SnapshotCache {
             self.stats.dropped_oversize += 1;
             return None;
         }
-        if let Some(i) = self
-            .entries
-            .iter()
-            .position(|e| self.keys[e.tokens.clone()] == *tokens)
-        {
-            self.remove(i);
-        }
         let (bytes, keys) = loop {
             let b = first_fit(&self.entries, |e| &e.bytes, self.arena.len(), size);
             let k = first_fit(&self.entries, |e| &e.tokens, self.keys.len(), tokens.len());
@@ -153,10 +137,26 @@ impl SnapshotCache {
     /// Publishes the last [`Self::reserve`]; call only after a clean prefill.
     pub fn commit(&mut self) {
         if let Some(mut e) = self.pending.take() {
+            // A same-key entry is replaced only now, so a failed write keeps it.
+            let key = &self.keys[e.tokens.clone()];
+            if let Some(i) = self
+                .entries
+                .iter()
+                .position(|o| self.keys[o.tokens.clone()] == *key)
+            {
+                self.remove(i);
+            }
             self.tick += 1;
             e.last_used = self.tick;
             self.stats.used_bytes += e.bytes.len() as u64;
             self.entries.push(e);
+        }
+    }
+
+    /// Discards the last [`Self::reserve`] after a short state write.
+    pub fn abort_short_write(&mut self) {
+        if self.pending.take().is_some() {
+            self.stats.short_writes += 1;
         }
     }
 
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn longest_prefix_and_lru_eviction() {
-        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 0);
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 0, 256);
         put(&mut c, &[1, 2], 4);
         put(&mut c, &[1, 2, 3], 4);
         assert!(
@@ -248,14 +248,14 @@ mod tests {
 
     #[test]
     fn uncommitted_reserve_is_invisible() {
-        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 0);
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 0, 256);
         let _ = c.reserve(&[1, 2], 4); // cancelled prefill: no commit
         assert!(c.longest_prefix(&[1, 2, 3]).is_none());
     }
 
     #[test]
     fn stored_bytes_round_trip_and_invalidate_drops_entry() {
-        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(16), 0);
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(16), 0, 256);
         c.reserve(&[4, 5], 3).unwrap().copy_from_slice(&[7, 8, 9]);
         c.commit();
         assert_eq!(c.longest_prefix(&[4, 5, 6]).unwrap().1, &[7, 8, 9]);
@@ -263,5 +263,20 @@ mod tests {
         assert!(c.longest_prefix(&[4, 5, 6]).is_none());
         let s = c.stats();
         assert_eq!((s.restore_failures, s.used_bytes), (1, 0));
+    }
+
+    #[test]
+    fn failed_rewrite_keeps_same_key_entry() {
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(16), 0, 256);
+        c.reserve(&[4, 5], 3).unwrap().copy_from_slice(&[7, 8, 9]);
+        c.commit();
+        let _ = c.reserve(&[4, 5], 3); // short write: never committed
+        c.abort_short_write();
+        assert_eq!(c.longest_prefix(&[4, 5, 6]).unwrap().1, &[7, 8, 9]);
+        c.reserve(&[4, 5], 3).unwrap().copy_from_slice(&[1, 2, 3]);
+        c.commit(); // replaces the old entry
+        assert_eq!(c.longest_prefix(&[4, 5, 6]).unwrap().1, &[1, 2, 3]);
+        let s = c.stats();
+        assert_eq!((s.short_writes, s.used_bytes), (1, 3));
     }
 }

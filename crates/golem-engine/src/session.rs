@@ -1107,6 +1107,8 @@ impl SessionInner {
         let wrote = unsafe { raw::llama_state_seq_get_data(ctx, dst.as_mut_ptr(), size, seq) };
         if wrote == size {
             cache.commit();
+        } else {
+            cache.abort_short_write();
         }
     }
 
@@ -1751,15 +1753,14 @@ fn snapshot_cache(
     if config.snapshot_ram_bytes == Some(0) {
         return Ok(None);
     }
-    let facts = golem_plan::ModelFacts::from_gguf(&config.model_path)
-        .map_err(|e| EngineError::InvalidModel(format!("snapshot sizing: {e}")))?;
-    let floor = u64::from(config.parallel).saturating_mul(golem_plan::snapshot_bytes(
-        facts.rs_bytes,
-        facts.kv_per_token,
-        u64::from(config.n_ctx),
-    ));
+    let facts = match config.model_facts {
+        Some(f) => f,
+        None => golem_plan::ModelFacts::from_gguf(&config.model_path)
+            .map_err(|e| EngineError::InvalidModel(format!("snapshot sizing: {e}")))?,
+    };
+    let (floor, default) = golem_plan::snapshot_arena(&facts, config.parallel, config.n_ctx);
     let bytes = match config.snapshot_ram_bytes {
-        None => (2u64 << 30).max(floor.saturating_mul(2)),
+        None => default,
         Some(n) if n < floor => {
             return Err(EngineError::InvalidConfig(format!(
                 "snapshot_ram_bytes {n} < floor {floor} (parallel {} × one {}-token snapshot)",
@@ -1779,10 +1780,11 @@ fn snapshot_cache(
         unsafe { raw::llama_n_ubatch(loaded.ctx().as_ptr()) }.hash(&mut h);
         h.finish()
     };
-    Ok(Some(
-        SnapshotCache::new(p3_glue::PinnedArena::new(len)?, model_key)
-            .with_max_tokens(config.n_ctx as usize),
-    ))
+    Ok(Some(SnapshotCache::new(
+        p3_glue::PinnedArena::new(len)?,
+        model_key,
+        config.n_ctx as usize,
+    )))
 }
 
 /// Prefill chunk length in tokens. Base cap `min(batch_tokens, n_ctx - 1)`:
