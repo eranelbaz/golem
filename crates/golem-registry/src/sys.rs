@@ -31,9 +31,12 @@ pub fn pid_exists(pid: u32) -> bool {
 
 /// Sends `sig` to `pid`.
 pub fn signal(pid: u32, sig: libc::c_int) -> io::Result<()> {
-    let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|&p| p > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pid must be positive"))?;
     // SAFETY: plain kill(2); a positive pid targets exactly one process.
-    if pid > 0 && unsafe { libc::kill(pid, sig) } == 0 {
+    if unsafe { libc::kill(pid, sig) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())

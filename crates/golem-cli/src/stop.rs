@@ -42,7 +42,11 @@ pub fn stop(args: &StopArgs) -> Result<(), Box<dyn Error>> {
     }
     golem_registry::signal(&i, libc::SIGTERM)?;
     if wait_exit(&i, TERM_GRACE).is_err() {
-        golem_registry::signal(&i, libc::SIGKILL)?;
+        // `signal` re-checks the owner: exiting during the grace is success.
+        match golem_registry::signal(&i, libc::SIGKILL) {
+            Err(golem_registry::RegistryError::InstanceNotFound(_)) => return Ok(()),
+            r => r?,
+        }
         wait_exit(&i, EXIT_WAIT)?;
     }
     Ok(())

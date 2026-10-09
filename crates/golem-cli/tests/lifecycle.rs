@@ -47,6 +47,14 @@ fn detach_list_stop_round_trip() {
         .to_owned();
     let list = golem(&rt, &["list"]);
     assert!(String::from_utf8_lossy(&list.stdout).contains(&id));
+    let sock = ["run/golem/instances", "state/golem/instances"]
+        .iter()
+        .map(|d| rt.join(d).join(format!("{id}.sock")))
+        .find(|p| p.exists())
+        .expect("control socket");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
     let st = golem(&rt, &["stop", &id]);
     assert!(
         st.status.success(),
@@ -120,5 +128,36 @@ fn detach_reports_child_load_failure() {
     let out = golem(&rt, &["serve", "/nonexistent.gguf", "--detach"]);
     assert!(!out.status.success()); // returns, does not hang
     assert!(String::from_utf8_lossy(&out.stderr).contains("error"));
+    assert!(ids(&rt).is_empty());
+}
+
+#[test]
+fn detach_load_timeout_kills_grandchild() {
+    let rt = common::tempdir_env();
+    let m = tiny_moe();
+    let out = golem(
+        &rt,
+        &[
+            "serve",
+            &m,
+            "--detach",
+            "--port",
+            "0",
+            "--load-timeout",
+            "0",
+        ],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    let pid: u32 = err
+        .split("killed instance pid ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(
+        golem_registry::pid_start_time(pid).is_err(),
+        "pid {pid} survived"
+    );
     assert!(ids(&rt).is_empty());
 }

@@ -64,6 +64,19 @@ pub fn redirect_stdio(log: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// `SIGKILL`s `pid` (the detached grandchild after a load timeout).
+pub fn kill(pid: u32) -> io::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|&p| p > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pid must be positive"))?;
+    // SAFETY: plain kill(2); a positive pid targets exactly one process.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `_exit(2)`: leave the intermediate fork child without running atexit
 /// handlers or destructors that belong to the parent's state.
 pub fn exit_now(code: i32) -> ! {

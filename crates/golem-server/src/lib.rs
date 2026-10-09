@@ -88,6 +88,8 @@ pub async fn serve_registered(
     let sock = guard.sock_path();
     let _ = std::fs::remove_file(&sock);
     let control = tokio::net::UnixListener::bind(&sock)?;
+    // Owner-only: the socket stops the instance.
+    std::fs::set_permissions(&sock, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let health = worker.health.clone();
     guard.update(|i| {
         i.endpoint = format!("http://{addr}");

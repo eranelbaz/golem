@@ -927,7 +927,7 @@ fn attachable(
 /// `golem serve --detach` with this run's model and engine flags (run-only
 /// flags dropped); returns `(id, endpoint)` from its ready line.
 fn start_detached() -> Result<(String, String), Box<dyn Error>> {
-    const RUN_ONLY: [&str; 4] = ["--keep", "--new", "--greedy", "--allow-overcommit"];
+    const RUN_ONLY: [&str; 3] = ["--keep", "--new", "--greedy"];
     const RUN_ONLY_VALUE: [&str; 2] = ["--prompt", "--parity-dump"];
     let mut argv = std::env::args().skip(1).peekable();
     let mut fwd = Vec::new();

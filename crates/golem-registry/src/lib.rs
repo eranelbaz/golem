@@ -9,7 +9,8 @@ pub mod control;
 mod sys;
 
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -25,9 +26,6 @@ pub use control::{ControlRequest, ControlResponse, StopMode, send};
 const GIB: u64 = 1 << 30;
 /// RAM kept free for the OS and page cache (§10, O5).
 const RAM_HEADROOM: u64 = 4 * GIB;
-/// A non-loading `serve` entry with a heartbeat this old and a dead socket
-/// is stale.
-const STALE_HEARTBEAT_S: u64 = 5;
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// One registered instance (`<id>.json`).
@@ -149,6 +147,9 @@ pub enum RegistryError {
     /// No live instance with that id or name.
     #[error("no running instance `{0}`")]
     InstanceNotFound(String),
+    /// More than one live instance serves that model name.
+    #[error("model `{0}` is served by several instances ({1}); pass an id")]
+    Ambiguous(String, String),
     /// Neither `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` nor `HOME` is set.
     #[error("no registry dir: set XDG_RUNTIME_DIR or HOME")]
     NoDir,
@@ -196,8 +197,12 @@ fn owner_alive(i: &Instance) -> bool {
     sys::pid_exists(i.pid) && pid_start_time(i.pid).is_ok_and(|t| t == i.pid_start_time)
 }
 
-/// Sends `sig` to the instance's process.
+/// Sends `sig` to the instance's process; `InstanceNotFound` once the owner
+/// exited or its pid was reused, so a stale entry never kills a stranger.
 pub fn signal(i: &Instance, sig: libc::c_int) -> Result<(), RegistryError> {
+    if !owner_alive(i) {
+        return Err(RegistryError::InstanceNotFound(i.id.clone()));
+    }
     Ok(sys::signal(i.pid, sig)?)
 }
 
@@ -336,9 +341,10 @@ impl Registry {
 
     fn lock(&self) -> Result<File, RegistryError> {
         if let Some(p) = self.lock_path.parent() {
-            std::fs::create_dir_all(p)?;
+            create_private_dir(p)?;
         }
         let f = OpenOptions::new()
+            .mode(0o600)
             .create(true)
             .truncate(false)
             .write(true)
@@ -349,7 +355,7 @@ impl Registry {
 
     /// Writes `i` and starts its heartbeat; dropping the guard removes it.
     pub fn register(&self, i: &Instance) -> Result<Guard, RegistryError> {
-        std::fs::create_dir_all(&self.dir)?;
+        create_private_dir(&self.dir)?;
         let mut i = i.clone();
         i.heartbeat_at = now();
         let path = self.dir.join(format!("{}.json", i.id));
@@ -402,7 +408,7 @@ impl Registry {
                 else {
                     continue;
                 };
-                if stale(&i, dir) {
+                if stale(&i) {
                     let _ = std::fs::remove_file(&path);
                     let _ = std::fs::remove_file(dir.join(format!("{}.sock", i.id)));
                 } else {
@@ -416,12 +422,22 @@ impl Registry {
 
     /// Live instance by id, else by served model name.
     pub fn find(&self, id_or_name: &str) -> Result<Instance, RegistryError> {
-        let live = self.list_live()?;
-        live.iter()
-            .find(|i| i.id == id_or_name)
-            .or_else(|| live.iter().find(|i| i.model == id_or_name))
-            .cloned()
-            .ok_or_else(|| RegistryError::InstanceNotFound(id_or_name.to_owned()))
+        let mut live = self.list_live()?;
+        if let Some(i) = live.iter().position(|i| i.id == id_or_name) {
+            return Ok(live.swap_remove(i));
+        }
+        live.retain(|i| i.model == id_or_name);
+        match live.len() {
+            0 => Err(RegistryError::InstanceNotFound(id_or_name.to_owned())),
+            1 => Ok(live.swap_remove(0)),
+            _ => Err(RegistryError::Ambiguous(
+                id_or_name.to_owned(),
+                live.iter()
+                    .map(|i| i.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+        }
     }
 
     /// A serving instance (`healthy`/`degraded`) started with `config_hash`.
@@ -454,21 +470,30 @@ impl Registry {
     }
 }
 
-/// Stale per §9.2: owner dead or pid reused; a serving (non-loading) entry
-/// also when its heartbeat is old and its control socket refuses.
-fn stale(i: &Instance, dir: &Path) -> bool {
-    if !owner_alive(i) {
-        return true;
-    }
-    i.kind == "serve"
-        && i.health != "loading"
-        && now().saturating_sub(i.heartbeat_at) >= STALE_HEARTBEAT_S
-        && std::os::unix::net::UnixStream::connect(dir.join(format!("{}.sock", i.id))).is_err()
+/// Stale per §9.2: owner dead or pid reused. A live owner is never reaped
+/// (an old heartbeat or a refusing socket only means it is busy or hung),
+/// so its socket is never unlinked under it.
+fn stale(i: &Instance) -> bool {
+    !owner_alive(i)
+}
+
+/// Owner-only (0700) registry dirs: entries and sockets control instances.
+fn create_private_dir(p: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(p)
 }
 
 fn write_entry(path: &Path, i: &Instance) -> io::Result<()> {
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(i)?)?;
+    let mut f = OpenOptions::new()
+        .mode(0o600)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(&serde_json::to_vec(i)?)?;
     std::fs::rename(&tmp, path)
 }
 

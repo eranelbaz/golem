@@ -69,10 +69,9 @@ fn stale_entries_reaped_live_kept() {
         .register(&inst("live", std::process::id(), now()))
         .unwrap();
     write(&d, &inst("dead", 999_999, now()));
-    write(&d, &inst("stale", std::process::id(), now() - 10));
     let ids: Vec<_> = r.list_live().unwrap().into_iter().map(|i| i.id).collect();
     assert_eq!(ids, ["live"]);
-    assert!(!d.join("dead.json").exists() && !d.join("stale.json").exists());
+    assert!(!d.join("dead.json").exists());
 }
 
 #[test]
@@ -181,4 +180,50 @@ fn compatible_requires_same_model_and_smaller_budgets() {
     want.ctx = 2048;
     want.model_mtime = 3;
     assert!(compatible(&run, &want).is_err());
+}
+
+#[test]
+fn live_owner_with_old_heartbeat_and_dead_socket_is_kept() {
+    let d = tempfile_dir();
+    let r = Registry::at(d.clone(), d.parent().unwrap().join("admit.lock"));
+    write(&d, &inst("hung", std::process::id(), now() - 60));
+    std::fs::write(d.join("hung.sock"), b"").unwrap();
+    assert_eq!(r.list_live().unwrap().len(), 1);
+    assert!(d.join("hung.sock").exists());
+}
+
+#[test]
+fn registry_dirs_and_entries_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile_dir().parent().unwrap().join("fresh");
+    let d = base.join("instances");
+    let r = Registry::at(d.clone(), base.join("lock/admit.lock"));
+    let _g = r.register(&inst("p", std::process::id(), now())).unwrap();
+    r.list_live().unwrap();
+    let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(d.clone()), 0o700);
+    assert_eq!(mode(base.join("lock")), 0o700);
+    assert_eq!(mode(d.join("p.json")), 0o600);
+    assert_eq!(mode(base.join("lock/admit.lock")), 0o600);
+}
+
+#[test]
+fn find_by_ambiguous_model_name_lists_ids() {
+    let d = tempfile_dir();
+    let r = Registry::at(d.clone(), d.parent().unwrap().join("admit.lock"));
+    write(&d, &inst("a1", std::process::id(), now()));
+    write(&d, &inst("a2", std::process::id(), now()));
+    let e = r.find("m").unwrap_err().to_string();
+    assert!(e.contains("a1") && e.contains("a2"), "{e}");
+    assert_eq!(r.find("a2").unwrap().id, "a2");
+}
+
+#[test]
+fn signal_refuses_reused_pid() {
+    let mut i = inst("x", std::process::id(), now());
+    i.pid_start_time = 1;
+    assert!(matches!(
+        golem_registry::signal(&i, 0),
+        Err(golem_registry::RegistryError::InstanceNotFound(_))
+    ));
 }

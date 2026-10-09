@@ -158,9 +158,10 @@ fn envelope(e: &(dyn std::error::Error + 'static)) -> ErrorEnvelope {
     ErrorEnvelope::new(code, e.to_string())
 }
 
-/// `serve --detach`: the parent waits on a pipe for the grandchild's one
-/// line (`ready <id> <endpoint>` or an `ErrorEnvelope`), prints `<id>
-/// <endpoint>` and exits; the setsid'd grandchild returns and serves.
+/// `serve --detach`: the parent waits on a pipe for the grandchild's
+/// `pid <pid>` line, then one line (`ready <id> <endpoint>` or an
+/// `ErrorEnvelope`), prints `<id> <endpoint>` and exits; the setsid'd
+/// grandchild returns and serves.
 fn detach(args: &serve::ServeArgs) {
     let fail = |msg: String| -> ! {
         eprintln!("{}", ErrorEnvelope::new(ErrorCode::InvalidRequest, msg));
@@ -202,7 +203,11 @@ fn detach(args: &serve::ServeArgs) {
 }
 
 /// Grandchild: serves, reporting readiness (or the load error) on `wr`.
-fn serve_detached(args: &serve::ServeArgs, id: String, wr: std::fs::File) -> ! {
+fn serve_detached(args: &serve::ServeArgs, id: String, mut wr: std::fs::File) -> ! {
+    // The parent kills us by this pid if the load outlives its timeout.
+    if writeln!(wr, "pid {}", std::process::id()).is_err() {
+        std::process::exit(1);
+    }
     let pipe = std::sync::Mutex::new(Some(wr));
     let report = |line: String| {
         if let Some(mut w) = pipe.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -236,19 +241,40 @@ fn serve_detached(args: &serve::ServeArgs, id: String, wr: std::fs::File) -> ! {
     }
 }
 
-/// Parent: one line from the grandchild, or EOF / timeout → failure with the
-/// log tail.
+/// Parent: the grandchild's pid, then one line, or EOF / timeout → failure
+/// with the log tail. On timeout the grandchild is SIGKILLed and its entry
+/// reaped, so no orphan outlives the failed start.
 fn wait_ready(rd: std::fs::File, log: &std::path::Path, timeout: Duration) -> ! {
+    let mut rd = std::io::BufReader::new(rd);
+    let mut line = String::new();
+    let _ = rd.read_line(&mut line);
+    let pid = line
+        .trim()
+        .strip_prefix("pid ")
+        .and_then(|p| p.parse::<u32>().ok());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        let _ = std::io::BufReader::new(rd).read_line(&mut line);
+        let _ = rd.read_line(&mut line);
         let _ = tx.send(line);
     });
-    let line = rx.recv_timeout(timeout).unwrap_or_default();
+    let (line, timed_out) = match rx.recv_timeout(timeout) {
+        Ok(l) => (l, false),
+        Err(_) => (String::new(), true),
+    };
     if let Some(rest) = line.trim().strip_prefix("ready ") {
         println!("{rest}");
         std::process::exit(0);
+    }
+    if let (true, Some(pid)) = (timed_out, pid) {
+        let _ = sys::kill(pid);
+        // Reap the killed grandchild's entry (owner dead once it is gone).
+        let t = std::time::Instant::now();
+        while golem_registry::pid_start_time(pid).is_ok() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = golem_registry::Registry::open().and_then(|r| r.list_live());
+        eprintln!("golem: load timed out; killed instance pid {pid}");
     }
     let tail = std::fs::read_to_string(log).unwrap_or_default();
     let lines: Vec<&str> = tail.lines().collect();
