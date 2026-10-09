@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 golem-gguf = { path = "../golem-gguf" }
+golem-plan = { path = "../golem-plan" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 golem-placement = { path = "../golem-placement" }
 golem-store = { path = "../golem-store" }

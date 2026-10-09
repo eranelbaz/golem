@@ -22,6 +22,7 @@ clap = { workspace = true }
 golem-api = { path = "../golem-api" }
 golem-engine = { path = "../golem-engine" }
 golem-llama-sys = { path = "../golem-llama-sys" }
+golem-plan = { path = "../golem-plan" }
 golem-placement = { path = "../golem-placement" }
 golem-server = { path = "../golem-server" }
 golem-store = { path = "../golem-store" }

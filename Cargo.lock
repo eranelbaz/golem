@@ -440,6 +440,7 @@ dependencies = [
  "golem-engine",
  "golem-llama-sys",
  "golem-placement",
+ "golem-plan",
  "golem-server",
  "golem-store",
  "libc",
@@ -459,6 +460,7 @@ dependencies = [
  "golem-gguf",
  "golem-llama-sys",
  "golem-placement",
+ "golem-plan",
  "golem-store",
  "libc",
  "serde",
@@ -504,6 +506,12 @@ dependencies = [
 [[package]]
 name = "golem-plan"
 version = "0.1.0"
+dependencies = [
+ "golem-gguf",
+ "serde",
+ "thiserror",
+ "xtask",
+]
 
 [[package]]
 name = "golem-registry"
