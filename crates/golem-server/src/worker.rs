@@ -7,10 +7,11 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent, chat::Stop};
+use golem_api::chat::{FunctionCall, Stop, ToolCall};
+use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent};
 use golem_engine::config::EngineConfig;
 use golem_engine::{
-    ChatTurn, EngineError, FinishReason, Piece, SamplingParams, Session, TurnOutcome,
+    ChatTurn, EngineError, FinishReason, OutputParser, Piece, SamplingParams, Session, TurnOutcome,
 };
 use golem_llama_sys::raw::LLAMA_DEFAULT_SEED;
 
@@ -48,6 +49,9 @@ pub enum Event {
     Text(String),
     /// Generated reasoning piece (`separate` mode only).
     Reasoning(String),
+    /// Tool-call delta: the first one per call carries `index`, `id`, `type`
+    /// and the name; later ones append to `arguments`.
+    ToolCall(ToolCall),
     /// Turn finished; sent after all post-turn work.
     Done(TurnOutcome),
     /// Turn failed; the envelope is the client-facing error.
@@ -348,17 +352,49 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
     };
-    let turn = golem_engine::TurnRequest::new(&turns)
+    // The raw array keeps assistant `tool_calls` and `tool` messages.
+    let messages_json = serde_json::to_string(&req.messages).unwrap_or_default();
+    let tools_json = req
+        .tools
+        .as_ref()
+        .map(|t| serde_json::to_string(t).unwrap_or_default());
+    let tool_choice = req
+        .tool_choice
+        .as_ref()
+        .map(|c| serde_json::to_string(c).unwrap_or_default());
+    let base = golem_engine::TurnRequest::new(&turns)
+        .messages_json(&messages_json)
+        .tools(tools_json.as_deref(), tool_choice.as_deref());
+    let tool_mode = tools_json.is_some() && req.tool_choice != Some("none".into());
+    let rendered = if tool_mode {
+        match session.render(&base) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                permit.send(Event::Failed(ErrorEnvelope::new(
+                    ErrorCode::InvalidRequest,
+                    e.to_string(),
+                )));
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let mut turn = base
         .sampling(sampling)
         .max_tokens(req.max_tokens)
         .stop(&stop)
         .cancel(Some(job.cancel.clone()));
+    if let Some(r) = &rendered {
+        turn = turn.rendered(r);
+    }
     let cancel = &job.cancel;
     let events = &job.events;
     let mut splitter = match job.reasoning {
-        ReasoningMode::Separate => session.reasoning_splitter(),
-        ReasoningMode::Inline => None,
+        ReasoningMode::Separate if rendered.is_none() => session.reasoning_splitter(),
+        _ => None,
     };
+    let mut tools = rendered.as_ref().map(|r| ToolStream::new(&r.parser));
     let send = |ev: Event| {
         if let Err(e) = events.try_send(ev) {
             if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
@@ -367,6 +403,7 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
             cancel.store(true, Ordering::SeqCst);
         }
     };
+    let send = &send;
     let mut send_piece = |p: Piece| {
         send(match p {
             Piece::Content(t) => Event::Text(t.into()),
@@ -388,6 +425,10 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
         }
         #[cfg(any(test, feature = "test-support"))]
         std::thread::sleep(Duration::from_millis(health.hooks.slow_ms));
+        if let Some(ts) = &mut tools {
+            ts.push(t, true, send);
+            return;
+        }
         match &mut splitter {
             Some(s) => s.push(t, &mut send_piece),
             None => send_piece(Piece::Content(t)),
@@ -396,6 +437,20 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
     if let Some(s) = &mut splitter {
         s.finish(&mut send_piece);
     }
+    let called = match &mut tools {
+        Some(ts) => {
+            ts.push("", false, send);
+            ts.calls > 0
+        }
+        None => false,
+    };
+    let res = res.map(|o| match o.finish {
+        FinishReason::Stop if called => TurnOutcome {
+            finish: FinishReason::ToolCalls,
+            ..o
+        },
+        _ => o,
+    });
     {
         let mut snap = health.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         snap.turns += 1;
@@ -410,6 +465,7 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
             let fatal = !matches!(
                 e,
                 EngineError::ContextOverflow { .. }
+                    | EngineError::ChatTemplate(_)
                     | EngineError::Tokenize(_)
                     | EngineError::TemplateApply(_)
                     | EngineError::TemplateUnavailable
@@ -428,6 +484,93 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
     };
     permit.send(event);
     fatal
+}
+
+/// Turns the growing generated text into OpenAI deltas by re-parsing it with
+/// the request's chat-layer parser (`partial` until the turn ends) and
+/// emitting what each parse added. Re-parsing is O(text) per piece — one
+/// parse per token at ≤ ~10 tok/s on the target, off the per-expert path.
+struct ToolStream<'p> {
+    parser: &'p OutputParser,
+    text: String,
+    content: String,
+    reasoning: String,
+    /// Per announced call: arguments sent so far.
+    args: Vec<String>,
+    calls: usize,
+}
+
+impl<'p> ToolStream<'p> {
+    fn new(parser: &'p OutputParser) -> Self {
+        Self {
+            parser,
+            text: String::new(),
+            content: String::new(),
+            reasoning: String::new(),
+            args: Vec::new(),
+            calls: 0,
+        }
+    }
+
+    fn push(&mut self, piece: &str, partial: bool, send: &dyn Fn(Event)) {
+        self.text.push_str(piece);
+        let Ok(msg) = self.parser.parse(&self.text, partial) else {
+            return;
+        };
+        let field = |k: &str| msg[k].as_str().unwrap_or_default().to_owned();
+        for (seen, now, ev) in [
+            (
+                &mut self.reasoning,
+                field("reasoning_content"),
+                Event::Reasoning as fn(String) -> Event,
+            ),
+            (&mut self.content, field("content"), Event::Text),
+        ] {
+            // A partial parse can only grow; anything else is a re-parse we
+            // cannot retract, so it is held until the text settles.
+            if let Some(add) = now.strip_prefix(seen.as_str()).filter(|a| !a.is_empty()) {
+                send(ev(add.to_owned()));
+                *seen = now;
+            }
+        }
+        let calls = msg["tool_calls"].as_array().map_or(&[][..], Vec::as_slice);
+        for (i, c) in calls.iter().enumerate() {
+            let name = c["function"]["name"].as_str().unwrap_or_default();
+            let args = c["function"]["arguments"].as_str().unwrap_or_default();
+            // Announce a call once its name is complete: arguments started,
+            // or the turn ended.
+            if i == self.args.len() {
+                if name.is_empty() || (partial && args.is_empty()) {
+                    break;
+                }
+                send(Event::ToolCall(ToolCall {
+                    index: Some(i as u32),
+                    id: Some(format!("call_{}", uuid::Uuid::new_v4().simple())),
+                    kind: Some("function".into()),
+                    function: FunctionCall {
+                        name: Some(name.into()),
+                        arguments: args.into(),
+                    },
+                }));
+                self.args.push(args.into());
+                self.calls += 1;
+                continue;
+            }
+            let seen = &mut self.args[i];
+            if let Some(add) = args.strip_prefix(seen.as_str()).filter(|a| !a.is_empty()) {
+                send(Event::ToolCall(ToolCall {
+                    index: Some(i as u32),
+                    id: None,
+                    kind: None,
+                    function: FunctionCall {
+                        name: None,
+                        arguments: add.into(),
+                    },
+                }));
+                *seen = args.into();
+            }
+        }
+    }
 }
 
 fn message_text(m: &golem_api::ChatMessage) -> String {

@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use golem_api::chat::{Choice, FinishReason, ModelCard};
+use golem_api::chat::{Choice, FinishReason, ModelCard, ToolCall};
 use golem_api::{
     ChatCompletionResponse, ChatMessage, ErrorCode, ErrorEnvelope, MessageContent, ModelList, Usage,
 };
@@ -144,18 +144,6 @@ async fn chat(
     authorize(&st.cfg, &headers)?;
     let Json(raw) = body.map_err(|e| api_err(ErrorCode::InvalidRequest, e.body_text()))?;
     let req = golem_api::policy::validate(&raw, &st.cfg.model_name)?;
-    // Not silently ignored: tool calls land with their task.
-    for (on, field) in [
-        (req.tools.is_some(), "tools"),
-        (req.tool_choice.is_some(), "tool_choice"),
-    ] {
-        if on {
-            return Err(api_err(
-                ErrorCode::UnsupportedField,
-                format!("field `{field}` is not supported yet"),
-            ));
-        }
-    }
     match st.health.get() {
         ServeState::Draining => return Err(api_err(ErrorCode::Busy, "server draining")),
         ServeState::Fatal | ServeState::FatalIo => return Err(backend_gone()),
@@ -198,10 +186,12 @@ async fn chat(
     }
     let _guard = guard;
     let (mut text, mut reasoning) = (String::new(), String::new());
+    let mut calls: Vec<ToolCall> = Vec::new();
     let outcome = loop {
         match rx.recv().await {
             Some(Event::Text(t)) => text.push_str(&t),
             Some(Event::Reasoning(t)) => reasoning.push_str(&t),
+            Some(Event::ToolCall(d)) => merge_tool_call(&mut calls, d),
             Some(Event::Done(o)) => break o,
             Some(Event::Failed(e)) => return Err(e.into()),
             // Worker died mid-job: never a 200 with truncated content.
@@ -218,9 +208,10 @@ async fn chat(
             index: 0,
             message: ChatMessage {
                 role: "assistant".into(),
-                content: Some(MessageContent::Text(text)),
+                content: (calls.is_empty() || !text.is_empty())
+                    .then_some(MessageContent::Text(text)),
                 reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
-                tool_calls: None,
+                tool_calls: (!calls.is_empty()).then_some(calls),
                 tool_call_id: None,
                 name: None,
             },
@@ -233,6 +224,17 @@ async fn chat(
         },
     })
     .into_response())
+}
+
+/// Folds one streamed tool-call delta into the full calls (`index` selects
+/// the call; `arguments` pieces append).
+fn merge_tool_call(calls: &mut Vec<ToolCall>, d: ToolCall) {
+    let i = d.index.unwrap_or(0) as usize;
+    if i >= calls.len() {
+        calls.push(ToolCall { index: None, ..d });
+        return;
+    }
+    calls[i].function.arguments.push_str(&d.function.arguments);
 }
 
 async fn models(

@@ -1,6 +1,7 @@
 //! Model loading, decode loop, and llama.h glue (tech design section 7).
 
 pub mod atomic;
+pub mod chat;
 pub mod config;
 pub mod error;
 pub mod gguf;
@@ -15,6 +16,7 @@ pub mod stream;
 pub mod timing;
 
 pub use atomic::write_atomic;
+pub use chat::{ChatTemplates, OutputParser, Rendered};
 pub use error::EngineError;
 pub use golem_placement::pool::P3Stats;
 pub use parity::ParityStep;

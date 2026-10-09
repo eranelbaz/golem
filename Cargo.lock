@@ -484,6 +484,7 @@ name = "golem-llama-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "cc",
  "cmake",
  "sha2",
  "thiserror",

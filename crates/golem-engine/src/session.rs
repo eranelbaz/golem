@@ -12,6 +12,7 @@ use golem_llama_sys::raw;
 use golem_llama_sys::{Backend, substrate_backend};
 use golem_placement::pool::P3Stats;
 
+use crate::chat::{ChatTemplates, Rendered};
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::gguf;
@@ -445,14 +446,6 @@ fn argmax_of(logits: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Chatml template copied from the `llm_chat_apply_template` CHATML branch of
-/// `vendor/llama.cpp/src/llama-chat.cpp` (the `ss <<` sequence rendered as the
-/// canonical jinja-style string; same literal as the vendor's own
-/// test-chat-template.cpp chatml case). llama.cpp detects chatml by the
-/// `<|im_start|>` substring and renders from its hardcoded branch, so this
-/// string is a detection key, never a parsed template.
-pub(crate) const FALLBACK_CHAT_TEMPLATE: &str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
-
 /// One message of a chat conversation.
 pub struct ChatTurn<'a> {
     /// Speaker role the chat template understands (`"system"`, `"user"`,
@@ -462,27 +455,43 @@ pub struct ChatTurn<'a> {
     pub content: &'a str,
 }
 
-/// CString pair backing one `raw::llama_chat_message` for the duration of a
-/// template-apply call.
-struct ChatMessageFFI {
-    role: CString,
-    content: CString,
+/// Builds the session's chat templates and validates them with a 1-message
+/// probe render; also returns the default template source.
+fn probe_templates(
+    loaded: &LoadedModel,
+    config: &EngineConfig,
+) -> Result<(ChatTemplates, String), EngineError> {
+    let over = config.chat_template.as_deref();
+    let chat = ChatTemplates::from_model(loaded.model().as_ptr(), over)?;
+    let probe = chat.render(r#"[{"role":"user","content":"ping"}]"#, None, None)?;
+    if probe.prompt.is_empty() {
+        return Err(EngineError::TemplateUnavailable);
+    }
+    let src = over.map(str::to_owned);
+    Ok((
+        chat,
+        src.or_else(|| loaded.model().chat_template())
+            .unwrap_or_default(),
+    ))
 }
 
-fn ffi_messages(messages: &[ChatTurn<'_>]) -> Result<Vec<ChatMessageFFI>, EngineError> {
-    messages
-        .iter()
-        .map(|m| {
-            Ok(ChatMessageFFI {
-                role: CString::new(m.role).map_err(|_| {
-                    EngineError::InvalidModel("chat message role contains NUL".into())
-                })?,
-                content: CString::new(m.content).map_err(|_| {
-                    EngineError::InvalidModel("chat message content contains NUL".into())
-                })?,
-            })
-        })
-        .collect()
+/// Renders `req`'s transcript (raw JSON, else its `ChatTurn`s) and tools.
+fn render(chat: &ChatTemplates, req: &TurnRequest<'_>) -> Result<Rendered, EngineError> {
+    let built;
+    let messages = match req.messages_json {
+        Some(m) => m,
+        None => {
+            built = serde_json::Value::Array(
+                req.messages
+                    .iter()
+                    .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                    .collect(),
+            )
+            .to_string();
+            &built
+        }
+    };
+    chat.render(messages, req.tools_json, req.tool_choice)
 }
 
 /// A loaded model bound to its resolved chat template, driving its decode
@@ -501,7 +510,9 @@ pub struct Session {
 pub(crate) struct SessionInner {
     loaded: LoadedModel,
     config: EngineConfig,
-    template: CString,
+    chat: ChatTemplates,
+    /// Default template source (reasoning-marker detection).
+    template: String,
     last_prompt_tokens: Vec<raw::llama_token>,
     /// P3 pool state when the RAM expert pool is enabled (nonzero
     /// `ram_experts_gib`); `None` keeps flagless runs pristine (hooks unset,
@@ -617,21 +628,7 @@ impl Session {
         if let Some(p) = p3.as_mut() {
             p.fit_device_cache()?;
         }
-        let template_src = loaded
-            .model()
-            .chat_template()
-            .unwrap_or_else(|| FALLBACK_CHAT_TEMPLATE.to_owned());
-        // Interior NUL would truncate the template at the FFI boundary: unusable.
-        let template = CString::new(template_src).map_err(|_| EngineError::TemplateUnavailable)?;
-
-        let probe = ffi_messages(&[ChatTurn {
-            role: "user",
-            content: "ping",
-        }])?;
-        // SAFETY: template is a live CString; probe CStrings outlive the call.
-        if unsafe { apply_template(&template, &probe, true) }?.is_empty() {
-            return Err(EngineError::TemplateUnavailable);
-        }
+        let (chat, template) = probe_templates(&loaded, config)?;
 
         let snapshots = snapshot_cache(config, &loaded)?;
 
@@ -644,6 +641,7 @@ impl Session {
                 inner: SessionInner {
                     loaded,
                     config: config.clone(),
+                    chat,
                     template,
                     last_prompt_tokens: Vec::new(),
                     p3,
@@ -670,19 +668,7 @@ impl Session {
     ) -> Result<Self, EngineError> {
         let _guard = construction_lock();
         let loaded = load_with_hooks(config, Some(ctx))?;
-        let template_src = loaded
-            .model()
-            .chat_template()
-            .unwrap_or_else(|| FALLBACK_CHAT_TEMPLATE.to_owned());
-        let template = CString::new(template_src).map_err(|_| EngineError::TemplateUnavailable)?;
-        let probe = ffi_messages(&[ChatTurn {
-            role: "user",
-            content: "ping",
-        }])?;
-        // SAFETY: template is a live CString; probe CStrings outlive the call.
-        if unsafe { apply_template(&template, &probe, true) }?.is_empty() {
-            return Err(EngineError::TemplateUnavailable);
-        }
+        let (chat, template) = probe_templates(&loaded, config)?;
         Ok({
             p3_glue::session_opened();
             Session {
@@ -692,6 +678,7 @@ impl Session {
                 inner: SessionInner {
                     loaded,
                     config: config.clone(),
+                    chat,
                     template,
                     last_prompt_tokens: Vec::new(),
                     p3: None,
@@ -856,10 +843,17 @@ impl Session {
         }
     }
 
+    /// Renders `req` through the chat layer; pass the result back via
+    /// [`TurnRequest::rendered`] to keep its [`crate::OutputParser`] for
+    /// parsing the generated text.
+    pub fn render(&self, req: &TurnRequest<'_>) -> Result<Rendered, EngineError> {
+        render(&self.inner.chat, req)
+    }
+
     /// Reasoning-marker splitter for the session's chat template (§8.1
     /// `reasoning_content`); `None` when the template has no markers.
     pub fn reasoning_splitter(&self) -> Option<crate::reasoning::ReasoningSplitter> {
-        crate::reasoning::ReasoningSplitter::from_template(&self.inner.template.to_string_lossy())
+        crate::reasoning::ReasoningSplitter::from_template(&self.inner.template)
     }
 
     /// Test seam: every later turn sets its own cancel flag right after
@@ -1045,9 +1039,14 @@ impl SessionInner {
         slot: &mut SlotState,
         req: &TurnRequest<'_>,
     ) -> Result<SeqResetGuard, EngineError> {
-        let msgs = ffi_messages(req.messages)?;
-        // SAFETY: template and msgs CStrings are alive for the duration of the call.
-        let rendered = unsafe { apply_template(&self.template, &msgs, true)? };
+        let own;
+        let rendered = match req.rendered {
+            Some(r) => r,
+            None => {
+                own = render(&self.chat, req)?;
+                &own
+            }
+        };
 
         let ctx = self.loaded.ctx();
         // SAFETY: ctx is live; the context is idle between turns.
@@ -1064,7 +1063,7 @@ impl SessionInner {
         // add_special = true: the fallback chatml renders no BOS text, so this
         // yields exactly one BOS.
         // SAFETY: vocab is live; rendered is valid for its byte length.
-        let prompt = unsafe { tokenize_prompt(vocab, &rendered, true, true)? };
+        let prompt = unsafe { tokenize_prompt(vocab, &rendered.prompt, true, true)? };
         if prompt.is_empty() {
             return Err(EngineError::Tokenize(0));
         }
@@ -1110,7 +1109,15 @@ impl SessionInner {
             .map_err(|_| EngineError::InvalidModel("vocab size is negative".to_owned()))?;
 
         let armed = slot::Armed {
-            sampler: Sampler::from_params(&req.sampling, n_vocab)?,
+            sampler: Sampler::from_params(
+                &req.sampling,
+                n_vocab,
+                rendered
+                    .has_grammar
+                    .then(|| rendered.parser.grammar_sampler(vocab))
+                    .transpose()?
+                    .flatten(),
+            )?,
             ffi: TurnFfi {
                 batch: Batch::init(batch_cap as i32, 0, 1),
                 prompt,
@@ -1451,14 +1458,23 @@ pub(crate) struct Sampler {
 
 impl Sampler {
     /// Chain per `p`: penalties (when either is nonzero — applied in greedy
-    /// mode too), then greedy for `temperature <= 0`, else
+    /// mode too), the request's tool-call `grammar` (owned sampler, moved
+    /// into the chain), then greedy for `temperature <= 0`, else
     /// top_k (if > 0) → top_p → temp → dist(seed).
-    pub(crate) fn from_params(p: &SamplingParams, n_vocab: i32) -> Result<Self, EngineError> {
+    pub(crate) fn from_params(
+        p: &SamplingParams,
+        n_vocab: i32,
+        grammar: Option<*mut raw::llama_sampler>,
+    ) -> Result<Self, EngineError> {
         // SAFETY: returns llama.cpp's default sampler-chain params by value.
         let params = unsafe { raw::llama_sampler_chain_default_params() };
         // SAFETY: params are defaults; freed exactly once in Drop via llama_sampler_free.
         let chain = unsafe { raw::llama_sampler_chain_init(params) };
         if chain.is_null() {
+            if let Some(g) = grammar {
+                // SAFETY: owned, never added to a chain.
+                unsafe { raw::llama_sampler_free(g) };
+            }
             return Err(EngineError::SamplerInit);
         }
         let s = Sampler { ptr: chain };
@@ -1478,6 +1494,9 @@ impl Sampler {
                     p.presence_penalty,
                 )
             });
+        }
+        if let Some(g) = grammar {
+            add(g);
         }
         if p.temperature <= 0.0 {
             // SAFETY: plain constructor; ownership passes to the chain.
@@ -1579,65 +1598,6 @@ unsafe fn fill_slot(
         **b.seq_id.add(i) = seq;
         *b.logits.add(i) = if wants_logits { 1 } else { 0 };
     }
-}
-
-/// Applies the chat template: sizing call with a null buffer (documented pattern,
-/// returns the total byte count), then the real call into a zeroed `count + 1`
-/// buffer (+1 because `strncpy` does not NUL-terminate an exact-size render).
-///
-/// # Safety
-/// `tmpl` must be a valid NUL-terminated CString, and every `ChatMessageFFI` in
-/// `msgs` must stay alive for the duration of the call.
-unsafe fn apply_template(
-    tmpl: &CStr,
-    msgs: &[ChatMessageFFI],
-    add_ass: bool,
-) -> Result<String, EngineError> {
-    // Pointers into msgs' CStrings; they outlive both FFI calls below.
-    let chat: Vec<raw::llama_chat_message> = msgs
-        .iter()
-        .map(|m| raw::llama_chat_message {
-            role: m.role.as_ptr(),
-            content: m.content.as_ptr(),
-        })
-        .collect();
-    let n_msg = chat.len();
-    // SAFETY: tmpl and chat point to live NUL-terminated data; null/0 buffer is
-    // the documented sizing call (returns the total number of bytes needed,
-    // negative on detection/apply failure).
-    let n = unsafe {
-        raw::llama_chat_apply_template(
-            tmpl.as_ptr(),
-            chat.as_ptr(),
-            n_msg,
-            add_ass,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if n < 0 {
-        return Err(EngineError::TemplateApply(n));
-    }
-    let mut buf = vec![0u8; usize::try_from(n).unwrap_or(0) + 1];
-    // SAFETY: buf is n+1 zeroed bytes and length n matches the sizing result.
-    let written = unsafe {
-        raw::llama_chat_apply_template(
-            tmpl.as_ptr(),
-            chat.as_ptr(),
-            n_msg,
-            add_ass,
-            buf.as_mut_ptr().cast(),
-            n,
-        )
-    };
-    if written < 0 {
-        return Err(EngineError::TemplateApply(written));
-    }
-    // SAFETY: buf is NUL-terminated (zeroed +1 byte; at most `written` render bytes).
-    let s = unsafe { CStr::from_ptr(buf.as_ptr().cast()) }
-        .to_string_lossy()
-        .into_owned();
-    Ok(s)
 }
 
 /// Tokenizes `text` (two-pass: null-buffer sizing call, whose negative return is
@@ -1960,12 +1920,36 @@ mod tests {
         assert!(forces_expert_offload(&pooled));
     }
 
+    /// One rendering path (§8.1): the shim's no-tools render of the tiny-moe
+    /// fallback (chatml) equals the old `llama_chat_apply_template` render.
     #[test]
-    fn fallback_template_contains_chatml_marker() {
-        // llama.cpp detects chatml by the <|im_start|> substring (llama-chat.cpp
-        // llm_chat_detect_template); the fallback must carry it.
-        assert!(FALLBACK_CHAT_TEMPLATE.contains("<|im_start|>"));
-        assert!(FALLBACK_CHAT_TEMPLATE.contains("<|im_end|>"));
+    fn shim_no_tools_render_matches_legacy_template_apply() {
+        let cfg = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let s = Session::new(&cfg).expect("tiny-moe loads");
+        let turns = [
+            ChatTurn {
+                role: "system",
+                content: "be brief",
+            },
+            ChatTurn {
+                role: "user",
+                content: "hello",
+            },
+            ChatTurn {
+                role: "assistant",
+                content: "hi there",
+            },
+            ChatTurn {
+                role: "user",
+                content: "again",
+            },
+        ];
+        let shim = s.render(&TurnRequest::new(&turns)).unwrap().prompt;
+        let legacy = legacy_apply_template(c"chatml", &turns, true);
+        assert_eq!(shim, legacy);
     }
 
     #[test]
@@ -2148,5 +2132,62 @@ mod tests {
             0,
             "multi-chunk prefill must not advance the policy step (§6.2)"
         );
+    }
+
+    /// Applies the chat template: sizing call with a null buffer (documented pattern,
+    /// returns the total byte count), then the real call into a zeroed `count + 1`
+    /// buffer (+1 because `strncpy` does not NUL-terminate an exact-size render).
+    ///
+    /// The pre-shim render path, kept as the no-tools parity oracle.
+    fn legacy_apply_template(tmpl: &CStr, turns: &[ChatTurn<'_>], add_ass: bool) -> String {
+        let owned: Vec<(CString, CString)> = turns
+            .iter()
+            .map(|t| {
+                (
+                    CString::new(t.role).unwrap(),
+                    CString::new(t.content).unwrap(),
+                )
+            })
+            .collect();
+        // Pointers into `owned`; they outlive both FFI calls below.
+        let chat: Vec<raw::llama_chat_message> = owned
+            .iter()
+            .map(|(r, c)| raw::llama_chat_message {
+                role: r.as_ptr(),
+                content: c.as_ptr(),
+            })
+            .collect();
+        let n_msg = chat.len();
+        // SAFETY: tmpl and chat point to live NUL-terminated data; null/0 buffer is
+        // the documented sizing call (returns the total number of bytes needed,
+        // negative on detection/apply failure).
+        let n = unsafe {
+            raw::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                chat.as_ptr(),
+                n_msg,
+                add_ass,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(n >= 0, "llama_chat_apply_template sizing failed: {n}");
+        let mut buf = vec![0u8; usize::try_from(n).unwrap_or(0) + 1];
+        // SAFETY: buf is n+1 zeroed bytes and length n matches the sizing result.
+        let written = unsafe {
+            raw::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                chat.as_ptr(),
+                n_msg,
+                add_ass,
+                buf.as_mut_ptr().cast(),
+                n,
+            )
+        };
+        assert!(written >= 0, "llama_chat_apply_template failed: {written}");
+        // SAFETY: buf is NUL-terminated (zeroed +1 byte; at most `written` render bytes).
+        unsafe { CStr::from_ptr(buf.as_ptr().cast()) }
+            .to_string_lossy()
+            .into_owned()
     }
 }

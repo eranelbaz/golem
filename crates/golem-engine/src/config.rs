@@ -55,6 +55,9 @@ pub struct EngineConfig {
     /// timings are recorded and flushed at turn end; `None` (the default)
     /// records nothing.
     pub timing_csv: Option<PathBuf>,
+    /// Jinja chat template overriding the model's own (`None`: model
+    /// metadata, else chatml).
+    pub chat_template: Option<String>,
     /// Routing-trace destination (§11 timing-CSV pattern): when set, every
     /// routing readback is appended to a preallocated per-step ring and
     /// flushed at turn end as `step\tphase\tlayer\tid,id,...` under a
@@ -166,6 +169,7 @@ impl Default for EngineConfig {
             // Off by default: only the CLI asks for the planner-sized arena.
             snapshot_ram_bytes: Some(0),
             model_facts: None,
+            chat_template: None,
         }
     }
 }

@@ -1,5 +1,5 @@
 //! `stream: true` responses (design §8.1): `chat.completion.chunk` frames
-//! over SSE — role chunk, content/reasoning deltas, the finish chunk, an
+//! over SSE — role chunk, content/reasoning/tool-call deltas, the finish chunk, an
 //! optional usage chunk, then `[DONE]`.
 
 use std::convert::Infallible;
@@ -83,7 +83,10 @@ async fn forward(
             _ = tx.closed() => return,
             ev = rx.recv() => ev,
         };
-        let terminal = !matches!(ev, Some(Event::Text(_) | Event::Reasoning(_)));
+        let terminal = !matches!(
+            ev,
+            Some(Event::Text(_) | Event::Reasoning(_) | Event::ToolCall(_))
+        );
         let frames = match ev {
             Some(Event::Text(t)) => vec![meta.delta(
                 Delta {
@@ -95,6 +98,13 @@ async fn forward(
             Some(Event::Reasoning(t)) => vec![meta.delta(
                 Delta {
                     reasoning_content: Some(t),
+                    ..Delta::default()
+                },
+                None,
+            )],
+            Some(Event::ToolCall(c)) => vec![meta.delta(
+                Delta {
+                    tool_calls: Some(vec![c]),
                     ..Delta::default()
                 },
                 None,

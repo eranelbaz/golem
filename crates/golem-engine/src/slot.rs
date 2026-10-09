@@ -43,8 +43,20 @@ impl Default for SamplingParams {
 
 /// One turn's request; build with [`TurnRequest::new`] and the setters.
 pub struct TurnRequest<'a> {
-    /// Transcript to render with the session template.
+    /// Transcript to render with the session template; ignored when
+    /// `messages_json` is set.
     pub messages: &'a [ChatTurn<'a>],
+    /// Raw OpenAI `messages` array (keeps assistant `tool_calls` and `tool`
+    /// messages, which `ChatTurn` cannot carry).
+    pub messages_json: Option<&'a str>,
+    /// OpenAI `tools` array JSON.
+    pub tools_json: Option<&'a str>,
+    /// OpenAI `tool_choice` JSON (`"auto"`, `"none"`, `"required"` or a
+    /// named-function object).
+    pub tool_choice: Option<&'a str>,
+    /// Pre-rendered prompt from [`crate::Session::render`]; overrides the
+    /// three fields above.
+    pub rendered: Option<&'a crate::chat::Rendered>,
     /// Sampler chain parameters.
     pub sampling: SamplingParams,
     /// Generated-token cap; `None` = `EngineConfig::n_predict`.
@@ -60,11 +72,34 @@ impl<'a> TurnRequest<'a> {
     pub fn new(messages: &'a [ChatTurn<'a>]) -> Self {
         Self {
             messages,
+            messages_json: None,
+            tools_json: None,
+            tool_choice: None,
+            rendered: None,
             sampling: SamplingParams::default(),
             max_tokens: None,
             stop: &[],
             cancel: None,
         }
+    }
+
+    /// Sets [`TurnRequest::messages_json`].
+    pub fn messages_json(mut self, json: &'a str) -> Self {
+        self.messages_json = Some(json);
+        self
+    }
+
+    /// Sets [`TurnRequest::tools_json`] and [`TurnRequest::tool_choice`].
+    pub fn tools(mut self, tools_json: Option<&'a str>, tool_choice: Option<&'a str>) -> Self {
+        self.tools_json = tools_json;
+        self.tool_choice = tool_choice;
+        self
+    }
+
+    /// Sets [`TurnRequest::rendered`].
+    pub fn rendered(mut self, rendered: &'a crate::chat::Rendered) -> Self {
+        self.rendered = Some(rendered);
+        self
     }
 
     /// Sets [`TurnRequest::sampling`].

@@ -73,16 +73,6 @@ async fn unsupported_field_is_400_envelope() {
     let r = app.clone().oneshot(chat(body)).await.unwrap();
     assert_eq!(r.status(), 400);
     assert_eq!(json(r).await["error"]["code"], "golem_unsupported_field");
-    // Supported by policy but not wired yet: refused, never silently ignored.
-    for extra in [serde_json::json!({"tools": [{"type":"function","function":{"name":"f"}}]})] {
-        let mut body = hi(4);
-        body.as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        let r = app.clone().oneshot(chat(body)).await.unwrap();
-        assert_eq!(r.status(), 400);
-        assert_eq!(json(r).await["error"]["code"], "golem_unsupported_field");
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

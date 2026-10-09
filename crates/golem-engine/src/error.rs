@@ -27,6 +27,9 @@ pub enum EngineError {
     /// llama_chat_apply_template returned a negative code.
     #[error("llama_chat_apply_template failed with code {0}")]
     TemplateApply(i32),
+    /// The chat layer (common/chat.h shim) rejected a render or parse.
+    #[error("chat template: {0}")]
+    ChatTemplate(String),
     /// llama_tokenize returned a negative code.
     #[error("llama_tokenize failed with code {0}")]
     Tokenize(i32),
