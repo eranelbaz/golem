@@ -182,13 +182,26 @@ pub struct Machine {
 }
 
 /// Prefill workspace model, fitted from measured points.
-#[derive(Debug, Default, Clone, Copy, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WsModel {
     /// Fixed part (512 MiB until measured).
     pub base: u64,
     /// Bytes per ubatch token.
     pub per_ubatch_token: u64,
 }
+
+/// `ws` until the T8 hardware sweep fits it (§12, M4.6): the §10 512 MiB
+/// starting point, slope **unmeasured** (0). Placeholder, not a measurement.
+pub const WS_UNMEASURED: WsModel = WsModel {
+    base: 512 << 20,
+    per_ubatch_token: 0,
+};
+
+/// Combined ROCm overhead on gfx1100, measured in M0 (2.64 GiB, m0-notes).
+pub const ROCM_OVERHEAD: u64 = 2_834_678_415;
+
+/// Candidate `--prefill-ubatch` values, largest first.
+const UBATCHES: [u32; 5] = [8192, 4096, 2048, 1024, 512];
 
 /// Plan knobs; zero `ram_experts` means the §10 default pool.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -197,11 +210,12 @@ pub struct PlanInput {
     pub ctx: u32,
     /// Concurrent sequences.
     pub parallel: u32,
-    /// Prefill ubatch tokens.
+    /// Context ubatch tokens (the streamed prefill ubatch; sizes `ws`).
     pub prefill_ubatch: u32,
     /// Prefill layer streaming enabled (§7.6).
     pub prefill_stream: bool,
-    /// Device expert-cache budget.
+    /// Device expert-cache budget; zero = whatever VRAM the other terms
+    /// leave (the runtime's derived K).
     pub vram_experts: u64,
     /// Host expert-pool budget.
     pub ram_experts: u64,
@@ -218,6 +232,172 @@ pub struct Term {
     pub name: &'static str,
     /// Bytes.
     pub bytes: u64,
+}
+
+/// A tier's sum; sub-lines (`parent.child`, e.g. `t_ne.shexp`) are already
+/// inside their parent and never counted twice.
+#[must_use]
+pub fn total(terms: &[Term]) -> u64 {
+    terms
+        .iter()
+        .filter(|t| !t.name.contains('.'))
+        .map(|t| t.bytes)
+        .sum()
+}
+
+/// The §10 verdict per tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanReport {
+    /// VRAM terms (§10 order).
+    pub vram: Vec<Term>,
+    /// RAM terms (§10 order).
+    pub ram: Vec<Term>,
+    /// `vram_total − Σ vram`.
+    pub vram_headroom: i64,
+    /// `ram_free − Σ ram`.
+    pub ram_headroom: i64,
+    /// Both headrooms ≥ 0.
+    pub feasible: bool,
+    /// When VRAM is over: the largest candidate ubatch that fits, if any.
+    pub largest_fitting_ubatch: Option<u32>,
+}
+
+impl PlanReport {
+    /// The failing inequalities with actual numbers, e.g. `VRAM 25.1 GiB >
+    /// 24.0 GiB; largest --prefill-ubatch that fits: 2048`; `None` when
+    /// feasible.
+    #[must_use]
+    pub fn violation(&self) -> Option<String> {
+        let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+        let cap = |t: &[Term], h: i64| total(t).saturating_add_signed(h);
+        let (vram_cap, ram_cap) = (
+            cap(&self.vram, self.vram_headroom),
+            cap(&self.ram, self.ram_headroom),
+        );
+        let mut out = Vec::new();
+        if self.vram_headroom < 0 {
+            out.push(format!(
+                "VRAM {:.1} GiB > {:.1} GiB",
+                gib(total(&self.vram)),
+                gib(vram_cap)
+            ));
+            if let Some(u) = self.largest_fitting_ubatch {
+                out.push(format!("largest --prefill-ubatch that fits: {u}"));
+            }
+        }
+        if self.ram_headroom < 0 {
+            out.push(format!(
+                "RAM {:.1} GiB > {:.1} GiB",
+                gib(total(&self.ram)),
+                gib(ram_cap)
+            ));
+        }
+        (!out.is_empty()).then(|| out.join("; "))
+    }
+
+    /// The named term's bytes (0 when absent).
+    #[must_use]
+    pub fn term(&self, name: &str) -> u64 {
+        self.vram
+            .iter()
+            .chain(&self.ram)
+            .find(|t| t.name == name)
+            .map_or(0, |t| t.bytes)
+    }
+}
+
+fn headroom(cap: u64, used: u64) -> i64 {
+    i64::try_from(cap)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::try_from(used).unwrap_or(i64::MAX))
+}
+
+/// VRAM tier (§10). Target at ctx 100k, parallel 1, ubatch 2048, unset
+/// cache: 8.98 GiB t_ne + 1.84 GiB kv + 0.14 GiB rs + 0.5 GiB ws + 3.69 GiB
+/// slabs + 2.64 GiB ROCm = 17.8 GiB → 6.2 GiB device expert cache.
+#[must_use]
+pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
+    let par = u64::from(i.parallel);
+    let mut t = vec![
+        Term {
+            name: "t_ne",
+            bytes: m.t_ne,
+        },
+        Term {
+            name: "t_ne.shexp",
+            bytes: m.shexp,
+        },
+        Term {
+            name: "kv",
+            bytes: m
+                .kv_per_token
+                .saturating_mul(u64::from(i.ctx))
+                .saturating_mul(par),
+        },
+        Term {
+            name: "recurrent_state",
+            bytes: m.rs_bytes.saturating_mul(par),
+        },
+        Term {
+            name: "ws",
+            bytes: i.ws.base.saturating_add(
+                i.ws.per_ubatch_token
+                    .saturating_mul(u64::from(i.prefill_ubatch)),
+            ),
+        },
+        Term {
+            name: "stream_slabs",
+            bytes: stream_bytes(m, i),
+        },
+        Term {
+            name: "rocm_overhead",
+            bytes: mach.rocm_overhead,
+        },
+    ];
+    let cache = if i.vram_experts > 0 {
+        i.vram_experts
+    } else {
+        mach.vram_total.saturating_sub(total(&t))
+    };
+    t.insert(
+        5,
+        Term {
+            name: "device_expert_cache",
+            bytes: cache,
+        },
+    );
+    t
+}
+
+/// The §10 memory model: one implementation for `golem plan` and the
+/// engine's load-time check (§6.4).
+#[must_use]
+pub fn plan(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> PlanReport {
+    let vram = vram_terms(m, mach, i);
+    let ram = ram_terms(m, mach, i);
+    let vram_headroom = headroom(mach.vram_total, total(&vram));
+    let ram_headroom = headroom(mach.ram_free, total(&ram));
+    let largest_fitting_ubatch = (vram_headroom < 0)
+        .then(|| {
+            UBATCHES.into_iter().find(|&u| {
+                u < i.prefill_ubatch && {
+                    let j = PlanInput {
+                        prefill_ubatch: u,
+                        ..*i
+                    };
+                    total(&vram_terms(m, mach, &j)) <= mach.vram_total
+                }
+            })
+        })
+        .flatten();
+    PlanReport {
+        feasible: vram_headroom >= 0 && ram_headroom >= 0,
+        vram,
+        ram,
+        vram_headroom,
+        ram_headroom,
+        largest_fitting_ubatch,
+    }
 }
 
 /// One state snapshot: recurrent state plus KV for `n_tokens` (§7.1).
@@ -306,6 +486,113 @@ mod tests {
     }
     fn get(t: &[Term], n: &str) -> u64 {
         t.iter().find(|t| t.name == n).unwrap().bytes
+    }
+
+    /// Real target: stream_slabs = 2 × 288 × 6,881,280 = 3,963,617,280 B;
+    /// staging_ring the same; rs = 145.56 MiB.
+    #[test]
+    fn stream_slabs_match_design_7_6() {
+        let r = plan(
+            &glm(),
+            &box24(),
+            &PlanInput {
+                prefill_stream: true,
+                ..PlanInput::default()
+            },
+        );
+        assert_eq!(get(&r.vram, "stream_slabs"), 3_963_617_280);
+        assert_eq!(get(&r.ram, "staging_ring"), 3_963_617_280);
+    }
+
+    #[test]
+    fn rs_and_kv_scale_with_parallel_and_ctx() {
+        let a = plan(
+            &glm(),
+            &box24(),
+            &PlanInput {
+                ctx: 4096,
+                parallel: 1,
+                ..Default::default()
+            },
+        );
+        let b = plan(
+            &glm(),
+            &box24(),
+            &PlanInput {
+                ctx: 4096,
+                parallel: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            get(&b.vram, "recurrent_state"),
+            2 * get(&a.vram, "recurrent_state")
+        );
+        assert_eq!(get(&a.vram, "kv"), 19_712 * 4096);
+    }
+
+    /// Target at ubatch 8192 with 1 MiB/token ws: 8 + 8.5 + 6 + 3.69 + 2.64
+    /// ≈ 28.8 GiB > 24 GiB; at 2048: ≈ 22.8 GiB fits, at 4096 ≈ 24.8 does not.
+    #[test]
+    fn oversized_ubatch_refused_with_largest_fitting_suggestion() {
+        let ws = WsModel {
+            base: 512 << 20,
+            per_ubatch_token: 1 << 20,
+        };
+        let r = plan(
+            &glm(),
+            &box24(),
+            &PlanInput {
+                prefill_stream: true,
+                prefill_ubatch: 8192,
+                vram_experts: 6 << 30,
+                ws,
+                ..Default::default()
+            },
+        );
+        assert!(!r.feasible);
+        let v = r.violation().unwrap();
+        assert!(v.starts_with("VRAM ") && v.contains("> 24.0 GiB"), "{v}");
+        assert!(v.contains("largest --prefill-ubatch that fits: "), "{v}");
+        let s = r.largest_fitting_ubatch.unwrap();
+        assert!([512, 1024, 2048, 4096].contains(&s));
+        assert!(
+            plan(
+                &glm(),
+                &box24(),
+                &PlanInput {
+                    prefill_ubatch: s,
+                    prefill_stream: true,
+                    vram_experts: 6 << 30,
+                    ws,
+                    ..Default::default()
+                }
+            )
+            .feasible
+        );
+    }
+
+    #[test]
+    fn unset_device_cache_takes_the_remaining_vram() {
+        let i = PlanInput {
+            ctx: 4096,
+            parallel: 1,
+            ws: WS_UNMEASURED,
+            ..Default::default()
+        };
+        let r = plan(&glm(), &box24(), &i);
+        assert!(r.feasible);
+        assert_eq!(r.vram_headroom, 0);
+        let set = plan(
+            &glm(),
+            &box24(),
+            &PlanInput {
+                vram_experts: 30 << 30,
+                ..i
+            },
+        );
+        assert!(!set.feasible);
+        assert!(set.vram_headroom < 0);
     }
 
     #[test]

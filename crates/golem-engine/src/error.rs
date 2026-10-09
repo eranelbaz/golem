@@ -67,6 +67,14 @@ pub enum EngineError {
     /// `golem_backend_unavailable`): refused rather than a silent CPU fallback.
     #[error("GPU backend unavailable for expert math: {0}")]
     BackendUnavailable(String),
+    /// The §10 memory model refuses the configuration at load (§6.4).
+    #[error("golem_plan_infeasible: {}", .0.violation().unwrap_or_default())]
+    PlanInfeasible(Box<golem_plan::PlanReport>),
+    /// A device-cache slab allocation failed after load (`llama_decode`
+    /// −2): the turn fails, the cache is reset and shrunk to the carried K,
+    /// and the session keeps serving degraded.
+    #[error("device expert cache allocation failed; shrunk to K = {0} experts per layer")]
+    DeviceCacheDegraded(u32),
 }
 
 #[cfg(test)]

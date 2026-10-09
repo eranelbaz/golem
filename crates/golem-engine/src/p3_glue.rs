@@ -788,6 +788,8 @@ pub struct SessionHooks {
     pub device_cache_experts: u32,
     /// Pending derived-K fit; `None` once fitted or with an explicit K.
     fit: Option<DeviceFit>,
+    /// `golem_slab_alloc_failures` already handled.
+    slab_failures_seen: u64,
     /// Model routed top-k (`expert_used_count`).
     pub top_k: u32,
     /// Prefill-stream state (§7.6); `None` when disabled.
@@ -885,7 +887,7 @@ impl SessionHooks {
             return Ok(());
         };
         let k_of = |budget: u64| {
-            k_from_free_vram(budget, fit.slab_bytes_per_expert, self.top_k)
+            k_from_free_vram(budget, fit.plan_cap, fit.slab_bytes_per_expert, self.top_k)
                 .map(|k| k.min(fit.k_bound))
         };
         let k = match k_of(free.saturating_sub(fit.stream_slab_vram)) {
@@ -909,6 +911,43 @@ impl SessionHooks {
         unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
         self.device_cache_experts = k;
         Ok(())
+    }
+
+    /// Caps the pending derived-K fit at the §10 plan's `device_expert_cache`
+    /// bytes. No-op for an explicit K.
+    pub(crate) fn cap_device_cache(&mut self, bytes: u64) {
+        if let Some(f) = self.fit.as_mut() {
+            f.plan_cap = bytes;
+        }
+    }
+
+    /// After a `llama_decode` −2: when C reports a new device-slab allocation
+    /// failure (ABI v12), frees every slab, halves K (never below top-k) and
+    /// returns it; `None` when the −2 was not a slab failure. The next compute
+    /// reallocates the smaller slabs; the session serves degraded.
+    pub(crate) fn shrink_after_slab_failure(&mut self) -> Option<u32> {
+        let ctx = self.ctx_ptr();
+        // SAFETY: FFI counter read on the live ctx.
+        let failures = unsafe { raw::golem_slab_alloc_failures(ctx) };
+        if failures == self.slab_failures_seen {
+            return None;
+        }
+        self.slab_failures_seen = failures;
+        // SAFETY: FFI on the live ctx between computes (the failed decode
+        // was synchronized; no slab in flight).
+        unsafe { raw::golem_reset_device_cache(ctx) };
+        self.device_cache_reset();
+        let k = (self.device_cache_experts / 2).max(self.top_k);
+        // SAFETY: FFI setter on the live ctx between computes.
+        unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
+        tracing::warn!(
+            from = self.device_cache_experts,
+            to = k,
+            "device expert-cache slab allocation failed (VRAM taken after load); \
+             cache reset and shrunk, serving degraded"
+        );
+        self.device_cache_experts = k;
+        Some(k)
     }
 
     /// Whether prefill streaming is enabled for this session.
@@ -1592,10 +1631,12 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         state,
         ctx_keep: hooked_ctx_keep,
         device_cache_experts: k_start,
+        slab_failures_seen: 0,
         fit: derived_k.then_some(DeviceFit {
             k_bound: k,
             slab_bytes_per_expert: slab,
             stream_slab_vram,
+            plan_cap: u64::MAX,
         }),
         top_k: n_expert_used,
         stream: stream.clone(),
@@ -1634,7 +1675,7 @@ fn derive_device_cache_experts(
     #[cfg(golem_backend_hip)]
     if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
         return Ok((
-            k_from_free_vram(free as u64, slab_bytes_per_expert, n_expert_used)?,
+            k_from_free_vram(free as u64, u64::MAX, slab_bytes_per_expert, n_expert_used)?,
             true,
         ));
     }
@@ -1653,6 +1694,9 @@ struct DeviceFit {
     /// Both prefill-stream slabs (0 without streaming); they allocate
     /// lazily, so the post-load free VRAM does not net them out yet.
     stream_slab_vram: u64,
+    /// The §10 plan's `device_expert_cache` bytes ([`SessionHooks::cap_device_cache`]);
+    /// `u64::MAX` = uncapped.
+    plan_cap: u64,
 }
 
 /// Device bytes one slab slot costs across the model: Σ_layers unit bytes —
@@ -1701,7 +1745,9 @@ fn class_layout(
 }
 
 /// Derived K from free VRAM against the exact budget (ruling R3):
-/// `⌊free / slab⌋ − 1` — the stream slabs, KV, `ws` and the non-expert
+/// `⌊min(free − headroom, plan_cap) / slab⌋ − 1`, so K never exceeds the
+/// §10 plan's `device_expert_cache` term nor what is actually free — the
+/// stream slabs, KV, `ws` and the non-expert
 /// weights were all subtracted (or already allocated) before this runs;
 /// `VRAM_HEADROOM_BYTES` (1 GiB) covers allocator fragmentation and driver
 /// drift. Rejected below top-k — a routed set larger than K aborts
@@ -1712,14 +1758,15 @@ const VRAM_HEADROOM_BYTES: u64 = 1 << 30;
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 fn k_from_free_vram(
     free: u64,
+    plan_cap: u64,
     slab_bytes_per_expert: u64,
     n_expert_used: u32,
 ) -> Result<u32, EngineError> {
-    let k = free.saturating_sub(VRAM_HEADROOM_BYTES) / slab_bytes_per_expert.max(1);
+    let k = free.saturating_sub(VRAM_HEADROOM_BYTES).min(plan_cap) / slab_bytes_per_expert.max(1);
     let k = k.saturating_sub(1).clamp(1, i32::MAX as u64);
     if k < u64::from(n_expert_used) {
         return Err(EngineError::PoolInit(format!(
-            "free VRAM {free} B supports a slab of only {k} experts per layer at \
+            "free VRAM {free} B (plan cap {plan_cap} B) supports a slab of only {k} experts per layer at \
              {slab_bytes_per_expert} B per routed expert (Σ unit bytes), below \
              expert_used_count {n_expert_used} — even single-token decode would abort; \
              free VRAM or lower the resident set"
@@ -2625,14 +2672,20 @@ mod tests {
         // Ruling R3 (exact budget): K = ⌊(free − 1 GiB headroom) / 644 MB⌋ − 1.
         // (2 × 6.657 GB − 1 GiB) / 644 MB = 19.0 → K = 18.
         assert_eq!(
-            k_from_free_vram(2 * 6_657_000_000, geo_bytes, 8).unwrap(),
+            k_from_free_vram(2 * 6_657_000_000, u64::MAX, geo_bytes, 8).unwrap(),
             18
         );
-        assert!(k_from_free_vram(1 << 30, geo_bytes, 8).is_err());
+        assert!(k_from_free_vram(1 << 30, u64::MAX, geo_bytes, 8).is_err());
         // Huge free VRAM stays within the i32 ABI (≤ 0 reads as "full slab" in C).
         assert_eq!(
-            k_from_free_vram(u64::MAX, geo_bytes, 8).unwrap(),
+            k_from_free_vram(u64::MAX, u64::MAX, geo_bytes, 8).unwrap(),
             i32::MAX as u32
+        );
+        // The §10 plan caps K below the free VRAM: a 6 GiB device_expert_cache
+        // term is ⌊6 GiB / 644 MB⌋ − 1 = 9, though 13.3 GB free allows 18.
+        assert_eq!(
+            k_from_free_vram(2 * 6_657_000_000, 6 << 30, geo_bytes, 8).unwrap(),
+            9
         );
     }
 

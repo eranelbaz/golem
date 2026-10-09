@@ -2211,6 +2211,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 golem_miss_kinds.clear();
                 golem_miss_ids.clear();
                 golem_evicts.clear();
+                bool golem_slab_failed = false;
                 for (int j = input_id; j < split->n_inputs; ++j) {
                     struct ggml_tensor * inp = split->inputs[j];
                     const int kind = golem_expert_stem_kind(inp->name);
@@ -2327,15 +2328,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 st.slab = ggml_new_tensor_3d(st.ctx, inp->type,
                                     inp->ne[0], inp->ne[1], (int64_t) K + 1);
                                 GGML_ASSERT(st.slab != nullptr);
-                                st.buf = ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
-                                GGML_ASSERT(st.buf != nullptr);
-                                GGML_ASSERT(st.slab->nb[2] == expert_size_j);
-                                ggml_backend_buffer_clear(st.buf, 0);
-                                st.K = K;
-                                st.expert_size = expert_size_j;
-                                // The slab's device bytes are gone: this plane must
-                                // re-copy everything on its next step.
-                                golem::golem_layer_invalidate(L, kind - 1);
+                                // ABI v12: a slab that no longer fits (VRAM taken
+                                // after load) fails the compute, never the process;
+                                // the engine resets the cache and lowers K.
+                                const bool inject = gctx->slab_fail_inject.load(std::memory_order_relaxed) > 0 &&
+                                                    gctx->slab_fail_inject.fetch_sub(1, std::memory_order_relaxed) > 0;
+                                st.buf = inject ? nullptr : ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
+                                if (st.buf == nullptr) {
+                                    ggml_free(st.ctx);
+                                    st.ctx = nullptr;
+                                    st.slab = nullptr;
+                                    st.K = 0;
+                                    golem::golem_layer_invalidate(L, kind - 1);
+                                    gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+                                    golem_slab_failed = true;
+                                } else {
+                                    GGML_ASSERT(st.slab->nb[2] == expert_size_j);
+                                    ggml_backend_buffer_clear(st.buf, 0);
+                                    st.K = K;
+                                    st.expert_size = expert_size_j;
+                                    // The slab's device bytes are gone: this plane must
+                                    // re-copy everything on its next step.
+                                    golem::golem_layer_invalidate(L, kind - 1);
+                                }
+                            }
+                            if (golem_slab_failed) {
+                                break;
                             }
                             // Remapped-ids device tensor: resized on ids-shape
                             // change (slot validity is independent of it).
@@ -2404,6 +2422,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             golem_miss_ids.push_back(id3);
                         }
                     }
+                }
+                if (golem_slab_failed) {
+                    // Nothing of this layer was issued yet; drain what
+                    // earlier layers queued, then fail the compute
+                    // (llama_decode -2). The slot tables already stepped
+                    // are stale until the engine resets the cache.
+                    golem_restore_ids();
+                    for (int i = 0; i < sched->n_backends; i++) {
+                        ggml_backend_synchronize(sched->backends[i]);
+                    }
+                    if (!golem_evict_d2h.empty()) {
+                        golem_evict_abandon_unfinished();
+                    }
+                    golem_in_flight_done(gctx);
+                    return GGML_STATUS_ALLOC_FAILED;
                 }
                 // Exclusive residency (O10): hand the layer's fully-valid
                 // evictions to the pool in ONE batched call — it returns D2H
@@ -3844,6 +3877,16 @@ int golem_policy_order_push(golem_ctx_t ctx, int32_t blk, int32_t kind,
 void golem_policy_order_epoch_advance(golem_ctx_t ctx) {
     if (ctx != NULL) {
         ctx->epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+uint64_t golem_slab_alloc_failures(golem_ctx_t ctx) {
+    return ctx == NULL ? 0 : ctx->slab_alloc_failures.load(std::memory_order_relaxed);
+}
+
+void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n) {
+    if (ctx != NULL) {
+        ctx->slab_fail_inject.store(n, std::memory_order_relaxed);
     }
 }
 

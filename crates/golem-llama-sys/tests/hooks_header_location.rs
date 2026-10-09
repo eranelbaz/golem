@@ -19,8 +19,8 @@ fn hooks_header_resolves_from_vendor_tree() {
         "hook registration missing"
     );
     assert!(
-        text.contains("#define GOLEM_HOOKS_ABI_VERSION 11"),
-        "hook ABI must be v11 (v10 prefill stream + v11 stream abort)"
+        text.contains("#define GOLEM_HOOKS_ABI_VERSION 12"),
+        "hook ABI must be v12 (v11 stream abort + v12 slab alloc failure)"
     );
     for sym in [
         "golem_evict_abandon_fn",

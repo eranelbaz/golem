@@ -616,8 +616,13 @@ impl Session {
         // BEFORE the model loads — the ctx must attach to the llama_model
         // before `llama_init_from_model` so its first `sched_reserve` sees
         // the hooks (cpy shrink). If the load fails, the guards drop cleanly.
+        let report = load_plan(config)?;
         let mut p3 = if config.ram_experts_gib > 0 {
-            Some(p3_glue::enable(config)?)
+            let mut p = p3_glue::enable(config)?;
+            if let Some(r) = &report {
+                p.cap_device_cache(r.term("device_expert_cache"));
+            }
+            Some(p)
         } else {
             None
         };
@@ -895,7 +900,16 @@ impl Session {
         req: &TurnRequest<'_>,
         emit: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, EngineError> {
-        let res = self.drive(req, emit);
+        let mut res = self.drive(req, emit);
+        if let Err(EngineError::Decode(-2)) = res
+            && let Some(k) = self
+                .inner
+                .p3
+                .as_mut()
+                .and_then(|p| p.shrink_after_slab_failure())
+        {
+            res = Err(EngineError::DeviceCacheDegraded(k));
+        }
         if res.is_err() {
             self.slots[0].flush_text(emit);
             self.slots[0].abort();
@@ -1800,6 +1814,84 @@ fn skip_ratio(bytes_copied: u64, bytes_skipped: u64) -> f64 {
     }
 }
 
+/// The §10 plan inputs for this config (`ws` unmeasured until T8). The
+/// context ubatch mirrors `load_with_hooks`; an explicit K prices its slab
+/// as `(K + 1) × Σ_layers unit bytes` — target 9 × 644,022,272 B = 5.4 GiB
+/// at K = 8.
+fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::PlanInput {
+    let ubatch = if config.prefill_stream {
+        match config.prefill_ubatch {
+            0 => 2048,
+            u => u,
+        }
+    } else {
+        config.batch_tokens
+    };
+    let per_expert = m.expert_bytes_total / u64::from(m.n_expert.max(1));
+    golem_plan::PlanInput {
+        ctx: config.n_ctx,
+        parallel: config.parallel,
+        prefill_ubatch: ubatch.min(config.n_ctx),
+        prefill_stream: config.prefill_stream,
+        vram_experts: match config.device_cache_experts {
+            0 => 0,
+            k => (u64::from(k) + 1) * per_expert,
+        },
+        ram_experts: config.ram_experts_gib << 30,
+        snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
+        ws: golem_plan::WS_UNMEASURED,
+    }
+}
+
+/// Load-time §10 VRAM feasibility (§6.4), same `golem_plan::plan` as
+/// `golem plan`, against the VRAM free before the load. RAM admission is
+/// the CLI's `fit_ram` over the same `ram_terms`, so RAM is not re-judged
+/// here. Err = `PlanInfeasible` with the failing inequality.
+fn check_plan(
+    config: &EngineConfig,
+    m: &golem_plan::ModelFacts,
+    vram_free: u64,
+) -> Result<golem_plan::PlanReport, EngineError> {
+    let mach = golem_plan::Machine {
+        vram_total: vram_free,
+        ram_total: u64::MAX,
+        ram_free: u64::MAX,
+        rocm_overhead: golem_plan::ROCM_OVERHEAD,
+    };
+    let r = golem_plan::plan(m, &mach, &plan_input(config, m));
+    if r.feasible {
+        Ok(r)
+    } else {
+        Err(EngineError::PlanInfeasible(Box::new(r)))
+    }
+}
+
+/// `(free, total)` device VRAM on a GPU build (`hipMemGetInfo`); `None`
+/// on CPU builds or when the runtime reports an error.
+pub fn device_vram() -> Option<(u64, u64)> {
+    #[cfg(golem_backend_hip)]
+    return golem_llama_sys::pinned::free_device_mem().map(|(f, t)| (f as u64, t as u64));
+    #[cfg(not(golem_backend_hip))]
+    None
+}
+
+/// Runs [`check_plan`] for a pooled session on a GPU build; `None` when the
+/// pool is off (the §10 tiers do not apply) or no VRAM reading exists.
+fn load_plan(config: &EngineConfig) -> Result<Option<golem_plan::PlanReport>, EngineError> {
+    if config.ram_experts_gib == 0 {
+        return Ok(None);
+    }
+    let Some((free, _)) = device_vram() else {
+        return Ok(None);
+    };
+    let facts = match config.model_facts {
+        Some(f) => f,
+        None => golem_plan::ModelFacts::from_gguf(&config.model_path)
+            .map_err(|e| EngineError::InvalidModel(format!("plan: {e}")))?,
+    };
+    check_plan(config, &facts, free).map(Some)
+}
+
 /// Builds the snapshot cache (§7.1) per `config.snapshot_ram_bytes`.
 /// Floor = `parallel × snapshot_bytes(n_ctx)`: one full-context snapshot per
 /// slot — below it long chats silently lose reuse, so smaller budgets are
@@ -1865,6 +1957,49 @@ fn prefill_chunk_cap(batch_tokens: usize, n_ctx: usize, pool: Option<(u32, u32)>
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    fn glm() -> golem_plan::ModelFacts {
+        golem_plan::ModelFacts {
+            t_ne: 9_640_226_040,
+            shexp: 1_123_024_896,
+            n_expert: 288,
+            expert_layers: 42,
+            max_plane_stride: 6_881_280,
+            expert_bytes_total: 185_478_414_336,
+            kv_per_token: 19_712,
+            rs_bytes: 152_633_344,
+            sparse_attn_layers: 11,
+        }
+    }
+
+    /// Target, 24 GiB free: 100k ctx + streamed 2048 ubatch + explicit K = 8
+    /// (9 × 644 MB = 5.4 GiB) is 8.98 + 1.84 + 0.14 + 0.5 + 5.4 + 3.69 + 2.64
+    /// ≈ 23.2 GiB → fits; K = 12 (7.8 GiB) → 25.6 GiB, refused.
+    #[test]
+    fn load_check_refuses_an_overcommitted_k() {
+        let mut cfg = EngineConfig {
+            n_ctx: 100_000,
+            ram_experts_gib: 57,
+            prefill_stream: true,
+            device_cache_experts: 8,
+            ..EngineConfig::default()
+        };
+        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        assert_eq!(r.term("device_expert_cache"), 9 * 644_022_272);
+        assert_eq!(r.term("stream_slabs"), 3_963_617_280);
+        cfg.device_cache_experts = 12;
+        let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
+        assert!(
+            matches!(&e, EngineError::PlanInfeasible(r) if !r.feasible),
+            "{e}"
+        );
+        assert!(e.to_string().contains("> 24.0 GiB"), "{e}");
+        // Derived K: the cache term is whatever the other terms leave.
+        cfg.device_cache_experts = 0;
+        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        assert_eq!(r.vram_headroom, 0);
+        assert!(r.term("device_expert_cache") > 6 << 30);
+    }
 
     #[test]
     fn skip_ratio_math() {

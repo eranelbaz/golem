@@ -462,6 +462,19 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
             (Event::Failed(draining()), false)
         }
         Ok(o) => (Event::Done(o), false),
+        Err(e @ EngineError::DeviceCacheDegraded(_)) => {
+            tracing::warn!("{e}");
+            if health.get() == ServeState::Healthy {
+                health.set(ServeState::Degraded);
+            }
+            (
+                Event::Failed(ErrorEnvelope::new(
+                    ErrorCode::BackendUnavailable,
+                    e.to_string(),
+                )),
+                false,
+            )
+        }
         Err(e) => {
             let fatal = !matches!(
                 e,

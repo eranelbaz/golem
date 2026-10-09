@@ -1,15 +1,16 @@
-//! `golem` CLI entry point (tech design §9): run, serve.
+//! `golem` CLI entry point (tech design §9): run, serve, plan.
 //! Bare `golem` (no subcommand) prints the version.
 //! Future: `golem import` (§5.5 store intake: hash + CRC + mirror a shard
 //! set into `$GOLEM_DATA_DIR`; `golem_store::import` already implements it).
 
 use clap::{Parser, Subcommand};
 
+mod plan;
 mod run;
 mod serve;
 
 #[derive(Parser)]
-#[command(name = "golem", version, about = "golem CLI: run, serve")]
+#[command(name = "golem", version, about = "golem CLI: run, serve, plan")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -33,6 +34,12 @@ enum Command {
     Serve {
         #[command(flatten)]
         args: serve::ServeArgs,
+    },
+    /// Print the §10 memory plan (VRAM/RAM tables, governing numbers,
+    /// verdict) from the GGUF header; exit 2 when it does not fit.
+    Plan {
+        #[command(flatten)]
+        args: plan::PlanArgs,
     },
 }
 
@@ -68,11 +75,21 @@ fn main() {
             run::run(&args)
         }
         Some(Command::Serve { args }) => serve::serve(&args),
+        Some(Command::Plan { args }) => match plan::plan(&args) {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(e),
+        },
     };
     if let Err(e) = status {
         let code = if e.is::<golem_server::ServeError>() {
             golem_api::ErrorCode::BackendUnavailable
-        } else if e.is::<run::PlanInfeasible>() {
+        } else if e.is::<run::PlanInfeasible>()
+            || matches!(
+                e.downcast_ref::<golem_engine::error::EngineError>(),
+                Some(golem_engine::error::EngineError::PlanInfeasible(_))
+            )
+        {
             golem_api::ErrorCode::PlanInfeasible
         } else {
             golem_api::ErrorCode::InvalidRequest
