@@ -170,11 +170,17 @@ impl StopMatcher {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Per-turn sampler chain and FFI state, owned by the active phase so
+/// `Prefill`/`Decode` cannot exist without them.
+pub(crate) struct Armed {
+    pub(crate) sampler: Sampler,
+    pub(crate) ffi: TurnFfi,
+}
+
 enum Phase {
     Idle,
-    Prefill,
-    Decode,
+    Prefill(Armed),
+    Decode(Armed),
     Done(FinishReason),
 }
 
@@ -182,7 +188,6 @@ enum Phase {
 pub struct SlotState {
     pub(crate) seq: i32,
     phase: Phase,
-    pub(crate) sampler: Option<Sampler>,
     stop: StopMatcher,
     pending: Vec<u8>,
     scratch: String,
@@ -192,7 +197,6 @@ pub struct SlotState {
     limit: u32,
     pub(crate) prompt_tokens: u32,
     cancel: Option<Arc<AtomicBool>>,
-    pub(crate) ffi: Option<TurnFfi>,
     pub(crate) parity: Option<Vec<ParityStep>>,
 }
 
@@ -201,7 +205,6 @@ impl SlotState {
         Self {
             seq,
             phase: Phase::Idle,
-            sampler: None,
             stop: StopMatcher::default(),
             pending: Vec::new(),
             scratch: String::new(),
@@ -211,28 +214,35 @@ impl SlotState {
             limit: 0,
             prompt_tokens: 0,
             cancel: None,
-            ffi: None,
             parity: None,
         }
     }
 
     /// Arms the slot for a turn whose prompt (`prompt_tokens`) is already
     /// tokenized and whose sampler is built; `limit` is the clamped token cap.
-    pub(crate) fn start(&mut self, req: &TurnRequest<'_>, prompt_tokens: u32, limit: u32) {
-        self.phase = Phase::Prefill;
+    pub(crate) fn start(
+        &mut self,
+        req: &TurnRequest<'_>,
+        prompt_tokens: u32,
+        limit: u32,
+        armed: Armed,
+    ) {
+        self.phase = Phase::Prefill(armed);
         self.stop.reset(req.stop);
         self.pending.clear();
         self.scratch.clear();
         self.pos = 0;
         self.generated.clear();
+        // No growth during decode when max_tokens > n_predict.
+        self.generated.reserve(limit as usize);
         self.limit = limit;
         self.prompt_tokens = prompt_tokens;
         self.cancel = req.cancel.clone();
     }
 
     pub(crate) fn finished(&self) -> Option<FinishReason> {
-        match self.phase {
-            Phase::Done(f) => Some(f),
+        match &self.phase {
+            Phase::Done(f) => Some(*f),
             _ => None,
         }
     }
@@ -246,7 +256,11 @@ impl SlotState {
     fn done(&mut self, f: FinishReason, emit: &mut dyn FnMut(&str)) {
         self.flush_text(emit);
         self.phase = Phase::Done(f);
-        self.ffi = None;
+    }
+
+    /// Drops any active phase (sampler, batch) after an `Err` exit.
+    pub(crate) fn abort(&mut self) {
+        self.phase = Phase::Idle;
     }
 
     /// Turn-end text flush: UTF-8 residue through the stop matcher, then the
@@ -268,25 +282,30 @@ impl SlotState {
 pub(crate) fn step(core: Core<'_>, emit: &mut dyn FnMut(&str)) -> Result<(), EngineError> {
     let Core { session, slots } = core;
     for slot in slots.iter_mut() {
-        match slot.phase {
-            Phase::Idle | Phase::Done(_) => {}
-            Phase::Prefill => {
+        // Move the phase out so the armed state is owned here; every arm
+        // writes the next phase back (no allocation: a stack move).
+        match std::mem::replace(&mut slot.phase, Phase::Idle) {
+            p @ (Phase::Idle | Phase::Done(_)) => slot.phase = p,
+            Phase::Prefill(mut a) => {
                 let cancel = slot.cancel.clone();
-                let ffi = slot.ffi.as_mut().expect("ffi armed by begin");
-                match session.prefill(ffi, slot.seq, cancel.as_deref())? {
+                match session.prefill(&mut a.ffi, slot.seq, cancel.as_deref())? {
                     None => slot.done(FinishReason::Cancelled, emit),
                     Some(_) if slot.limit == 0 => slot.done(FinishReason::Length, emit),
                     Some(last) => {
                         slot.pos = slot.prompt_tokens as usize;
                         session.start_decode()?;
-                        let sampler = slot.sampler.as_ref().expect("sampler armed by begin");
-                        slot.tok =
-                            session.sample(sampler, ffi, last as i32 - 1, slot.parity.as_mut(), 0);
-                        slot.phase = Phase::Decode;
+                        slot.tok = session.sample(
+                            &a.sampler,
+                            &a.ffi,
+                            last as i32 - 1,
+                            slot.parity.as_mut(),
+                            0,
+                        );
+                        slot.phase = Phase::Decode(a);
                     }
                 }
             }
-            Phase::Decode => {
+            Phase::Decode(mut a) => {
                 let t0 = std::time::Instant::now();
                 if session.is_eog(slot.tok) {
                     slot.done(FinishReason::Stop, emit);
@@ -300,7 +319,6 @@ pub(crate) fn step(core: Core<'_>, emit: &mut dyn FnMut(&str)) -> Result<(), Eng
                 if hit {
                     slot.pending.clear();
                     slot.phase = Phase::Done(FinishReason::Stop);
-                    slot.ffi = None;
                     continue;
                 }
                 // One KV slot stays free: never decode at pos >= n_ctx_seq - 1.
@@ -313,11 +331,10 @@ pub(crate) fn step(core: Core<'_>, emit: &mut dyn FnMut(&str)) -> Result<(), Eng
                     slot.done(FinishReason::Cancelled, emit);
                     continue;
                 }
-                let ffi = slot.ffi.as_mut().expect("ffi armed by begin");
-                session.decode(ffi, slot.seq, slot.tok, slot.pos, n, t0)?;
+                session.decode(&mut a.ffi, slot.seq, slot.tok, slot.pos, n, t0)?;
                 slot.pos += 1;
-                let sampler = slot.sampler.as_ref().expect("sampler armed by begin");
-                slot.tok = session.sample(sampler, ffi, 0, slot.parity.as_mut(), n);
+                slot.tok = session.sample(&a.sampler, &a.ffi, 0, slot.parity.as_mut(), n);
+                slot.phase = Phase::Decode(a);
             }
         }
     }

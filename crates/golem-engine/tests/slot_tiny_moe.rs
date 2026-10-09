@@ -2,7 +2,10 @@
 mod common;
 use golem_engine::config::EngineConfig;
 use golem_engine::{ChatTurn, FinishReason, SamplingParams, Session, TurnRequest};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 fn session() -> Session {
     Session::new(&common::tiny_moe_config()).expect("tiny-moe session")
@@ -78,27 +81,29 @@ fn preset_cancel_stops_before_first_token() {
     );
 }
 
-/// Recurrent state cannot be rewound (§2.5): a cancelled turn on the hybrid
-/// fixture must leave no state behind for the next turn.
+/// Recurrent state cannot be rewound (§2.5): a turn cancelled mid-decode on
+/// the hybrid fixture must leave sequence 0 empty.
 #[test]
 fn cancelled_turn_leaves_no_state_on_hybrid() {
-    let cfg = common::tiny_hybrid_config();
-    let mut fresh = String::new();
-    Session::new(&cfg)
-        .expect("tiny-hybrid session")
-        .turn(&TurnRequest::new(MSG), &mut |t| fresh.push_str(t))
-        .unwrap();
-
-    let mut s = Session::new(&cfg).expect("tiny-hybrid session");
-    let c = Arc::new(AtomicBool::new(true));
+    let mut s = Session::new(&common::tiny_hybrid_config()).expect("tiny-hybrid session");
+    let c = Arc::new(AtomicBool::new(false));
+    let flag = c.clone();
+    let mut pieces = 0;
     let out = s
-        .turn(&TurnRequest::new(MSG).cancel(Some(c)), &mut |_| {})
+        .turn(&TurnRequest::new(MSG).cancel(Some(c)), &mut |_| {
+            pieces += 1;
+            if pieces >= 2 {
+                flag.store(true, Ordering::Relaxed);
+            }
+        })
         .unwrap();
     assert_eq!(out.finish, FinishReason::Cancelled);
-    let mut after = String::new();
-    s.turn(&TurnRequest::new(MSG), &mut |t| after.push_str(t))
-        .unwrap();
-    assert_eq!(fresh, after);
+    assert!(
+        out.completion_tokens >= 2,
+        "precondition: cancel must land mid-decode, got {} tokens",
+        out.completion_tokens
+    );
+    assert_eq!(s.seq_pos_max(0), -1, "sequence 0 left state after cancel");
 }
 
 #[test]

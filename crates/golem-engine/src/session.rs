@@ -1,7 +1,7 @@
 //! Model + context lifecycle (tech design §7): backend init, load with
 //! fail-fast sanity checks, RAII teardown, the §4.3 decode self-check probe,
 //! chat-template resolution (model metadata, else the chatml fallback), and
-//! the single-slot greedy decode loop (`Session::chat_turn`).
+//! the per-turn entry points (`Session::turn`, driving `slot::step`).
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
@@ -824,6 +824,20 @@ impl Session {
         Ok(out?.completion_tokens)
     }
 
+    /// Test seam: highest position held for `seq` in the KV/recurrent memory,
+    /// `-1` when the sequence is empty.
+    #[doc(hidden)]
+    pub fn seq_pos_max(&self, seq: i32) -> i32 {
+        // SAFETY: ctx is live for `&self`; `&self` excludes a concurrent turn,
+        // so no decode is in flight; the query only reads memory metadata.
+        unsafe {
+            raw::llama_memory_seq_pos_max(
+                raw::llama_get_memory(self.inner.loaded.ctx().as_ptr()),
+                seq,
+            )
+        }
+    }
+
     /// Runs one turn on slot 0: renders `req.messages`, clears the KV cache,
     /// re-prefills the full transcript in chunks, then samples per
     /// `req.sampling` until EOG, a stop string, `max_tokens` (default
@@ -839,6 +853,7 @@ impl Session {
         let res = self.drive(req, emit);
         if res.is_err() {
             self.slots[0].flush_text(emit);
+            self.slots[0].abort();
         }
         res
     }
@@ -990,18 +1005,20 @@ impl SessionInner {
         let n_vocab_us = usize::try_from(n_vocab)
             .map_err(|_| EngineError::InvalidModel("vocab size is negative".to_owned()))?;
 
-        slot.sampler = Some(Sampler::from_params(&req.sampling, n_vocab)?);
-        slot.ffi = Some(TurnFfi {
-            batch: Batch::init(batch_cap as i32, 0, 1),
-            prompt,
-            chunk_cap,
-            n_ubatch,
-            streaming,
-            n_vocab: n_vocab_us,
-            verify: false,
-            placement_before: ExpertPlacement::default(),
-        });
-        slot.start(req, prompt_len, limit);
+        let armed = slot::Armed {
+            sampler: Sampler::from_params(&req.sampling, n_vocab)?,
+            ffi: TurnFfi {
+                batch: Batch::init(batch_cap as i32, 0, 1),
+                prompt,
+                chunk_cap,
+                n_ubatch,
+                streaming,
+                n_vocab: n_vocab_us,
+                verify: false,
+                placement_before: ExpertPlacement::default(),
+            },
+        };
+        slot.start(req, prompt_len, limit, armed);
         Ok(guard)
     }
 
