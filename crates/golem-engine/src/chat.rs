@@ -50,7 +50,8 @@ pub struct Rendered {
     pub prompt: String,
     /// Parser for this request's generated text.
     pub parser: OutputParser,
-    pub(crate) has_grammar: bool,
+    /// Tool-call grammar (GBNF); empty when the request has none.
+    pub(crate) grammar: String,
 }
 
 /// Parses one request's generated text; dropping it releases the request's
@@ -91,12 +92,14 @@ impl ChatTemplates {
     }
 
     /// Renders OpenAI `messages` (+ optional `tools`/`tool_choice` JSON) with
-    /// the generation prompt appended.
+    /// the generation prompt appended. `reasoning_inline` keeps reasoning and
+    /// its markers in the parsed `content`.
     pub fn render(
         &self,
         messages_json: &str,
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
+        reasoning_inline: bool,
     ) -> Result<Rendered, EngineError> {
         let m = cstr(messages_json, "messages")?;
         let t = tools_json.map(|t| cstr(t, "tools")).transpose()?;
@@ -110,6 +113,7 @@ impl ChatTemplates {
                 m.as_ptr(),
                 t.as_ref().map_or(std::ptr::null(), |t| t.as_ptr()),
                 c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                i32::from(reasoning_inline),
                 &mut prompt,
                 &mut grammar,
                 &mut handle,
@@ -128,7 +132,7 @@ impl ChatTemplates {
                 chat: self.0.clone(),
                 handle,
             },
-            has_grammar: !grammar.is_empty(),
+            grammar,
         })
     }
 }
@@ -206,7 +210,9 @@ mod tests {
     #[test]
     fn glm_auto_parses_canned_tool_call() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let r = t.render(&user(), Some(&tools()), Some("\"auto\"")).unwrap();
+        let r = t
+            .render(&user(), Some(&tools()), Some("\"auto\""), false)
+            .unwrap();
         assert!(
             r.prompt.contains("get_weather"),
             "tools rendered into the prompt"
@@ -229,7 +235,7 @@ mod tests {
     #[test]
     fn glm_plain_answer_has_no_tool_calls() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let r = t.render(&user(), Some(&tools()), None).unwrap();
+        let r = t.render(&user(), Some(&tools()), None, false).unwrap();
         let msg = r.parser.parse("</think>It is sunny.", false).unwrap();
         assert_eq!(msg["content"], "It is sunny.");
         assert!(msg.get("tool_calls").is_none());
@@ -239,6 +245,63 @@ mod tests {
     fn named_choice_outside_tools_is_an_error() {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let choice = r#"{"type":"function","function":{"name":"nope"}}"#;
-        assert!(t.render(&user(), Some(&tools()), Some(choice)).is_err());
+        assert!(
+            t.render(&user(), Some(&tools()), Some(choice), false)
+                .is_err()
+        );
+    }
+
+    /// A named choice on the target template yields a grammar whose root
+    /// forces the call (no optional free-text `until-N?` before it). GLM's
+    /// required grammar is lazy upstream; the shim makes it eager.
+    #[test]
+    fn glm_named_choice_forces_call() {
+        let t = ChatTemplates::from_source(GLM).unwrap();
+        let choice = r#"{"type":"function","function":{"name":"get_weather"}}"#;
+        let r = t
+            .render(&user(), Some(&tools()), Some(choice), false)
+            .unwrap();
+        assert!(!r.grammar.is_empty());
+        let root = r
+            .grammar
+            .lines()
+            .find(|l| l.starts_with("root ::="))
+            .unwrap();
+        // `until-N` inside the reasoning block stays; an optional free-text
+        // `until-N?` before the call must not.
+        assert!(
+            !root
+                .split_whitespace()
+                .any(|w| w.starts_with("until-") && w.ends_with('?')),
+            "{root}"
+        );
+        assert!(root.ends_with("tool-call"), "{root}");
+    }
+
+    #[test]
+    fn glm_inline_reasoning_stays_in_content() {
+        let t = ChatTemplates::from_source(GLM).unwrap();
+        let r = t.render(&user(), Some(&tools()), None, true).unwrap();
+        let msg = r.parser.parse("hmm</think>It is sunny.", false).unwrap();
+        assert!(
+            msg["content"].as_str().unwrap().contains("hmm</think>"),
+            "{msg}"
+        );
+        assert!(msg.get("reasoning_content").is_none());
+    }
+
+    /// No-tools GLM render equals `llama_chat_apply_template`'s built-in
+    /// CHATGLM_4 path apart from what the jinja adds by design (the reasoning
+    /// header and `<think>` generation prompt); both emit `[gMASK]<sop>` once,
+    /// as text — the GLM vocab sets no add-BOS, so tokenizing with
+    /// `add_special` adds no second BOS.
+    #[test]
+    fn glm_no_tools_render_starts_like_legacy() {
+        let t = ChatTemplates::from_source(GLM).unwrap();
+        let p = t.render(&user(), None, None, false).unwrap().prompt;
+        assert!(p.starts_with("[gMASK]<sop>"), "{p}");
+        assert_eq!(p.matches("[gMASK]<sop>").count(), 1, "{p}");
+        assert!(p.contains("<|user|>"), "{p}");
+        assert!(p.contains("weather in Paris?<|assistant|>"), "{p}");
     }
 }

@@ -16,15 +16,17 @@ typedef struct golem_chat golem_chat;
 
 // Templates from `model` metadata (chatml when it ships none), or from
 // `tmpl_override` when non-NULL and non-empty (`model` may then be NULL).
-// NULL on failure.
+// NULL on failure, or when both are absent.
 golem_chat * golem_chat_init(const struct llama_model * model, const char * tmpl_override);
 
 // messages/tools/tool_choice are OpenAI JSON (tools/tool_choice may be NULL;
 // tool_choice is "auto"|"none"|"required" or {"type":"function","function":{"name":..}}).
 // out_prompt/out_grammar are malloc'd; out_handle indexes the parser params kept
-// in `chat` until golem_chat_release. Returns 0 on success.
+// in `chat` until golem_chat_release. `reasoning_inline` != 0 leaves reasoning
+// and its markers in `content` when parsing. Returns 0 on success.
 int golem_chat_apply(golem_chat * chat, const char * messages_json, const char * tools_json,
-                     const char * tool_choice, char ** out_prompt, char ** out_grammar, int * out_handle);
+                     const char * tool_choice, int reasoning_inline, char ** out_prompt, char ** out_grammar,
+                     int * out_handle);
 
 // Grammar sampler for `handle` (lazy with its triggers, or eager with the
 // generation prompt prefilled), or *out = NULL when the request has no

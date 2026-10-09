@@ -364,7 +364,8 @@ fn run_job(session: &mut Session, job: &Job, health: &HealthState) -> bool {
         .map(|c| serde_json::to_string(c).unwrap_or_default());
     let base = golem_engine::TurnRequest::new(&turns)
         .messages_json(&messages_json)
-        .tools(tools_json.as_deref(), tool_choice.as_deref());
+        .tools(tools_json.as_deref(), tool_choice.as_deref())
+        .reasoning_inline(job.reasoning == ReasoningMode::Inline);
     let tool_mode = tools_json.is_some() && req.tool_choice != Some("none".into());
     let rendered = if tool_mode {
         match session.render(&base) {
@@ -514,8 +515,12 @@ impl<'p> ToolStream<'p> {
 
     fn push(&mut self, piece: &str, partial: bool, send: &dyn Fn(Event)) {
         self.text.push_str(piece);
-        let Ok(msg) = self.parser.parse(&self.text, partial) else {
-            return;
+        let msg = match self.parser.parse(&self.text, partial) {
+            Ok(msg) => msg,
+            Err(_) if partial => return,
+            // Unparseable final text is still the model's answer: emit what
+            // was not yet sent as content.
+            Err(_) => serde_json::json!({ "content": self.text }),
         };
         let field = |k: &str| msg[k].as_str().unwrap_or_default().to_owned();
         for (seen, now, ev) in [
@@ -527,9 +532,15 @@ impl<'p> ToolStream<'p> {
             (&mut self.content, field("content"), Event::Text),
         ] {
             // A partial parse can only grow; anything else is a re-parse we
-            // cannot retract, so it is held until the text settles.
-            if let Some(add) = now.strip_prefix(seen.as_str()).filter(|a| !a.is_empty()) {
-                send(ev(add.to_owned()));
+            // cannot retract, so it is held until the text settles. The final
+            // parse flushes what is held past the longest common prefix.
+            let sent = match now.strip_prefix(seen.as_str()) {
+                Some(_) => seen.len(),
+                None if partial => continue,
+                None => common_prefix(seen, &now),
+            };
+            if now.len() > sent {
+                send(ev(now[sent..].to_owned()));
                 *seen = now;
             }
         }
@@ -573,6 +584,15 @@ impl<'p> ToolStream<'p> {
     }
 }
 
+/// Byte length of the longest common prefix of `a` and `b`, on a char
+/// boundary.
+fn common_prefix(a: &str, b: &str) -> usize {
+    a.char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map_or(a.len().min(b.len()), |((i, _), _)| i)
+}
+
 fn message_text(m: &golem_api::ChatMessage) -> String {
     match &m.content {
         None => String::new(),
@@ -580,6 +600,47 @@ fn message_text(m: &golem_api::ChatMessage) -> String {
         Some(MessageContent::Parts(parts)) => {
             parts.iter().filter_map(|p| p.text.as_deref()).collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GLM: &str = include_str!("../../golem-engine/tests/fixtures/glm-5.3-flash.jinja");
+
+    /// A final parse failure (here: NUL in the text) still delivers the
+    /// generated text as content instead of finishing empty.
+    #[test]
+    fn final_parse_failure_falls_back_to_raw_content() {
+        let t = golem_engine::ChatTemplates::from_source(GLM).unwrap();
+        let r = t
+            .render(
+                r#"[{"role":"user","content":"hi"}]"#,
+                Some("[]"),
+                None,
+                false,
+            )
+            .unwrap();
+        let out = std::cell::RefCell::new(String::new());
+        let send = |ev: Event| match ev {
+            Event::Text(t) => out.borrow_mut().push_str(&t),
+            other => panic!("unexpected {other:?}"),
+        };
+        let mut ts = ToolStream::new(&r.parser);
+        ts.push("bad\0", true, &send);
+        ts.push("text", true, &send);
+        assert!(out.borrow().is_empty(), "partial failures are held");
+        ts.push("", false, &send);
+        assert_eq!(*out.borrow(), "bad\0text");
+        assert_eq!(ts.calls, 0);
+    }
+
+    #[test]
+    fn common_prefix_respects_char_boundaries() {
+        assert_eq!(common_prefix("abé", "abè"), 2);
+        assert_eq!(common_prefix("ab", "abc"), 2);
+        assert_eq!(common_prefix("abc", "ab"), 2);
     }
 }
 

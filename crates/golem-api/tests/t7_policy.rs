@@ -29,6 +29,7 @@ fn sample(field: &str) -> serde_json::Value {
         "logit_bias" => json!({"1": 1}),
         "logprobs" => json!(true),
         "reasoning_effort" => json!("high"),
+        "parallel_tool_calls" => json!(true),
         other => panic!("table field {other} has no sample; add one"),
     }
 }

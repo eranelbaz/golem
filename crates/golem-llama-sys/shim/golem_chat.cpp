@@ -70,6 +70,9 @@ struct golem_chat {
 extern "C" {
 
 golem_chat * golem_chat_init(const llama_model * model, const char * tmpl_override) {
+    if (!model && (!tmpl_override || !*tmpl_override)) {
+        return nullptr;
+    }
     try {
         auto * c = new golem_chat();
         c->tmpls = common_chat_templates_init(model, tmpl_override ? tmpl_override : "");
@@ -80,14 +83,15 @@ golem_chat * golem_chat_init(const llama_model * model, const char * tmpl_overri
 }
 
 int golem_chat_apply(golem_chat * chat, const char * messages_json, const char * tools_json,
-                     const char * tool_choice, char ** out_prompt, char ** out_grammar, int * out_handle) {
+                     const char * tool_choice, int reasoning_inline, char ** out_prompt, char ** out_grammar,
+                     int * out_handle) {
     if (!chat || !messages_json || !out_prompt || !out_grammar || !out_handle) {
         return 1;
     }
     try {
         common_chat_templates_inputs in;
         in.messages         = common_chat_msgs_parse_oaicompat(common_json::parse(messages_json));
-        in.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        in.reasoning_format = reasoning_inline ? COMMON_REASONING_FORMAT_NONE : COMMON_REASONING_FORMAT_DEEPSEEK;
         std::string named;
         in.tool_choice = parse_tool_choice(tool_choice, named);
         if (tools_json && *tools_json) {
@@ -117,14 +121,15 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         if (!params.parser.empty()) {
             r.parser.parser.load(params.parser);
         }
-        r.grammar      = in.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED && !params.grammar_lazy ?
-                             force_call(params.grammar) :
-                             params.grammar;
-        r.grammar_lazy = params.grammar_lazy;
+        // Some templates (GLM) keep a required grammar lazy; a lazy grammar never
+        // forces anything, so a required call is always eager.
+        bool required  = in.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED && !params.grammar.empty();
+        r.grammar      = required ? force_call(params.grammar) : params.grammar;
+        r.grammar_lazy = params.grammar_lazy && !required;
         r.triggers     = params.grammar_triggers;
 
         char * p = dup(params.prompt);
-        char * g = dup(params.grammar);
+        char * g = dup(r.grammar);
         if (!p || !g) {
             std::free(p);
             std::free(g);

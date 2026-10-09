@@ -463,7 +463,7 @@ fn probe_templates(
 ) -> Result<(ChatTemplates, String), EngineError> {
     let over = config.chat_template.as_deref();
     let chat = ChatTemplates::from_model(loaded.model().as_ptr(), over)?;
-    let probe = chat.render(r#"[{"role":"user","content":"ping"}]"#, None, None)?;
+    let probe = chat.render(r#"[{"role":"user","content":"ping"}]"#, None, None, false)?;
     if probe.prompt.is_empty() {
         return Err(EngineError::TemplateUnavailable);
     }
@@ -491,7 +491,12 @@ fn render(chat: &ChatTemplates, req: &TurnRequest<'_>) -> Result<Rendered, Engin
             &built
         }
     };
-    chat.render(messages, req.tools_json, req.tool_choice)
+    chat.render(
+        messages,
+        req.tools_json,
+        req.tool_choice,
+        req.reasoning_inline,
+    )
 }
 
 /// A loaded model bound to its resolved chat template, driving its decode
@@ -1060,8 +1065,9 @@ impl SessionInner {
         };
 
         let vocab = self.loaded.model().vocab();
-        // add_special = true: the fallback chatml renders no BOS text, so this
-        // yields exactly one BOS.
+        // add_special = true: the chat layer strips a leading BOS text when the
+        // vocab adds BOS (common/chat.cpp), and GLM's `[gMASK]<sop>` is template
+        // text with no vocab BOS, so this yields at most one BOS.
         // SAFETY: vocab is live; rendered is valid for its byte length.
         let prompt = unsafe { tokenize_prompt(vocab, &rendered.prompt, true, true)? };
         if prompt.is_empty() {
@@ -1112,8 +1118,7 @@ impl SessionInner {
             sampler: Sampler::from_params(
                 &req.sampling,
                 n_vocab,
-                rendered
-                    .has_grammar
+                (!rendered.grammar.is_empty())
                     .then(|| rendered.parser.grammar_sampler(vocab))
                     .transpose()?
                     .flatten(),

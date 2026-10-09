@@ -54,6 +54,8 @@ pub struct TurnRequest<'a> {
     /// OpenAI `tool_choice` JSON (`"auto"`, `"none"`, `"required"` or a
     /// named-function object).
     pub tool_choice: Option<&'a str>,
+    /// Parse reasoning and its markers into `content` (`--reasoning inline`).
+    pub reasoning_inline: bool,
     /// Pre-rendered prompt from [`crate::Session::render`]; overrides the
     /// three fields above.
     pub rendered: Option<&'a crate::chat::Rendered>,
@@ -75,6 +77,7 @@ impl<'a> TurnRequest<'a> {
             messages_json: None,
             tools_json: None,
             tool_choice: None,
+            reasoning_inline: false,
             rendered: None,
             sampling: SamplingParams::default(),
             max_tokens: None,
@@ -93,6 +96,12 @@ impl<'a> TurnRequest<'a> {
     pub fn tools(mut self, tools_json: Option<&'a str>, tool_choice: Option<&'a str>) -> Self {
         self.tools_json = tools_json;
         self.tool_choice = tool_choice;
+        self
+    }
+
+    /// Sets [`TurnRequest::reasoning_inline`].
+    pub fn reasoning_inline(mut self, inline: bool) -> Self {
+        self.reasoning_inline = inline;
         self
     }
 

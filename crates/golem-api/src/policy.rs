@@ -48,6 +48,10 @@ pub const FIELD_POLICY: &[(&str, FieldRule)] = &[
         FieldRule::Unsupported("logprobs are not implemented in v1"),
     ),
     (
+        "parallel_tool_calls",
+        FieldRule::Unsupported("at most one tool call is generated per turn"),
+    ),
+    (
         "reasoning_effort",
         FieldRule::Unsupported("the model has no reasoning-effort control"),
     ),
