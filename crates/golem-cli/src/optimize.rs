@@ -88,6 +88,7 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     }
     // Baseline = today's resolved config: env and file apply, no profile.
     let layers = crate::config::Layers::from_process()?;
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut mach = machine();
     let (config, requested_snapshot) = engine_config(
         &args.engine,
