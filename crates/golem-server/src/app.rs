@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -101,11 +102,16 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// `/v1/chat/completions`, `/v1/models`, `/health`; everything else 404.
+/// `/v1/chat/completions`, `/v1/models`, `/metrics` (behind the API key
+/// when set), `/health` (always open); everything else 404.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let keyed = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
+        .route("/metrics", get(metrics))
+        .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
+    Router::new()
+        .merge(keyed)
         .route("/health", get(health))
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())
@@ -118,35 +124,68 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn authorize(cfg: &ServerConfig, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(key) = &cfg.api_key else {
-        return Ok(());
-    };
-    let got = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if got == Some(key.as_str()) {
-        Ok(())
-    } else {
-        Err(ApiError(
-            StatusCode::UNAUTHORIZED,
-            ErrorEnvelope::new(ErrorCode::InvalidRequest, "missing or wrong API key"),
-        ))
+/// Compares in time independent of where the inputs differ.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().max(b.len());
+    let diff = (0..n).fold((a.len() ^ b.len()) as u8, |d, i| {
+        d | (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0))
+    });
+    std::hint::black_box(diff) == 0 && a.len() == b.len()
+}
+
+/// `--api-key`: a missing or wrong `Authorization: Bearer` is a 401
+/// `golem_invalid_request` (built here, not through the 400 code map).
+async fn authorize(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(key) = &st.cfg.api_key {
+        let got = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !ct_eq(got.as_bytes(), key.as_bytes()) {
+            st.health.count_error(ErrorCode::InvalidRequest);
+            return ApiError(
+                StatusCode::UNAUTHORIZED,
+                ErrorEnvelope::new(ErrorCode::InvalidRequest, "missing or wrong API key"),
+            )
+            .into_response();
+        }
     }
+    next.run(req).await
 }
 
 async fn chat(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let health = st.health.clone();
+    match chat_inner(st, body).await {
+        Ok(r) => r,
+        Err(e) => {
+            health.count_error(e.1.error.code);
+            e.into_response()
+        }
+    }
+}
+
+async fn chat_inner(
+    st: AppState,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
-    authorize(&st.cfg, &headers)?;
     let Json(raw) = body.map_err(|e| api_err(ErrorCode::InvalidRequest, e.body_text()))?;
     let req = golem_api::policy::validate(&raw, &st.cfg.model_name)?;
     match st.health.get() {
-        ServeState::Draining => return Err(api_err(ErrorCode::Busy, "server draining")),
-        ServeState::Fatal | ServeState::FatalIo => return Err(backend_gone()),
+        ServeState::Draining | ServeState::Releasing => {
+            return Err(api_err(ErrorCode::Busy, "server draining"));
+        }
+        ServeState::FatalIo => {
+            return Err(api_err(
+                ErrorCode::StorageUnavailable,
+                "every replica of a model shard is unreadable",
+            ));
+        }
+        ServeState::Fatal => return Err(backend_gone()),
         _ => {}
     }
     let stream = req.stream == Some(true);
@@ -161,12 +200,18 @@ async fn chat(
         reasoning: st.cfg.reasoning,
     };
     let deadline = Instant::now() + ACCEPT_RETRY;
+    // Counted before the send: the worker's dequeue may run first.
+    st.health.queued.fetch_add(1, Ordering::Relaxed);
     loop {
         match st.jobs.try_send(job) {
             Ok(()) => break,
-            Err(TrySendError::Disconnected(_)) => return Err(backend_gone()),
+            Err(TrySendError::Disconnected(_)) => {
+                st.health.queued.fetch_sub(1, Ordering::Relaxed);
+                return Err(backend_gone());
+            }
             Err(TrySendError::Full(j)) => {
                 if Instant::now() >= deadline {
+                    st.health.queued.fetch_sub(1, Ordering::Relaxed);
                     return Err(api_err(ErrorCode::Busy, "all slots busy"));
                 }
                 job = j;
@@ -181,6 +226,7 @@ async fn chat(
             created: now_secs(),
             model: st.cfg.model_name.clone(),
             include_usage,
+            health: st.health.clone(),
         };
         return Ok(crate::sse::response(meta, rx, guard).into_response());
     }
@@ -237,11 +283,7 @@ fn merge_tool_call(calls: &mut Vec<ToolCall>, d: ToolCall) {
     calls[i].function.arguments.push_str(&d.function.arguments);
 }
 
-async fn models(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<ModelList>, ApiError> {
-    authorize(&st.cfg, &headers)?;
+async fn models(State(st): State<AppState>) -> Result<Json<ModelList>, ApiError> {
     Ok(Json(ModelList {
         object: "list".into(),
         data: vec![ModelCard {
@@ -253,16 +295,30 @@ async fn models(
     }))
 }
 
+/// §8.1/§11: `{state, tiers: {vram_fill, ram_fill}, degraded: [...]}`.
 async fn health(State(st): State<AppState>) -> Response {
     let state = st.health.get();
     let snap = st.health.snapshot();
+    let m = *st.health.metrics.lock().unwrap_or_else(|p| p.into_inner());
     let status = match state {
         ServeState::Healthy | ServeState::Degraded => StatusCode::OK,
-        ServeState::Loading | ServeState::Draining => StatusCode::SERVICE_UNAVAILABLE,
-        ServeState::Fatal | ServeState::FatalIo => StatusCode::INTERNAL_SERVER_ERROR,
+        ServeState::Loading
+        | ServeState::Draining
+        | ServeState::Releasing
+        | ServeState::FatalIo => StatusCode::SERVICE_UNAVAILABLE,
+        ServeState::Fatal => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    let mut degraded = Vec::new();
+    if state == ServeState::Degraded {
+        degraded.push("device_cache");
+    }
+    if st.health.stalled() {
+        degraded.push("stalled");
+    }
     let body = serde_json::json!({
         "state": state.as_str(),
+        "tiers": { "vram_fill": m.vram_fill(), "ram_fill": m.ram_fill },
+        "degraded": degraded,
         "model": st.cfg.model_name,
         "turns": snap.turns,
         "device_cache_skip_ratio": snap.device_cache_skip_ratio,
@@ -270,7 +326,19 @@ async fn health(State(st): State<AppState>) -> Response {
     (status, Json(body)).into_response()
 }
 
-async fn not_found() -> ApiError {
+async fn metrics(State(st): State<AppState>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        crate::metrics::render(&st.health),
+    )
+        .into_response()
+}
+
+async fn not_found(State(st): State<AppState>) -> ApiError {
+    st.health.count_error(ErrorCode::NotFound);
     api_err(ErrorCode::NotFound, "no such route")
 }
 
@@ -337,6 +405,54 @@ mod tests {
             Event::Reasoning("plan".into()),
             Event::Text("answer".into()),
         ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_key_guards_v1_but_not_health() {
+        let mut cfg = crate::test_support::test_server_config();
+        cfg.api_key = Some("s3cret".into());
+        let (jobs, _rx) = std::sync::mpsc::sync_channel::<Job>(0);
+        let health = Arc::new(HealthState::new());
+        health.set(ServeState::Healthy);
+        let app = router(AppState {
+            cfg: Arc::new(cfg),
+            jobs,
+            health,
+        });
+        let get = |path: &str, key: Option<&str>| {
+            let mut r = axum::http::Request::get(path);
+            if let Some(k) = key {
+                r = r.header("authorization", format!("Bearer {k}"));
+            }
+            r.body(Body::empty()).unwrap()
+        };
+        let r = app.clone().oneshot(get("/v1/models", None)).await.unwrap();
+        assert_eq!(r.status(), 401);
+        let v: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap())
+                .unwrap();
+        assert_eq!(v["error"]["code"], "golem_invalid_request");
+        let r = app
+            .clone()
+            .oneshot(get("/v1/models", Some("wrong")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        let r = app
+            .clone()
+            .oneshot(get("/v1/models", Some("s3cret")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let r = app.clone().oneshot(get("/health", None)).await.unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_keys() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

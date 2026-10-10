@@ -20,8 +20,8 @@ use golem_store::ChunkQueue;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// Arguments of the `run` subcommand (tech design §9 minimal surface; flags
-/// only — §9.4 precedence rules are not implemented).
+/// Arguments of the `run` subcommand (tech design §9). Engine flags resolve
+/// through §9.4 precedence ([`crate::config`]).
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
     /// Path to the GGUF model file (first shard of a split).
@@ -54,12 +54,12 @@ pub struct RunArgs {
 #[derive(Debug, clap::Args)]
 pub struct EngineArgs {
     /// Maximum tokens to generate per completion (engine §7.2 default: 64).
-    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
-    pub n_predict: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub n_predict: Option<u32>,
     /// Context size in KV cache slots (engine §7.2 default: 256).
-    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(2..))]
-    pub ctx: u32,
-    /// Decode threads (engine §7.2 default: logical CPUs / 2, min 1). The
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..))]
+    pub ctx: Option<u32>,
+    /// CPU threadpool size (R-15 default: physical cores / 2, min 1). The
     /// calibration matrix runs reference-vs-reference legs at differing
     /// thread counts (cpu-t16 vs cpu-t4), so the suite driver injects this
     /// flag per leg.
@@ -122,44 +122,44 @@ pub struct EngineArgs {
     pub routing_trace: Option<PathBuf>,
     /// P2 evict-first order among a layer's non-routed VRAM slots:
     /// `score` (§6.2 decayed score, the default) or `recency`.
-    #[arg(long, value_name = "ORDER", default_value = "score", value_parser = parse_vram_order)]
-    pub vram_order: VramOrder,
+    #[arg(long, value_name = "ORDER")]
+    pub vram_order: Option<VramOrder>,
     /// §6.5 next-layer routing prediction (P5): `off` (default), `protect`
     /// (shield predicted experts from RAM eviction) or `read` (page predicted
     /// experts in at prefetch priority). Needs the RAM expert pool.
-    #[arg(long, value_name = "MODE", default_value = "off", value_parser = parse_prefetch)]
-    pub prefetch: PrefetchMode,
-    /// Layers ahead each MoE layer predicts for `--prefetch`.
-    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4))]
-    pub prefetch_lookahead: u32,
+    #[arg(long, value_name = "MODE")]
+    pub prefetch: Option<PrefetchMode>,
+    /// Layers ahead each MoE layer predicts for `--prefetch` (default 1).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub prefetch_lookahead: Option<u32>,
     /// RAM/VRAM expert residency (design §6.3 O10): `inclusive` (default)
     /// keeps an expert's pool slot while its VRAM copy exists; `exclusive`
     /// releases the pool slot once the H2D lands and copies evictions back
     /// into the pool (or drops them when a RAM victim scores higher). Needs
     /// the RAM expert pool. Exclusive is opt-in until the inclusive-vs-
     /// exclusive A/B proves it on decode tok/s.
-    #[arg(long, value_name = "MODE", default_value = "inclusive", value_parser = parse_residency)]
-    pub residency: Residency,
+    #[arg(long, value_name = "MODE")]
+    pub residency: Option<Residency>,
     /// Prefill layer streaming (design §7.6): prompt chunks of
     /// `--prefill-ubatch` tokens stream each expert plane through
     /// double-buffered device slabs instead of paging misses into the pool.
     /// Needs the RAM expert pool. Auto-disabled with a warning when the
     /// stream slabs cannot fit alongside a K ≥ top-k device cache.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub prefill_stream: bool,
     /// Streamed prefill ubatch (`EngineConfig::prefill_ubatch`); the
     /// context's n_ubatch (and compute buffer) when `--prefill-stream` is
     /// on. Default 2048 (§7.6).
-    #[arg(long, value_name = "TOKENS", default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..))]
-    pub prefill_ubatch: u32,
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+    pub prefill_ubatch: Option<u32>,
     /// Minimum prompt-tail length that still streams (`EngineConfig::
     /// prefill_stream_min`); shorter tails take the per-token path.
-    #[arg(long, value_name = "TOKENS", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..))]
-    pub prefill_stream_min: u32,
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+    pub prefill_stream_min: Option<u32>,
     /// Routed-share switch above which a streamed plane fills whole instead
     /// of routed-only (hidden measurement knob).
-    #[arg(long, hide = true, default_value_t = 0.85)]
-    pub prefill_stream_routed_max: f32,
+    #[arg(long, hide = true)]
+    pub prefill_stream_routed_max: Option<f32>,
     /// State-snapshot arena in GiB (§7.1: turn N+1 restores turn N's prompt
     /// state and prefills only the delta). 0 disables snapshots; omitted =
     /// `max(2 GiB, 2 × floor)`, shrunk toward the floor (one full-context
@@ -167,70 +167,95 @@ pub struct EngineArgs {
     /// refused (`golem_plan_infeasible`).
     #[arg(long, value_name = "GIB", value_parser = parse_gib)]
     pub snapshot_ram_gib: Option<f64>,
+    /// R-15 CPU pinning: `auto` (default) pins the decode thread — and with
+    /// it ggml's threadpool — to the V-cache CCD and the I/O threads to the
+    /// other CCD; a no-op with one CCD. `off` leaves affinity alone.
+    #[arg(long, value_name = "MODE")]
+    pub pin: Option<Pin>,
+    /// R-8: full SHA-256 of every shard at start instead of the sampled
+    /// check (needs a manifest).
+    #[arg(long)]
+    pub full_verify: bool,
 }
 
-fn parse_residency(s: &str) -> Result<Residency, String> {
-    match s {
-        "inclusive" => Ok(Residency::Inclusive),
-        "exclusive" => Ok(Residency::Exclusive),
-        _ => Err(format!("want inclusive or exclusive, got {s:?}")),
-    }
+/// `--pin` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pin {
+    /// Pin when a V-cache CCD exists.
+    Auto,
+    /// Never pin.
+    Off,
 }
 
-fn parse_prefetch(s: &str) -> Result<PrefetchMode, String> {
-    match s {
-        "off" => Ok(PrefetchMode::Off),
-        "protect" => Ok(PrefetchMode::Protect),
-        "read" => Ok(PrefetchMode::Read),
-        _ => Err(format!("want off, protect or read, got {s:?}")),
-    }
-}
-
-fn parse_vram_order(s: &str) -> Result<VramOrder, String> {
-    match s {
-        "score" => Ok(VramOrder::Score),
-        "recency" => Ok(VramOrder::Recency),
-        _ => Err(format!("want score or recency, got {s:?}")),
+impl std::str::FromStr for Pin {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            _ => Err(format!("want auto or off, got {s:?}")),
+        }
     }
 }
 
 impl EngineArgs {
-    /// Maps the CLI surface onto `EngineConfig` (flag name ↔ config field):
-    /// `--ctx` → `n_ctx`, `--threads` → `threads`, `--n-gpu-layers` →
-    /// `n_gpu_layers`, `--flash-attn` → `flash_attn_on`, `--cpu-moe-layers`
-    /// → `cpu_moe_layers`, `--device-cache-experts` → `device_cache_experts`.
-    /// Everything else stays at the engine default.
-    pub fn to_config(&self, model: PathBuf) -> EngineConfig {
-        let default = EngineConfig::default();
-        EngineConfig {
+    /// Maps the CLI surface onto `EngineConfig` (flag name ↔ config field:
+    /// `--ctx` → `n_ctx`, `--flash-attn` → `flash_attn_on`, the rest by
+    /// name), each flag resolved flag > env `GOLEM_<FLAG>` > `golem.toml`
+    /// > profile > engine default (§9.4).
+    pub fn to_config(
+        &self,
+        model: PathBuf,
+        l: &crate::config::Layers<'_>,
+    ) -> Result<EngineConfig, crate::config::ConfigError> {
+        let d = EngineConfig::default();
+        let flag = |b: bool| b.then_some(true);
+        let snapshot_ram_gib: Option<f64> = l.opt(self.snapshot_ram_gib, "snapshot_ram_gib")?;
+        let (decode_cpuset, io_cpuset) = match l.get(self.pin, "pin", Pin::Auto)? {
+            Pin::Auto => golem_store::sys::detect_vcache_split()
+                .map_or((None, None), |(v, rest)| (Some(v), Some(rest))),
+            Pin::Off => (None, None),
+        };
+        Ok(EngineConfig {
             model_path: model,
-            n_ctx: self.ctx,
-            n_predict: self.n_predict,
-            threads: self.threads.unwrap_or(default.threads),
-            n_gpu_layers: self.n_gpu_layers.unwrap_or(0),
-            flash_attn_on: self.flash_attn,
-            cpu_moe_layers: self.cpu_moe_layers,
+            n_ctx: l.get(self.ctx, "ctx", d.n_ctx)?,
+            n_predict: l.get(self.n_predict, "n_predict", d.n_predict)?,
+            threads: l.get(self.threads, "threads", d.threads)?,
+            n_gpu_layers: l.get(self.n_gpu_layers, "n_gpu_layers", 0)?,
+            flash_attn_on: l.get(flag(self.flash_attn), "flash_attn", false)?,
+            cpu_moe_layers: l.opt(self.cpu_moe_layers, "cpu_moe_layers")?,
             // Fractional GiB floor to the engine's whole-GiB unit; a value in
             // (0, 1) therefore disables the pool — the help text says so.
-            ram_experts_gib: self.ram_experts_gib.unwrap_or(0.0).max(0.0) as u64,
-            device_cache_experts: self.device_cache_experts.unwrap_or(0),
-            io_threads: self.io_threads,
-            manifest_path: self.manifest.clone(),
-            timing_csv: self.timing_csv.clone(),
-            routing_trace: self.routing_trace.clone(),
-            vram_order: self.vram_order,
-            prefetch: self.prefetch,
-            prefetch_lookahead: self.prefetch_lookahead,
-            residency: self.residency,
-            prefill_stream: self.prefill_stream,
-            prefill_ubatch: self.prefill_ubatch,
-            prefill_stream_min: self.prefill_stream_min,
-            prefill_stream_routed_max: self.prefill_stream_routed_max,
-            snapshot_ram_bytes: self
-                .snapshot_ram_gib
-                .map(|g| (g * (1u64 << 30) as f64) as u64),
-            ..default
-        }
+            ram_experts_gib: l
+                .get(self.ram_experts_gib, "ram_experts_gib", 0.0f64)?
+                .max(0.0) as u64,
+            device_cache_experts: l.get(self.device_cache_experts, "device_cache_experts", 0)?,
+            io_threads: l.opt(self.io_threads, "io_threads")?,
+            manifest_path: l.opt(self.manifest.clone(), "manifest")?,
+            timing_csv: l.opt(self.timing_csv.clone(), "timing_csv")?,
+            routing_trace: l.opt(self.routing_trace.clone(), "routing_trace")?,
+            vram_order: l.get(self.vram_order, "vram_order", d.vram_order)?,
+            prefetch: l.get(self.prefetch, "prefetch", d.prefetch)?,
+            prefetch_lookahead: l.get(self.prefetch_lookahead, "prefetch_lookahead", 1)?,
+            residency: l.get(self.residency, "residency", d.residency)?,
+            prefill_stream: l.get(flag(self.prefill_stream), "prefill_stream", false)?,
+            prefill_ubatch: l.get(self.prefill_ubatch, "prefill_ubatch", d.prefill_ubatch)?,
+            prefill_stream_min: l.get(
+                self.prefill_stream_min,
+                "prefill_stream_min",
+                d.prefill_stream_min,
+            )?,
+            prefill_stream_routed_max: l.get(
+                self.prefill_stream_routed_max,
+                "prefill_stream_routed_max",
+                d.prefill_stream_routed_max,
+            )?,
+            snapshot_ram_bytes: snapshot_ram_gib.map(|g| (g * (1u64 << 30) as f64) as u64),
+            full_verify: l.get(flag(self.full_verify), "full_verify", false)?,
+            decode_cpuset,
+            io_cpuset,
+            ..d
+        })
     }
 }
 
@@ -247,15 +272,19 @@ impl std::fmt::Display for PlanInfeasible {
 
 impl Error for PlanInfeasible {}
 
-/// Resolves the engine flags for `model`: §9 inference (printed), flag
-/// cross-checks, the §10 RAM fit and the mlock preflight — shared by `run`
-/// and `serve` (`parallel` = decode slots, sizing the snapshot floor).
+/// Resolves the engine flags for `model`: §9.4 precedence, §9 inference
+/// (printed), flag cross-checks, the §10 RAM fit and the mlock preflight —
+/// shared by `run` and `serve` (`parallel` = decode slots, sizing the
+/// snapshot floor). Also returns the requested (pre-fit) snapshot bytes,
+/// the registry's config identity.
 pub fn engine_config(
     engine: &EngineArgs,
     model: &Path,
     parallel: u32,
-) -> Result<EngineConfig, Box<dyn Error>> {
-    let mut config = engine.to_config(model.to_path_buf());
+) -> Result<(EngineConfig, Option<u64>), Box<dyn Error>> {
+    let layers = crate::config::Layers::from_process()?;
+    let mut config = engine.to_config(model.to_path_buf(), &layers)?;
+    let requested_snapshot = config.snapshot_ram_bytes;
     config.parallel = parallel;
     // §9 inference: explicit flags already won in `to_config`; fill the rest
     // from the model folder and the compiled backend.
@@ -324,7 +353,7 @@ pub fn engine_config(
         config.ram_experts_gib,
         snap,
     )?;
-    Ok(config)
+    Ok((config, requested_snapshot))
 }
 
 /// §10 RAM admission, one rule: `ram_pool + snapshots + host_overhead +
@@ -418,19 +447,19 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         // No model: main() already printed the run help.
         None => return Ok(()),
     };
-    let config = engine_config(&args.engine, &model, 1)?;
-    let eff = crate::serve::effective(&config, args.engine.snapshot_ram_gib)?;
+    let (config, requested_snapshot) = engine_config(&args.engine, &model, 1)?;
+    let eff = crate::serve::effective(&config, requested_snapshot)?;
     let reg = golem_registry::Registry::open()?;
     if !args.new && args.parity_dump.is_none() {
         if let Some(i) = attachable(&reg, &eff)? {
             eprintln!("golem: attached to instance {} ({})", i.id, i.endpoint);
-            return attach(&i, args.prompt.as_deref(), args.engine.n_predict);
+            return attach(&i, args.prompt.as_deref(), config.n_predict);
         }
         if args.keep {
             let (id, endpoint) = start_detached()?;
             eprintln!("golem: started instance {id} ({endpoint})");
             let i = reg.find(&id)?;
-            return attach(&i, args.prompt.as_deref(), args.engine.n_predict);
+            return attach(&i, args.prompt.as_deref(), config.n_predict);
         }
     }
     let model_name = model
@@ -474,7 +503,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
 
     let result = match (&args.prompt, &args.parity_dump) {
         (Some(prompt), Some(dump)) => {
-            one_shot_parity(&mut session, &model, prompt, dump, args.engine.n_predict)
+            one_shot_parity(&mut session, &model, prompt, dump, config.n_predict)
         }
         (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out, &mut trace_out),
         // The dump records exactly one prompt (header `prompt_tokens`), so a
@@ -617,7 +646,7 @@ fn expert_plane_bytes(model: &Path, manifest: Option<&Path>) -> Result<u64, Box<
     // Store-backed run: the manifest's expert_index is the source of truth
     // (already cross-checked against the replica tensor tables at open).
     if let Some(mpath) = manifest {
-        let queue = Arc::new(ChunkQueue::new(0));
+        let queue = Arc::new(ChunkQueue::new(0, None));
         let src = StoreExpertSource::open(mpath, queue)?;
         return Ok(src.expert_bytes());
     }
@@ -1322,7 +1351,8 @@ mod tests {
         // inferred and keeping the manifest would hard-error the run.
         let mut config = parse_run_args(&["run", "model.gguf"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         config.model_path = model.clone();
         let inferred = infer_defaults(&mut config, None);
         assert_eq!(
@@ -1348,7 +1378,8 @@ mod tests {
         // builds — the CPU-leg repro on GPU hardware must stay reachable.
         let mut config = parse_run_args(&["run", "--n-gpu-layers", "0", "model.gguf"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         config.model_path = model.clone();
         infer_defaults(&mut config, Some(0));
         assert_eq!(config.n_gpu_layers, 0, "explicit 0 must not be re-inferred");
@@ -1365,7 +1396,8 @@ mod tests {
             "model.gguf",
         ])
         .engine
-        .to_config("model.gguf".into());
+        .to_config("model.gguf".into(), &crate::config::Layers::none())
+        .unwrap();
         config.model_path = model;
         infer_defaults(&mut config, Some(7));
         assert_eq!(config.n_gpu_layers, 7);
@@ -1381,7 +1413,8 @@ mod tests {
     fn run_args_default_to_the_cpu_only_config() {
         let config = parse_run_args(&["run", "model.gguf"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.model_path, PathBuf::from("model.gguf"));
         assert_eq!(config.n_ctx, 256);
         assert_eq!(config.n_predict, 64);
@@ -1408,12 +1441,14 @@ mod tests {
     fn run_args_map_ram_experts_gib_flag_into_config() {
         let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.ram_experts_gib, 2);
         // Fractional GiB floor to the engine's whole-GiB unit.
         let config = parse_run_args(&["run", "m.gguf", "--ram-experts-gib", "2.75"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.ram_experts_gib, 2);
     }
 
@@ -1421,11 +1456,13 @@ mod tests {
     fn run_args_map_device_cache_experts_flag_into_config() {
         let config = parse_run_args(&["run", "m.gguf"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.device_cache_experts, 0, "unset = derive from VRAM");
         let config = parse_run_args(&["run", "m.gguf", "--device-cache-experts", "9"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.device_cache_experts, 9);
     }
 
@@ -1433,11 +1470,13 @@ mod tests {
     fn run_args_map_vram_order_flag_into_config() {
         let config = parse_run_args(&["run", "m.gguf"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.vram_order, VramOrder::Score);
         let config = parse_run_args(&["run", "m.gguf", "--vram-order", "recency"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.vram_order, VramOrder::Recency);
         let bad = RunArgs::augment_args(clap::Command::new("run")).try_get_matches_from([
             "run",
@@ -1452,7 +1491,8 @@ mod tests {
     fn run_args_map_prefetch_flags_into_config() {
         let config = parse_run_args(&["run", "m.gguf"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(
             (config.prefetch, config.prefetch_lookahead),
             (PrefetchMode::Off, 1)
@@ -1466,7 +1506,8 @@ mod tests {
             "2",
         ])
         .engine
-        .to_config("model.gguf".into());
+        .to_config("model.gguf".into(), &crate::config::Layers::none())
+        .unwrap();
         assert_eq!(
             (config.prefetch, config.prefetch_lookahead),
             (PrefetchMode::Read, 2)
@@ -1482,11 +1523,13 @@ mod tests {
     fn run_args_map_io_threads_flag_into_config() {
         let config = parse_run_args(&["run", "m.gguf"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.io_threads, None, "unset = derived per-drive count");
         let config = parse_run_args(&["run", "m.gguf", "--io-threads", "4"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.io_threads, Some(4));
     }
 
@@ -1512,8 +1555,11 @@ mod tests {
             "--cpu-moe-layers",
             "45",
         ]);
-        assert_eq!(args.engine.n_predict, 64, "n_predict default untouched");
-        let config = args.engine.to_config("model.gguf".into());
+        let config = args
+            .engine
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
+        assert_eq!(config.n_predict, 64, "n_predict default untouched");
         assert_eq!(config.threads, 16);
         assert_eq!(config.n_gpu_layers, 99);
         assert!(config.flash_attn_on);
@@ -1526,7 +1572,8 @@ mod tests {
         // change only threads, the mislabeled-leg probe changes only layers.
         let config = parse_run_args(&["run", "m.gguf", "--threads", "4"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.threads, 4);
         assert_eq!(config.n_gpu_layers, 0);
         assert!(!config.flash_attn_on);
@@ -1534,7 +1581,8 @@ mod tests {
 
         let config = parse_run_args(&["run", "m.gguf", "--n-gpu-layers", "7"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert_eq!(config.threads, EngineConfig::default().threads);
         assert_eq!(config.n_gpu_layers, 7);
         assert!(!config.flash_attn_on);
@@ -1542,7 +1590,8 @@ mod tests {
 
         let config = parse_run_args(&["run", "m.gguf", "--flash-attn"])
             .engine
-            .to_config("model.gguf".into());
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
         assert!(config.flash_attn_on);
         assert_eq!(config.n_gpu_layers, 0);
         assert_eq!(config.cpu_moe_layers, None);

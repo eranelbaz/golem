@@ -17,9 +17,9 @@ pub struct EngineConfig {
     /// Decode slots (concurrent sequences). Only 1 is accepted until the
     /// multi-slot scheduler lands.
     pub parallel: u32,
-    /// Decode threads (§7.2 as amended: logical CPUs / 2, min 1 — CPU-side
-    /// ops still run on these: sampling, the non-offloaded tail, tokenizer,
-    /// ids readback).
+    /// CPU threadpool size (§7.2 as amended by R-15: physical cores / 2,
+    /// min 1 — CPU-side ops still run on these: sampling, the non-offloaded
+    /// tail, tokenizer, ids readback). Target: 16 physical cores → 8.
     pub threads: u32,
     /// Model layers to offload to the GPU (`llama_model_params::n_gpu_layers`,
     /// llama.h): 0 keeps the whole model on CPU — the CI-leg default.
@@ -103,6 +103,24 @@ pub struct EngineConfig {
     /// Header facts the caller already parsed (snapshot floor sizing);
     /// `None` = the engine reads them from `model_path`.
     pub model_facts: Option<golem_plan::ModelFacts>,
+    /// R-15: CPUs the store read queue and prefetch threads pin themselves
+    /// to at spawn (the non-V-cache CCD); `None` leaves them unpinned.
+    pub io_cpuset: Option<golem_store::sys::CpuSet>,
+    /// R-15: CPUs the thread calling `Session::new` pins itself to before
+    /// anything loads (the V-cache CCD), so ggml's threadpool and every
+    /// load-time thread inherit it; `None` leaves affinity untouched.
+    pub decode_cpuset: Option<golem_store::sys::CpuSet>,
+    /// R-8 start check: full SHA-256 of every shard instead of the sampled
+    /// windows (`--full-verify`). The check runs only with a manifest.
+    pub full_verify: bool,
+}
+
+/// R-15 default CPU threadpool: physical cores / 2 (min 1), logical / 2
+/// when the physical count is unknown.
+pub fn default_threads() -> u32 {
+    let phys = sysinfo::System::new().physical_core_count();
+    let n = phys.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+    (n / 2).max(1) as u32
 }
 
 /// RAM/VRAM expert residency policy (§6.3 O10, `--residency`).
@@ -146,9 +164,7 @@ impl Default for EngineConfig {
             batch_tokens: 512,
             n_predict: 64,
             parallel: 1,
-            threads: std::thread::available_parallelism()
-                .map(|n| (n.get() / 2).max(1) as u32)
-                .unwrap_or(1),
+            threads: default_threads(),
             n_gpu_layers: 0,
             flash_attn_on: false,
             cpu_moe_layers: None,
@@ -170,6 +186,43 @@ impl Default for EngineConfig {
             snapshot_ram_bytes: Some(0),
             model_facts: None,
             chat_template: None,
+            io_cpuset: None,
+            decode_cpuset: None,
+            full_verify: false,
+        }
+    }
+}
+
+impl std::str::FromStr for Residency {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "inclusive" => Ok(Self::Inclusive),
+            "exclusive" => Ok(Self::Exclusive),
+            _ => Err(format!("want inclusive or exclusive, got {s:?}")),
+        }
+    }
+}
+
+impl std::str::FromStr for PrefetchMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "off" => Ok(Self::Off),
+            "protect" => Ok(Self::Protect),
+            "read" => Ok(Self::Read),
+            _ => Err(format!("want off, protect or read, got {s:?}")),
+        }
+    }
+}
+
+impl std::str::FromStr for VramOrder {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "score" => Ok(Self::Score),
+            "recency" => Ok(Self::Recency),
+            _ => Err(format!("want score or recency, got {s:?}")),
         }
     }
 }
@@ -185,6 +238,9 @@ mod tests {
         assert_eq!(c.batch_tokens, 512);
         assert_eq!(c.n_predict, 64);
         assert!(c.threads >= 1, "threadpool never empty");
+        if let Some(p) = sysinfo::System::new().physical_core_count() {
+            assert_eq!(c.threads, (p / 2).max(1) as u32, "R-15: physical / 2");
+        }
         assert_eq!(c.model_path, PathBuf::new());
         assert_eq!(
             c.n_gpu_layers, 0,

@@ -21,8 +21,13 @@ pub struct StopArgs {
 
 /// Grace between SIGTERM and SIGKILL for instances without a socket.
 const TERM_GRACE: Duration = Duration::from_secs(5);
-/// Wait for the process to exit after a socket stop (30 s drain + teardown).
-const EXIT_WAIT: Duration = Duration::from_secs(90);
+/// Teardown allowance (munlock + unregister of the ≈ 63 GiB pool, snapshot
+/// arena, staging ring). Unmeasured on the target until the
+/// `m4.7-start-verify.md` HW leg records it; 60 s is a placeholder bound.
+const TEARDOWN: Duration = Duration::from_secs(60);
+/// Exit wait after a socket stop: 30 s drain + 60 s worker join + teardown
+/// + 30 s margin.
+const EXIT_WAIT: Duration = Duration::from_secs(30 + 60 + TEARDOWN.as_secs() + 30);
 
 /// Stops the instance and waits for its process to exit.
 pub fn stop(args: &StopArgs) -> Result<(), Box<dyn Error>> {
@@ -38,7 +43,7 @@ pub fn stop(args: &StopArgs) -> Result<(), Box<dyn Error>> {
             StopMode::Graceful
         };
         golem_registry::send(&i.id, &ControlRequest::Stop { mode })?;
-        return wait_exit(&i, EXIT_WAIT);
+        return follow_drain(&i, args.now);
     }
     golem_registry::signal(&i, libc::SIGTERM)?;
     if wait_exit(&i, TERM_GRACE).is_err() {
@@ -50,6 +55,43 @@ pub fn stop(args: &StopArgs) -> Result<(), Box<dyn Error>> {
         wait_exit(&i, EXIT_WAIT)?;
     }
     Ok(())
+}
+
+/// Polls the registry entry until it is gone or the pid exits, printing
+/// each phase (`draining → cancelling → releasing`) as the instance's
+/// published health moves through it.
+fn follow_drain(i: &golem_registry::Instance, now: bool) -> Result<(), Box<dyn Error>> {
+    let t = Instant::now();
+    let mut printed: Vec<&str> = Vec::new();
+    let mut say = |p: &'static str| {
+        if !printed.contains(&p) {
+            printed.push(p);
+            eprintln!("golem: {} {p}", i.id);
+        }
+    };
+    if !now {
+        say("draining");
+    }
+    loop {
+        if golem_registry::exited(i) {
+            return Ok(());
+        }
+        let health = match Registry::open()?.find(&i.id) {
+            Ok(e) => e.health,
+            Err(golem_registry::RegistryError::InstanceNotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if health == "releasing" || now || t.elapsed() > golem_server::DRAIN_GRACE {
+            say("cancelling");
+        }
+        if health == "releasing" {
+            say("releasing");
+        }
+        if t.elapsed() > EXIT_WAIT {
+            return Err(format!("instance {} did not exit within {EXIT_WAIT:?}", i.id).into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn wait_exit(i: &golem_registry::Instance, within: Duration) -> Result<(), Box<dyn Error>> {

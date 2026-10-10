@@ -122,7 +122,12 @@ impl Drop for PrefetchHandle {
 /// that finds no cold victim skips the unit (P17: it never evicts a
 /// demand-hot key). Source errors warn and continue; they never kill the
 /// thread.
-pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> PrefetchHandle {
+/// `io_cpuset` pins the thread at spawn (R-15, off the V-cache CCD).
+pub fn spawn_prefetch(
+    pool: Arc<ExpertPool>,
+    access: Arc<dyn AccessFeed>,
+    io_cpuset: Option<golem_store::sys::CpuSet>,
+) -> PrefetchHandle {
     const IDLE: Duration = Duration::from_millis(25);
     // One unit page-in is ≈ 15.2 MB / 6.5 GB/s ≈ 2.3 ms; re-check well inside it.
     const DEMAND_BACKOFF: Duration = Duration::from_micros(200);
@@ -132,6 +137,11 @@ pub fn spawn_prefetch(pool: Arc<ExpertPool>, access: Arc<dyn AccessFeed>) -> Pre
         let stop = stop.clone();
         let paused = paused.clone();
         spawn(move || {
+            if let Some(set) = &io_cpuset
+                && let Err(e) = golem_store::sys::pin_current_thread(set)
+            {
+                tracing::warn!("prefetch thread pinning: {e}");
+            }
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -329,7 +339,7 @@ mod tests {
         let source = StdArc::new(GateSource::new((u32::MAX, u32::MAX)));
         let pool = test_pool(8, arc_dyn(source.clone()));
         let feed = StdArc::new(QueueFeed::new(vec![(0, 0), (0, 1)]));
-        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed));
+        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed), None);
         until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 2);
         assert!(pool.residency.is_resident(0, 0));
         assert!(pool.residency.is_resident(0, 1));
@@ -368,7 +378,7 @@ mod tests {
         let source = StdArc::new(GateSource::new((0, 7)));
         let pool = test_pool(8, arc_dyn(source.clone()));
         let feed = StdArc::new(QueueFeed::new(vec![(0, 0)]));
-        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()));
+        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()), None);
 
         // Round 1: prefetch pages expert 0.
         until(|| pool.stats.prefetch_pageins.load(Ordering::Relaxed) == 1);

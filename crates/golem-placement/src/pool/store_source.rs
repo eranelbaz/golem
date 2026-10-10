@@ -446,6 +446,14 @@ impl StoreExpertSource {
     pub fn registry(&self) -> &ReplicaRegistry {
         &self.registry
     }
+
+    /// Live instance health (§5.2/§11): atomic replica-health reads, no I/O.
+    pub fn health(&self) -> InstanceHealth {
+        instance_health(
+            &self.registry,
+            self.checksum_degraded.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl ExpertSource for StoreExpertSource {
@@ -937,7 +945,7 @@ mod tests {
     #[test]
     fn maps_layer_kind_expert_to_manifest_shard_offset() {
         let (mpath, d0, d1) = fixture("map", Some(true));
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         // plane(): entry offsets_bytes position + tensor base (dense lead 1 →
         // pool layer 0). Gate lives in shard 0 at tensor offset 0.
         let (off, stride) = src.plane(0, ExpertKind::Gate, 1).unwrap();
@@ -970,14 +978,14 @@ mod tests {
         );
         let p = dir.join("manifest.json");
         std::fs::write(&p, json).unwrap();
-        let err = StoreExpertSource::open(&p, Arc::new(ChunkQueue::new(1))).unwrap_err();
+        let err = StoreExpertSource::open(&p, Arc::new(ChunkQueue::new(1, None))).unwrap_err();
         assert!(err.to_string().contains("expert_index"), "{err}");
     }
 
     #[test]
     fn read_expert_batched_drains_planes_in_one_batch() {
         let (mpath, _, _) = fixture("batched", Some(true));
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         let batch = [(ExpertKind::Gate, 1u32), (ExpertKind::Up, 0u32)];
         let shard_of = |k: ExpertKind| if k == ExpertKind::Gate { 0 } else { 1 };
 
@@ -1062,7 +1070,7 @@ mod tests {
     #[test]
     fn read_expert_batched_fails_when_a_shards_replicas_die() {
         let (mpath, _, _) = fixture("batched-dead", Some(true));
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         // Kill shard 1's replicas (the up plane); gate (shard 0) is healthy.
         let replica_count = src.registry().slots(1).len();
         assert!(replica_count > 0);
@@ -1082,7 +1090,7 @@ mod tests {
     #[test]
     fn absent_crc32c_skips_verification_and_logs_once() {
         let (mpath, _, _) = fixture("nocrc", None);
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         assert!(
             !src.crc_enabled(),
             "no crc32c in manifest → verification off"
@@ -1096,14 +1104,14 @@ mod tests {
         // The flag is the observable hook for the once-at-open skip log:
         // absent digests → off, present digests → on.
         let (mpath, _, _) = fixture("withcrc", Some(true));
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         assert!(src.crc_enabled());
     }
 
     #[test]
     fn fast_in_place_path_when_buffer_hosts_covering_region() {
         let (mpath, _, _) = fixture("fastpath", Some(true));
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         for (kind, shard) in [(ExpertKind::Gate, 0usize), (ExpertKind::Up, 1)] {
             for expert in 0..2u32 {
                 let (off, stride) = src.plane(0, kind, expert).unwrap();
@@ -1146,7 +1154,7 @@ mod tests {
             &format!(r#"replicas": ["{}", "{}"]"#, dir.display(), rep2.display()),
         );
         std::fs::write(&mpath, json).unwrap();
-        StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
     }
 
     #[test]
@@ -1168,7 +1176,7 @@ mod tests {
             &format!(r#"replicas": ["{}", "{}"]"#, dir.display(), rep2.display()),
         );
         std::fs::write(&mpath, json).unwrap();
-        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap_err();
+        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap_err();
         assert!(err.to_string().contains("shard-1 tensor table"), "{err}");
     }
 
@@ -1180,7 +1188,7 @@ mod tests {
             .unwrap()
             .replace("\"bytes_per_expert\": 16", "\"bytes_per_expert\": 15");
         std::fs::write(&mpath, json).unwrap();
-        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap_err();
+        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap_err();
         assert!(err.to_string().contains("tensor table says"), "{err}");
     }
 
@@ -1193,14 +1201,14 @@ mod tests {
             .unwrap()
             .replace("\"offsets_bytes\": [0, 16]", "\"offsets_bytes\": [0, 8192]");
         std::fs::write(&mpath, json).unwrap();
-        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap_err();
+        let err = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap_err();
         assert!(err.to_string().contains("exceeds shard size"), "{err}");
     }
 
     #[test]
     fn crc_mismatch_surfaces_as_invalid_data_read_error() {
         let (mpath, _, _) = fixture("badcrc", Some(false));
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         assert!(src.crc_enabled());
         let mut buf = vec![0u8; 8192];
         let err = src
@@ -1236,7 +1244,7 @@ mod tests {
         // though the read completes via the survivor.
         let tag = "failover";
         let (mpath, _, _) = fixture_in(tag, [Some(true), Some(true)], 2);
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         truncate_replica(tag, SHARD0);
         let mut buf = vec![0u8; STRIDE as usize];
         src.read_expert(0, ExpertKind::Gate, 0, &mut buf, 0)
@@ -1256,7 +1264,7 @@ mod tests {
         // DegradedChecksum — the sticky flag feeds every recomputation.
         let tag = "sticky";
         let (mpath, _, _) = fixture_in(tag, [Some(false), Some(true)], 2);
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         let mut buf = vec![0u8; STRIDE as usize];
         let err = src
             .read_expert(0, ExpertKind::Gate, 0, &mut buf, 0)
@@ -1281,7 +1289,7 @@ mod tests {
     #[test]
     fn read_expert_returns_io_error_when_all_replicas_unavailable() {
         let (mpath, _, _) = fixture("unavail", Some(true));
-        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1))).unwrap();
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
         for s in src.registry().shards() {
             for r in &s.replicas {
                 r.mark_degraded();

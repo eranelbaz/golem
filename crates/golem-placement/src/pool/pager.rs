@@ -795,6 +795,18 @@ impl ExpertPool {
         })
     }
 
+    /// Fraction of pool slots holding a unit (one free-list lock; called
+    /// at the metrics cadence, never per expert).
+    pub fn fill(&self) -> f64 {
+        let total = self.arena.slot_count();
+        let free = self.residency.free_slot_count();
+        if total == 0 {
+            0.0
+        } else {
+            1.0 - free as f64 / f64::from(total)
+        }
+    }
+
     /// Number of demand page-ins currently in flight (§6.5 gate input).
     pub fn demand_inflight(&self) -> usize {
         self.demand_inflight.load(Ordering::Relaxed)

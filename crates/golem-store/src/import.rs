@@ -882,6 +882,37 @@ pub fn verify_replica(path: &Path, want_sha: &str, chunk: usize) -> Result<(), I
     }
 }
 
+/// R-8 sample count and window: 16 × 1 MiB per shard.
+pub const SAMPLES: u64 = 16;
+/// R-8 sample window bytes.
+pub const SAMPLE_BYTES: u64 = 1 << 20;
+
+/// SHA-256 hex of each window `[i·len/16, +1 MiB)` (clamped to EOF) of
+/// `path`; pages dropped after each read so expert bytes stay out of the
+/// page cache. Target: 6 shards × 16 MiB = 96 MiB read at start vs 186 GiB
+/// for a full hash.
+pub fn sampled_sha256(path: &Path) -> Result<Vec<String>, ImportError> {
+    use std::os::unix::fs::FileExt;
+    let io = |e| ImportError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    };
+    let f = std::fs::File::open(path).map_err(io)?;
+    let len = f.metadata().map_err(io)?.len();
+    let mut buf = vec![0u8; SAMPLE_BYTES as usize];
+    (0..SAMPLES)
+        .map(|i| {
+            let off = i * len / SAMPLES;
+            let n = SAMPLE_BYTES.min(len - off) as usize;
+            f.read_exact_at(&mut buf[..n], off).map_err(io)?;
+            if !crate::sys::drop_page_cache(&f, off, n) {
+                warn_dontneed(path);
+            }
+            Ok(sha256_hex(&buf[..n]))
+        })
+        .collect()
+}
+
 /// `golem import` inputs (§5.5).
 #[derive(Debug, Clone, Default)]
 pub struct ImportRequest {
@@ -1062,21 +1093,33 @@ pub fn import(req: &ImportRequest) -> Result<ImportOutcome, ImportError> {
     roots.push(src.clone());
     roots.extend(replicas.iter().cloned());
     let warnings = crate::replica::shared_device_pairs(&roots);
-    let shards = scan
-        .shards
-        .iter()
-        .enumerate()
-        .map(|(i, s)| ShardEntry {
-            file: s
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+    let mut shards = Vec::with_capacity(scan.shards.len());
+    for (i, s) in scan.shards.iter().enumerate() {
+        let file = s.file_name().unwrap_or_default();
+        // R-8: one mtime for every copy, so the start-time check holds on
+        // whichever replica the instance loads.
+        let mtime = scan.stamps[i].1;
+        for r in &replicas {
+            let p = r.join(file);
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .and_then(|f| f.set_modified(mtime))
+                .map_err(|e| ImportError::Io { path: p, source: e })?;
+        }
+        shards.push(ShardEntry {
+            file: file.to_string_lossy().into_owned(),
             bytes: digests.bytes[i],
             sha256: digests.sha256[i].clone(),
             replicas: roots.clone(),
-        })
-        .collect();
+            sampled_sha256: Some(sampled_sha256(s)?),
+            mtime: Some(
+                mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+        });
+    }
     let expert_index = scan
         .planes
         .iter()

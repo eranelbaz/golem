@@ -15,6 +15,7 @@ pub mod slot;
 pub mod snapshot;
 pub mod stream;
 pub mod timing;
+pub mod verify;
 
 pub use atomic::write_atomic;
 pub use chat::{ChatTemplates, OutputParser, Rendered};

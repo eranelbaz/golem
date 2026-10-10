@@ -3,7 +3,7 @@
 //! on a `sync_channel(parallel − 1)`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +16,8 @@ use golem_engine::{
     Scheduler, Session, SlotEvent, SlotJob, TurnOutcome,
 };
 use golem_llama_sys::raw::LLAMA_DEFAULT_SEED;
+
+use crate::metrics::{MetricsSnapshot, code_index};
 
 /// Per-job event channel depth: 256 pieces ≫ one SSE write, so a live reader
 /// never fills it; at ≤ ~10 tok/s cold decode on the target that is ≥ 25 s
@@ -74,8 +76,11 @@ pub enum ServeState {
     Draining = 3,
     /// Worker dead; requests get 500.
     Fatal = 4,
-    /// Worker dead on a storage error.
+    /// Every replica of a shard unreadable (§5.2): requests get 503
+    /// `golem_storage_unavailable`; the process keeps answering `/health`.
     FatalIo = 5,
+    /// Drained; tearing down (pool munlock, unregister).
+    Releasing = 6,
 }
 
 impl ServeState {
@@ -88,6 +93,7 @@ impl ServeState {
             Self::Draining => "draining",
             Self::Fatal => "fatal",
             Self::FatalIo => "fatal-io",
+            Self::Releasing => "releasing",
         }
     }
 
@@ -98,7 +104,8 @@ impl ServeState {
             2 => Self::Degraded,
             3 => Self::Draining,
             4 => Self::Fatal,
-            _ => Self::FatalIo,
+            5 => Self::FatalIo,
+            _ => Self::Releasing,
         }
     }
 }
@@ -112,11 +119,28 @@ pub struct HealthSnapshot {
     pub device_cache_skip_ratio: Option<f64>,
 }
 
+/// `/health` reports `degraded:stalled` past this gap between decode
+/// progress marks while a job is active: one cold streamed 2048-token
+/// ubatch on the target (≈ 24.5 s) + 30 s.
+pub const STALL_MS: u64 = 54_500;
+
+/// Published every [`METRICS_EVERY`] steps and at turn end.
+const METRICS_EVERY: u64 = 64;
+
 /// Shared instance health; written by the worker and the drain path.
 #[derive(Debug)]
 pub struct HealthState {
     state: AtomicU8,
     snapshot: Mutex<HealthSnapshot>,
+    /// Worker-published counters (`/metrics`, `/health` tiers).
+    pub(crate) metrics: Mutex<MetricsSnapshot>,
+    /// Per-[`ErrorCode`] responses, indexed by [`code_index`].
+    pub(crate) errors: [AtomicU64; crate::metrics::N_CODES],
+    /// Jobs handed to the worker and not yet dequeued.
+    pub(crate) queued: AtomicI64,
+    epoch: Instant,
+    /// ms since `epoch` of the last `llama_decode` return or admission.
+    last_progress: AtomicU64,
     /// Cancel flags of the jobs on the worker (one per busy slot).
     in_flight: Mutex<Vec<Arc<AtomicBool>>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -128,6 +152,11 @@ impl HealthState {
         Self {
             state: AtomicU8::new(ServeState::Loading as u8),
             snapshot: Mutex::new(HealthSnapshot::default()),
+            metrics: Mutex::new(MetricsSnapshot::default()),
+            errors: Default::default(),
+            queued: AtomicI64::new(0),
+            epoch: Instant::now(),
+            last_progress: AtomicU64::new(0),
             in_flight: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             hooks: TestHooks::default(),
@@ -144,8 +173,39 @@ impl HealthState {
         let _ = self
             .state
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                (cur < ServeState::Fatal as u8).then_some(s as u8)
+                (!matches!(
+                    ServeState::from_u8(cur),
+                    ServeState::Fatal | ServeState::FatalIo
+                ))
+                .then_some(s as u8)
             });
+    }
+
+    /// Counts one error response.
+    pub(crate) fn count_error(&self, code: ErrorCode) {
+        self.errors[code_index(code)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_progress(&self) {
+        self.last_progress
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// A job is active and no decode progressed for [`STALL_MS`].
+    pub fn stalled(&self) -> bool {
+        self.stalled_at(self.epoch.elapsed().as_millis() as u64)
+    }
+
+    fn stalled_at(&self, now_ms: u64) -> bool {
+        self.busy() && now_ms.saturating_sub(self.last_progress.load(Ordering::Relaxed)) > STALL_MS
+    }
+
+    /// Jobs on the worker.
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// Last published tier snapshot.
@@ -353,6 +413,9 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
     let mut pieces: Vec<(usize, String)> = Vec::with_capacity(n);
     let mut ended: Vec<(usize, Result<TurnOutcome, EngineError>)> = Vec::with_capacity(n);
     let mut changed = false;
+    let mut slot_tokens = vec![0u64; n];
+    let mut steps = 0u64;
+    publish_metrics(sch, health, &slot_tokens);
     loop {
         // Block only when every slot is free; else poll between steps.
         let idle = runs.iter().all(Option::is_none);
@@ -374,8 +437,12 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
                     }
                 }
             };
+            health.queued.fetch_sub(1, Ordering::Relaxed);
             match admit(sch, &mut runs, job, health) {
-                Ok(()) => changed = true,
+                Ok(()) => {
+                    changed = true;
+                    health.mark_progress();
+                }
                 Err(true) => {
                     fail_all(&mut runs, health);
                     return;
@@ -389,9 +456,30 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
         if runs.iter().all(Option::is_none) {
             continue;
         }
+        if storage_lost(sch, &mut runs, health) {
+            // No further decode may touch the dead shard: answer every
+            // later job until the handlers disconnect.
+            while let Ok(job) = rx.recv() {
+                health.queued.fetch_sub(1, Ordering::Relaxed);
+                let _ = job.events.try_send(Event::Failed(storage_unavailable()));
+            }
+            return;
+        }
         let stepped = catch_unwind(AssertUnwindSafe(|| {
-            step(sch, &mut runs, &mut pieces, &mut ended, health)
+            step(
+                sch,
+                &mut runs,
+                &mut pieces,
+                &mut ended,
+                health,
+                &mut slot_tokens,
+            )
         }));
+        health.mark_progress();
+        steps += 1;
+        if steps.is_multiple_of(METRICS_EVERY) {
+            publish_metrics(sch, health, &slot_tokens);
+        }
         // A step error (or panic) after `llama_decode` leaves every slot's
         // sequence in an unknown state, so the worker is fatal and every
         // slot fails with it; per-slot batch failures are recovered inside
@@ -428,6 +516,41 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
     }
 }
 
+/// §5.2 fatal I/O, checked once per step (a handful of atomic replica
+/// health reads, never per expert): a shard with no readable replica fails
+/// every in-flight job with 503 `golem_storage_unavailable` and moves the
+/// instance to `fatal-io`.
+fn storage_lost(sch: &mut Scheduler, runs: &mut [Option<SlotRun>], health: &HealthState) -> bool {
+    if sch.session().storage_health() != Some(golem_store::InstanceHealth::FatalIo) {
+        return false;
+    }
+    health.set(ServeState::FatalIo);
+    health.publish_in_flight(std::iter::empty());
+    for r in runs.iter_mut() {
+        if let Some(run) = r.take() {
+            run.permit.send(Event::Failed(storage_unavailable()));
+        }
+    }
+    publish_metrics(sch, health, &[]);
+    true
+}
+
+fn storage_unavailable() -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::StorageUnavailable,
+        "every replica of a model shard is unreadable",
+    )
+}
+
+/// Copies the session's counters into the shared snapshot: one `try_lock`,
+/// skipped on contention (the next cadence point republishes).
+fn publish_metrics(sch: &mut Scheduler, health: &HealthState, slot_tokens: &[u64]) {
+    let Ok(mut m) = health.metrics.try_lock() else {
+        return;
+    };
+    m.refresh(sch.session(), slot_tokens);
+}
+
 /// Fatal worker: drops every in-flight job (its stream closes before a
 /// terminal event → 500), then `Disconnected` for new ones.
 fn fail_all(runs: &mut [Option<SlotRun>], health: &HealthState) {
@@ -456,9 +579,16 @@ fn admit(
     }
     // `begin_drain` sets Draining then cancels the published flags; a job
     // dequeued after that is answered busy here.
-    if health.get() == ServeState::Draining {
-        let _ = job.events.try_send(Event::Failed(draining()));
-        return Err(false);
+    match health.get() {
+        ServeState::Draining | ServeState::Releasing => {
+            let _ = job.events.try_send(Event::Failed(draining()));
+            return Err(false);
+        }
+        ServeState::FatalIo => {
+            let _ = job.events.try_send(Event::Failed(storage_unavailable()));
+            return Err(false);
+        }
+        _ => {}
     }
     #[cfg(any(test, feature = "test-support"))]
     if health
@@ -552,6 +682,10 @@ fn admit(
         splitter,
         tools: tool_mode.then(ToolStream::new),
     });
+    #[cfg(any(test, feature = "test-support"))]
+    if health.hooks.fail_storage.swap(false, Ordering::SeqCst) {
+        sch.session().fail_storage_for_test();
+    }
     Ok(())
 }
 
@@ -563,6 +697,7 @@ fn step(
     pieces: &mut Vec<(usize, String)>,
     ended: &mut Vec<(usize, Result<TurnOutcome, EngineError>)>,
     health: &HealthState,
+    slot_tokens: &mut [u64],
 ) -> Result<bool, EngineError> {
     pieces.clear();
     ended.clear();
@@ -584,6 +719,7 @@ fn step(
         let Some(run) = runs[i].as_mut() else {
             continue;
         };
+        slot_tokens[i] += 1;
         #[cfg(any(test, feature = "test-support"))]
         if health
             .hooks
@@ -602,6 +738,9 @@ fn step(
     for (i, res) in ended.drain(..) {
         let Some(run) = runs[i].take() else { continue };
         finish(sch, run, i, res, health);
+    }
+    if finished {
+        publish_metrics(sch, health, slot_tokens);
     }
     Ok(finished)
 }
@@ -853,6 +992,17 @@ mod tests {
         w.shutdown(|| {}, Duration::from_secs(30)).ok();
     }
 
+    #[test]
+    fn stalled_only_with_an_active_job_past_the_bound() {
+        let h = HealthState::new();
+        assert!(!h.stalled_at(STALL_MS + 1), "idle is never stalled");
+        h.publish_in_flight(std::iter::once(Arc::new(AtomicBool::new(false))));
+        assert!(!h.stalled_at(STALL_MS));
+        assert!(h.stalled_at(STALL_MS + 1));
+        h.mark_progress();
+        assert!(!h.stalled_at(STALL_MS));
+    }
+
     /// A final parse failure (here: NUL in the text) still delivers the
     /// generated text as content instead of finishing empty.
     #[test]
@@ -899,6 +1049,7 @@ const INJECT_AFTER_TOKEN: u8 = 2;
 pub struct TestHooks {
     panic: AtomicU8,
     slow_ms: u64,
+    fail_storage: AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -917,6 +1068,15 @@ impl TestHooks {
     pub fn panic_at_start() -> Self {
         Self {
             panic: AtomicU8::new(INJECT_AT_START),
+            ..Self::default()
+        }
+    }
+
+    /// Every store replica is marked unreadable right after the first job
+    /// is admitted (the m3.3 `mark_degraded` fault seam).
+    pub fn fail_storage_after_admit() -> Self {
+        Self {
+            fail_storage: AtomicBool::new(true),
             ..Self::default()
         }
     }

@@ -315,3 +315,90 @@ async fn streaming_shutdown_ends_with_draining_error_frame() {
         "{resp}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_parse_as_prometheus_text() {
+    let body = golem_server::test_support::get_text("/metrics").await;
+    for line in body
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let (name, val) = line.rsplit_once(' ').expect(line);
+        assert!(
+            name.split('{')
+                .next()
+                .unwrap()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "{line}"
+        );
+        val.parse::<f64>().unwrap_or_else(|_| panic!("{line}"));
+    }
+    assert!(body.contains("golem_queue_depth "), "{body}");
+    assert!(
+        body.contains("golem_errors_total{code=\"golem_busy\"} "),
+        "{body}"
+    );
+    // on HIP builds the series is emitted and must be 0; on CPU it is omitted (on_cpu is nonzero there)
+    #[cfg(golem_backend_hip)]
+    assert!(body.contains("golem_expert_mul_mat_id_off_gpu_total 0"));
+    #[cfg(not(golem_backend_hip))]
+    assert!(!body.contains("golem_expert_mul_mat_id_off_gpu_total"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_reports_tiers_and_degraded_list() {
+    let app = router_for_test(golem_server::test_engine_config()).await;
+    let r = app
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json(r).await;
+    assert_eq!(v["state"], "healthy");
+    assert!(
+        v["tiers"].as_object().unwrap().contains_key("vram_fill"),
+        "{v}"
+    );
+    assert!(
+        v["tiers"].as_object().unwrap().contains_key("ram_fill"),
+        "{v}"
+    );
+    assert_eq!(v["degraded"], serde_json::json!([]));
+}
+
+/// Graceful drain (§9.2): the in-flight stream finishes with `[DONE]`, a
+/// request arriving during the drain gets 503, and serve returns < 35 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_finishes_in_flight_stream_and_refuses_new_requests() {
+    let mut scfg = golem_server::test_support::test_server_config();
+    scfg.drain_grace = Duration::from_secs(30);
+    let (addr, stop, task) = golem_server::test_support::serve_with(
+        golem_server::test_engine_config(),
+        TestHooks::slow_decode(50),
+        scfg,
+    )
+    .await;
+    let t = Instant::now();
+    let client = tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi_stream(48))));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let late = tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi(2))))
+        .await
+        .unwrap();
+    assert!(
+        late.starts_with("HTTP/1.1 503") && late.contains("golem_busy"),
+        "{late}"
+    );
+    let resp = client.await.unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200") && resp.contains("[DONE]"),
+        "{resp}"
+    );
+    tokio::time::timeout(Duration::from_secs(35), task)
+        .await
+        .expect("serve returns within 35 s")
+        .unwrap()
+        .unwrap();
+    assert!(t.elapsed() < Duration::from_secs(35));
+}

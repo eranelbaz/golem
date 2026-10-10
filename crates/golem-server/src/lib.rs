@@ -1,6 +1,7 @@
 //! Instance process: HTTP server, slot scheduler, decode loop (tech design sections 2 and 7).
 
 mod app;
+mod metrics;
 mod sse;
 mod worker;
 
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use app::{AppState, router};
+pub use metrics::MetricsSnapshot;
 pub use worker::{
     Event, HealthSnapshot, HealthState, Job, ReasoningMode, ServeState, ShutdownTimeout,
     WorkerHandle, spawn_worker,
@@ -29,7 +31,13 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     /// Reasoning delivery (`--reasoning`).
     pub reasoning: ReasoningMode,
+    /// Graceful-shutdown grace (§9.2): the in-flight request may finish
+    /// within it before it is cancelled; 0 (`stop --now`) cancels at once.
+    pub drain_grace: Duration,
 }
+
+/// Default `drain_grace` (§9.2).
+pub const DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 /// Why [`serve`] failed.
 #[derive(Debug, thiserror::Error)]
@@ -67,9 +75,6 @@ pub async fn serve(
     serve_listener(listener, cfg, worker, shutdown).await?;
     Ok(addr)
 }
-
-/// Graceful `stop` drain bound (§9.2): the in-flight request may finish.
-const STOP_DRAIN: Duration = Duration::from_secs(30);
 
 /// [`serve`] for a registered instance: writes the bound endpoint and
 /// health transitions into `guard`, and answers the control socket next to
@@ -137,8 +142,7 @@ async fn control_loop(
     }
 }
 
-/// One control exchange; blocking std I/O on a blocking-pool thread (the
-/// graceful stop waits out the drain).
+/// One control exchange; blocking std I/O on a blocking-pool thread.
 fn control_conn(
     s: std::os::unix::net::UnixStream,
     health: Arc<HealthState>,
@@ -162,12 +166,12 @@ fn control_conn(
             })
         }
         Ok(ControlRequest::Stop { mode }) => {
-            if mode == StopMode::Graceful {
+            // Ack at once; `serve_listener` runs the drain (grace, then
+            // cancel) and `golem stop` follows it through the registry.
+            if mode == StopMode::Now {
+                health.begin_drain();
+            } else {
                 health.set(ServeState::Draining);
-                let t = std::time::Instant::now();
-                while health.busy() && t.elapsed() < STOP_DRAIN {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
             }
             let _ = stop.try_send(());
             serde_json::json!({ "ok": true })
@@ -188,6 +192,7 @@ async fn serve_listener(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
     let health = worker.health.clone();
+    let grace = cfg.drain_grace;
     let state = AppState {
         cfg: Arc::new(cfg),
         jobs: worker.jobs.clone(),
@@ -202,9 +207,18 @@ async fn serve_listener(
                 _ = shutdown => {}
                 _ = worker_dead(&drain) => {}
             }
+            // New requests 503 from here; the in-flight ones get `grace`.
+            drain.set(ServeState::Draining);
+            let t = tokio::time::Instant::now();
+            while drain.busy() && t.elapsed() < grace {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tracing::info!("draining → cancelling");
             drain.begin_drain();
         })
         .await;
+    health.set(ServeState::Releasing);
+    tracing::info!("cancelling → releasing");
     let h = health.clone();
     let joined = tokio::task::spawn_blocking(move || {
         worker.shutdown(|| h.cancel_in_flight(), WORKER_JOIN_TIMEOUT)
@@ -218,15 +232,16 @@ async fn serve_listener(
     }
     served?;
     match health.get() {
-        s @ (ServeState::Fatal | ServeState::FatalIo) => Err(ServeError::WorkerDied(s.as_str())),
+        s @ ServeState::Fatal => Err(ServeError::WorkerDied(s.as_str())),
         _ => Ok(()),
     }
 }
 
 /// Resolves once the worker is fatal; polled since `fatal` is terminal and
-/// 100 ms is noise against process teardown.
+/// 100 ms is noise against process teardown. `fatal-io` keeps serving
+/// (503s and `/health`, §5.2).
 async fn worker_dead(health: &HealthState) {
-    while !matches!(health.get(), ServeState::Fatal | ServeState::FatalIo) {
+    while health.get() != ServeState::Fatal {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -260,7 +275,35 @@ pub mod test_support {
             model_name: "tiny-moe".into(),
             api_key: None,
             reasoning: ReasoningMode::Separate,
+            // Shutdown tests exercise the cancel path; drain tests set it.
+            drain_grace: Duration::ZERO,
         }
+    }
+
+    /// GET `path` on a fresh fixture router (all layers offloaded on HIP
+    /// builds, so I2 placement is meaningful); the body as text.
+    pub async fn get_text(path: &str) -> String {
+        use tower::ServiceExt;
+        let cfg = EngineConfig {
+            n_gpu_layers: if cfg!(golem_backend_hip) { 99 } else { 0 },
+            ..test_engine_config()
+        };
+        let r = router_for_test(cfg)
+            .await
+            .oneshot(
+                axum::http::Request::get(path)
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        String::from_utf8(
+            axum::body::to_bytes(r.into_body(), 1 << 20)
+                .await
+                .expect("body")
+                .to_vec(),
+        )
+        .expect("utf-8 body")
     }
 
     /// Router over a freshly spawned worker; the worker thread is detached.
@@ -291,6 +334,19 @@ pub mod test_support {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<(), ServeError>>,
     ) {
+        serve_with(cfg, hooks, test_server_config()).await
+    }
+
+    /// [`serve_on_port0`] with an explicit `ServerConfig` (port ignored).
+    pub async fn serve_with(
+        cfg: EngineConfig,
+        hooks: TestHooks,
+        scfg: ServerConfig,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), ServeError>>,
+    ) {
         let worker = tokio::task::spawn_blocking(move || spawn_worker_with_hooks(cfg, hooks))
             .await
             .expect("spawn_worker task")
@@ -300,14 +356,9 @@ pub mod test_support {
             .expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(serve_listener(
-            listener,
-            test_server_config(),
-            worker,
-            async move {
-                let _ = rx.await;
-            },
-        ));
+        let task = tokio::spawn(serve_listener(listener, scfg, worker, async move {
+            let _ = rx.await;
+        }));
         (addr, tx, task)
     }
 }

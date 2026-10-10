@@ -20,6 +20,7 @@ pub(crate) struct ChunkMeta {
     pub created: u64,
     pub model: String,
     pub include_usage: bool,
+    pub health: std::sync::Arc<crate::worker::HealthState>,
 }
 
 impl ChunkMeta {
@@ -124,7 +125,10 @@ async fn forward(
                 v.push(SseEvent::default().data("[DONE]"));
                 v
             }
-            Some(Event::Failed(e)) => vec![error_frame(&e)],
+            Some(Event::Failed(e)) => {
+                meta.health.count_error(e.error.code);
+                vec![error_frame(&e)]
+            }
             // Worker died mid-stream: an error frame, never a clean `[DONE]`.
             None => vec![error_frame(&backend_gone_envelope())],
         };

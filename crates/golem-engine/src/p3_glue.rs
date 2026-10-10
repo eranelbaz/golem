@@ -818,6 +818,28 @@ impl SessionHooks {
         self.state.policy.step.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Fraction of RAM-pool slots holding a unit.
+    pub fn pool_fill(&self) -> f64 {
+        self.state.pool.fill()
+    }
+
+    /// Store-backed source health (§5.2/§11); `None` on the GGUF pread path.
+    pub fn storage_health(&self) -> Option<golem_store::InstanceHealth> {
+        self.state.store.as_ref().map(|s| s.health())
+    }
+
+    /// Test seam: marks every replica of every shard unreadable.
+    #[doc(hidden)]
+    pub fn fail_storage_for_test(&self) {
+        if let Some(s) = &self.state.store {
+            for sh in s.registry().shards() {
+                for r in &sh.replicas {
+                    r.mark_degraded();
+                }
+            }
+        }
+    }
+
     /// §6.5 prefetch and prediction counters.
     pub fn prefetch_stats(&self) -> PrefetchStats {
         let p = &self.state.pred;
@@ -1349,7 +1371,10 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     let (source, store): (Arc<dyn ExpertSource>, Option<Arc<StoreExpertSource>>) =
         match &config.manifest_path {
             Some(manifest_path) => {
-                let queue = Arc::new(ChunkQueue::new(config.io_threads.unwrap_or(0)));
+                let queue = Arc::new(ChunkQueue::new(
+                    config.io_threads.unwrap_or(0),
+                    config.io_cpuset.clone(),
+                ));
                 let store = Arc::new(
                     StoreExpertSource::open(manifest_path, queue)
                         .map_err(|e| EngineError::PoolInit(e.to_string()))?,
@@ -1591,11 +1616,13 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             )
         };
     }
-    let prefetch = state
-        .pred
-        .queue
-        .clone()
-        .map(|q| spawn_prefetch(state.pool.clone(), q as Arc<dyn AccessFeed>));
+    let prefetch = state.pred.queue.clone().map(|q| {
+        spawn_prefetch(
+            state.pool.clone(),
+            q as Arc<dyn AccessFeed>,
+            config.io_cpuset.clone(),
+        )
+    });
     // Order publisher: 250 µs poll — the order may lag ≥ 1 step by design;
     // the copy_done flush bounds the worst case without blocking.
     let publisher = spawn_order_publisher(state.clone(), std::time::Duration::from_micros(250));

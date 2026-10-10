@@ -49,6 +49,11 @@ pub struct ServeArgs {
     /// Skip the O5 admission check against running instances.
     #[arg(long)]
     pub allow_overcommit: bool,
+    /// Require `Authorization: Bearer <KEY>` on `/v1/*` and `/metrics`
+    /// (`/health` stays open). Also `GOLEM_API_KEY` / `api_key` in
+    /// `golem.toml`.
+    #[arg(long, value_name = "KEY")]
+    pub api_key: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
 }
@@ -62,11 +67,11 @@ pub enum Reasoning {
     Separate,
 }
 
-/// The requested (pre-RAM-fit) configuration identity; `snapshot_ram_gib` is
-/// the flag, since the resolved arena tracks free RAM.
+/// The requested (pre-RAM-fit) configuration identity; `snapshot_ram_bytes`
+/// is the resolved request, since the fitted arena tracks free RAM.
 pub fn effective(
     config: &EngineConfig,
-    snapshot_ram_gib: Option<f64>,
+    snapshot_ram_bytes: Option<u64>,
 ) -> Result<EffectiveConfig, Box<dyn Error>> {
     let path = std::fs::canonicalize(&config.model_path)?;
     let meta = std::fs::metadata(&path)?;
@@ -80,7 +85,7 @@ pub fn effective(
         ctx: config.n_ctx,
         parallel: config.parallel,
         ram_experts_gib: config.ram_experts_gib,
-        snapshot_ram_bytes: snapshot_ram_gib.map(|g| (g * (1u64 << 30) as f64) as u64),
+        snapshot_ram_bytes,
     })
 }
 
@@ -177,7 +182,8 @@ pub fn serve(
         args.parallel,
         std::env::var("GOLEM_ALLOW_PARALLEL").as_deref() == Ok("1"),
     )?;
-    let config = engine_config(&args.engine, &args.model, args.parallel)?;
+    let (config, requested_snapshot) = engine_config(&args.engine, &args.model, args.parallel)?;
+    let api_key = crate::config::Layers::from_process()?.opt(args.api_key.clone(), "api_key")?;
     let model_name = match &args.model_name {
         Some(n) => n.clone(),
         None => read_metadata(&args.model)?
@@ -190,7 +196,7 @@ pub fn serve(
                     .unwrap_or_default()
             }),
     };
-    let eff = effective(&config, args.engine.snapshot_ram_gib)?;
+    let eff = effective(&config, requested_snapshot)?;
     let guard = Arc::new(register(
         reg,
         id,
@@ -216,7 +222,8 @@ pub fn serve(
         host: args.host,
         port: args.port,
         model_name,
-        api_key: None,
+        api_key,
+        drain_grace: golem_server::DRAIN_GRACE,
         reasoning: match args.reasoning {
             Reasoning::Inline => ReasoningMode::Inline,
             Reasoning::Separate => ReasoningMode::Separate,

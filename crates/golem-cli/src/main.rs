@@ -5,6 +5,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod config;
 mod list;
 mod plan;
 mod run;
@@ -58,24 +59,33 @@ enum Command {
         #[command(flatten)]
         args: list::ListArgs,
     },
-    /// Stop a running instance by id or model name.
+    /// Stop a running instance by id or model name (drains first).
     Stop {
         #[command(flatten)]
         args: stop::StopArgs,
     },
 }
 
-fn init_tracing() {
-    // Engine diagnostics (store health transitions, pool/stream warnings) go
-    // to stderr; `RUST_LOG` overrides the warn default.
-    let _ = tracing_subscriber::fmt()
+/// Engine diagnostics (store health transitions, pool/stream warnings) go
+/// to stderr; `RUST_LOG` overrides the `warn` default. `json`: one JSON
+/// object per line (`serve` off a TTY or detached).
+fn init_tracing(json: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let b = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
+        .with_env_filter(filter);
+    let _ = if json {
+        b.json().try_init()
+    } else {
+        b.with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+            .try_init()
+    };
+}
+
+/// `serve` logs JSON when detached or when stderr is not a TTY.
+fn serve_json_logs(detach: bool) -> bool {
+    detach || !std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
 
 fn main() {
@@ -86,7 +96,10 @@ fn main() {
     {
         detach(args);
     }
-    init_tracing();
+    match &cli.command {
+        Some(Command::Serve { args }) => init_tracing(serve_json_logs(args.detach)),
+        _ => init_tracing(false),
+    }
     let status = match cli.command {
         None => {
             println!("golem {}", env!("CARGO_PKG_VERSION"));
@@ -196,7 +209,7 @@ fn detach(args: &serve::ServeArgs) {
                 sys::exit_now(1);
             }
             drop(log);
-            init_tracing();
+            init_tracing(true);
             serve_detached(args, id, wr)
         }
     }

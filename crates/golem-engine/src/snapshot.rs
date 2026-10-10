@@ -174,6 +174,11 @@ impl SnapshotCache {
         }
     }
 
+    /// Arena bytes (mlocked when pinned).
+    pub fn arena_bytes(&self) -> u64 {
+        self.arena.len() as u64
+    }
+
     /// Counter snapshot.
     pub fn stats(&self) -> SnapshotStats {
         self.stats

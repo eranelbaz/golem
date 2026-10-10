@@ -446,6 +446,7 @@ mod tests {
                 bytes: bytes as u64,
                 sha256: "0".repeat(64),
                 replicas: vec![dir.to_path_buf()],
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -589,6 +590,7 @@ mod tests {
                 bytes: 64,
                 sha256: "0".repeat(64),
                 replicas: vec![shard_dir.clone(), shard_dir.clone()],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -612,6 +614,7 @@ mod tests {
                 bytes: 64,
                 sha256: "0".repeat(64),
                 replicas: vec![shard_dir],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -637,6 +640,7 @@ mod tests {
                 bytes: 64,
                 sha256: "0".repeat(64),
                 replicas: vec![shard_dir],
+                ..Default::default()
             }],
             ..Default::default()
         };

@@ -638,6 +638,14 @@ impl Session {
         if config.ram_experts_gib > 0 {
             p3_glue::refuse_if_pool_session_live()?;
         }
+        if let Some(set) = &config.decode_cpuset {
+            golem_store::sys::pin_current_thread(set)?;
+        }
+        if let Some(m) = &config.manifest_path {
+            for w in crate::verify::verify_model(&config.model_path, m, config.full_verify)? {
+                tracing::warn!("{w}");
+            }
+        }
         // P3 (§3.4): build the RAM expert pool + create the per-model ctx
         // BEFORE the model loads — the ctx must attach to the llama_model
         // before `llama_init_from_model` so its first `sched_reserve` sees
@@ -817,6 +825,46 @@ impl Session {
         let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 3]>() };
         let load = |i: usize| counters[i].load(std::sync::atomic::Ordering::Relaxed);
         Some(DeviceCacheStats::new(load(0), load(1), load(2)))
+    }
+
+    /// Expert `MUL_MAT_ID` nodes the scheduler placed on a CPU backend
+    /// (process-cumulative, I2: must stay 0 on HIP builds). Process-global
+    /// like [`expert_placement`].
+    pub fn expert_mul_mat_id_off_gpu(&self) -> u64 {
+        expert_placement().on_cpu
+    }
+
+    /// Locked RAM: expert pool (mlocked + GPU-registered) plus the
+    /// snapshot arena.
+    pub fn locked_ram_bytes(&self) -> u64 {
+        let pool = if self.inner.p3.is_some() {
+            self.inner.config.ram_experts_gib << 30
+        } else {
+            0
+        };
+        pool + self
+            .inner
+            .snapshots
+            .as_ref()
+            .map_or(0, SnapshotCache::arena_bytes)
+    }
+
+    /// Fraction of RAM-pool slots in use; `None` without the pool.
+    pub fn pool_fill(&self) -> Option<f64> {
+        self.inner.p3.as_ref().map(|p| p.pool_fill())
+    }
+
+    /// Store-backed source health; `None` without a manifest-backed pool.
+    pub fn storage_health(&self) -> Option<golem_store::InstanceHealth> {
+        self.inner.p3.as_ref().and_then(|p| p.storage_health())
+    }
+
+    /// Test seam: marks every store replica unreadable.
+    #[doc(hidden)]
+    pub fn fail_storage_for_test(&self) {
+        if let Some(p) = &self.inner.p3 {
+            p.fail_storage_for_test();
+        }
     }
 
     /// Flushes the §11 per-step rows into `w` without destroying the

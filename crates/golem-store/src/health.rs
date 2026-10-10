@@ -98,6 +98,7 @@ mod tests {
                         .enumerate()
                         .map(|(r, dir)| root.join(format!("s{s}-r{r}-{dir}")))
                         .collect(),
+                    ..Default::default()
                 }
             })
             .collect();
