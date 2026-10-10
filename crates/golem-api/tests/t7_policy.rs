@@ -134,3 +134,25 @@ fn max_completion_tokens_aliases_max_tokens() {
     r["max_completion_tokens"] = json!(7);
     assert_eq!(validate(&r, "tiny-moe").unwrap().max_tokens, Some(7));
 }
+
+#[test]
+fn reasoning_effort_maps_onto_template_levels() {
+    let with = |e: &str| {
+        let mut r = base();
+        r["reasoning_effort"] = json!(e);
+        validate(&r, "tiny-moe")
+    };
+    assert_eq!(
+        with("medium").unwrap().reasoning_effort.as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        with("minimal").unwrap().reasoning_effort.as_deref(),
+        Some("low")
+    );
+    assert_eq!(with("max").unwrap().reasoning_effort, None);
+    assert_eq!(
+        with("huge").unwrap_err().error.code,
+        ErrorCode::InvalidRequest
+    );
+}

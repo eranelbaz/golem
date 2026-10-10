@@ -368,7 +368,7 @@ struct SlotRun {
     /// not because the client left.
     slow_client: std::cell::Cell<bool>,
     admitted: Instant,
-    /// First generated piece: prefill ends one decode before it.
+    /// First emitted piece (stop-string holdback can delay it).
     first_piece: Option<Instant>,
 }
 
@@ -868,8 +868,10 @@ fn finish(
     permit.send(event);
 }
 
-/// One INFO line per finished request: status, finish, and prefill /
-/// generation throughput (prefill time = admission → first piece).
+/// One INFO line per finished request: status (499 = client left), finish,
+/// and prefill / generation rates. Prefill time is admission → first piece,
+/// so a snapshot-restored prompt or `--parallel` > 1 reads as latency, not
+/// throughput.
 fn log_turn(run: &SlotRun, event: &Event) {
     let end = Instant::now();
     let first = run.first_piece.unwrap_or(end);
@@ -878,7 +880,7 @@ fn log_turn(run: &SlotRun, event: &Event) {
     let rate = |n: u32, s: f64| if s > 0.0 { f64::from(n) / s } else { 0.0 };
     match event {
         Event::Done(o) => tracing::info!(
-            status = 200,
+            status = if run.job.events.is_closed() { 499 } else { 200 },
             finish = ?o.finish,
             prompt_tokens = o.prompt_tokens,
             completion_tokens = o.completion_tokens,

@@ -103,6 +103,19 @@ pub fn validate(
             "`max_tokens` must be ≥ 1".into(),
         ));
     }
+    // OpenAI levels onto the template's `low`/`high`; `max` (the template
+    // default) sends nothing.
+    req.reasoning_effort = match req.reasoning_effort.as_deref() {
+        None | Some("max") => None,
+        Some("minimal" | "low") => Some("low".into()),
+        Some("medium" | "high") => Some("high".into()),
+        Some(other) => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                format!("`reasoning_effort` `{other}` is not one of minimal|low|medium|high|max"),
+            ));
+        }
+    };
     if req.n.unwrap_or(1) != 1 {
         return Err(err(ErrorCode::InvalidRequest, "`n` must be 1".into()));
     }
