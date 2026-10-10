@@ -120,14 +120,14 @@ mod tests {
         f.set_modified(mtime).unwrap();
     }
 
-    // 32 MiB shard: windows start every 2 MiB and are 1 MiB long, so
-    // [1 MiB, 2 MiB) is unsampled.
+    // 32 MiB shard: windows start every 31/15 MiB and are 1 MiB long, so
+    // [1 MiB, 2 MiB) is unsampled and the last window ends at EOF.
     const LEN: u32 = 32 << 20;
 
     #[test]
     fn flip_inside_sampled_window_fails() {
         let (dir, m) = fixture("in", LEN);
-        flip(&dir, (6 << 20) + 5); // window 3 = [6 MiB, 7 MiB)
+        flip(&dir, u64::from(LEN) - 1); // last byte: window 15 ends at EOF
         assert!(verify_shards(&dir, &m, false).is_err());
     }
 

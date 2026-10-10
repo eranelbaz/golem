@@ -50,8 +50,8 @@ fn hook_abi_types_generated() {
     // constant the bindings came from matches the compiled substrate.
     // ABI v9 adds the abandoned-D2H hook (parked evictions whose plane
     // copies were not all issued must be reported, not committed).
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 12);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 12);
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 13);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 13);
     let fns: &[(&str, *const ())] = &[
         ("golem_set_predict", raw::golem_set_predict as *const ()),
         (
@@ -94,7 +94,7 @@ fn hook_abi_types_generated() {
 #[test]
 fn batched_ensure_signature() {
     // The batched ensure carries the miss list (kinds + ids) and writes the
-    // pool pointers — the exact v5 shape.
+    // pool pointers — the v5 shape; v13 returns a failure code.
     extern "C" fn f(
         _payload: *mut std::ffi::c_void,
         _tensor: *const std::ffi::c_void,
@@ -102,7 +102,8 @@ fn batched_ensure_signature() {
         _ids: *const i32,
         _n: i32,
         _out: *mut *const std::ffi::c_void,
-    ) {
+    ) -> i32 {
+        0
     }
     let g: raw::golem_ensure_host_resident_fn = Some(f);
     assert_eq!(std::mem::size_of::<raw::golem_ensure_host_resident_fn>(), 8);

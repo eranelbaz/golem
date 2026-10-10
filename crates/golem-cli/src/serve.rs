@@ -16,7 +16,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::run::{EngineArgs, engine_config};
 
 /// Arguments of the `serve` subcommand.
-#[derive(Debug, clap::Args)]
+#[derive(clap::Args)]
 pub struct ServeArgs {
     /// Path to the GGUF model file (first shard of a split).
     pub model: PathBuf,
@@ -50,12 +50,31 @@ pub struct ServeArgs {
     #[arg(long)]
     pub allow_overcommit: bool,
     /// Require `Authorization: Bearer <KEY>` on `/v1/*` and `/metrics`
-    /// (`/health` stays open). Also `GOLEM_API_KEY` / `api_key` in
-    /// `golem.toml`.
+    /// (`/health` stays open). The flag is visible to every user in `ps`:
+    /// prefer `GOLEM_API_KEY` or `api_key` in `golem.toml`.
     #[arg(long, value_name = "KEY")]
     pub api_key: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+/// Manual so the API key never reaches a log line.
+impl std::fmt::Debug for ServeArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeArgs")
+            .field("model", &self.model)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("parallel", &self.parallel)
+            .field("model_name", &self.model_name)
+            .field("reasoning", &self.reasoning)
+            .field("detach", &self.detach)
+            .field("load_timeout", &self.load_timeout)
+            .field("allow_overcommit", &self.allow_overcommit)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("engine", &self.engine)
+            .finish()
+    }
 }
 
 /// `--reasoning` values.
@@ -182,8 +201,10 @@ pub fn serve(
         args.parallel,
         std::env::var("GOLEM_ALLOW_PARALLEL").as_deref() == Ok("1"),
     )?;
-    let (config, requested_snapshot) = engine_config(&args.engine, &args.model, args.parallel)?;
-    let api_key = crate::config::Layers::from_process()?.opt(args.api_key.clone(), "api_key")?;
+    let layers = crate::config::Layers::from_process()?;
+    let (config, requested_snapshot) =
+        engine_config(&args.engine, &args.model, args.parallel, &layers)?;
+    let api_key = layers.opt(args.api_key.clone(), "api_key")?;
     let model_name = match &args.model_name {
         Some(n) => n.clone(),
         None => read_metadata(&args.model)?
@@ -268,5 +289,17 @@ mod tests {
         assert!(super::check_parallel(1, false).is_ok());
         assert!(super::check_parallel(4, false).is_err());
         assert!(super::check_parallel(4, true).is_ok());
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        #[derive(clap::Parser)]
+        struct P {
+            #[command(flatten)]
+            a: super::ServeArgs,
+        }
+        let p = <P as clap::Parser>::parse_from(["serve", "m.gguf", "--api-key", "s3cret"]);
+        let d = format!("{:?}", p.a);
+        assert!(!d.contains("s3cret") && d.contains("<redacted>"), "{d}");
     }
 }

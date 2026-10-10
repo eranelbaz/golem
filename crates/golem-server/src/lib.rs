@@ -19,7 +19,7 @@ pub use worker::{
 };
 
 /// Listener and API identity of one instance.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Bind address; `127.0.0.1` by default (CLI).
     pub host: IpAddr,
@@ -34,6 +34,20 @@ pub struct ServerConfig {
     /// Graceful-shutdown grace (§9.2): the in-flight request may finish
     /// within it before it is cancelled; 0 (`stop --now`) cancels at once.
     pub drain_grace: Duration,
+}
+
+/// Manual so the API key never reaches a log line.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("model_name", &self.model_name)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("reasoning", &self.reasoning)
+            .field("drain_grace", &self.drain_grace)
+            .finish()
+    }
 }
 
 /// Default `drain_grace` (§9.2).
@@ -57,6 +71,12 @@ pub enum ServeError {
 /// Bound on the worker join at shutdown: one non-abortable `llama_decode`
 /// step on the target is ≪ 60 s even cold.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bound on closing connections once the drain ended: a cancelled stream
+/// stops within one plane (≈0.11 s cold) and only its last frames remain to
+/// flush; a reader that stalls past 10 s is cut (30 s grace + 10 s + 60 s
+/// join = 100 s, under `golem stop`'s 180 s exit wait).
+const CLOSE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Binds `cfg.host:cfg.port`, prints `listening on {addr}` to stderr, serves
 /// until `shutdown` resolves, then drains (in-flight job cancelled, answered
@@ -201,8 +221,10 @@ async fn serve_listener(
     let drain = health.clone();
     // The router (and its jobs sender clones) drops when this returns, so the
     // worker's `recv` sees `Disconnected` once the handle's sender drops too.
-    let served = axum::serve(listener, router(state))
-        .with_graceful_shutdown(async move {
+    let served = serve_bounded(
+        listener,
+        router(state),
+        async move {
             tokio::select! {
                 _ = shutdown => {}
                 _ = worker_dead(&drain) => {}
@@ -215,8 +237,10 @@ async fn serve_listener(
             }
             tracing::info!("draining → cancelling");
             drain.begin_drain();
-        })
-        .await;
+        },
+        CLOSE_DEADLINE,
+    )
+    .await;
     health.set(ServeState::Releasing);
     tracing::info!("cancelling → releasing");
     let h = health.clone();
@@ -234,6 +258,136 @@ async fn serve_listener(
     match health.get() {
         s @ ServeState::Fatal => Err(ServeError::WorkerDied(s.as_str())),
         _ => Ok(()),
+    }
+}
+
+/// Serves `app` until `shutdown` resolves, then closes gracefully; a
+/// connection still open `close_deadline` later (a client that stopped
+/// reading a stream) is aborted, so shutdown never waits on a peer.
+async fn serve_bounded(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    close_deadline: Duration,
+) -> io::Result<()> {
+    use std::future::IntoFuture;
+    let (kill, killed) = tokio::sync::watch::channel(false);
+    let drained = Arc::new(tokio::sync::Notify::new());
+    let signal = drained.clone();
+    let served = axum::serve(KillableListener { listener, killed }, app)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            signal.notify_one();
+        })
+        .into_future();
+    tokio::pin!(served);
+    tokio::select! {
+        r = &mut served => return r,
+        _ = async {
+            drained.notified().await;
+            tokio::time::sleep(close_deadline).await;
+        } => {}
+    }
+    tracing::warn!("connections still open {close_deadline:?} after drain; aborting them");
+    let _ = kill.send(true);
+    served.await
+}
+
+/// TCP listener whose connections fail with `ConnectionAborted` once the
+/// kill flag is set (wakes a write blocked on a stalled peer too).
+struct KillableListener {
+    listener: tokio::net::TcpListener,
+    killed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl axum::serve::Listener for KillableListener {
+    type Io = KillableIo;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (KillableIo, SocketAddr) {
+        loop {
+            match self.listener.accept().await {
+                Ok((io, addr)) => {
+                    let mut rx = self.killed.clone();
+                    let kill = Box::pin(async move {
+                        // A dropped sender means serve returned: never fire.
+                        if rx.wait_for(|&k| k).await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                    return (KillableIo { io, kill }, addr);
+                }
+                // Transient (EMFILE, aborted handshake): back off, retry.
+                Err(e) => {
+                    tracing::warn!("accept: {e}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+}
+
+/// One accepted connection plus its kill signal (one boxed future per
+/// connection, never per request byte).
+struct KillableIo {
+    io: tokio::net::TcpStream,
+    kill: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl KillableIo {
+    fn killed(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        self.kill.as_mut().poll(cx).is_ready()
+    }
+}
+
+fn aborted() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "shutdown close deadline")
+}
+
+impl tokio::io::AsyncRead for KillableIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.killed(cx) {
+            return std::task::Poll::Ready(Err(aborted()));
+        }
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for KillableIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.killed(cx) {
+            return std::task::Poll::Ready(Err(aborted()));
+        }
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.killed(cx) {
+            return std::task::Poll::Ready(Err(aborted()));
+        }
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -577,5 +731,89 @@ pub mod sse_support {
             })
             .clone();
         Logs(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let cfg = ServerConfig {
+            api_key: Some("s3cret".into()),
+            ..test_support::test_server_config()
+        };
+        let d = format!("{cfg:?}");
+        assert!(!d.contains("s3cret") && d.contains("<redacted>"), "{d}");
+    }
+
+    /// A client that never reads an endless stream fills the socket
+    /// buffers and parks the server's write; the drain must still end
+    /// within the close deadline, and a normal in-flight request completes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_deadline_cuts_a_stalled_stream_reader() {
+        use axum::routing::get;
+        let chunk = axum::body::Bytes::from(vec![b'x'; 64 << 10]);
+        let app = axum::Router::new()
+            .route(
+                "/ok",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    "ok"
+                }),
+            )
+            .route(
+                "/stream",
+                get(move || async move {
+                    let it = std::iter::repeat_with(move || {
+                        Ok::<_, std::convert::Infallible>(chunk.clone())
+                    });
+                    axum::body::Body::from_stream(tokio_stream::iter(it))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let deadline = Duration::from_secs(1);
+        let task = tokio::spawn(serve_bounded(
+            listener,
+            app,
+            async move {
+                let _ = rx.await;
+            },
+            deadline,
+        ));
+        let req = move |path: &str| {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            write!(
+                s,
+                "GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            s
+        };
+        let _stalled = req("/stream");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let normal = tokio::task::spawn_blocking(move || {
+            let mut out = String::new();
+            req("/ok").read_to_string(&mut out).unwrap();
+            out
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let t = std::time::Instant::now();
+        tx.send(()).unwrap();
+        tokio::time::timeout(deadline + Duration::from_secs(5), task)
+            .await
+            .expect("serve returns despite the stalled reader")
+            .unwrap()
+            .unwrap();
+        assert!(t.elapsed() >= deadline, "the stalled stream held the drain");
+        let out = normal.await.unwrap();
+        assert!(
+            out.starts_with("HTTP/1.1 200") && out.ends_with("ok"),
+            "{out}"
+        );
     }
 }

@@ -14,7 +14,12 @@ use tower::ServiceExt;
 /// store's `O_DIRECT` reads are page-aligned), plus its manifest (one
 /// shard, replica = the copy's dir). Returns (model, manifest).
 fn fixture() -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("golem-fatal-io-{}", std::process::id()));
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "golem-fatal-io-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let model = dir.join("tiny-moe-320.gguf");
     let mut bytes = std::fs::read(golem_server::test_engine_config().model_path).unwrap();
@@ -57,6 +62,17 @@ async fn body_json(r: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn all_replicas_unreadable_is_fatal_io_503() {
+    fatal_io_503(TestHooks::fail_storage_after_admit()).await;
+}
+
+/// The replicas die inside the page-in itself (ABI v13 ensure failure):
+/// the process survives and the request still gets the 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn replicas_lost_during_read_is_fatal_io_503() {
+    fatal_io_503(TestHooks::fail_storage_during_read()).await;
+}
+
+async fn fatal_io_503(hooks: TestHooks) {
     let (model, manifest) = fixture();
     let cfg = golem_engine::config::EngineConfig {
         model_path: model,
@@ -65,7 +81,7 @@ async fn all_replicas_unreadable_is_fatal_io_503() {
         manifest_path: Some(manifest),
         ..golem_server::test_engine_config()
     };
-    let app = router_with_hooks(cfg, TestHooks::fail_storage_after_admit()).await;
+    let app = router_with_hooks(cfg, hooks).await;
     let chat = || {
         Request::post("/v1/chat/completions")
             .header("content-type", "application/json")

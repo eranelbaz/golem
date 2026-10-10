@@ -2498,10 +2498,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (!golem_miss_ids.empty()) {
                     golem_miss_out.resize(golem_miss_ids.size());
                     std::fill(golem_miss_out.begin(), golem_miss_out.end(), nullptr);
+                    int32_t ensure_rc = 0;
                     {
                         golem_cb_guard cb;
-                        gctx->ensure(gctx->payload, input, golem_miss_kinds.data(), golem_miss_ids.data(),
-                                     (int32_t) golem_miss_ids.size(), golem_miss_out.data());
+                        ensure_rc = gctx->ensure(gctx->payload, input, golem_miss_kinds.data(), golem_miss_ids.data(),
+                                                 (int32_t) golem_miss_ids.size(), golem_miss_out.data());
+                    }
+                    if (ensure_rc != 0) {
+                        // ABI v13: the misses could not be paged in; drain
+                        // what earlier layers queued and fail the compute.
+                        golem_restore_ids();
+                        for (int i = 0; i < sched->n_backends; i++) {
+                            ggml_backend_synchronize(sched->backends[i]);
+                        }
+                        if (!golem_evict_d2h.empty()) {
+                            golem_evict_abandon_unfinished();
+                        }
+                        golem_in_flight_done(gctx);
+                        return GGML_STATUS_FAILED;
                     }
                     for (size_t i5 = 0; i5 < golem_miss_out.size(); ++i5) {
                         GGML_ASSERT(golem_miss_out[i5] != NULL);

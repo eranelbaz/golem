@@ -457,12 +457,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
             continue;
         }
         if storage_lost(sch, &mut runs, health) {
-            // No further decode may touch the dead shard: answer every
-            // later job until the handlers disconnect.
-            while let Ok(job) = rx.recv() {
-                health.queued.fetch_sub(1, Ordering::Relaxed);
-                let _ = job.events.try_send(Event::Failed(storage_unavailable()));
-            }
+            refuse_all(rx, health);
             return;
         }
         let stepped = catch_unwind(AssertUnwindSafe(|| {
@@ -488,6 +483,11 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
             Ok(Ok(finished)) => {
                 changed = finished;
                 false
+            }
+            // A page-in failed mid-decode on a dead shard (ABI v13).
+            Ok(Err(EngineError::StorageUnavailable)) if storage_lost(sch, &mut runs, health) => {
+                refuse_all(rx, health);
+                return;
             }
             Ok(Err(e)) => {
                 tracing::error!("decode worker: {e}");
@@ -533,6 +533,15 @@ fn storage_lost(sch: &mut Scheduler, runs: &mut [Option<SlotRun>], health: &Heal
     }
     publish_metrics(sch, health, &[]);
     true
+}
+
+/// No further decode may touch the dead shard: answers every later job
+/// until the handlers disconnect.
+fn refuse_all(rx: &Receiver<Job>, health: &HealthState) {
+    while let Ok(job) = rx.recv() {
+        health.queued.fetch_sub(1, Ordering::Relaxed);
+        let _ = job.events.try_send(Event::Failed(storage_unavailable()));
+    }
 }
 
 fn storage_unavailable() -> ErrorEnvelope {
@@ -685,6 +694,14 @@ fn admit(
     #[cfg(any(test, feature = "test-support"))]
     if health.hooks.fail_storage.swap(false, Ordering::SeqCst) {
         sch.session().fail_storage_for_test();
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    if health
+        .hooks
+        .fail_storage_in_read
+        .swap(false, Ordering::SeqCst)
+    {
+        sch.session().fail_storage_in_read_for_test();
     }
     Ok(())
 }
@@ -1050,6 +1067,7 @@ pub struct TestHooks {
     panic: AtomicU8,
     slow_ms: u64,
     fail_storage: AtomicBool,
+    fail_storage_in_read: AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1077,6 +1095,15 @@ impl TestHooks {
     pub fn fail_storage_after_admit() -> Self {
         Self {
             fail_storage: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// Every store replica dies inside the first job's first page-in, so
+    /// the in-flight read itself fails (not the per-step pre-check).
+    pub fn fail_storage_during_read() -> Self {
+        Self {
+            fail_storage_in_read: AtomicBool::new(true),
             ..Self::default()
         }
     }

@@ -8,7 +8,8 @@
 // double-buffered device slabs, byte sources decided by the pool without
 // touching decode residency; v11 lets the stream source abort the compute --
 // returns 1 to cancel the ubatch mid-split; v12 turns a failed device-slab
-// allocation into a failed compute instead of an abort). Part of the vendored ggml include tree; the ABI is
+// allocation into a failed compute instead of an abort; v13 lets ensure
+// fail a compute when the store cannot page the misses in). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
@@ -34,7 +35,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 12
+#define GOLEM_HOOKS_ABI_VERSION 13
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -46,12 +47,15 @@ int golem_hooks_abi_version(void);
  * loader's expert bytes may live in a read-only file mmap. The pool holds a
  * lease on each returned slot until the matching copy_done(payload) call, so
  * eviction cannot recycle a slot mid-DMA. `tensor` is the first expert input
- * of the layer that step (identity only for logging). */
-typedef void (*golem_ensure_host_resident_fn)(void *payload, const void *tensor,
-                                              const int32_t *miss_kinds,
-                                              const int32_t *miss_ids,
-                                              int32_t n_miss,
-                                              const void **out_ptrs);
+ * of the layer that step (identity only for logging).
+ * Returns 0 = out_ptrs filled; nonzero (ABI v13) = the misses could not be
+ * paged in (every replica unreadable): C drains the split's issued copies
+ * and the compute returns GGML_STATUS_FAILED -- llama_decode returns -3. */
+typedef int32_t (*golem_ensure_host_resident_fn)(void *payload, const void *tensor,
+                                                 const int32_t *miss_kinds,
+                                                 const int32_t *miss_ids,
+                                                 int32_t n_miss,
+                                                 const void **out_ptrs);
 
 /* Hook (exclusive residency, design §6.3 O10): device-slab slots were
  * evicted; decide where their bytes go. ONE call per (layer, compute) with

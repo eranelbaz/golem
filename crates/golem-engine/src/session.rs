@@ -639,12 +639,19 @@ impl Session {
             p3_glue::refuse_if_pool_session_live()?;
         }
         if let Some(set) = &config.decode_cpuset {
-            golem_store::sys::pin_current_thread(set)?;
-        }
-        if let Some(m) = &config.manifest_path {
-            for w in crate::verify::verify_model(&config.model_path, m, config.full_verify)? {
-                tracing::warn!("{w}");
+            match golem_store::sys::pin_current_thread(set) {
+                Ok(()) => {}
+                Err(e) if config.pin_auto => tracing::warn!("decode thread pinning: {e}"),
+                Err(e) => return Err(e.into()),
             }
+        }
+        match &config.manifest_path {
+            Some(m) => {
+                for w in crate::verify::verify_model(&config.model_path, m, config.full_verify)? {
+                    tracing::warn!("{w}");
+                }
+            }
+            None => tracing::warn!("no manifest: start-time model verification (R-8) skipped"),
         }
         // P3 (§3.4): build the RAM expert pool + create the per-model ctx
         // BEFORE the model loads — the ctx must attach to the llama_model
@@ -864,6 +871,15 @@ impl Session {
     pub fn fail_storage_for_test(&self) {
         if let Some(p) = &self.inner.p3 {
             p.fail_storage_for_test();
+        }
+    }
+
+    /// Test seam: the next page-in marks every replica unreadable before
+    /// its reads, so the in-flight read fails.
+    #[doc(hidden)]
+    pub fn fail_storage_in_read_for_test(&self) {
+        if let Some(p) = &self.inner.p3 {
+            p.fail_storage_in_read_for_test();
         }
     }
 
@@ -1581,6 +1597,14 @@ impl SessionInner {
                 -1,
             )
         };
+    }
+
+    /// Whether the store-backed source reports `FatalIo` (§5.2).
+    pub(crate) fn storage_lost(&self) -> bool {
+        self.p3
+            .as_ref()
+            .and_then(|p| p.storage_health())
+            .is_some_and(|h| h == golem_store::InstanceHealth::FatalIo)
     }
 
     /// Slab-failure recovery (§2.4): a `Decode(-2)` shrinks the device

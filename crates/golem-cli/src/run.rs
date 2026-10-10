@@ -211,7 +211,8 @@ impl EngineArgs {
         let d = EngineConfig::default();
         let flag = |b: bool| b.then_some(true);
         let snapshot_ram_gib: Option<f64> = l.opt(self.snapshot_ram_gib, "snapshot_ram_gib")?;
-        let (decode_cpuset, io_cpuset) = match l.get(self.pin, "pin", Pin::Auto)? {
+        let pin = l.get(self.pin, "pin", Pin::Auto)?;
+        let (decode_cpuset, io_cpuset) = match pin {
             Pin::Auto => golem_store::sys::detect_vcache_split()
                 .map_or((None, None), |(v, rest)| (Some(v), Some(rest))),
             Pin::Off => (None, None),
@@ -254,6 +255,7 @@ impl EngineArgs {
             full_verify: l.get(flag(self.full_verify), "full_verify", false)?,
             decode_cpuset,
             io_cpuset,
+            pin_auto: pin == Pin::Auto,
             ..d
         })
     }
@@ -281,9 +283,9 @@ pub fn engine_config(
     engine: &EngineArgs,
     model: &Path,
     parallel: u32,
+    layers: &crate::config::Layers<'_>,
 ) -> Result<(EngineConfig, Option<u64>), Box<dyn Error>> {
-    let layers = crate::config::Layers::from_process()?;
-    let mut config = engine.to_config(model.to_path_buf(), &layers)?;
+    let mut config = engine.to_config(model.to_path_buf(), layers)?;
     let requested_snapshot = config.snapshot_ram_bytes;
     config.parallel = parallel;
     // §9 inference: explicit flags already won in `to_config`; fill the rest
@@ -447,7 +449,8 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         // No model: main() already printed the run help.
         None => return Ok(()),
     };
-    let (config, requested_snapshot) = engine_config(&args.engine, &model, 1)?;
+    let layers = crate::config::Layers::from_process()?;
+    let (config, requested_snapshot) = engine_config(&args.engine, &model, 1, &layers)?;
     let eff = crate::serve::effective(&config, requested_snapshot)?;
     let reg = golem_registry::Registry::open()?;
     if !args.new && args.parity_dump.is_none() {

@@ -96,7 +96,7 @@ void s_release(void * p, uint64_t seq) {
                   s->held.end());
 }
 
-void s_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi,
+int32_t s_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi,
               int32_t n, const void ** out) {
     auto * s = (SState *) p;
     s->ensure_calls.fetch_add(1);
@@ -105,6 +105,7 @@ void s_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi,
     for (int32_t i = 0; i < n; ++i) {
         out[i] = s->plane_ptr(mk[i], mi[i]);
     }
+    return 0;
 }
 
 void s_routing(void *, int32_t, const void *, const int32_t *, int64_t, int32_t) {}

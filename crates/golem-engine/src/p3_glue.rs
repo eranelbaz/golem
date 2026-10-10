@@ -294,6 +294,9 @@ struct HookState {
     /// Test seam: absolute stream plane count at which `stream_source` sets
     /// the turn's cancel flag (0 = off).
     test_cancel_plane: AtomicU64,
+    /// Test seam: the next ensure call marks every replica unreadable
+    /// before its page-in reads, so the read itself fails.
+    test_fail_storage_in_read: AtomicBool,
 }
 
 /// One turn's registration of its cancel flag in `HookState.abort`.
@@ -831,13 +834,16 @@ impl SessionHooks {
     /// Test seam: marks every replica of every shard unreadable.
     #[doc(hidden)]
     pub fn fail_storage_for_test(&self) {
-        if let Some(s) = &self.state.store {
-            for sh in s.registry().shards() {
-                for r in &sh.replicas {
-                    r.mark_degraded();
-                }
-            }
-        }
+        self.state.fail_storage();
+    }
+
+    /// Test seam: the next `ensure_host_resident` kills every replica
+    /// inside its page-in, so the in-flight read fails.
+    #[doc(hidden)]
+    pub fn fail_storage_in_read_for_test(&self) {
+        self.state
+            .test_fail_storage_in_read
+            .store(true, Ordering::Relaxed);
     }
 
     /// §6.5 prefetch and prediction counters.
@@ -1603,6 +1609,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         stream_armed: AtomicBool::new(false),
         abort: AtomicPtr::new(std::ptr::null_mut()),
         test_cancel_plane: AtomicU64::new(0),
+        test_fail_storage_in_read: AtomicBool::new(false),
     });
     if config.prefetch != PrefetchMode::Off {
         // SAFETY: FFI setter on the live ctx, before the first graph build;
@@ -1918,9 +1925,9 @@ impl Drop for PinnedArena {
     }
 }
 
-/// Loud terminal state for FFI-adjacent contract violations (the void ABI
-/// leaves no non-silent failure path; corrupt-weight
-/// decode is worse than a dead process — documented, deliberate).
+/// Loud terminal state for FFI-adjacent contract violations (corrupt-weight
+/// decode is worse than a dead process — documented, deliberate). Storage
+/// loss is not one: it fails the compute through the ABI v13 ensure code.
 pub(crate) fn p3_fatal(context: String) -> ! {
     // stderr is the one channel always available in an abort path (tracing
     // may have no subscriber installed).
@@ -1964,7 +1971,9 @@ unsafe fn state_of<'a>(payload: *mut c_void) -> &'a HookState {
 ///
 /// # Contract
 /// A null tensor, a negative `n_miss`, or an out-of-range
-/// `(kind, id)` is a contract violation → logged + `abort()`.
+/// `(kind, id)` is a contract violation → logged + `abort()`. A source read
+/// failure (every replica unreadable, §5.2) returns 1 (ABI v13): C fails the
+/// compute (`llama_decode` −3) and the store health reads `FatalIo`.
 // The C ABI fixes the signature; the pointer contract is documented above
 // and enforced by the guarded body.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -1975,15 +1984,15 @@ pub extern "C" fn ensure_host_resident(
     miss_ids: *const i32,
     n_miss: i32,
     out_ptrs: *mut *const c_void,
-) {
+) -> i32 {
     guarded("ensure_host_resident", || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         let Some(entry) = h.entry_for(tensor) else {
-            return; // non-expert tensor: upstream behavior
+            return 0; // non-expert tensor: upstream behavior
         };
         if n_miss <= 0 {
-            return; // nothing missed this segment
+            return 0; // nothing missed this segment
         }
         if miss_kinds.is_null() || miss_ids.is_null() {
             p3_fatal("P3: ensure_host_resident called with null miss list".into());
@@ -2027,18 +2036,28 @@ pub extern "C" fn ensure_host_resident(
         // §11: a few `Instant::now()` per layer is the sanctioned hot-path cost.
         // The scratch mutex stays held across the call: the decode thread is
         // its only contender (stated invariant), so this serializes nothing.
+        if h.test_fail_storage_in_read.swap(false, Ordering::Relaxed) {
+            h.fail_storage();
+        }
         let t0 = std::time::Instant::now();
         let paged = h.pool.ensure_batch(entry.layer, &scratch, out);
         drop(scratch);
         h.p3_wait_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         h.ensure_calls.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = paged {
-            p3_fatal(format!(
+        match paged {
+            Ok(()) => {}
+            // Storage loss is an operational state, not a contract breach:
+            // fail the compute; the caller reads the store health.
+            Err(e @ golem_placement::pool::PoolError::Source { .. }) => {
+                tracing::error!(layer = entry.layer, n_miss = n, "P3 page-in failed: {e}");
+                return 1;
+            }
+            Err(e) => p3_fatal(format!(
                 "P3 page-in failed (layer {}, n_miss {n}): {e}; \
                  aborting rather than decoding on garbage",
                 entry.layer
-            ));
+            )),
         }
 
         // Counters visibility: one info line per 1000 slow paths (real metrics
@@ -2052,6 +2071,7 @@ pub extern "C" fn ensure_host_resident(
                 "P3 slow-path progress"
             );
         }
+        0
     })
 }
 
@@ -2407,6 +2427,17 @@ pub extern "C" fn routing(
 }
 
 impl HookState {
+    /// Marks every replica of every store shard unreadable (fault seam).
+    fn fail_storage(&self) {
+        if let Some(s) = &self.store {
+            for sh in s.registry().shards() {
+                for r in &sh.replicas {
+                    r.mark_degraded();
+                }
+            }
+        }
+    }
+
     /// Publishes the scored policy snapshot for the next compute's D2H floor
     /// decisions (exclusive residency, O10): every key's §6.2 decayed score
     /// at the current step, built into one fresh snapshot. Once per decode

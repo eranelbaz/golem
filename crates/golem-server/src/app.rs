@@ -10,7 +10,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use golem_api::chat::{Choice, FinishReason, ModelCard, ToolCall};
 use golem_api::{
@@ -102,12 +102,14 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// `/v1/chat/completions`, `/v1/models`, `/metrics` (behind the API key
-/// when set), `/health` (always open); everything else 404.
+/// `/v1/chat/completions`, `/v1/models`, `/metrics` and unknown `/v1/*`
+/// (behind the API key when set; no route probing without it), `/health`
+/// (always open); everything else 404.
 pub fn router(state: AppState) -> Router {
     let keyed = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
+        .route("/v1/{*rest}", any(not_found))
         .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
@@ -444,6 +446,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
+        let r = app.clone().oneshot(get("/v1/nope", None)).await.unwrap();
+        assert_eq!(r.status(), 401, "unknown /v1 paths are keyed too");
+        let r = app.clone().oneshot(get("/v1/nope", Some("s3cret"))).await;
+        assert_eq!(r.unwrap().status(), 404);
         let r = app.clone().oneshot(get("/health", None)).await.unwrap();
         assert_eq!(r.status(), 200);
     }

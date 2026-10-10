@@ -98,7 +98,8 @@ fn hooked_guard_unregisters_and_recovers_payload() {
         _c: *const i32,
         _n: i32,
         _o: *mut *const std::ffi::c_void,
-    ) {
+    ) -> i32 {
+        0
     }
     extern "C" fn nop2(
         _payload: *mut std::ffi::c_void,

@@ -137,7 +137,10 @@ pub fn detect_vcache_split() -> Option<(CpuSet, CpuSet)> {
             continue;
         };
         let size = size.trim();
-        let kib = size.strip_suffix('K').unwrap_or(size).parse::<u64>().ok()?;
+        let Ok(kib) = size.strip_suffix('K').unwrap_or(size).parse::<u64>() else {
+            tracing::debug!("{name}: unparsable L3 size {size:?}; skipped");
+            continue;
+        };
         l3.push((kib, list.trim().to_owned()));
     }
     vcache_split(&l3)

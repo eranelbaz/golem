@@ -75,6 +75,10 @@ pub enum EngineError {
     /// and the session keeps serving degraded.
     #[error("device expert cache allocation failed; shrunk to K = {0} experts per layer")]
     DeviceCacheDegraded(u32),
+    /// Every replica of a model shard is unreadable (§5.2 fatal I/O): the
+    /// page-in failed mid-decode; no later decode can succeed.
+    #[error("every replica of a model shard is unreadable")]
+    StorageUnavailable,
 }
 
 #[cfg(test)]

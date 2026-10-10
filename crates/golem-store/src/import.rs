@@ -887,10 +887,11 @@ pub const SAMPLES: u64 = 16;
 /// R-8 sample window bytes.
 pub const SAMPLE_BYTES: u64 = 1 << 20;
 
-/// SHA-256 hex of each window `[i·len/16, +1 MiB)` (clamped to EOF) of
-/// `path`; pages dropped after each read so expert bytes stay out of the
-/// page cache. Target: 6 shards × 16 MiB = 96 MiB read at start vs 186 GiB
-/// for a full hash.
+/// SHA-256 hex of each window `[i·(len−1 MiB)/15, +1 MiB)` of `path`: the
+/// first starts at 0 and the last ends at EOF (a file under 1 MiB is one
+/// window repeated). Pages dropped after each read so expert bytes stay out
+/// of the page cache. Target: 6 shards × 16 MiB = 96 MiB read at start vs
+/// 186 GiB for a full hash. The one window function for import and verify.
 pub fn sampled_sha256(path: &Path) -> Result<Vec<String>, ImportError> {
     use std::os::unix::fs::FileExt;
     let io = |e| ImportError::Io {
@@ -902,7 +903,7 @@ pub fn sampled_sha256(path: &Path) -> Result<Vec<String>, ImportError> {
     let mut buf = vec![0u8; SAMPLE_BYTES as usize];
     (0..SAMPLES)
         .map(|i| {
-            let off = i * len / SAMPLES;
+            let off = i * len.saturating_sub(SAMPLE_BYTES) / (SAMPLES - 1);
             let n = SAMPLE_BYTES.min(len - off) as usize;
             f.read_exact_at(&mut buf[..n], off).map_err(io)?;
             if !crate::sys::drop_page_cache(&f, off, n) {

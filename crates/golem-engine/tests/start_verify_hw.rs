@@ -26,8 +26,30 @@ fn hw_start_verify_sampled_vs_full_cold() {
             );
         }
     };
+    // Cold-run preconditions (Evidence): no golem instance maps a shard,
+    // and `fincore` reports 0 resident pages for each after the eviction.
+    let cold = || {
+        for s in &m.shards {
+            let p = model.with_file_name(&s.file);
+            let users = std::process::Command::new("fuser")
+                .arg(&p)
+                .output()
+                .expect("fuser");
+            let pids = String::from_utf8_lossy(&users.stdout);
+            assert!(pids.trim().is_empty(), "{p:?} mapped by pid(s) {pids}");
+            let out = std::process::Command::new("fincore")
+                .args(["--raw", "--noheadings", "--output", "RES"])
+                .arg(&p)
+                .output()
+                .expect("fincore");
+            let res = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(res.trim(), "0", "{p:?} resident bytes after eviction");
+            println!("HW precondition {p:?}: fincore RES=0, no mapping pid");
+        }
+    };
     for full in [false, true] {
         evict();
+        cold();
         let t = Instant::now();
         let warnings = golem_engine::verify::verify_model(&model, &manifest, full).expect("verify");
         println!(

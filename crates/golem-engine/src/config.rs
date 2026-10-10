@@ -110,6 +110,9 @@ pub struct EngineConfig {
     /// anything loads (the V-cache CCD), so ggml's threadpool and every
     /// load-time thread inherit it; `None` leaves affinity untouched.
     pub decode_cpuset: Option<golem_store::sys::CpuSet>,
+    /// The cpusets came from `--pin auto` detection: a decode pin failure
+    /// warns and continues instead of failing the load.
+    pub pin_auto: bool,
     /// R-8 start check: full SHA-256 of every shard instead of the sampled
     /// windows (`--full-verify`). The check runs only with a manifest.
     pub full_verify: bool,
@@ -188,6 +191,7 @@ impl Default for EngineConfig {
             chat_template: None,
             io_cpuset: None,
             decode_cpuset: None,
+            pin_auto: false,
             full_verify: false,
         }
     }

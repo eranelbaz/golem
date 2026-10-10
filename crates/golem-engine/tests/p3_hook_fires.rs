@@ -44,7 +44,7 @@ fn drive_step(payload: *mut libc::c_void, gate: *mut raw::ggml_tensor) -> [*cons
     let mut out: [*const u8; 3] = [std::ptr::null(); 3];
     let kinds = [1, 2, 3]; // gate, up, down
     let miss_ids = [3, 3, 3];
-    p3_glue::ensure_host_resident(
+    let rc = p3_glue::ensure_host_resident(
         payload,
         gate.cast(),
         kinds.as_ptr(),
@@ -52,6 +52,7 @@ fn drive_step(payload: *mut libc::c_void, gate: *mut raw::ggml_tensor) -> [*cons
         3,
         out.as_mut_ptr().cast(),
     );
+    assert_eq!(rc, 0, "ensure paged in");
     p3_glue::copy_done(payload);
     out
 }
