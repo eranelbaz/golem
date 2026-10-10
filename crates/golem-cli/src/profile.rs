@@ -429,6 +429,10 @@ pub fn sweep(
             eprintln!("golem optimize: winner not confirmed by the reverse-order rerun");
             Ok(None)
         }
+        Err(e) if e.is::<StopSweep>() => {
+            eprintln!("golem optimize: winner kept unconfirmed ({e})");
+            Ok(Some(best))
+        }
         Err(e) => {
             eprintln!("golem optimize: confirmation failed: {e}");
             Ok(None)

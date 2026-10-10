@@ -28,6 +28,8 @@ const MIB: u64 = 1 << 20;
 /// after a child exits, before the next one starts.
 const RETURN_SLACK: u64 = profile::SLACK;
 const RETURN_WAIT: Duration = Duration::from_secs(30);
+/// Total free-VRAM drift tolerated across the sweep before it stops.
+const DRIFT_BUDGET: u64 = 1 << 30;
 /// Measured runs per candidate (median).
 const RUNS: usize = 5;
 /// Warm-up stops once the RAM-pool hit rate moves less than 1 pp per turn.
@@ -137,13 +139,19 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     );
     let mut mem0 = (free_vram, mlocked());
     let deadline = Instant::now() + Duration::from_secs(args.max_minutes * 60);
-    // Longest measurement so far: a candidate that cannot finish before the
-    // deadline is not started.
+    // Longest measurement so far. After the baseline `sweep` measures in
+    // pairs (candidate + incumbent), so a pair starts only if both fit.
     let mut longest = Duration::ZERO;
+    let mut n_measured = 0usize;
     let mut candidates: Vec<(Knobs, Result<Metrics, String>)> = Vec::new();
     let mut first = true;
     let mut measure = |k: &Knobs| -> Result<Metrics, Box<dyn Error>> {
-        if Instant::now() + longest >= deadline {
+        let need = if n_measured % 2 == 1 {
+            2 * longest
+        } else {
+            longest
+        };
+        if Instant::now() + need >= deadline {
             return Err(Box::new(StopSweep(format!(
                 "--max-minutes {} reached",
                 args.max_minutes
@@ -172,8 +180,8 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
                     first = false;
                     let per = t0.elapsed().as_secs_f64();
                     println!(
-                        "golem optimize: {per:.0} s per candidate → ≤ {n_cand} candidates ≈ {:.0} min \
-                         per pass (bounded by --max-minutes {})",
+                        "golem optimize: {per:.0} s per measurement → ≤ {n_cand} measurements ≈ \
+                         {:.0} min per pass (bounded by --max-minutes {})",
                         per * n_cand as f64 / 60.0,
                         args.max_minutes
                     );
@@ -181,19 +189,30 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
             }
             Err(e) => println!("candidate {line}: disqualified: {e}"),
         }
+        n_measured += 1;
         longest = longest.max(t0.elapsed());
         candidates.push((*k, r.as_ref().map(|m| m.warm).map_err(|e| e.to_string())));
         mem0 = memory_returned(mem0)?;
+        if free_vram.saturating_sub(mem0.0) > DRIFT_BUDGET {
+            return Err(Box::new(StopSweep(format!(
+                "free VRAM fell {} MiB during the sweep (budget {} MiB)",
+                (free_vram - mem0.0) / MIB,
+                DRIFT_BUDGET / MIB
+            ))));
+        }
         r.map(|m| m.warm)
     };
     let result = profile::sweep(&Knobs::default(), &axes, &mut measure)?;
+    // Lowest free VRAM any candidate ran with: the profile applies only when
+    // at least that much is free.
+    let measured_vram = mem0.0.min(free_vram);
     let baseline = candidates
         .iter()
         .find_map(|(k, m)| (*k == Knobs::default()).then(|| m.clone().ok()).flatten())
         .ok_or("baseline measurement failed")?;
     let p = Profile {
         fingerprint: fp.0,
-        measured_free_vram: free_vram,
+        measured_free_vram: measured_vram,
         measured_free_ram: free_ram,
         knobs: result.map(|r| r.0),
         metrics: result.map_or(baseline, |r| r.1),
