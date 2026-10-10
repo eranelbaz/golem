@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Print the next open task issue: deps resolved (dep closed or its PR merged)
+# and ranked by the O8–O10 attack order in docs/tech-design.md §14.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# O8–O10 attack order; issues not listed fall back to ascending number.
+order=(63 50 51 64 53 52 49 54 66 65)
+
+rows="$(gh issue list --state open --limit 1000 --json number,title --jq '.[] | "\(.number)\t\(.title)"' | sort -n)"
+closed="$(gh issue list --state closed --limit 1000 --json number --jq '.[].number')"
+log="$(git log --format=%s -10 main)"
+
+ready=()
+while IFS=$'\t' read -r num title; do
+  body="$(gh issue view "$num" --json body -q .body)"
+  deps="$(printf '%s' "$body" | rg -o '^\*\*Deps:\*\*.*' | rg -o '[0-9]+' || true)"
+  milestone="$(printf '%s' "$title" | rg -o 'task\(m[0-9]+\.[0-9]+' | rg -o 'm[0-9]+\.[0-9]+' || true)"
+  blocked=0
+  for d in $deps; do
+    if printf '%s\n' "$closed" | rg -qx "$d"; then continue; fi
+    if printf '%s' "$log" | rg -q "\(#$d\)"; then continue; fi
+    blocked=1
+    break
+  done
+  # skip issues whose work already landed on main (merged but left open)
+  if [ -n "$milestone" ] && printf '%s' "$log" | rg -qiF "$milestone"; then continue; fi
+  [ "$blocked" = 0 ] && ready+=("$num")
+done <<<"$rows"
+
+if [ "${#ready[@]}" = 0 ]; then echo "no ready issue found"; exit 1; fi
+
+best="" best_rank=$((${#order[@]} + 1))
+for n in "${ready[@]}"; do
+  rank=${#order[@]}
+  for i in "${!order[@]}"; do [ "${order[$i]}" = "$n" ] && rank=$i && break; done
+  if [ "$rank" -lt "$best_rank" ]; then best_rank=$rank; best=$n; fi
+done
+
+issue="$(printf '%s\n' "$rows" | rg -P "^\Q$best\E\t" | cut -f2)"
+branch="${best}-${issue}"
+branch="${branch//task(/task}"
+branch="$(printf '%s' "$branch" | tr -d '():.' | tr ' ' '-')"
+echo "#$best $issue"
+echo "branch: $branch"
