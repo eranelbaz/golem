@@ -1,5 +1,5 @@
 //! The CLI's process-control FFI for `serve --detach`: pipe, fork, setsid,
-//! stdio redirection.
+//! stdio redirection, and the optimize child's parent-death signal.
 #![allow(unsafe_code)]
 
 use std::fs::File;
@@ -75,6 +75,23 @@ pub fn kill(pid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// `prctl(PR_SET_PDEATHSIG, SIGKILL)`: the kernel kills this process when
+/// its parent thread exits.
+pub fn die_with_parent() -> io::Result<()> {
+    // SAFETY: PR_SET_PDEATHSIG takes one integer signal argument; no memory
+    // is passed.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `getppid(2)`.
+pub fn parent_pid() -> u32 {
+    // SAFETY: no arguments; always succeeds.
+    unsafe { libc::getppid() }.unsigned_abs()
 }
 
 /// `_exit(2)`: leave the intermediate fork child without running atexit

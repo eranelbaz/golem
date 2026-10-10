@@ -486,15 +486,28 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     let eff = crate::serve::effective(&config, requested_snapshot)?;
     let reg = golem_registry::Registry::open()?;
     if !args.new && args.parity_dump.is_none() {
+        // Same layers as `serve`: the key a `--keep` server was started
+        // with, or the operator's configured key for an existing one.
+        let api_key: Option<String> = layers.opt(None, "api_key")?;
         if let Some(i) = attachable(&reg, &eff)? {
             eprintln!("golem: attached to instance {} ({})", i.id, i.endpoint);
-            return attach(&i, args.prompt.as_deref(), config.n_predict);
+            return attach(
+                &i,
+                args.prompt.as_deref(),
+                config.n_predict,
+                api_key.as_deref(),
+            );
         }
         if args.keep {
             let (id, endpoint) = start_detached()?;
             eprintln!("golem: started instance {id} ({endpoint})");
             let i = reg.find(&id)?;
-            return attach(&i, args.prompt.as_deref(), config.n_predict);
+            return attach(
+                &i,
+                args.prompt.as_deref(),
+                config.n_predict,
+                api_key.as_deref(),
+            );
         }
     }
     let model_name = model
@@ -1029,6 +1042,7 @@ fn attach(
     i: &golem_registry::Instance,
     prompt: Option<&str>,
     n_predict: u32,
+    api_key: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let addr = i
         .endpoint
@@ -1037,7 +1051,7 @@ fn attach(
     let mut history: Vec<serde_json::Value> = Vec::new();
     let turn = |history: &mut Vec<serde_json::Value>, text: String| {
         history.push(serde_json::json!({"role": "user", "content": text}));
-        let reply = stream_chat(addr, &i.model, history, n_predict)?;
+        let reply = stream_chat(addr, &i.model, history, n_predict, api_key)?;
         history.push(serde_json::json!({"role": "assistant", "content": reply}));
         println!();
         Ok::<_, Box<dyn Error>>(())
@@ -1074,16 +1088,20 @@ fn stream_chat(
     model: &str,
     messages: &[serde_json::Value],
     n_predict: u32,
+    api_key: Option<&str>,
 ) -> Result<String, Box<dyn Error>> {
+    // `run` is greedy; the server's OpenAI default is temperature 1.
     let body = serde_json::json!({
         "model": model, "messages": messages, "stream": true, "max_tokens": n_predict,
+        "temperature": 0,
     })
     .to_string();
+    let auth = api_key.map_or(String::new(), |k| format!("authorization: Bearer {k}\r\n"));
     let mut s = std::net::TcpStream::connect(addr)?;
     write!(
         s,
         "POST /v1/chat/completions HTTP/1.0\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
-         content-length: {}\r\n\r\n{body}",
+         {auth}content-length: {}\r\n\r\n{body}",
         body.len()
     )?;
     let mut lines = std::io::BufReader::new(s).lines();

@@ -889,6 +889,7 @@ impl Session {
     }
 
     /// Test seam: marks every store replica unreadable.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn fail_storage_for_test(&self) {
         if let Some(p) = &self.inner.p3 {
@@ -898,6 +899,7 @@ impl Session {
 
     /// Test seam: the next page-in marks every replica unreadable before
     /// its reads, so the in-flight read fails.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn fail_storage_in_read_for_test(&self) {
         if let Some(p) = &self.inner.p3 {
@@ -974,6 +976,7 @@ impl Session {
 
     /// Test seam: truncates every stored snapshot so its next restore is
     /// rejected by `llama_state_seq_set_data`.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn corrupt_snapshots_for_test(&mut self) {
         if let Some(c) = self.inner.snapshots.as_mut() {
@@ -996,6 +999,7 @@ impl Session {
 
     /// Test seam: every later turn sets its own cancel flag right after
     /// prefill chunk `n` decodes (0 disables).
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn cancel_after_prefill_chunks_for_test(&mut self, n: u32) {
         self.inner.test_cancel_after_chunks = n;
@@ -1075,6 +1079,7 @@ impl Session {
 
     /// Test seam: the `n`-th generation batch from now (1-based) fails as if
     /// `llama_decode` returned 1, without running it (0 disables).
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn fail_generation_step_for_test(&mut self, n: u32) {
         self.inner.test_fail_gen_step = n;

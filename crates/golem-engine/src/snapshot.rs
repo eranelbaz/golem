@@ -186,6 +186,7 @@ impl SnapshotCache {
 
     /// Test seam: cuts every stored state to half its length, so the next
     /// restore of it must be rejected.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn truncate_all_for_test(&mut self) {
         for e in &mut self.entries {
             let half = e.bytes.len() / 2;

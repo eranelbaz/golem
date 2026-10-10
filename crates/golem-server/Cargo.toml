@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 # Fixture path + fault injection for the integration tests.
-test-support = ["dep:xtask", "dep:tracing-subscriber", "dep:tower"]
+test-support = ["dep:xtask", "dep:tracing-subscriber", "dep:tower", "golem-engine/test-support"]
 
 [dependencies]
 axum = { workspace = true }

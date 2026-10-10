@@ -197,11 +197,19 @@ fn owner_alive(i: &Instance) -> bool {
     sys::pid_exists(i.pid) && pid_start_time(i.pid).is_ok_and(|t| t == i.pid_start_time)
 }
 
-/// Sends `sig` to the instance's process; `InstanceNotFound` once the owner
-/// exited or its pid was reused, so a stale entry never kills a stranger.
+/// Sends `sig` to the instance's `children`, then its process;
+/// `InstanceNotFound` once the owner exited or its pid was reused, so a
+/// stale entry never kills a stranger. A child that already exited is
+/// skipped.
 pub fn signal(i: &Instance, sig: libc::c_int) -> Result<(), RegistryError> {
     if !owner_alive(i) {
         return Err(RegistryError::InstanceNotFound(i.id.clone()));
+    }
+    for &c in &i.children {
+        match sys::signal(c, sig) {
+            Err(e) if e.raw_os_error() != Some(libc::ESRCH) => return Err(e.into()),
+            _ => {}
+        }
     }
     Ok(sys::signal(i.pid, sig)?)
 }

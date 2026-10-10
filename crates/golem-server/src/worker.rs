@@ -120,9 +120,10 @@ pub struct HealthSnapshot {
 }
 
 /// `/health` reports `degraded:stalled` past this gap between decode
-/// progress marks while a job is active: one cold streamed 2048-token
-/// ubatch on the target (≈ 24.5 s) + 30 s.
-pub const STALL_MS: u64 = 54_500;
+/// progress marks while a job is active: one cold streamed default
+/// `prefill_ubatch` on the target plus a 30 s margin.
+// 2048 tok / 5.6 tok/s (docs/baselines/m3.6-prefill-stream.md) ≈ 365.7 s + 30 s = 395.7 s.
+pub const STALL_MS: u64 = 2048 * 10_000 / 56 + 30_000;
 
 /// Published every [`METRICS_EVERY`] steps and at turn end.
 const METRICS_EVERY: u64 = 64;
@@ -363,29 +364,36 @@ struct SlotRun {
     permit: tokio::sync::mpsc::OwnedPermit<Event>,
     splitter: Option<ReasoningSplitter>,
     tools: Option<ToolStream>,
+    /// Cancelled because the event channel was full (client too slow),
+    /// not because the client left.
+    slow_client: std::cell::Cell<bool>,
+}
+
+/// Non-blocking delivery; a full or closed channel cancels the job.
+fn try_deliver(job: &Job, slow_client: &std::cell::Cell<bool>, ev: Event) {
+    if let Err(e) = job.events.try_send(ev) {
+        if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+            tracing::warn!("client too slow to drain events; cancelling");
+            slow_client.set(true);
+        }
+        job.cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 impl SlotRun {
     #[cfg(any(test, feature = "test-support"))]
     fn send(&self, ev: Event) {
-        if let Err(e) = self.job.events.try_send(ev) {
-            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                tracing::warn!("client too slow to drain events; cancelling");
-            }
-            self.job.cancel.store(true, Ordering::SeqCst);
-        }
+        try_deliver(&self.job, &self.slow_client, ev);
     }
 
     fn piece(&mut self, parser: Option<&OutputParser>, t: &str) {
-        let (job, splitter, tools) = (&self.job, &mut self.splitter, &mut self.tools);
-        let send = |ev: Event| {
-            if let Err(e) = job.events.try_send(ev) {
-                if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                    tracing::warn!("client too slow to drain events; cancelling");
-                }
-                job.cancel.store(true, Ordering::SeqCst);
-            }
-        };
+        let (job, splitter, tools, slow) = (
+            &self.job,
+            &mut self.splitter,
+            &mut self.tools,
+            &self.slow_client,
+        );
+        let send = |ev: Event| try_deliver(job, slow, ev);
         if let (Some(ts), Some(p)) = (tools.as_mut(), parser) {
             ts.push(p, t, true, &send);
             return;
@@ -690,6 +698,7 @@ fn admit(
         permit,
         splitter,
         tools: tool_mode.then(ToolStream::new),
+        slow_client: std::cell::Cell::new(false),
     });
     #[cfg(any(test, feature = "test-support"))]
     if health.hooks.fail_storage.swap(false, Ordering::SeqCst) {
@@ -774,13 +783,10 @@ fn finish(
         job,
         splitter,
         tools,
+        slow_client,
         ..
     } = &mut run;
-    let send = |ev: Event| {
-        if job.events.try_send(ev).is_err() {
-            job.cancel.store(true, Ordering::SeqCst);
-        }
-    };
+    let send = |ev: Event| try_deliver(job, slow_client, ev);
     if let Some(s) = splitter {
         s.finish(&mut |p: Piece| {
             send(match p {
@@ -811,6 +817,18 @@ fn finish(
     let event = match res {
         Ok(o) if o.finish == FinishReason::Cancelled && health.get() == ServeState::Draining => {
             Event::Failed(draining())
+        }
+        // A live client that fell behind gets an error, not a truncated
+        // `Done`; a closed receiver (disconnect) keeps `Done`.
+        Ok(o)
+            if o.finish == FinishReason::Cancelled
+                && run.slow_client.get()
+                && !run.job.events.is_closed() =>
+        {
+            Event::Failed(ErrorEnvelope::new(
+                ErrorCode::BackendUnavailable,
+                "client too slow to drain events",
+            ))
         }
         Ok(o) => Event::Done(o),
         Err(e @ EngineError::DeviceCacheDegraded(_)) => {
@@ -1006,6 +1024,27 @@ mod tests {
             .any(|e| matches!(e, Event::Done(_) | Event::Failed(_)));
         assert!(!a_done, "slot 0 already finished when slot 1 started");
         assert!(rg.blocking_recv().is_none(), "cancelled queued job ran");
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
+    /// A reader that never drains fills the channel: the job ends with
+    /// `Failed(BackendUnavailable)` through the reserved permit, not `Done`.
+    #[test]
+    fn slow_client_gets_failed_not_done() {
+        let w = spawn_worker(crate::test_engine_config()).expect("worker");
+        let (mut j, _) = job("count to ten", 64);
+        // Capacity 1: the reserved terminal permit takes the only slot, so
+        // the first text piece finds the channel full.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        j.events = tx;
+        assert!(w.jobs.send(j).is_ok());
+        match rx.blocking_recv() {
+            Some(Event::Failed(env)) => {
+                assert_eq!(env.error.code, ErrorCode::BackendUnavailable);
+                assert!(env.error.message.contains("too slow"), "{env}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
         w.shutdown(|| {}, Duration::from_secs(30)).ok();
     }
 

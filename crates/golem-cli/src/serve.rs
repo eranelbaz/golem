@@ -20,25 +20,27 @@ use crate::run::{EngineArgs, engine_config};
 pub struct ServeArgs {
     /// Path to the GGUF model file (first shard of a split).
     pub model: PathBuf,
-    /// Bind address.
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: IpAddr,
-    /// Bind port; 0 picks a free one (printed as `listening on ADDR`).
-    #[arg(long, default_value_t = 0)]
-    pub port: u16,
+    /// Bind address [default: 127.0.0.1].
+    #[arg(long)]
+    pub host: Option<IpAddr>,
+    /// Bind port; 0 picks a free one (printed as `listening on ADDR`)
+    /// [default: 0].
+    #[arg(long)]
+    pub port: Option<u16>,
     /// Decode slots batched by the scheduler. Values > 1 are refused until
     /// the `parallel ∈ {2,4}` HW leg passes (`docs/baselines/m4.4-batching.md`,
     /// `m4.6-plan-t8.md`); `GOLEM_ALLOW_PARALLEL=1` lifts that for testing.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
-    pub parallel: u32,
+    /// [default: 1]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub parallel: Option<u32>,
     /// Model id served on the API; default GGUF `general.name`, else the
     /// file stem.
     #[arg(long)]
     pub model_name: Option<String>,
     /// Reasoning delivery: `separate` → `reasoning_content`, `inline` →
-    /// left in `content` with its markers.
-    #[arg(long, value_enum, default_value_t = Reasoning::Separate)]
-    pub reasoning: Reasoning,
+    /// left in `content` with its markers [default: separate].
+    #[arg(long, value_enum)]
+    pub reasoning: Option<Reasoning>,
     /// Fork into the background once loaded: prints `<id> <endpoint>` and
     /// exits; the server logs to `$GOLEM_DATA_DIR/logs/<id>.log`.
     #[arg(long)]
@@ -84,6 +86,36 @@ pub enum Reasoning {
     Inline,
     /// Reasoning goes to `reasoning_content`.
     Separate,
+}
+
+impl std::str::FromStr for Reasoning {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        <Self as clap::ValueEnum>::from_str(s, true)
+    }
+}
+
+/// `serve` flags resolved through §9.4 layers (flag > env > file > profile
+/// > default).
+struct Listen {
+    host: IpAddr,
+    port: u16,
+    parallel: u32,
+    reasoning: Reasoning,
+    model_name: Option<String>,
+}
+
+fn listen(
+    args: &ServeArgs,
+    layers: &crate::config::Layers<'_>,
+) -> Result<Listen, crate::config::ConfigError> {
+    Ok(Listen {
+        host: layers.get(args.host, "host", IpAddr::from([127, 0, 0, 1]))?,
+        port: layers.get(args.port, "port", 0)?,
+        parallel: layers.get(args.parallel, "parallel", 1)?,
+        reasoning: layers.get(args.reasoning, "reasoning", Reasoning::Separate)?,
+        model_name: layers.opt(args.model_name.clone(), "model_name")?,
+    })
 }
 
 /// The requested (pre-RAM-fit) configuration identity; `snapshot_ram_bytes`
@@ -210,17 +242,18 @@ pub fn serve(
     id: String,
     ready: impl FnOnce(&str) + Send,
 ) -> Result<(), Box<dyn Error>> {
-    check_parallel(
-        args.parallel,
-        std::env::var("GOLEM_ALLOW_PARALLEL").as_deref() == Ok("1"),
-    )?;
     let layers = crate::config::Layers::from_process()?
         .with_profile(&args.model, args.engine.no_optimize_profile);
+    let l = listen(args, &layers)?;
+    check_parallel(
+        l.parallel,
+        std::env::var("GOLEM_ALLOW_PARALLEL").as_deref() == Ok("1"),
+    )?;
     let (config, requested_snapshot) =
-        engine_config(&args.engine, &args.model, args.parallel, &layers)?;
+        engine_config(&args.engine, &args.model, l.parallel, &layers)?;
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;
-    let model_name = match &args.model_name {
-        Some(n) => n.clone(),
+    let model_name = match l.model_name {
+        Some(n) => n,
         None => read_metadata(&args.model)?
             .kv_str("general.name")
             .map(str::to_owned)
@@ -254,12 +287,12 @@ pub fn serve(
     };
     let worker = spawn_worker(config)?;
     let cfg = ServerConfig {
-        host: args.host,
-        port: args.port,
+        host: l.host,
+        port: l.port,
         model_name,
         api_key,
         drain_grace: golem_server::DRAIN_GRACE,
-        reasoning: match args.reasoning {
+        reasoning: match l.reasoning {
             Reasoning::Inline => ReasoningMode::Inline,
             Reasoning::Separate => ReasoningMode::Separate,
         },
@@ -303,6 +336,32 @@ mod tests {
         assert!(super::check_parallel(1, false).is_ok());
         assert!(super::check_parallel(4, false).is_err());
         assert!(super::check_parallel(4, true).is_ok());
+    }
+
+    /// §9.4: `GOLEM_PORT` beats the file and the default; the flag beats it.
+    #[test]
+    fn port_precedence_flag_env_file_default() {
+        #[derive(clap::Parser)]
+        struct P {
+            #[command(flatten)]
+            a: super::ServeArgs,
+        }
+        let layers = |env: &'static dyn Fn(&str) -> Option<String>| crate::config::Layers {
+            file: toml::from_str("port = 7000\nhost = \"0.0.0.0\"").unwrap(),
+            profile: toml::Table::new(),
+            env,
+        };
+        let env: &'static dyn Fn(&str) -> Option<String> =
+            &|k| (k == "GOLEM_PORT").then(|| "8123".to_owned());
+        let none: &'static dyn Fn(&str) -> Option<String> = &|_| None;
+        let bare = <P as clap::Parser>::parse_from(["serve", "m.gguf"]).a;
+        let flag = <P as clap::Parser>::parse_from(["serve", "m.gguf", "--port", "9"]).a;
+        assert_eq!(super::listen(&bare, &layers(env)).unwrap().port, 8123);
+        assert_eq!(super::listen(&flag, &layers(env)).unwrap().port, 9);
+        let file = super::listen(&bare, &layers(none)).unwrap();
+        assert_eq!((file.port, file.host.to_string()), (7000, "0.0.0.0".into()));
+        let d = super::listen(&bare, &crate::config::Layers::none()).unwrap();
+        assert_eq!((d.port, d.parallel), (0, 1));
     }
 
     #[test]

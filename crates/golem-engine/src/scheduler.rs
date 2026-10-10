@@ -92,11 +92,6 @@ impl Scheduler {
             .count()
     }
 
-    /// Any slot prefilling or generating.
-    pub fn any_active(&mut self) -> bool {
-        self.session.parts().1.iter().any(|s| s.is_active())
-    }
-
     /// Arms the first free slot; hands the job back when all are busy. An
     /// arming error (context overflow, grammar) surfaces as that slot's
     /// `Failed` on the next `step`. The job is returned by value (the brief's

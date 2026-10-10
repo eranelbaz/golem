@@ -183,10 +183,10 @@ impl Layers<'_> {
         sys.refresh_memory();
         let vram = crate::profile::sysfs_vram().map(|(f, _)| f);
         if crate::profile::applicable(&p, vram, sys.available_memory()) {
-            eprintln!("golem: optimize profile {} applied", &p.fingerprint[..12]);
+            tracing::info!("golem: optimize profile {} applied", &p.fingerprint[..12]);
             self.profile = profile_table(p.knobs.as_ref());
         } else {
-            eprintln!(
+            tracing::info!(
                 "golem: optimize profile {} ignored: measured with more free memory than now",
                 &p.fingerprint[..12]
             );

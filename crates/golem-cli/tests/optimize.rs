@@ -341,3 +341,57 @@ fn optimize_real_model() {
     );
     assert!(stdout.contains("winner") || stdout.contains("baseline recorded"));
 }
+
+/// `stop` on an `optimize` entry reaches the `--measure-one` child listed
+/// in its `children`, not only the parent.
+#[test]
+fn stop_optimize_kills_measuring_child() {
+    let rt = common::tempdir_env();
+    let mut parent = common::golem_cmd(&rt)
+        .env("XDG_CONFIG_HOME", rt.join("config"))
+        .args(["optimize", "--model"])
+        .arg(common::tiny_moe_path())
+        .args(["--n-predict", "100000", "--ctx", "4096"])
+        .args(["--snapshot-ram-gib", "0", "--axes", "threads=1,2"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let dir = rt.join("run/golem/instances");
+    let t = std::time::Instant::now();
+    let (id, child) = loop {
+        let found = std::fs::read_dir(&dir).ok().and_then(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .find_map(|e| {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+                    let c = v["children"].as_array()?.first()?.as_u64()?;
+                    Some((v["id"].as_str()?.to_owned(), c))
+                })
+        });
+        if let Some(f) = found {
+            break f;
+        }
+        assert!(t.elapsed().as_secs() < 60, "no measuring child within 60 s");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let st = common::golem_cmd(&rt).args(["stop", &id]).output().unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let _ = parent.wait();
+    let t = std::time::Instant::now();
+    let alive = || {
+        std::fs::read_to_string(format!("/proc/{child}/stat")).is_ok_and(|s| {
+            s.rsplit_once(')')
+                .is_some_and(|(_, r)| !r.trim_start().starts_with('Z'))
+        })
+    };
+    while alive() && t.elapsed().as_secs() < 10 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!alive(), "measuring child {child} survived stop");
+}

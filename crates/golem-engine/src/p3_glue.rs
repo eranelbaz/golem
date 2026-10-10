@@ -832,6 +832,7 @@ impl SessionHooks {
     }
 
     /// Test seam: marks every replica of every shard unreadable.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn fail_storage_for_test(&self) {
         self.state.fail_storage();
@@ -839,6 +840,7 @@ impl SessionHooks {
 
     /// Test seam: the next `ensure_host_resident` kills every replica
     /// inside its page-in, so the in-flight read fails.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn fail_storage_in_read_for_test(&self) {
         self.state
@@ -1039,6 +1041,7 @@ impl SessionHooks {
     /// Test seam: sets the active turn's cancel flag from inside the
     /// `n`-th `stream_source` call (1-based, counted from now), so the
     /// abort fires mid-ubatch; `0` disables.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn cancel_at_stream_plane_for_test(&self, n: u64) {
         let base = self.stream_stats().map_or(0, |s| s.planes);

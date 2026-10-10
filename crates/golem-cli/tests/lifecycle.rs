@@ -122,6 +122,39 @@ fn run_attaches_to_compatible_instance_and_keep_leaves_server() {
     assert!(ids(&rt).is_empty());
 }
 
+/// A keyed instance: `run` resolves `GOLEM_API_KEY` like `serve` and sends
+/// it as a bearer token, so the attach succeeds instead of a 401.
+#[test]
+fn run_attaches_to_keyed_instance() {
+    let rt = common::tempdir_env();
+    let m = tiny_moe();
+    let out = common::golem_cmd(&rt)
+        .env("GOLEM_API_KEY", "k3y")
+        .args(["serve", &m, "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let out = common::golem_cmd(&rt)
+        .env("GOLEM_API_KEY", "k3y")
+        .args(["run", &m, "--prompt", "hi", "--n-predict", "2"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(golem(&rt, &["stop", &id]).status.success());
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains(&format!("attached to instance {id}")), "{err}");
+    assert!(!out.stdout.is_empty(), "no reply: {err}");
+}
+
 #[test]
 fn detach_reports_child_load_failure() {
     let rt = common::tempdir_env();

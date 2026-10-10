@@ -575,13 +575,19 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
         .parent_entry
         .as_deref()
         .ok_or("--parent-entry missing")?;
+    // A parent that dies (even SIGKILLed) takes the child with it; a parent
+    // that died before the prctl is caught by the pid check below.
+    crate::sys::die_with_parent()?;
     // Wait for the parent's go byte: it is written after this pid joins the
     // entry's `children`.
     let mut go = [0u8; 1];
     std::io::Read::read_exact(&mut std::io::stdin(), &mut go)?;
     // The parent's entry is this child's only reservation.
     let entry = Registry::open()?.find(parent)?;
-    if entry.kind != "optimize" || !entry.children.contains(&std::process::id()) {
+    if entry.kind != "optimize"
+        || entry.pid != crate::sys::parent_pid()
+        || !entry.children.contains(&std::process::id())
+    {
         return Err(format!("entry `{parent}` does not own this measurement").into());
     }
     let layers = crate::config::Layers::from_process()?;

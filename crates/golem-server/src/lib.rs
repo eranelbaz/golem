@@ -27,7 +27,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Model id clients must send and `/v1/models` lists.
     pub model_name: String,
-    /// When set, `/v1/*` requires `Authorization: Bearer <key>`.
+    /// When set, `/v1/*` and `/metrics` require `Authorization: Bearer <key>`
+    /// (`/health` stays open).
     pub api_key: Option<String>,
     /// Reasoning delivery (`--reasoning`).
     pub reasoning: ReasoningMode,
