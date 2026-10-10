@@ -410,7 +410,7 @@ An expert may be evicted from RAM only if no in-flight read targets it (floors d
 
 - A slot = one chat sequence: KV-cache sequence id, request state, sampling params, output channel.
 - *Amended 2026-09-29 (review R-4, R-1):* **per-slot state snapshot/restore is a v1 requirement.** The engine today clears memory and re-prefills the whole transcript every turn (`session.rs` "stateless per turn"), and prefill is the most expensive operation on this architecture (§2.4), so turn N costs O(transcript). At turn end, snapshot the sequence state (`llama_state_seq_get_data`: recurrent state + KV), keyed by the token prefix. When a request extends a snapshotted prefix, restore it and prefill only the delta. Snapshots are host-RAM-budgeted (≈145 MiB recurrent + KV per snapshot) and LRU-evicted. They are the only correct form of prefix reuse on a recurrent model.
-- v1 concurrency: up to `--parallel N` slots (default 1 for `golem run`, ~~4~~ **1** for `golem serve`; *amended 2026-09-29, review D-13:* 4 independent slots route ≈30.7 unique experts per layer per step versus 32 with no sharing, so under the §2.4 PCIe/disk ceilings aggregate tok/s is ≈flat and each slot runs at ≈¼ speed. Raise the default only when M3.5 measures a batching win). MoE + disk-paged experts makes heavy batching a bandwidth amplifier (each slot's routed experts union); v1 keeps batching modest and *measures* before raising defaults — batching interacts with the placement hot set, so the default is conservative by design.
+- v1 concurrency: up to `--parallel N` slots (default 1 for `golem run`, ~~4~~ **1** for `golem serve`; *amended 2026-09-29, review D-13:* 4 independent slots route ≈30.7 unique experts per layer per step versus 32 with no sharing, so under the §2.4 PCIe/disk ceilings aggregate tok/s is ≈flat and each slot runs at ≈¼ speed. Raise the default only when M3.5 measures a batching win). *Amended 2026-10-10:* `serve --parallel` > 1 is refused unless `GOLEM_ALLOW_PARALLEL=1` until the target HW batching leg (`docs/baselines/m4.4-batching.md`, #83) passes. MoE + disk-paged experts makes heavy batching a bandwidth amplifier (each slot's routed experts union); v1 keeps batching modest and *measures* before raising defaults — batching interacts with the placement hot set, so the default is conservative by design.
 - Batching is dynamic: each decode iteration includes every slot whose tokens are ready (continuous batching, slot join/leave at iteration boundaries — the same discipline `llama-server` uses, re-implemented over `llama.h`, which supports multi-sequence batched decode).
 
 ### 7.2 Decode loop
@@ -485,7 +485,7 @@ Writing a draft model is not part of it.
 |----------|--------|-------|
 | `POST /v1/chat/completions` | v1 | streaming (`stream: true`, SSE) and non-streaming |
 | `GET /v1/models` | v1 | the instance's single model |
-| `GET /health` | v1 | Golem extension: liveness + tier states + degraded flags (§11) |
+| `GET /health` | v1 | Golem extension: `state`, `tiers{vram_fill,ram_fill}`, `degraded`, `model`, `turns`, `device_cache_skip_ratio` (§11) |
 | `GET /metrics` | v1 | Prometheus-format (§11) |
 | everything else | — | 404 `golem_not_found` (typed, §8.4) |
 
@@ -500,14 +500,15 @@ Strict allowlist — anything requested-but-unsupported gets an explicit typed e
 | `temperature`, `top_p`, `max_tokens` (`max_completion_tokens` aliased), `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `n` (must be 1) | supported |
 | `stream`, `stream_options.include_usage` | supported (SSE; final frame carries usage) |
 | `tools`, `tool_choice` | **Decided 2026-09-29 (O2, review R-14):** supported. Tools are rendered through the pinned chat template, and tool calls are parsed from the model output by llama.cpp's chat layer for that template, then returned as OpenAI `tool_calls` (streaming: `delta.tool_calls`). `tool_choice`: `auto`, `none`, `required`, and a named function (enforced by the template/grammar where the substrate supports it, else a typed 400). Parallel tool calls follow the template. Acceptance: a T7 golden test per template path, plus a T2-style parity check that the rendered prompt is byte-identical to the reference runtime's. |
-| `response_format` (json schema), `logit_bias`, `logprobs`, `reasoning_effort` | **400 `golem_unsupported_field`** naming the field and the reason. Clients probing capabilities get answers, not silence |
+| `reasoning_effort` | *Amended 2026-10-10:* supported. Passed to the chat template as `reasoning_effort`. GLM's template knows `low`/`high`, else `max`, so `minimal`/`low` → `low`, `medium`/`high` → `high`, `max`/absent → template default; any other value → 400 `golem_invalid_request` |
+| `response_format` (json schema), `logit_bias`, `logprobs` | **400 `golem_unsupported_field`** naming the field and the reason. Clients probing capabilities get answers, not silence |
 | `top_k` | Golem extension, supported |
 
 Usage reporting: prompt/completion token counts from llama.cpp counters — cost-accurate, since we own the loop.
 
 ### 8.3 SSE shape
 
-Standard OpenAI chunk framing (`data: {chunk}\n\n`, `data: [DONE]`), deltas carrying `content` and/or `reasoning_content` (§7.3), terminal frame `usage` when `include_usage`. Backpressure: SSE streams are tokio-guarded; a dead client cancels its slot (decode loop preempts at the next iteration boundary).
+Standard OpenAI chunk framing (`data: {chunk}\n\n`, `data: [DONE]`), deltas carrying `content` and/or `reasoning_content` (§7.3), terminal frame `usage` when `include_usage`. Backpressure: SSE streams are tokio-guarded; a dead client cancels its slot (decode loop preempts at the next iteration boundary). *Known deviation (2026-10-10, #90):* an error mid-stream (drain, worker death) sends the error frame without a trailing `data: [DONE]`; a live client that cannot keep up with the event buffer gets a `golem_backend_unavailable` error frame, never a truncated `finish_reason: stop`.
 
 ### 8.4 Error model
 
@@ -522,7 +523,7 @@ Codes (stable, documented): `golem_backend_unavailable`, `golem_plan_infeasible`
 
 ### 8.5 Server posture
 
-Binds `127.0.0.1` by default (port: auto-select, recorded in the registry; `--host/--port` to override). Optional bearer token (`--api-key`). No TLS in v1 (loopback tool; document the reverse-proxy path). `golem serve` runs in the foreground by default — logs to stderr, Ctrl-C = graceful drain — with `--detach` (double-fork, logs to `$GOLEM_DATA_DIR/logs/<instance>.log`, PID in registry) for the background habit.
+Binds `127.0.0.1` by default (port: auto-select, recorded in the registry; `--host/--port` to override). Optional bearer token (`--api-key`). No TLS in v1 (loopback tool; document the reverse-proxy path). `golem serve` runs in the foreground by default — logs to stderr; *amended 2026-10-10:* Ctrl-C cancels in-flight requests at once (a second Ctrl-C exits without teardown), SIGTERM and `golem stop` keep the 30 s drain grace (`golem stop --now` cancels at once) — with `--detach` (double-fork, logs to `$GOLEM_DATA_DIR/logs/<instance>.log`, PID in registry) for the background habit.
 
 ---
 
@@ -547,7 +548,7 @@ Each instance is an independent process with its own VRAM budget; concurrent ins
 
 ### 9.4 Config precedence
 
-Flags > env (`GOLEM_*`, uppercase, one per flag) > config file (`$GOLEM_CONFIG_DIR/golem.toml`) > built-in defaults. The instance's effective config hash is recorded in the registry (§9.2); `golem run` only attaches to an instance whose config hash is *compatible* (same model; placement budgets that fit the running instance), else it reports the conflict and offers to start a new instance.
+Flags > env (`GOLEM_*`, uppercase, one per flag) > config file (`$GOLEM_CONFIG_DIR/golem.toml`) > `golem optimize` profile > built-in defaults. *Amended 2026-10-10:* the profile (`$XDG_CONFIG_HOME/golem/tuning/<fingerprint>.json`, `~/.config` when unset) applies only when it holds a winner, the hardware/model/engine fingerprint matches (GPU, CPU topology, model shards' name/size/mtime, engine version and vendor pin), and free RAM/VRAM now are at least what the sweep measured minus 256 MiB; `--no-optimize-profile` skips it. The instance's effective config hash is recorded in the registry (§9.2); `golem run` only attaches to an instance whose config hash is *compatible* (same model; placement budgets that fit the running instance), else it reports the conflict and runs in-process (*amended 2026-10-10:* `--new` skips the check; `--keep` starts a detached `serve` and attaches).
 
 ---
 
@@ -585,8 +586,8 @@ KV per token without loading the model: read from the arch table (glm5next entry
 
 ## 11. Observability
 
-- **Tracing:** `tracing` + JSON logs to stderr/file; spans for request lifecycle, decode steps (sampled), page-ins, evictions.
-- **Metrics** (`/metrics`, Prometheus): token rates per slot; bytes disk→RAM (demand vs prefetch), RAM→VRAM (demand vs promote), VRAM evictions; P2 skip ratio (device-cache hit rate); P3 slow-path rate (the key health number — should be ≈0 steady-state); *amended 2026-09-29:* `prefetch_hit_rate` (prefetched keys accessed before eviction, §6.5 H-6), `prefetch_wasted_bytes` (prefetched, evicted unaccessed, §6.5, amended 2026-10-03), `mtp_acceptance_rate` (§7.5), `state_snapshot_hits` (§7.1), and an I2 guard counter of expert `MUL_MAT_ID`s executed off-GPU (must stay 0, C-4); tier fill levels; replica health; per-code error counters.
+- **Tracing:** `tracing` + JSON logs to stderr/file; spans for request lifecycle, decode steps (sampled), page-ins, evictions. *Amended 2026-10-10:* `serve` logs at INFO for `golem_server`, `tower_http` and `golem_engine::slot` and at WARN otherwise (`RUST_LOG` overrides); JSON when detached or off a TTY, text otherwise. It logs every HTTP request/response with status and latency, and one `chat completion` line per request with status (499 = client disconnected), finish reason, prompt/completion tokens, `prefill_tok_s` (admission → first piece; a snapshot-restored prompt or `--parallel` > 1 reads as latency) and `gen_tok_s`.
+- **Metrics** (`/metrics`, Prometheus): token rates per slot; bytes disk→RAM (demand vs prefetch), RAM→VRAM (demand vs promote), VRAM evictions; P2 skip ratio (device-cache hit rate); P3 slow-path rate (the key health number — should be ≈0 steady-state); *amended 2026-09-29:* `prefetch_hit_rate` (prefetched keys accessed before eviction, §6.5 H-6), `prefetch_wasted_bytes` (prefetched, evicted unaccessed, §6.5, amended 2026-10-03), `mtp_acceptance_rate` (§7.5), `state_snapshot_hits` (§7.1), and an I2 guard counter of expert `MUL_MAT_ID`s executed off-GPU (must stay 0, C-4); tier fill levels; replica health; per-code error counters. *Amended 2026-10-10 (as exported in M4):* `golem_device_cache_{bytes_copied,bytes_skipped,evictions}_total`, `golem_pool_{demand_pageins,fast_hits,evictions,bytes_paged,source_errors}_total`, `golem_prefetch_hit_rate`, `golem_prefetch_wasted_bytes`, `golem_state_snapshot_{hits,misses,restore_failures,evictions,dropped_oversize}_total`, `golem_state_snapshot_bytes`, `golem_expert_mul_mat_id_off_gpu_total` (HIP builds), `golem_locked_ram_bytes`, `golem_vram_free_bytes`, `golem_queue_depth`, `golem_in_flight`, `golem_errors_total{code}`, `golem_slot_tokens_total{slot}`. Not yet exported: `mtp_acceptance_rate` (MTP deferred), RAM→VRAM demand vs promote split, replica health, CPU/DMA expert counts (#88); tier fill is in `/health`.
 - **Per-step timing (amended 2026-10-03, BMoE, §16).** Counters say how many misses; they cannot say why cold decode moves ≈2 GB/s against 5.8–8 GiB/s of disk (§2.4). `--timing-csv <path>` writes one row per decode step: step, tokens, wall ms, P3 wait ms (time inside `ensure_host_resident`, measured in the Rust trampoline), disk read ms and bytes, H2D ms (HIP events on the copy stream) and bytes, policy ms, and compute ms = wall − the measured parts. A column that is not measured in a given build is written `unmeasured`, never `0`. The file starts with a header carrying engine version, fork commit and the full resolved config. Cost: a few `Instant::now()` per layer and one event pair per H2D batch, no allocation per row (preallocated ring flushed at turn end), so it obeys the hot-path rules and can stay on during benchmarks.
 - **Placement journal:** ring buffer (last N steps of access sets + transitions) dumped to `$GOLEM_DATA_DIR/journals/<instance>/` on shutdown, reused for score seeding (§6.3) and offline policy tuning.
 - **Health states:** `healthy` / `degraded:{replica,io,checksum}` / `draining` / `fatal-io` — surfaced in `/health`, `golem list`, and log lines. Degraded is a first-class, visible state (spec: detect and report, never silently).
