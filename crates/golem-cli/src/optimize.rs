@@ -135,17 +135,21 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         axes.len(),
         args.max_minutes
     );
-    let mem0 = (free_vram, mlocked());
+    let mut mem0 = (free_vram, mlocked());
     let deadline = Instant::now() + Duration::from_secs(args.max_minutes * 60);
+    // Longest measurement so far: a candidate that cannot finish before the
+    // deadline is not started.
+    let mut longest = Duration::ZERO;
     let mut candidates: Vec<(Knobs, Result<Metrics, String>)> = Vec::new();
     let mut first = true;
     let mut measure = |k: &Knobs| -> Result<Metrics, Box<dyn Error>> {
-        if Instant::now() >= deadline {
+        if Instant::now() + longest >= deadline {
             return Err(Box::new(StopSweep(format!(
                 "--max-minutes {} reached",
                 args.max_minutes
             ))));
         }
+        let t0 = Instant::now();
         let r = plan_check(&config, &facts, &mach, k, &base_plan).and_then(|()| {
             println!("plan ok: {}", serde_json::to_string(k)?);
             run_child(&id, &guard, k)
@@ -166,16 +170,20 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
                 );
                 if first {
                     first = false;
+                    let per = t0.elapsed().as_secs_f64();
                     println!(
-                        "golem optimize: expected wall clock ≈ {n_cand} × ({:.1} s load + 6 turns)",
-                        m.load_s
+                        "golem optimize: {per:.0} s per candidate → ≤ {n_cand} candidates ≈ {:.0} min \
+                         per pass (bounded by --max-minutes {})",
+                        per * n_cand as f64 / 60.0,
+                        args.max_minutes
                     );
                 }
             }
             Err(e) => println!("candidate {line}: disqualified: {e}"),
         }
+        longest = longest.max(t0.elapsed());
         candidates.push((*k, r.as_ref().map(|m| m.warm).map_err(|e| e.to_string())));
-        memory_returned(mem0)?;
+        mem0 = memory_returned(mem0)?;
         r.map(|m| m.warm)
     };
     let result = profile::sweep(&Knobs::default(), &axes, &mut measure)?;
@@ -251,26 +259,34 @@ fn mlocked() -> u64 {
         .map_or(0, |kb| kb * 1024)
 }
 
-/// Waits for the last child's VRAM and locked RAM to come back; a candidate
-/// measured on a machine still holding the previous one's memory would be
-/// priced wrong, so the sweep stops instead.
-fn memory_returned((vram0, locked0): (u64, u64)) -> Result<(), Box<dyn Error>> {
+/// Waits for the last child's locked RAM to come back (a child still
+/// holding its pool would price the next candidate wrong, so the sweep
+/// stops). Free VRAM is shared with the desktop and drifts once the child
+/// has exited: a lower reading is warned about and becomes the new baseline.
+fn memory_returned((vram0, locked0): (u64, u64)) -> Result<(u64, u64), Box<dyn Error>> {
     let t = Instant::now();
     loop {
         let vram = profile::sysfs_vram().map_or(vram0, |(f, _)| f);
         let locked = mlocked();
-        if vram + RETURN_SLACK >= vram0 && locked <= locked0 + RETURN_SLACK {
-            return Ok(());
+        let vram_back = vram + RETURN_SLACK >= vram0;
+        if vram_back && locked <= locked0 + RETURN_SLACK {
+            return Ok((vram0, locked0));
         }
         if t.elapsed() > RETURN_WAIT {
-            return Err(Box::new(StopSweep(format!(
-                "memory not returned after the candidate: free VRAM {} MiB (was {} MiB), \
-                 locked RAM {} MiB (was {} MiB)",
+            if locked > locked0 + RETURN_SLACK {
+                return Err(Box::new(StopSweep(format!(
+                    "locked RAM not returned after the candidate: {} MiB (was {} MiB)",
+                    locked / MIB,
+                    locked0 / MIB
+                ))));
+            }
+            eprintln!(
+                "golem optimize: free VRAM {} MiB after the candidate (was {} MiB); another \
+                 process is using VRAM, continuing from the lower reading",
                 vram / MIB,
-                vram0 / MIB,
-                locked / MIB,
-                locked0 / MIB
-            ))));
+                vram0 / MIB
+            );
+            return Ok((vram, locked0));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
