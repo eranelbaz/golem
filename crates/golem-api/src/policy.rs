@@ -31,6 +31,7 @@ pub const FIELD_POLICY: &[(&str, FieldRule)] = &[
     ("stream_options", FieldRule::Supported),
     ("tools", FieldRule::Supported),
     ("tool_choice", FieldRule::Supported),
+    ("reasoning_effort", FieldRule::Supported),
     ("metadata", FieldRule::Tolerated),
     ("user", FieldRule::Tolerated),
     ("request_id", FieldRule::Tolerated),
@@ -50,10 +51,6 @@ pub const FIELD_POLICY: &[(&str, FieldRule)] = &[
     (
         "parallel_tool_calls",
         FieldRule::Unsupported("at most one tool call is generated per turn"),
-    ),
-    (
-        "reasoning_effort",
-        FieldRule::Unsupported("the model has no reasoning-effort control"),
     ),
 ];
 

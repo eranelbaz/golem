@@ -71,7 +71,17 @@ fn detach_list_stop_round_trip() {
 fn run_attaches_to_compatible_instance_and_keep_leaves_server() {
     let rt = common::tempdir_env();
     let m = tiny_moe();
-    let out = golem(&rt, &["serve", &m, "--detach", "--ctx", "4096"]);
+    let out = golem(
+        &rt,
+        &[
+            "serve",
+            &m,
+            "--detach",
+            "--ctx",
+            "4096",
+            "--allow-overcommit",
+        ],
+    );
     assert!(
         out.status.success(),
         "{}",

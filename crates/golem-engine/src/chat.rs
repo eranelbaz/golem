@@ -93,17 +93,22 @@ impl ChatTemplates {
 
     /// Renders OpenAI `messages` (+ optional `tools`/`tool_choice` JSON) with
     /// the generation prompt appended. `reasoning_inline` keeps reasoning and
-    /// its markers in the parsed `content`.
+    /// its markers in the parsed `content`; `reasoning_effort` is the
+    /// template's `reasoning_effort` variable.
     pub fn render(
         &self,
         messages_json: &str,
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
         reasoning_inline: bool,
+        reasoning_effort: Option<&str>,
     ) -> Result<Rendered, EngineError> {
         let m = cstr(messages_json, "messages")?;
         let t = tools_json.map(|t| cstr(t, "tools")).transpose()?;
         let c = tool_choice.map(|c| cstr(c, "tool_choice")).transpose()?;
+        let e = reasoning_effort
+            .map(|e| cstr(e, "reasoning_effort"))
+            .transpose()?;
         let (mut prompt, mut grammar, mut handle) = (std::ptr::null_mut(), std::ptr::null_mut(), 0);
         // SAFETY: the handle is live; inputs are live NUL-terminated strings or
         // NULL; outputs are written only on success.
@@ -114,6 +119,7 @@ impl ChatTemplates {
                 t.as_ref().map_or(std::ptr::null(), |t| t.as_ptr()),
                 c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
                 i32::from(reasoning_inline),
+                e.as_ref().map_or(std::ptr::null(), |e| e.as_ptr()),
                 &mut prompt,
                 &mut grammar,
                 &mut handle,
@@ -211,7 +217,7 @@ mod tests {
     fn glm_auto_parses_canned_tool_call() {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let r = t
-            .render(&user(), Some(&tools()), Some("\"auto\""), false)
+            .render(&user(), Some(&tools()), Some("\"auto\""), false, None)
             .unwrap();
         assert!(
             r.prompt.contains("get_weather"),
@@ -235,7 +241,9 @@ mod tests {
     #[test]
     fn glm_plain_answer_has_no_tool_calls() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let r = t.render(&user(), Some(&tools()), None, false).unwrap();
+        let r = t
+            .render(&user(), Some(&tools()), None, false, None)
+            .unwrap();
         let msg = r.parser.parse("</think>It is sunny.", false).unwrap();
         assert_eq!(msg["content"], "It is sunny.");
         assert!(msg.get("tool_calls").is_none());
@@ -246,7 +254,7 @@ mod tests {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let choice = r#"{"type":"function","function":{"name":"nope"}}"#;
         assert!(
-            t.render(&user(), Some(&tools()), Some(choice), false)
+            t.render(&user(), Some(&tools()), Some(choice), false, None)
                 .is_err()
         );
     }
@@ -259,7 +267,7 @@ mod tests {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let choice = r#"{"type":"function","function":{"name":"get_weather"}}"#;
         let r = t
-            .render(&user(), Some(&tools()), Some(choice), false)
+            .render(&user(), Some(&tools()), Some(choice), false, None)
             .unwrap();
         assert!(!r.grammar.is_empty());
         let root = r
@@ -281,7 +289,7 @@ mod tests {
     #[test]
     fn glm_inline_reasoning_stays_in_content() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let r = t.render(&user(), Some(&tools()), None, true).unwrap();
+        let r = t.render(&user(), Some(&tools()), None, true, None).unwrap();
         let msg = r.parser.parse("hmm</think>It is sunny.", false).unwrap();
         assert!(
             msg["content"].as_str().unwrap().contains("hmm</think>"),
@@ -296,9 +304,18 @@ mod tests {
     /// as text — the GLM vocab sets no add-BOS, so tokenizing with
     /// `add_special` adds no second BOS.
     #[test]
+    fn glm_reasoning_effort_reaches_template() {
+        let t = ChatTemplates::from_source(GLM).unwrap();
+        let p = |e| t.render(&user(), None, None, false, e).unwrap().prompt;
+        assert!(p(None).contains("Reasoning Effort: Max"), "{}", p(None));
+        assert!(p(Some("low")).contains("Reasoning Effort: Low"));
+        assert!(p(Some("high")).contains("Reasoning Effort: High"));
+    }
+
+    #[test]
     fn glm_no_tools_render_starts_like_legacy() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let p = t.render(&user(), None, None, false).unwrap().prompt;
+        let p = t.render(&user(), None, None, false, None).unwrap().prompt;
         assert!(p.starts_with("[gMASK]<sop>"), "{p}");
         assert_eq!(p.matches("[gMASK]<sop>").count(), 1, "{p}");
         assert!(p.contains("<|user|>"), "{p}");

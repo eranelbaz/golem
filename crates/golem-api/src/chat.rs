@@ -60,6 +60,9 @@ pub struct ChatCompletionRequest {
     /// Golem extension: top-k sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
+    /// Passed to the chat template as `reasoning_effort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// `stop` is a string or a list of strings.

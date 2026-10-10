@@ -467,7 +467,13 @@ fn probe_templates(
 ) -> Result<(ChatTemplates, String), EngineError> {
     let over = config.chat_template.as_deref();
     let chat = ChatTemplates::from_model(loaded.model().as_ptr(), over)?;
-    let probe = chat.render(r#"[{"role":"user","content":"ping"}]"#, None, None, false)?;
+    let probe = chat.render(
+        r#"[{"role":"user","content":"ping"}]"#,
+        None,
+        None,
+        false,
+        None,
+    )?;
     if probe.prompt.is_empty() {
         return Err(EngineError::TemplateUnavailable);
     }
@@ -500,6 +506,7 @@ fn render(chat: &ChatTemplates, req: &TurnRequest<'_>) -> Result<Rendered, Engin
         req.tools_json,
         req.tool_choice,
         req.reasoning_inline,
+        req.reasoning_effort,
     )
 }
 

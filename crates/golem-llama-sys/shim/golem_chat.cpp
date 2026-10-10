@@ -83,8 +83,8 @@ golem_chat * golem_chat_init(const llama_model * model, const char * tmpl_overri
 }
 
 int golem_chat_apply(golem_chat * chat, const char * messages_json, const char * tools_json,
-                     const char * tool_choice, int reasoning_inline, char ** out_prompt, char ** out_grammar,
-                     int * out_handle) {
+                     const char * tool_choice, int reasoning_inline, const char * reasoning_effort,
+                     char ** out_prompt, char ** out_grammar, int * out_handle) {
     if (!chat || !messages_json || !out_prompt || !out_grammar || !out_handle) {
         return 1;
     }
@@ -92,6 +92,9 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         common_chat_templates_inputs in;
         in.messages         = common_chat_msgs_parse_oaicompat(common_json::parse(messages_json));
         in.reasoning_format = reasoning_inline ? COMMON_REASONING_FORMAT_NONE : COMMON_REASONING_FORMAT_DEEPSEEK;
+        if (reasoning_effort && *reasoning_effort) {
+            in.chat_template_kwargs["reasoning_effort"] = common_json(std::string(reasoning_effort)).dump();
+        }
         std::string named;
         in.tool_choice = parse_tool_choice(tool_choice, named);
         if (tools_json && *tools_json) {

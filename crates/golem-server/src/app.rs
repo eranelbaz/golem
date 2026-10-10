@@ -17,7 +17,8 @@ use golem_api::{
     ChatCompletionResponse, ChatMessage, ErrorCode, ErrorEnvelope, MessageContent, ModelList, Usage,
 };
 use golem_engine::FinishReason as EngineFinish;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use crate::ServerConfig;
 use crate::worker::{EVENT_CAPACITY, Event, HealthState, Job, ServeState};
@@ -41,18 +42,21 @@ const ACCEPT_STEP: Duration = Duration::from_millis(10);
 /// Error response: status plus §8.4 envelope.
 struct ApiError(StatusCode, ErrorEnvelope);
 
+pub(crate) fn status_of(code: ErrorCode) -> StatusCode {
+    match code {
+        ErrorCode::UnsupportedField
+        | ErrorCode::InvalidRequest
+        | ErrorCode::ModelMismatch
+        | ErrorCode::MultimodalUnsupported => StatusCode::BAD_REQUEST,
+        ErrorCode::NotFound => StatusCode::NOT_FOUND,
+        ErrorCode::Busy | ErrorCode::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 impl From<ErrorEnvelope> for ApiError {
     fn from(e: ErrorEnvelope) -> Self {
-        let status = match e.error.code {
-            ErrorCode::UnsupportedField
-            | ErrorCode::InvalidRequest
-            | ErrorCode::ModelMismatch
-            | ErrorCode::MultimodalUnsupported => StatusCode::BAD_REQUEST,
-            ErrorCode::NotFound => StatusCode::NOT_FOUND,
-            ErrorCode::Busy | ErrorCode::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        Self(status, e)
+        Self(status_of(e.error.code), e)
     }
 }
 
@@ -116,7 +120,11 @@ pub fn router(state: AppState) -> Router {
         .merge(keyed)
         .route("/health", get(health))
         .fallback(not_found)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .with_state(state)
 }
 

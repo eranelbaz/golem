@@ -75,12 +75,16 @@ enum Command {
     },
 }
 
+/// `serve` default filter: request lines (method, URI, status, tok/s) and
+/// cancels are INFO.
+const SERVE_LOG: &str = "warn,golem_server=info,tower_http=info,golem_engine::slot=info";
+
 /// Engine diagnostics (store health transitions, pool/stream warnings) go
-/// to stderr; `RUST_LOG` overrides the `warn` default. `json`: one JSON
-/// object per line (`serve` off a TTY or detached).
-fn init_tracing(json: bool) {
+/// to stderr; `RUST_LOG` overrides `default`. `json`: one JSON object per
+/// line (`serve` off a TTY or detached).
+fn init_tracing(json: bool, default: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
     let b = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(filter);
@@ -106,8 +110,8 @@ fn main() {
         detach(args);
     }
     match &cli.command {
-        Some(Command::Serve { args }) => init_tracing(serve_json_logs(args.detach)),
-        _ => init_tracing(false),
+        Some(Command::Serve { args }) => init_tracing(serve_json_logs(args.detach), SERVE_LOG),
+        _ => init_tracing(false, "warn"),
     }
     let status = match cli.command {
         None => {
@@ -219,7 +223,7 @@ fn detach(args: &serve::ServeArgs) {
                 sys::exit_now(1);
             }
             drop(log);
-            init_tracing(true);
+            init_tracing(true, SERVE_LOG);
             serve_detached(args, id, wr)
         }
     }

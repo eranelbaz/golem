@@ -58,6 +58,8 @@ pub struct TurnRequest<'a> {
     pub tool_choice: Option<&'a str>,
     /// Parse reasoning and its markers into `content` (`--reasoning inline`).
     pub reasoning_inline: bool,
+    /// Template `reasoning_effort` variable (OpenAI `reasoning_effort`).
+    pub reasoning_effort: Option<&'a str>,
     /// Pre-rendered prompt from [`crate::Session::render`]; overrides the
     /// three fields above.
     pub rendered: Option<&'a crate::chat::Rendered>,
@@ -80,6 +82,7 @@ impl<'a> TurnRequest<'a> {
             tools_json: None,
             tool_choice: None,
             reasoning_inline: false,
+            reasoning_effort: None,
             rendered: None,
             sampling: SamplingParams::default(),
             max_tokens: None,
@@ -104,6 +107,12 @@ impl<'a> TurnRequest<'a> {
     /// Sets [`TurnRequest::reasoning_inline`].
     pub fn reasoning_inline(mut self, inline: bool) -> Self {
         self.reasoning_inline = inline;
+        self
+    }
+
+    /// Sets [`TurnRequest::reasoning_effort`].
+    pub fn reasoning_effort(mut self, effort: Option<&'a str>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 

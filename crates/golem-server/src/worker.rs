@@ -367,6 +367,9 @@ struct SlotRun {
     /// Cancelled because the event channel was full (client too slow),
     /// not because the client left.
     slow_client: std::cell::Cell<bool>,
+    admitted: Instant,
+    /// First generated piece: prefill ends one decode before it.
+    first_piece: Option<Instant>,
 }
 
 /// Non-blocking delivery; a full or closed channel cancels the job.
@@ -658,7 +661,8 @@ fn admit(
     let base = golem_engine::TurnRequest::new(&turns)
         .messages_json(&messages_json)
         .tools(tools_json.as_deref(), tool_choice.as_deref())
-        .reasoning_inline(job.reasoning == ReasoningMode::Inline);
+        .reasoning_inline(job.reasoning == ReasoningMode::Inline)
+        .reasoning_effort(req.reasoning_effort.as_deref());
     let tool_mode = tools_json.is_some() && req.tool_choice != Some("none".into());
     let invalid = |e: EngineError| {
         Event::Failed(ErrorEnvelope::new(ErrorCode::InvalidRequest, e.to_string()))
@@ -699,6 +703,8 @@ fn admit(
         splitter,
         tools: tool_mode.then(ToolStream::new),
         slow_client: std::cell::Cell::new(false),
+        admitted: Instant::now(),
+        first_piece: None,
     });
     #[cfg(any(test, feature = "test-support"))]
     if health.hooks.fail_storage.swap(false, Ordering::SeqCst) {
@@ -746,6 +752,7 @@ fn step(
             continue;
         };
         slot_tokens[i] += 1;
+        run.first_piece.get_or_insert_with(Instant::now);
         #[cfg(any(test, feature = "test-support"))]
         if health
             .hooks
@@ -856,8 +863,39 @@ fn finish(
             Event::Failed(env)
         }
     };
+    log_turn(&run, &event);
     let SlotRun { permit, .. } = run;
     permit.send(event);
+}
+
+/// One INFO line per finished request: status, finish, and prefill /
+/// generation throughput (prefill time = admission → first piece).
+fn log_turn(run: &SlotRun, event: &Event) {
+    let end = Instant::now();
+    let first = run.first_piece.unwrap_or(end);
+    let prefill_s = first.duration_since(run.admitted).as_secs_f64();
+    let gen_s = end.duration_since(first).as_secs_f64();
+    let rate = |n: u32, s: f64| if s > 0.0 { f64::from(n) / s } else { 0.0 };
+    match event {
+        Event::Done(o) => tracing::info!(
+            status = 200,
+            finish = ?o.finish,
+            prompt_tokens = o.prompt_tokens,
+            completion_tokens = o.completion_tokens,
+            prefill_s = format_args!("{prefill_s:.2}"),
+            prefill_tok_s = format_args!("{:.1}", rate(o.prompt_tokens, prefill_s)),
+            gen_tok_s = format_args!("{:.1}", rate(o.completion_tokens.saturating_sub(1), gen_s)),
+            "chat completion"
+        ),
+        Event::Failed(e) => tracing::info!(
+            status = crate::app::status_of(e.error.code).as_u16(),
+            code = ?e.error.code,
+            elapsed_s = format_args!("{:.2}", end.duration_since(run.admitted).as_secs_f64()),
+            "chat completion failed: {}",
+            e.error.message
+        ),
+        _ => {}
+    }
 }
 
 /// Turns the growing generated text into OpenAI deltas by re-parsing it with
@@ -1070,6 +1108,7 @@ mod tests {
                 Some("[]"),
                 None,
                 false,
+                None,
             )
             .unwrap();
         let out = std::cell::RefCell::new(String::new());
