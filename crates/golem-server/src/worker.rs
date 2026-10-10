@@ -428,6 +428,10 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
     let mut steps = 0u64;
     publish_metrics(sch, health, &slot_tokens);
     loop {
+        // Before a blocking `recv`: a finished job must not stay "busy".
+        if std::mem::take(&mut changed) {
+            health.publish_in_flight(runs.iter().flatten().map(|r| r.job.cancel.clone()));
+        }
         // Block only when every slot is free; else poll between steps.
         let idle = runs.iter().all(Option::is_none);
         while sch.free_slots() > 0 {

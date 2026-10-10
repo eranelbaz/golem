@@ -402,3 +402,25 @@ async fn drain_finishes_in_flight_stream_and_refuses_new_requests() {
         .unwrap();
     assert!(t.elapsed() < Duration::from_secs(35));
 }
+
+/// After a finished request the idle worker reports not busy, so shutdown
+/// does not sit out the whole drain grace.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_after_finished_request_skips_grace() {
+    let mut scfg = golem_server::test_support::test_server_config();
+    scfg.drain_grace = Duration::from_secs(30);
+    let (addr, stop, task) = golem_server::test_support::serve_with(
+        golem_server::test_engine_config(),
+        TestHooks::default(),
+        scfg,
+    )
+    .await;
+    let resp = tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi(4))))
+        .await
+        .unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    let t = Instant::now();
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
