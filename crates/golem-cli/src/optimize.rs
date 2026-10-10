@@ -26,7 +26,7 @@ use crate::run::{EngineArgs, engine_config};
 const MIB: u64 = 1 << 20;
 /// Free VRAM / locked RAM must return this close to the pre-sweep reading
 /// after a child exits, before the next one starts.
-const RETURN_SLACK: u64 = 256 * MIB;
+const RETURN_SLACK: u64 = profile::SLACK;
 const RETURN_WAIT: Duration = Duration::from_secs(30);
 /// Measured runs per candidate (median).
 const RUNS: usize = 5;
@@ -49,8 +49,8 @@ pub struct OptimizeArgs {
     #[arg(long, default_value_t = 120)]
     pub max_minutes: u64,
     /// Override the swept axes: `knob=v1,v2;knob=...` over threads,
-    /// numa_interleave, o_direct, io_threads, io_depth, async_h2d,
-    /// vram_experts_frac.
+    /// numa_interleave, o_direct, io_threads, io_depth, vram_experts_frac
+    /// (`async_h2d` is refused).
     #[arg(long)]
     pub axes: Option<String>,
     /// Internal: measure one knob set (JSON) and print its metrics.
@@ -59,8 +59,9 @@ pub struct OptimizeArgs {
     /// Internal: the parent's registry entry id.
     #[arg(long, hide = true)]
     pub parent_entry: Option<String>,
-    /// Test seam: admit against a machine whose RAM/VRAM hold the planned
-    /// bytes once but not twice.
+    /// Test seam (debug builds only): admit against a machine whose RAM/VRAM
+    /// hold the planned bytes once but not twice.
+    #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
     pub test_tight_budget: bool,
     #[command(flatten)]
@@ -88,6 +89,7 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     let (config, requested_snapshot) = engine_config(&args.engine, &args.model, 1, &layers)?;
     let facts = config.model_facts.ok_or("model facts unresolved")?;
     let fp = profile::fingerprint(&args.model)?;
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut mach = machine();
     let (free_vram, free_ram) = (profile::sysfs_vram().map_or(0, |(f, _)| f), mach.ram_free);
     let eff = crate::serve::effective(&config, requested_snapshot)?;
@@ -104,6 +106,7 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         &eff,
         &mach,
     )?;
+    #[cfg(debug_assertions)]
     if args.test_tight_budget {
         mach.ram_total = inst.planned_ram + inst.planned_ram / 2;
         mach.ram_free = mach.ram_total + (4 << 30);
@@ -115,13 +118,15 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     let id = guard.instance().id;
 
     let base_plan = plan_for(&config, &facts, &mach, &Knobs::default());
-    let axes = match &args.axes {
+    let mut axes = match &args.axes {
         Some(s) => parse_axes(s)?,
         None => default_axes(&config),
     };
+    fold_defaults(&mut axes, &config);
+    let base = Knobs::default();
     let n_cand = 1 + 2 * axes
         .iter()
-        .map(|a| a.len().saturating_sub(1))
+        .map(|a| a.variants(&base).iter().filter(|k| **k != base).count())
         .sum::<usize>();
     println!(
         "golem optimize: {} axes, ≤ {n_cand} candidates per pass (2 passes max, paired with the \
@@ -187,7 +192,17 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         baseline,
         candidates,
     };
-    let path = profile::save_profile(&p)?;
+    // A no-winner run never replaces a saved winner for this fingerprint.
+    let kept = if result.is_none() {
+        profile::load_profile(&profile::Fingerprint(p.fingerprint.clone()))
+            .and_then(|_| profile::profile_path(&profile::Fingerprint(p.fingerprint.clone())))
+    } else {
+        None
+    };
+    let path = match kept.clone() {
+        Some(path) => path,
+        None => profile::save_profile(&p)?,
+    };
     match result {
         Some((k, m)) => println!(
             "winner {}: {:.2} tok/s vs baseline {:.2} ({:+.1}%); profile saved: {}",
@@ -197,8 +212,13 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
             (m.tok_s / baseline.tok_s - 1.0) * 100.0,
             path.display()
         ),
+        None if kept.is_some() => println!(
+            "baseline {:.2} tok/s: no winner this run; existing profile kept: {}",
+            baseline.tok_s,
+            path.display()
+        ),
         None => println!(
-            "baseline {:.2} tok/s kept: baseline recorded, no profile saved ({})",
+            "baseline {:.2} tok/s: no winner; baseline recorded (not applied by run/serve): {}",
             baseline.tok_s,
             path.display()
         ),
@@ -313,18 +333,23 @@ fn run_child(
     guard: &golem_registry::Guard,
     k: &Knobs,
 ) -> Result<Measured, Box<dyn Error>> {
-    let child = std::process::Command::new(std::env::current_exe()?)
+    let mut child = std::process::Command::new(std::env::current_exe()?)
         .args(std::env::args_os().skip(1))
         .args(["--measure-one", &serde_json::to_string(k)?])
         .args(["--parent-entry", parent])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     let pid = child.id();
     guard.update(|i| i.children.push(pid));
+    // The child checks ownership only after this byte: its pid is in the
+    // entry first. Dropping stdin on error makes the child's read fail.
+    let go = child.stdin.take().map(|mut s| s.write_all(b"g"));
     let out = child.wait_with_output();
     guard.update(|i| i.children.retain(|&c| c != pid));
     let out = out?;
+    go.ok_or("child stdin missing")??;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -362,7 +387,11 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
                 "o_direct" => Axis::ODirect(vals(v)?),
                 "io_threads" => Axis::IoThreads(vals(v)?),
                 "io_depth" => Axis::IoDepth(vals(v)?),
-                "async_h2d" => Axis::AsyncH2d(vals(v)?),
+                "async_h2d" => {
+                    return Err("async_h2d is not sweepable: the engine refuses it at load \
+                                (no dedicated copy stream)"
+                        .into());
+                }
                 "vram_experts_frac" => Axis::VramExpertsFrac(vals(v)?),
                 other => return Err(format!("unknown knob {other:?}").into()),
             })
@@ -394,6 +423,35 @@ fn default_axes(config: &EngineConfig) -> Vec<Axis> {
         axes.push(Axis::VramExpertsFrac(vec![1.0, 0.75, 0.5]));
     }
     axes
+}
+
+/// Rewrites axis values equal to the baseline's effective setting as the
+/// [`Knobs`] default (0/false), so the baseline is never re-measured under
+/// another spelling and the candidate count is exact.
+fn fold_defaults(axes: &mut [Axis], config: &EngineConfig) {
+    fn fold<T: PartialEq + Copy>(v: &mut Vec<T>, is_default: impl Fn(T) -> bool, zero: T) {
+        for x in v.iter_mut() {
+            if is_default(*x) {
+                *x = zero;
+            }
+        }
+        let mut seen = Vec::new();
+        v.retain(|x| {
+            let new = !seen.contains(x);
+            seen.push(*x);
+            new
+        });
+    }
+    for a in axes {
+        match a {
+            Axis::Threads(v) => fold(v, |x| x == config.threads, 0),
+            Axis::NumaInterleave(v) => fold(v, |x| x == config.numa_interleave, false),
+            Axis::ODirect(v) => fold(v, |x| x == config.o_direct, false),
+            Axis::IoThreads(v) => fold(v, |x| Some(x) == config.io_threads, 0),
+            Axis::IoDepth(v) => fold(v, |x| x == config.io_depth.max(1), 0),
+            Axis::VramExpertsFrac(v) => fold(v, |x| x == config.vram_experts_frac, 0.0),
+        }
+    }
 }
 
 /// `k` over the resolved baseline config; 0/false knobs keep it.
@@ -517,6 +575,10 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
         .parent_entry
         .as_deref()
         .ok_or("--parent-entry missing")?;
+    // Wait for the parent's go byte: it is written after this pid joins the
+    // entry's `children`.
+    let mut go = [0u8; 1];
+    std::io::Read::read_exact(&mut std::io::stdin(), &mut go)?;
     // The parent's entry is this child's only reservation.
     let entry = Registry::open()?.find(parent)?;
     if entry.kind != "optimize" || !entry.children.contains(&std::process::id()) {

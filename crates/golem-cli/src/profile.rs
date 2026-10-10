@@ -28,19 +28,19 @@ pub struct FingerprintInput {
 }
 
 /// Pure hash of `i`.
-pub fn fingerprint_of(i: &FingerprintInput) -> Fingerprint {
-    let json = serde_json::to_vec(i).unwrap_or_default();
-    Fingerprint(
+pub fn fingerprint_of(i: &FingerprintInput) -> Result<Fingerprint, serde_json::Error> {
+    let json = serde_json::to_vec(i)?;
+    Ok(Fingerprint(
         Sha256::digest(&json)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect(),
-    )
+    ))
 }
 
 /// Fingerprint of this machine + `model` + this build.
 pub fn fingerprint(model: &Path) -> Result<Fingerprint, Box<dyn Error>> {
-    Ok(fingerprint_of(&probe(model)?))
+    Ok(fingerprint_of(&probe(model)?)?)
 }
 
 fn read(p: impl AsRef<Path>) -> String {
@@ -173,15 +173,13 @@ pub enum Axis {
     IoThreads(Vec<usize>),
     /// [`Knobs::io_depth`].
     IoDepth(Vec<u32>),
-    /// [`Knobs::async_h2d`].
-    AsyncH2d(Vec<bool>),
     /// [`Knobs::vram_experts_frac`].
     VramExpertsFrac(Vec<f32>),
 }
 
 impl Axis {
     /// `base` with this axis set to each of its values.
-    fn variants(&self, base: &Knobs) -> Vec<Knobs> {
+    pub fn variants(&self, base: &Knobs) -> Vec<Knobs> {
         fn each<T: Copy>(v: &[T], set: impl Fn(&mut Knobs, T), base: &Knobs) -> Vec<Knobs> {
             v.iter()
                 .map(|&x| {
@@ -197,19 +195,7 @@ impl Axis {
             Axis::ODirect(v) => each(v, |k, x| k.o_direct = x, base),
             Axis::IoThreads(v) => each(v, |k, x| k.io_threads = x, base),
             Axis::IoDepth(v) => each(v, |k, x| k.io_depth = x, base),
-            Axis::AsyncH2d(v) => each(v, |k, x| k.async_h2d = x, base),
             Axis::VramExpertsFrac(v) => each(v, |k, x| k.vram_experts_frac = x, base),
-        }
-    }
-
-    /// Values tried, for the wall-clock estimate.
-    pub fn len(&self) -> usize {
-        match self {
-            Axis::Threads(v) => v.len(),
-            Axis::NumaInterleave(v) | Axis::ODirect(v) | Axis::AsyncH2d(v) => v.len(),
-            Axis::IoThreads(v) => v.len(),
-            Axis::IoDepth(v) => v.len(),
-            Axis::VramExpertsFrac(v) => v.len(),
         }
     }
 }
@@ -273,10 +259,17 @@ impl Profile {
     }
 }
 
-/// A profile measured with more free memory than exists now would plan a
-/// pool or device cache that no longer fits.
-pub fn applicable(p: &Profile, free_vram: u64, free_ram: u64) -> bool {
-    free_vram >= p.measured_free_vram && free_ram >= p.measured_free_ram
+/// Reading noise tolerated between the sweep's free-memory snapshot and
+/// now (≈ 1% of the target's 24 GiB VRAM).
+pub const SLACK: u64 = 256 << 20;
+
+/// A profile measured with more free memory than exists now (beyond
+/// [`SLACK`]) would plan a pool or device cache that no longer fits.
+/// `free_vram` `None` (no sysfs reading) skips the VRAM comparison rather
+/// than counting as 0 free.
+pub fn applicable(p: &Profile, free_vram: Option<u64>, free_ram: u64) -> bool {
+    free_vram.is_none_or(|v| v + SLACK >= p.measured_free_vram)
+        && free_ram + SLACK >= p.measured_free_ram
 }
 
 /// `(free, total)` VRAM of the first amdgpu card from sysfs — no HIP
@@ -306,9 +299,28 @@ pub fn profile_path(fp: &Fingerprint) -> Option<PathBuf> {
     tuning_dir().map(|d| d.join(format!("{}.json", fp.0)))
 }
 
-/// The saved profile for `fp` when it carries a winner.
+/// The saved profile for `fp` when it carries a winner. An unreadable or
+/// corrupt file is warned about and ignored.
 pub fn load_profile(fp: &Fingerprint) -> Option<Profile> {
-    let p: Profile = serde_json::from_slice(&std::fs::read(profile_path(fp)?).ok()?).ok()?;
+    let path = profile_path(fp)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("golem: warning: optimize profile {}: {e}", path.display());
+            return None;
+        }
+    };
+    let p: Profile = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "golem: warning: optimize profile {} corrupt, ignored: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
     (p.fingerprint == fp.0 && p.knobs.is_some()).then_some(p)
 }
 

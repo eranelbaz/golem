@@ -147,3 +147,43 @@ fn async_h2d_default_keeps_output_and_on_is_refused() {
     let e = greedy(&on).unwrap_err().to_string();
     assert!(e.contains("async_h2d"), "{e}");
 }
+
+/// HIP leg: the store-backed knobs on the GPU split with the
+/// engine-registered hooks, K = 4 device slots < one expert tensor
+/// (8 experts): greedy output unchanged and every expert op on the GPU.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn store_knobs_keep_output_and_experts_on_gpu() {
+    use golem_engine::session::expert_placement;
+    let gpu = || {
+        let off = common::offload::offload_config();
+        EngineConfig {
+            n_gpu_layers: off.n_gpu_layers,
+            cpu_moe_layers: off.cpu_moe_layers,
+            ..pooled()
+        }
+    };
+    let base = gpu();
+    let before = expert_placement();
+    let want = greedy(&base).unwrap();
+    assert!(!want.is_empty());
+    for cfg in [
+        EngineConfig {
+            io_depth: 2,
+            ..gpu()
+        },
+        EngineConfig {
+            numa_interleave: true,
+            ..gpu()
+        },
+        EngineConfig {
+            o_direct: true,
+            ..gpu()
+        },
+    ] {
+        assert_eq!(greedy(&cfg).unwrap(), want);
+    }
+    let after = expert_placement();
+    let (on_gpu, on_cpu) = (after.on_gpu - before.on_gpu, after.on_cpu - before.on_cpu);
+    assert!(on_cpu == 0 && on_gpu > 0, "on_gpu={on_gpu} on_cpu={on_cpu}");
+}

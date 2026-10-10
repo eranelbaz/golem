@@ -145,9 +145,16 @@ fn profile_ignored_when_less_free_memory_now() {
         measured_free_ram: 80 << 30,
         ..Profile::test_default()
     };
-    assert!(applicable(&p, 20 << 30, 80 << 30));
-    assert!(!applicable(&p, 18 << 30, 80 << 30));
-    assert!(!applicable(&p, 20 << 30, 78 << 30));
+    assert!(applicable(&p, Some(20 << 30), 80 << 30));
+    assert!(!applicable(&p, Some(18 << 30), 80 << 30));
+    assert!(!applicable(&p, Some(20 << 30), 78 << 30));
+    // Reading noise within the slack still applies.
+    let noise = (20 << 30) - profile::SLACK;
+    assert!(applicable(&p, Some(noise), (80 << 30) - profile::SLACK));
+    assert!(!applicable(&p, Some(noise - 1), 80 << 30));
+    // Unknown VRAM (no sysfs) is not 0 free; RAM still decides.
+    assert!(applicable(&p, None, 80 << 30));
+    assert!(!applicable(&p, None, 78 << 30));
 }
 
 #[test]
@@ -156,7 +163,7 @@ fn fingerprint_changes_with_any_component() {
     let real = profile::probe(&model).unwrap();
     assert_eq!(
         profile::fingerprint(&model).unwrap().0,
-        fingerprint_of(&real).0,
+        fingerprint_of(&real).unwrap().0,
         "fingerprint(path) = fingerprint_of(probe(path))"
     );
     let base = FingerprintInput {
@@ -183,9 +190,9 @@ fn fingerprint_changes_with_any_component() {
             ..base.clone()
         },
     ];
-    let mut seen = vec![fingerprint_of(&base).0];
+    let mut seen = vec![fingerprint_of(&base).unwrap().0];
     for v in &variants {
-        let f = fingerprint_of(v).0;
+        let f = fingerprint_of(v).unwrap().0;
         assert_eq!(f.len(), 64, "hex sha256");
         assert!(!seen.contains(&f), "{f} repeats");
         seen.push(f);
@@ -295,7 +302,7 @@ fn optimize_on_fixture_with_budget_below_one_expert_tensor() {
     let fp = profile::fingerprint(&model).unwrap().0;
     let rec = rt.join(format!("config/golem/tuning/{fp}.json"));
     assert!(
-        stdout.contains("profile saved") || stdout.contains("baseline recorded, no profile saved"),
+        stdout.contains("profile saved") || stdout.contains("baseline recorded"),
         "{stdout}"
     );
     let p: Profile = serde_json::from_slice(&std::fs::read(&rec).unwrap()).unwrap();

@@ -181,7 +181,7 @@ impl Layers<'_> {
         };
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
-        let vram = crate::profile::sysfs_vram().map_or(0, |(f, _)| f);
+        let vram = crate::profile::sysfs_vram().map(|(f, _)| f);
         if crate::profile::applicable(&p, vram, sys.available_memory()) {
             eprintln!("golem: optimize profile {} applied", &p.fingerprint[..12]);
             self.profile = profile_table(p.knobs.as_ref());
