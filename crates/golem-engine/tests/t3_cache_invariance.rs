@@ -145,7 +145,7 @@ fn register_p2_hooks() {
         miss_ids: *const i32,
         n_miss: i32,
         ptrs: *mut *const libc::c_void,
-    ) {
+    ) -> i32 {
         // ABI v2: the substrate copies from the returned pointers, so serve
         // the tensor's REAL per-expert planes — the same bytes the unpooled
         // upstream path reads (`input->data + id·nb[2]`). One shared static
@@ -165,6 +165,7 @@ fn register_p2_hooks() {
             let id = unsafe { *miss_ids.add(i) };
             unsafe { *ptrs.add(i) = base.byte_add(id as usize * stride).cast() };
         }
+        0
     }
     extern "C" fn on_routing(
         _payload: *mut libc::c_void,
