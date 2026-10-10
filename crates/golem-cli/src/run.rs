@@ -315,6 +315,7 @@ pub fn engine_config(
     model: &Path,
     parallel: u32,
     layers: &crate::config::Layers<'_>,
+    ram_free: u64,
 ) -> Result<(EngineConfig, Option<u64>), Box<dyn Error>> {
     let mut config = engine.to_config(model.to_path_buf(), layers)?;
     let requested_snapshot = config.snapshot_ram_bytes;
@@ -368,9 +369,7 @@ pub fn engine_config(
         );
     }
     let facts = golem_plan::ModelFacts::from_gguf(model)?;
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let (snap, pool) = fit_ram(&facts, sys.available_memory(), &config)?;
+    let (snap, pool) = fit_ram(&facts, ram_free, &config)?;
     if pool != config.ram_experts_gib {
         eprintln!(
             "golem: RAM short: expert pool shrunk {} -> {pool} GiB to keep {snap} B of state snapshots",
@@ -482,7 +481,10 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     };
     let layers = crate::config::Layers::from_process()?
         .with_profile(&model, args.engine.no_optimize_profile);
-    let (config, requested_snapshot) = engine_config(&args.engine, &model, 1, &layers)?;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let (config, requested_snapshot) =
+        engine_config(&args.engine, &model, 1, &layers, sys.available_memory())?;
     let eff = crate::serve::effective(&config, requested_snapshot)?;
     let reg = golem_registry::Registry::open()?;
     if !args.new && args.parity_dump.is_none() {

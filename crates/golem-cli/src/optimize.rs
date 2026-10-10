@@ -88,11 +88,16 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     }
     // Baseline = today's resolved config: env and file apply, no profile.
     let layers = crate::config::Layers::from_process()?;
-    let (config, requested_snapshot) = engine_config(&args.engine, &args.model, 1, &layers)?;
+    let mut mach = machine();
+    let (config, requested_snapshot) = engine_config(
+        &args.engine,
+        &args.model,
+        1,
+        &layers,
+        engine_ram_free(args, &mach),
+    )?;
     let facts = config.model_facts.ok_or("model facts unresolved")?;
     let fp = profile::fingerprint(&args.model)?;
-    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-    let mut mach = machine();
     let (free_vram, free_ram) = (profile::sysfs_vram().map_or(0, |(f, _)| f), mach.ram_free);
     let eff = crate::serve::effective(&config, requested_snapshot)?;
     let model_name = args
@@ -252,6 +257,19 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     }
     drop(guard);
     Ok(())
+}
+
+/// RAM reading for `engine_config`'s fit. Under the debug-only tight-budget
+/// seam the fit must not judge the host: the seam's machine is defined by the
+/// planned bytes and is enforced at admission, so the fit sees an
+/// always-sufficient reading and the planned pool stays verbatim.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+fn engine_ram_free(args: &OptimizeArgs, mach: &golem_plan::Machine) -> u64 {
+    #[cfg(debug_assertions)]
+    if args.test_tight_budget {
+        return 1 << 40;
+    }
+    mach.ram_free
 }
 
 /// This machine from sysfs/sysinfo — the parent never starts a HIP runtime.
@@ -626,7 +644,13 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
         return Err(format!("entry `{parent}` does not own this measurement").into());
     }
     let layers = crate::config::Layers::from_process()?;
-    let (mut config, _) = engine_config(&args.engine, &args.model, 1, &layers)?;
+    let (mut config, _) = engine_config(
+        &args.engine,
+        &args.model,
+        1,
+        &layers,
+        engine_ram_free(args, &machine()),
+    )?;
     apply(&mut config, knobs);
     evict(&args.model)?;
     let t = Instant::now();

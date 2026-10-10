@@ -249,8 +249,15 @@ pub fn serve(
         l.parallel,
         std::env::var("GOLEM_ALLOW_PARALLEL").as_deref() == Ok("1"),
     )?;
-    let (config, requested_snapshot) =
-        engine_config(&args.engine, &args.model, l.parallel, &layers)?;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let (config, requested_snapshot) = engine_config(
+        &args.engine,
+        &args.model,
+        l.parallel,
+        &layers,
+        sys.available_memory(),
+    )?;
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;
     let model_name = match l.model_name {
         Some(n) => n,
