@@ -175,7 +175,7 @@ pub fn serve(
 ) -> Result<(), Box<dyn Error>> {
     check_parallel(
         args.parallel,
-        std::env::var_os("GOLEM_ALLOW_PARALLEL").is_some(),
+        std::env::var("GOLEM_ALLOW_PARALLEL").as_deref() == Ok("1"),
     )?;
     let config = engine_config(&args.engine, &args.model, args.parallel)?;
     let model_name = match &args.model_name {

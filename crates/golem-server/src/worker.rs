@@ -185,8 +185,8 @@ impl HealthState {
     }
 
     /// Republishes the busy slots' flags; a job admitted while Draining is
-    /// cancelled here, so `begin_drain` never misses one. Once per step:
-    /// one mutex per decode step, not per routed expert.
+    /// cancelled here, so `begin_drain` never misses one. Only when the job
+    /// set changed (admission or finish), never per decode step.
     fn publish_in_flight(&self, flags: impl Iterator<Item = Arc<AtomicBool>>) {
         let mut v = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
         v.clear();
@@ -349,6 +349,10 @@ impl SlotRun {
 fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
     let n = sch.free_slots();
     let mut runs: Vec<Option<SlotRun>> = (0..n).map(|_| None).collect();
+    // Per-step event buffers, reused: no allocation per step.
+    let mut pieces: Vec<(usize, String)> = Vec::with_capacity(n);
+    let mut ended: Vec<(usize, Result<TurnOutcome, EngineError>)> = Vec::with_capacity(n);
+    let mut changed = false;
     loop {
         // Block only when every slot is free; else poll between steps.
         let idle = runs.iter().all(Option::is_none);
@@ -370,18 +374,33 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
                     }
                 }
             };
-            if let Err(true) = admit(sch, &mut runs, job, health) {
-                fail_all(&mut runs, health);
-                return;
+            match admit(sch, &mut runs, job, health) {
+                Ok(()) => changed = true,
+                Err(true) => {
+                    fail_all(&mut runs, health);
+                    return;
+                }
+                Err(false) => {}
             }
         }
-        health.publish_in_flight(runs.iter().flatten().map(|r| r.job.cancel.clone()));
+        if std::mem::take(&mut changed) {
+            health.publish_in_flight(runs.iter().flatten().map(|r| r.job.cancel.clone()));
+        }
         if runs.iter().all(Option::is_none) {
             continue;
         }
-        let stepped = catch_unwind(AssertUnwindSafe(|| step(sch, &mut runs, health)));
+        let stepped = catch_unwind(AssertUnwindSafe(|| {
+            step(sch, &mut runs, &mut pieces, &mut ended, health)
+        }));
+        // A step error (or panic) after `llama_decode` leaves every slot's
+        // sequence in an unknown state, so the worker is fatal and every
+        // slot fails with it; per-slot batch failures are recovered inside
+        // `Scheduler::step` and arrive as `SlotEvent::Failed`.
         let fatal = match stepped {
-            Ok(Ok(())) => false,
+            Ok(Ok(finished)) => {
+                changed = finished;
+                false
+            }
             Ok(Err(e)) => {
                 tracing::error!("decode worker: {e}");
                 true
@@ -537,21 +556,31 @@ fn admit(
 }
 
 /// One scheduler step; delivers each slot's pieces and terminal events.
+/// `Ok(true)` when a slot finished (the in-flight set changed).
 fn step(
     sch: &mut Scheduler,
     runs: &mut [Option<SlotRun>],
+    pieces: &mut Vec<(usize, String)>,
+    ended: &mut Vec<(usize, Result<TurnOutcome, EngineError>)>,
     health: &HealthState,
-) -> Result<(), EngineError> {
-    let mut ended: Vec<(usize, Result<TurnOutcome, EngineError>)> = Vec::new();
+) -> Result<bool, EngineError> {
+    pieces.clear();
+    ended.clear();
     // `parser` borrows `sch`, so text is buffered per step and delivered
     // after: ≤ one piece per slot per step (the Task 3 `String` budget).
-    let mut pieces: Vec<(usize, String)> = Vec::with_capacity(runs.len());
     sch.step(&mut |i, e| match e {
         SlotEvent::Text(t) => pieces.push((i, t)),
         SlotEvent::Done(o) => ended.push((i, Ok(o))),
         SlotEvent::Failed(e) => ended.push((i, Err(e))),
     })?;
-    for (i, t) in pieces {
+    // Greedy slots replay a degraded batch, so no `Failed` may carry it.
+    if let Some(k) = sch.take_degraded() {
+        tracing::warn!("{}", EngineError::DeviceCacheDegraded(k));
+        if health.get() == ServeState::Healthy {
+            health.set(ServeState::Degraded);
+        }
+    }
+    for (i, t) in pieces.drain(..) {
         let Some(run) = runs[i].as_mut() else {
             continue;
         };
@@ -569,11 +598,12 @@ fn step(
         std::thread::sleep(Duration::from_millis(health.hooks.slow_ms));
         run.piece(sch.parser(i), &t);
     }
-    for (i, res) in ended {
+    let finished = !ended.is_empty();
+    for (i, res) in ended.drain(..) {
         let Some(run) = runs[i].take() else { continue };
         finish(sch, run, i, res, health);
     }
-    Ok(())
+    Ok(finished)
 }
 
 /// Final flushes and the slot's one terminal event.

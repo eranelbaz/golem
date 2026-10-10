@@ -1,0 +1,8 @@
+# Every engine/server/CLI test loads a model on the one GPU; uncapped
+# (32 threads here) they stall each other past the tests' latency bounds.
+[test-groups]
+gpu = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'package(golem-engine) | package(golem-server) | package(golem-cli)'
+test-group = 'gpu'

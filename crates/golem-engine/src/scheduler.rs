@@ -124,6 +124,12 @@ impl Scheduler {
         Ok(id)
     }
 
+    /// K of a device-cache degradation hit by a batched step since the last
+    /// call (greedy slots replay it, so no `Failed` may carry it).
+    pub fn take_degraded(&mut self) -> Option<u32> {
+        self.session.parts().0.degraded.take()
+    }
+
     /// One `llama_decode` across the active slots (see `slot::step`), then
     /// reports finished slots. `Ok(true)` while any slot is still active.
     pub fn step(&mut self, out: &mut dyn FnMut(SlotId, SlotEvent)) -> Result<bool, EngineError> {

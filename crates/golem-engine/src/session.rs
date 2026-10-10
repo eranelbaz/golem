@@ -554,6 +554,8 @@ pub(crate) struct SessionInner {
     pub(crate) rr: usize,
     /// Decode steps since the last streamed chunk (`slot::STREAM_EVERY`).
     pub(crate) decode_since_stream: u32,
+    /// K of the last batched slab degradation, until the scheduler reports it.
+    pub(crate) degraded: Option<u32>,
     /// Test seam: the n-th generation step (1-based, counted from when it is
     /// set) fails with `Decode(1)` before reaching `llama_decode` (0 = off).
     test_fail_gen_step: u32,
@@ -692,6 +694,7 @@ impl Session {
                     abort,
                     rr: 0,
                     decode_since_stream: 0,
+                    degraded: None,
                     test_fail_gen_step: 0,
                 },
             }
@@ -736,6 +739,7 @@ impl Session {
                     abort,
                     rr: 0,
                     decode_since_stream: 0,
+                    degraded: None,
                     test_fail_gen_step: 0,
                 },
             }

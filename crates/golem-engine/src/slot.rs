@@ -253,7 +253,8 @@ pub struct SlotState {
     limit: u32,
     pub(crate) prompt_tokens: u32,
     cancel: Option<Arc<AtomicBool>>,
-    /// Greedy without penalties: a failed batch can be replayed exactly.
+    /// Greedy without penalties: a failed batch can be replayed exactly. A
+    /// grammar does not matter: greedy + grammar is deterministic too.
     replayable: bool,
     /// Failed batches survived this turn (a second one fails the slot).
     failures: u8,
@@ -444,19 +445,21 @@ pub(crate) fn step(
         }
     }
 
-    // The joiner: first prefilling slot from the round-robin cursor.
-    let joiner = (0..n)
-        .map(|k| (session.rr + k) % n)
-        .find(|&i| matches!(slots[i].phase, Phase::Prefill(_)));
+    // The joiner: first prefilling slot from the round-robin cursor; if it
+    // needs a streamed chunk that is deferred, the next routed-only one.
     let n_dec = slots
         .iter()
         .filter(|s| matches!(s.phase, Phase::Decode(_)))
         .count();
-    let joiner_streams = joiner.is_some_and(|j| match &slots[j].phase {
-        Phase::Prefill(a) => session.next_chunk(&a.ffi, 0).1,
-        _ => false,
-    });
-    let stream_mode = joiner_streams && (n_dec == 0 || session.decode_since_stream >= STREAM_EVERY);
+    let may_stream = n_dec == 0 || session.decode_since_stream >= STREAM_EVERY;
+    let streams = |i: usize| match &slots[i].phase {
+        Phase::Prefill(a) => Some(session.next_chunk(&a.ffi, 0).1),
+        _ => None,
+    };
+    let joiner = (0..n)
+        .map(|k| (session.rr + k) % n)
+        .find(|&i| streams(i).is_some_and(|st| may_stream || !st));
+    let stream_mode = joiner.is_some_and(|j| streams(j) == Some(true));
 
     session.batch_clear();
     let mut n_gen = 0u32;
@@ -478,9 +481,7 @@ pub(crate) fn step(
         }
     }
     let mut stream: Option<Option<Arc<AtomicBool>>> = None;
-    if let Some(j) = joiner
-        && (stream_mode || !joiner_streams)
-    {
+    if let Some(j) = joiner {
         let s = &mut slots[j];
         if let Phase::Prefill(a) = &mut s.phase {
             let (len, streams) = session.next_chunk(&a.ffi, n_gen as usize);
@@ -537,6 +538,9 @@ pub(crate) fn step(
         Err(e) if !recover => return Err(e),
         Err(e) => {
             let e = session.recover_slab(e);
+            if let EngineError::DeviceCacheDegraded(k) = e {
+                session.degraded = Some(k);
+            }
             tracing::warn!(error = %e, "batch decode failed: resetting its sequences");
             for (i, s) in slots.iter_mut().enumerate().filter(|(_, s)| s.in_batch) {
                 recover_slot(session, s, &e, &mut |t| emit(i, t));
@@ -607,7 +611,10 @@ fn recover_slot(
     s.failures += 1;
     let fail = |s: &mut SlotState, emit: &mut dyn FnMut(&str), msg: String| {
         s.flush_text(emit);
-        s.phase = Phase::Failed(EngineError::BackendUnavailable(msg));
+        s.phase = Phase::Failed(match e {
+            EngineError::DeviceCacheDegraded(k) => EngineError::DeviceCacheDegraded(*k),
+            _ => EngineError::BackendUnavailable(msg),
+        });
     };
     if s.failures > 1 {
         fail(s, emit, format!("decode failed twice: {e}"));
