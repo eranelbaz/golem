@@ -1377,14 +1377,20 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     let (source, store): (Arc<dyn ExpertSource>, Option<Arc<StoreExpertSource>>) =
         match &config.manifest_path {
             Some(manifest_path) => {
-                let queue = Arc::new(ChunkQueue::new(
-                    config.io_threads.unwrap_or(0),
-                    config.io_cpuset.clone(),
-                ));
+                let queue = Arc::new(
+                    ChunkQueue::new(config.io_threads.unwrap_or(0), config.io_cpuset.clone())
+                        .with_io_depth(config.io_depth as usize),
+                );
                 let store = Arc::new(
                     StoreExpertSource::open(manifest_path, queue)
                         .map_err(|e| EngineError::PoolInit(e.to_string()))?,
                 );
+                if config.o_direct {
+                    for r in store.registry().shards().iter().flat_map(|s| &s.replicas) {
+                        r.require_direct()
+                            .map_err(|e| EngineError::PoolInit(format!("o_direct: {e}")))?;
+                    }
+                }
                 let source: Arc<dyn ExpertSource> = store.clone();
                 (source, Some(store))
             }
@@ -1450,8 +1456,14 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     let classes = geo.classes();
     // C clamps the slab to n_experts, so that is the per-layer staging bound.
     let layout = class_layout(&classes, pool_bytes, k.min(geo.n_experts))?;
-    let arena = golem_placement::pool::Arena::new(&layout)
-        .map_err(|e| EngineError::PoolInit(e.to_string()))?;
+    let new_arena = || golem_placement::pool::Arena::new(&layout);
+    let arena = if config.numa_interleave {
+        golem_store::sys::with_numa_interleave(new_arena)
+            .map_err(|e| EngineError::PoolInit(format!("numa_interleave: {e}")))?
+    } else {
+        new_arena()
+    }
+    .map_err(|e| EngineError::PoolInit(e.to_string()))?;
     // Layer → class index, aligned with `layout`/`classes` ordering.
     let mut class_of_layer = vec![0u8; n_layers as usize];
     for (c, (_, layers)) in classes.iter().enumerate() {

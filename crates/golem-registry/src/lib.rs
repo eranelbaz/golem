@@ -459,6 +459,7 @@ impl Registry {
     ) -> Result<Guard, ErrorEnvelope> {
         let _lock = self.lock()?;
         let running = self.live_locked()?;
+        exclusive_optimize(&running, &i.kind)?;
         admit(
             &running,
             i.planned_vram,
@@ -468,6 +469,28 @@ impl Registry {
         )?;
         Ok(self.register(i)?)
     }
+}
+
+/// #81: an `optimize` sweep measures the whole machine, so it starts only
+/// with nothing live, and nothing starts while it runs. Never bypassed by
+/// `allow_overcommit`.
+fn exclusive_optimize(running: &[Instance], kind: &str) -> Result<(), ErrorEnvelope> {
+    let refuse = |msg: String| Err(ErrorEnvelope::new(ErrorCode::Busy, msg));
+    if let Some(o) = running.iter().find(|i| i.kind == "optimize") {
+        return refuse(format!(
+            "optimize sweep `{}` is running; wait for it or `golem stop {}`",
+            o.id, o.id
+        ));
+    }
+    if kind == "optimize"
+        && let Some(i) = running.first()
+    {
+        return refuse(format!(
+            "optimize needs the machine to itself; instance `{}` ({}) is live — `golem stop {}`",
+            i.id, i.kind, i.id
+        ));
+    }
+    Ok(())
 }
 
 /// Stale per §9.2: owner dead or pid reused. A live owner is never reaped

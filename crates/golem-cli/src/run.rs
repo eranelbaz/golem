@@ -101,6 +101,28 @@ pub struct EngineArgs {
     /// replica (D-12: per-drive threads, never per-file).
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
+    /// Derived store reader threads per physical drive (D-12: 1–2; default
+    /// 1); `--io-threads` overrides the derived count.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=8))]
+    pub io_depth: Option<u32>,
+    /// Interleave the RAM expert pool across NUMA nodes (no-op on one node).
+    #[arg(long)]
+    pub numa_interleave: bool,
+    /// Require `O_DIRECT` store reads: fail instead of falling back to
+    /// buffered + DONTNEED. Needs a manifest.
+    #[arg(long)]
+    pub o_direct: bool,
+    /// Pooled H2D on a dedicated copy stream (refused: the substrate has
+    /// none yet).
+    #[arg(long, hide = true)]
+    pub async_h2d: bool,
+    /// Share of the planner's device-expert-cache allowance a derived
+    /// `--device-cache-experts` may use, in (0, 1] (default 1).
+    #[arg(long, value_name = "FRAC")]
+    pub vram_experts_frac: Option<f32>,
+    /// Ignore the saved `golem optimize` profile for this model.
+    #[arg(long)]
+    pub no_optimize_profile: bool,
     /// Model manifest (§4.2): the P3 expert pool then reads expert planes
     /// from the manifest's replica set through the shared chunk queue
     /// (striped, CRC-checked) instead of the single GGUF replica. Omitted →
@@ -232,6 +254,15 @@ impl EngineArgs {
                 .max(0.0) as u64,
             device_cache_experts: l.get(self.device_cache_experts, "device_cache_experts", 0)?,
             io_threads: l.opt(self.io_threads, "io_threads")?,
+            io_depth: l.get(self.io_depth, "io_depth", d.io_depth)?,
+            numa_interleave: l.get(flag(self.numa_interleave), "numa_interleave", false)?,
+            o_direct: l.get(flag(self.o_direct), "o_direct", false)?,
+            async_h2d: l.get(flag(self.async_h2d), "async_h2d", false)?,
+            vram_experts_frac: l.get(
+                self.vram_experts_frac,
+                "vram_experts_frac",
+                d.vram_experts_frac,
+            )?,
             manifest_path: l.opt(self.manifest.clone(), "manifest")?,
             timing_csv: l.opt(self.timing_csv.clone(), "timing_csv")?,
             routing_trace: l.opt(self.routing_trace.clone(), "routing_trace")?,
@@ -449,7 +480,8 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         // No model: main() already printed the run help.
         None => return Ok(()),
     };
-    let layers = crate::config::Layers::from_process()?;
+    let layers = crate::config::Layers::from_process()?
+        .with_profile(&model, args.engine.no_optimize_profile);
     let (config, requested_snapshot) = engine_config(&args.engine, &model, 1, &layers)?;
     let eff = crate::serve::effective(&config, requested_snapshot)?;
     let reg = golem_registry::Registry::open()?;

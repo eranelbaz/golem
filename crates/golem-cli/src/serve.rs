@@ -123,6 +123,20 @@ pub fn register(
     allow_overcommit: bool,
 ) -> Result<Guard, Box<dyn Error>> {
     let mach = crate::plan::machine(None);
+    let inst = instance(id, kind, model, config, eff, &mach)?;
+    Ok(reg.admit_and_register(&inst, &mach, allow_overcommit)?)
+}
+
+/// The `loading` registry entry [`register`] admits, priced on `mach`.
+pub fn instance(
+    id: String,
+    kind: &str,
+    model: String,
+    config: &EngineConfig,
+    eff: &EffectiveConfig,
+    mach: &golem_plan::Machine,
+) -> Result<Instance, Box<dyn Error>> {
+    let mach = *mach;
     let facts = config.model_facts.ok_or("model facts unresolved")?;
     let input = golem_plan::PlanInput {
         ctx: config.n_ctx,
@@ -149,7 +163,7 @@ pub fn register(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let inst = Instance {
+    Ok(Instance {
         id,
         pid,
         pid_start_time: golem_registry::pid_start_time(pid)?,
@@ -164,8 +178,7 @@ pub fn register(
         heartbeat_at: now,
         children: Vec::new(),
         config: Some(eff.clone()),
-    };
-    Ok(reg.admit_and_register(&inst, &mach, allow_overcommit)?)
+    })
 }
 
 /// Fresh instance id.
@@ -201,7 +214,8 @@ pub fn serve(
         args.parallel,
         std::env::var("GOLEM_ALLOW_PARALLEL").as_deref() == Ok("1"),
     )?;
-    let layers = crate::config::Layers::from_process()?;
+    let layers = crate::config::Layers::from_process()?
+        .with_profile(&args.model, args.engine.no_optimize_profile);
     let (config, requested_snapshot) =
         engine_config(&args.engine, &args.model, args.parallel, &layers)?;
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;

@@ -98,6 +98,9 @@ pub struct ReplicaSlot {
     /// Cleared on the first direct-read failure (H-9 runtime fallback, not a
     /// degrade); the slot then stays buffered + `DONTNEED`.
     direct_ok: AtomicBool,
+    /// Set by [`ReplicaSlot::require_direct`]: a read that cannot go direct
+    /// fails instead of falling back to buffered.
+    direct_only: AtomicBool,
     /// Cleared after the first `DONTNEED` failure so the warn fires once per
     /// slot, not once per read (a per-read warn floods the log).
     warned_dontneed: AtomicBool,
@@ -163,6 +166,19 @@ impl ReplicaSlot {
         self.direct.is_some()
     }
 
+    /// `--o-direct`: from now on every read goes `O_DIRECT` or fails (no
+    /// buffered fallback). Refused when the open-time probe found no handle.
+    pub fn require_direct(&self) -> std::io::Result<()> {
+        if self.direct.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{}: O_DIRECT unavailable", self.path.display()),
+            ));
+        }
+        self.direct_only.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Test-only view: whether a direct handle exists at all.
     #[cfg(test)]
     fn has_direct(&self) -> bool {
@@ -177,11 +193,21 @@ impl ReplicaSlot {
         let aligned = offset.is_multiple_of(DIRECT_ALIGN)
             && (buf.len() as u64).is_multiple_of(DIRECT_ALIGN)
             && (buf.as_ptr() as u64).is_multiple_of(DIRECT_ALIGN);
+        let only = self.direct_only.load(Ordering::Relaxed);
+        if only && !aligned {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "O_DIRECT required but the read is not 4 KiB-aligned",
+            ));
+        }
         if aligned
-            && self.direct_ok()
+            && (only || self.direct_ok())
             && let Some(d) = &self.direct
         {
             if let Err(e) = d.read_full(offset, buf) {
+                if only {
+                    return Err(e);
+                }
                 if self.direct_ok.swap(false, Ordering::Relaxed) {
                     tracing::warn!(
                         path = %self.path.display(),
@@ -276,6 +302,7 @@ impl ReplicaRegistry {
                     direct,
                     buffered: Box::new(file),
                     direct_ok: AtomicBool::new(true),
+                    direct_only: AtomicBool::new(false),
                     warned_dontneed: AtomicBool::new(true),
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
                     errors: AtomicU64::new(0),
@@ -515,6 +542,7 @@ mod tests {
             })),
             buffered: FakeReads::buffered().0,
             direct_ok: AtomicBool::new(true),
+            direct_only: AtomicBool::new(false),
             warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
@@ -542,6 +570,7 @@ mod tests {
             direct: None,
             buffered: FakeReads::buffered().0,
             direct_ok: AtomicBool::new(false),
+            direct_only: AtomicBool::new(false),
             warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),

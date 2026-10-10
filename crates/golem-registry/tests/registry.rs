@@ -227,3 +227,43 @@ fn signal_refuses_reused_pid() {
         Err(golem_registry::RegistryError::InstanceNotFound(_))
     ));
 }
+
+/// #81: an optimize sweep is exclusive in both directions, and
+/// `allow_overcommit` bypasses neither rule.
+#[test]
+fn optimize_registration_is_exclusive() {
+    let d = tempfile_dir();
+    let r = Registry::at(d.clone(), d.parent().unwrap().join("admit.lock"));
+    let small = |id: &str, kind: &str| Instance {
+        kind: kind.into(),
+        planned_vram: 0,
+        planned_ram: 0,
+        ..inst(id, std::process::id(), now())
+    };
+    let g = r
+        .admit_and_register(&small("s", "serve"), &machine(), true)
+        .unwrap();
+    let e = r
+        .admit_and_register(&small("o", "optimize"), &machine(), true)
+        .unwrap_err();
+    assert!(
+        e.error.message.contains("instance `s`"),
+        "{}",
+        e.error.message
+    );
+    drop(g);
+    let opt = r
+        .admit_and_register(&small("o", "optimize"), &machine(), false)
+        .unwrap();
+    for kind in ["serve", "run", "optimize"] {
+        let e = r
+            .admit_and_register(&small("x", kind), &machine(), true)
+            .unwrap_err();
+        assert!(e.error.message.contains("optimize"), "{}", e.error.message);
+    }
+    drop(opt);
+    assert!(
+        r.admit_and_register(&small("s2", "serve"), &machine(), false)
+            .is_ok()
+    );
+}

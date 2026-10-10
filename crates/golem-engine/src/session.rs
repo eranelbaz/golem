@@ -638,6 +638,25 @@ impl Session {
         if config.ram_experts_gib > 0 {
             p3_glue::refuse_if_pool_session_live()?;
         }
+        // The vendored scheduler issues pooled H2D on the compute stream
+        // between the split's event wait and its compute; no copy stream
+        // exists to overlap it on.
+        if config.async_h2d {
+            return Err(EngineError::InvalidConfig(
+                "async_h2d: no dedicated H2D copy stream in this substrate".into(),
+            ));
+        }
+        if config.o_direct && (config.manifest_path.is_none() || config.ram_experts_gib == 0) {
+            return Err(EngineError::InvalidConfig(
+                "o_direct needs the store-backed pool (a manifest and ram_experts_gib > 0)".into(),
+            ));
+        }
+        if !(config.vram_experts_frac > 0.0 && config.vram_experts_frac <= 1.0) {
+            return Err(EngineError::InvalidConfig(format!(
+                "vram_experts_frac {} outside (0, 1]",
+                config.vram_experts_frac
+            )));
+        }
         if let Some(set) = &config.decode_cpuset {
             match golem_store::sys::pin_current_thread(set) {
                 Ok(()) => {}
@@ -661,7 +680,10 @@ impl Session {
         let mut p3 = if config.ram_experts_gib > 0 {
             let mut p = p3_glue::enable(config)?;
             if let Some(r) = &report {
-                p.cap_device_cache(r.term("device_expert_cache"));
+                p.cap_device_cache(
+                    (r.term("device_expert_cache") as f64 * f64::from(config.vram_experts_frac))
+                        as u64,
+                );
             }
             Some(p)
         } else {

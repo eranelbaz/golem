@@ -46,6 +46,24 @@ pub struct EngineConfig {
     /// Store reader threads per drain (§5.4 `--io-threads`); `None` derives
     /// one thread per physical drive hosting an eligible replica.
     pub io_threads: Option<usize>,
+    /// Derived store reader threads per physical drive (§5.2, D-12: 1–2);
+    /// 0 = 1. Ignored when `io_threads` is set.
+    pub io_depth: u32,
+    /// Interleave the RAM expert pool's pages across every NUMA node
+    /// (`MPOL_INTERLEAVE` while the arena faults in); `false` keeps the
+    /// first-touch policy. A no-op on one node.
+    pub numa_interleave: bool,
+    /// Store reads must go `O_DIRECT` (§5.4): a replica without a direct
+    /// handle, or a direct read failure, fails the read instead of falling
+    /// back to buffered + `DONTNEED`. Needs a manifest. `false` keeps the
+    /// probe-and-fall-back behaviour.
+    pub o_direct: bool,
+    /// Pooled expert H2D on a dedicated copy stream overlapping compute.
+    /// Not implemented by the vendored scheduler: `true` is refused at load.
+    pub async_h2d: bool,
+    /// Share of the §10 planner's `device_expert_cache` allowance the
+    /// derived K may use (1.0 = all of it). No effect with an explicit K.
+    pub vram_experts_frac: f32,
     /// Model manifest (§4.2) for the store-backed expert source: when set,
     /// the P3 slow path reads expert planes from the manifest's replica set
     /// through the shared chunk queue; `None` (the default) reads the single
@@ -174,6 +192,11 @@ impl Default for EngineConfig {
             ram_experts_gib: 0,
             device_cache_experts: 0,
             io_threads: None,
+            io_depth: 0,
+            numa_interleave: false,
+            o_direct: false,
+            async_h2d: false,
+            vram_experts_frac: 1.0,
             manifest_path: None,
             timing_csv: None,
             routing_trace: None,

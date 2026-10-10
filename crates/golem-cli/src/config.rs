@@ -99,11 +99,38 @@ where
     Ok(resolve_opt(flag, env_key, file, file_key, profile, profile_key, env)?.unwrap_or(default))
 }
 
+/// The profile layer for `knobs` (`None`: no profile, or
+/// `--no-optimize-profile`). Zero/false knobs mean "engine default" and are
+/// left out so lower layers decide.
+pub fn profile_table(knobs: Option<&crate::profile::Knobs>) -> toml::Table {
+    let mut t = toml::Table::new();
+    let Some(k) = knobs else {
+        return t;
+    };
+    let mut put = |key: &str, on: bool, v: toml::Value| {
+        if on {
+            t.insert(key.into(), v);
+        }
+    };
+    put("threads", k.threads > 0, i64::from(k.threads).into());
+    put("numa_interleave", k.numa_interleave, true.into());
+    put("o_direct", k.o_direct, true.into());
+    put("io_threads", k.io_threads > 0, (k.io_threads as i64).into());
+    put("io_depth", k.io_depth > 0, i64::from(k.io_depth).into());
+    put("async_h2d", k.async_h2d, true.into());
+    put(
+        "vram_experts_frac",
+        k.vram_experts_frac > 0.0,
+        f64::from(k.vram_experts_frac).into(),
+    );
+    t
+}
+
 /// The non-flag layers for one invocation.
 pub struct Layers<'a> {
     /// `golem.toml` contents (empty when absent).
     pub file: toml::Table,
-    /// Profile defaults (empty until profiles land).
+    /// `golem optimize` profile knobs ([`profile_table`]).
     pub profile: toml::Table,
     /// Env lookup (`std::env::var` in production).
     pub env: &'a dyn Fn(&str) -> Option<String>,
@@ -136,6 +163,35 @@ impl Layers<'_> {
             profile: toml::Table::new(),
             env: &|k| std::env::var(k).ok(),
         })
+    }
+
+    /// Adds the saved `golem optimize` profile for `model` as the profile
+    /// layer, unless `disabled` (`--no-optimize-profile`), or the profile was
+    /// measured with more free VRAM/RAM than is free now.
+    #[must_use]
+    pub fn with_profile(mut self, model: &std::path::Path, disabled: bool) -> Self {
+        if disabled {
+            return self;
+        }
+        let Some(p) = crate::profile::fingerprint(model)
+            .ok()
+            .and_then(|fp| crate::profile::load_profile(&fp))
+        else {
+            return self;
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let vram = crate::profile::sysfs_vram().map_or(0, |(f, _)| f);
+        if crate::profile::applicable(&p, vram, sys.available_memory()) {
+            eprintln!("golem: optimize profile {} applied", &p.fingerprint[..12]);
+            self.profile = profile_table(p.knobs.as_ref());
+        } else {
+            eprintln!(
+                "golem: optimize profile {} ignored: measured with more free memory than now",
+                &p.fingerprint[..12]
+            );
+        }
+        self
     }
 
     /// No env, file or profile: flags and defaults only.

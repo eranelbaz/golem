@@ -116,6 +116,8 @@ pub struct ChunkQueue {
     /// An explicit override wins over the derived per-drive count (D-12
     /// bounds the default at 1–2 per drive; the operator's flag does not).
     io_threads: usize,
+    /// Derived reader threads per drive (D-12: 1–2); 0 behaves as 1.
+    io_depth: usize,
     /// R-15: CPUs each drain reader pins itself to at spawn.
     io_cpuset: Option<crate::sys::CpuSet>,
     /// Cumulative disk time (ns) and bytes served by this queue's drains
@@ -139,11 +141,20 @@ impl ChunkQueue {
         Self {
             inner: Mutex::new(QueueInner::default()),
             io_threads,
+            io_depth: 1,
             io_cpuset,
             disk_ns: AtomicU64::new(0),
             disk_bytes: AtomicU64::new(0),
             degraded_reads: AtomicU64::new(0),
         }
+    }
+
+    /// Derived reader threads per drive (`--io-depth`, D-12); an explicit
+    /// `io_threads` still wins.
+    #[must_use]
+    pub fn with_io_depth(mut self, depth: usize) -> Self {
+        self.io_depth = depth.max(1);
+        self
     }
 
     /// Cumulative in-drain replica degradation events (§5.2): snapshot
@@ -687,7 +698,7 @@ fn drain_reads(
     let workers = (if queue.io_threads > 0 {
         queue.io_threads
     } else {
-        drives.max(1)
+        drives.max(1) * queue.io_depth
     })
     .min(list.len().max(1));
 

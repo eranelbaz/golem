@@ -21,6 +21,7 @@ hip-tests = []
 clap = { workspace = true }
 golem-api = { path = "../golem-api" }
 golem-engine = { path = "../golem-engine" }
+golem-gguf = { path = "../golem-gguf" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 golem-plan = { path = "../golem-plan" }
 golem-placement = { path = "../golem-placement" }

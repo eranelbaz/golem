@@ -93,6 +93,56 @@ pub fn pin_current_thread(set: &CpuSet) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Runs `f` with the calling thread's memory policy set to interleave over
+/// every online NUMA node (`MPOL_INTERLEAVE`), so pages it faults in (an
+/// mlocked arena) spread across nodes; the default policy is restored after.
+/// One node: `f` runs unchanged.
+pub fn with_numa_interleave<T>(f: impl FnOnce() -> T) -> std::io::Result<T> {
+    const MPOL_DEFAULT: libc::c_long = 0;
+    const MPOL_INTERLEAVE: libc::c_long = 3;
+    let online = std::fs::read_to_string("/sys/devices/system/node/online")
+        .ok()
+        .and_then(|s| CpuSet::parse_list(&s))
+        .map_or_else(Vec::new, |n| n.0);
+    if online.len() < 2 {
+        return Ok(f());
+    }
+    let mut mask = [0 as libc::c_ulong; 16];
+    let bits = libc::c_ulong::BITS as usize;
+    for n in online {
+        if n >= mask.len() * bits {
+            return Err(std::io::Error::other(format!(
+                "NUMA node {n} out of mask range"
+            )));
+        }
+        mask[n / bits] |= 1 << (n % bits);
+    }
+    // SAFETY: set_mempolicy(2) reads `mask` (live, `maxnode` bits long) and
+    // only changes this thread's allocation policy.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_INTERLEAVE,
+            mask.as_ptr(),
+            (mask.len() * bits) as libc::c_ulong,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let out = f();
+    // SAFETY: MPOL_DEFAULT takes no node mask.
+    unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_DEFAULT,
+            std::ptr::null::<libc::c_ulong>(),
+            0 as libc::c_ulong,
+        )
+    };
+    Ok(out)
+}
+
 /// R-15 CCD split from `(l3 size, shared_cpu_list)` pairs (one per CPU's
 /// `cache/index3`): `(v-cache CCD, other CCDs)`, or `None` when there is one
 /// L3 domain or no size difference (nothing to prefer).
