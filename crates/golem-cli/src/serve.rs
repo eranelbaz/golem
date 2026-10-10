@@ -286,6 +286,7 @@ pub fn serve(
         )
     };
     let worker = spawn_worker(config)?;
+    let health = worker.health.clone();
     let cfg = ServerConfig {
         host: l.host,
         port: l.port,
@@ -298,10 +299,19 @@ pub fn serve(
         },
     };
     rt.block_on(async {
+        // SIGTERM keeps the §9.2 drain grace. Ctrl-C is interactive: it
+        // cancels in-flight work at once, and a second Ctrl-C exits.
         let shutdown = async move {
             tokio::select! {
                 _ = term.recv() => {}
-                _ = int.recv() => {}
+                _ = int.recv() => {
+                    health.begin_drain();
+                    tokio::spawn(async move {
+                        int.recv().await;
+                        eprintln!("second interrupt: exiting without teardown");
+                        crate::sys::exit_now(130);
+                    });
+                }
             }
         };
         golem_server::serve_registered(cfg, worker, shutdown, guard, |a| {
