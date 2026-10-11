@@ -687,10 +687,7 @@ impl Session {
         let mut p3 = if config.ram_experts_gib > 0 {
             let mut p = p3_glue::enable(config)?;
             if let Some(r) = &report {
-                p.cap_device_cache(
-                    (r.term("device_expert_cache") as f64 * f64::from(config.vram_experts_frac))
-                        as u64,
-                );
+                p.cap_device_cache(r.term("device_expert_cache"));
             }
             Some(p)
         } else {
@@ -2073,7 +2070,7 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
     } else {
         config.batch_tokens
     };
-    let per_expert = m.expert_bytes_total / u64::from(m.n_expert.max(1));
+    let per_expert = m.slab_bytes_per_expert();
     golem_plan::PlanInput {
         ctx: config.n_ctx,
         parallel: config.parallel,
@@ -2104,7 +2101,7 @@ fn check_plan(
         ram_free: u64::MAX,
         rocm_overhead: golem_plan::ROCM_OVERHEAD,
     };
-    let r = golem_plan::plan(m, &mach, &plan_input(config, m));
+    let r = golem_plan::plan_at_frac(m, &mach, &plan_input(config, m), config.vram_experts_frac);
     if r.feasible {
         Ok(r)
     } else {
@@ -2228,6 +2225,7 @@ mod tests {
             t_ne: 9_640_226_040,
             shexp: 1_123_024_896,
             n_expert: 288,
+            top_k: 8,
             expert_layers: 42,
             max_plane_stride: 6_881_280,
             expert_bytes_total: 185_478_414_336,
@@ -2264,6 +2262,10 @@ mod tests {
         let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
         assert_eq!(r.vram_headroom, 0);
         assert!(r.term("device_expert_cache") > 6 << 30);
+        // Half of that 6.6 GB cache holds K = 4 < top_k 8.
+        cfg.vram_experts_frac = 0.5;
+        let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
+        assert!(e.to_string().contains("device_expert_cache "), "{e}");
     }
 
     #[test]

@@ -31,6 +31,10 @@ pub struct PlanArgs {
     /// Device expert-cache cap; omitted = what the other VRAM terms leave.
     #[arg(long, value_name = "GIB")]
     pub vram_experts_gib: Option<f64>,
+    /// Fraction (0, 1] of the derived device expert-cache allowance; same knob
+    /// as `run --vram-experts-frac`.
+    #[arg(long, default_value_t = 1.0, value_parser = frac, conflicts_with = "vram_experts_gib")]
+    pub vram_experts_frac: f32,
     /// Host expert-pool cap; omitted = min(0.75 · free RAM, Σ expert bytes).
     #[arg(long, value_name = "GIB")]
     pub ram_experts_gib: Option<f64>,
@@ -43,6 +47,15 @@ pub struct PlanArgs {
     /// Machine-readable report on stdout.
     #[arg(long)]
     pub json: bool,
+}
+
+fn frac(s: &str) -> Result<f32, String> {
+    let f: f32 = s.parse().map_err(|e| format!("{s}: {e}"))?;
+    if f > 0.0 && f <= 1.0 {
+        Ok(f)
+    } else {
+        Err(format!("{s} outside (0, 1]"))
+    }
 }
 
 fn bytes(gib: Option<f64>) -> u64 {
@@ -79,6 +92,8 @@ pub fn infeasible_envelope(r: &PlanReport) -> ErrorEnvelope {
             "vram_overrun": over(r.vram_headroom),
             "ram_overrun": over(r.ram_headroom),
             "largest_fitting_ubatch": r.largest_fitting_ubatch,
+            "device_expert_cache": r.term("device_expert_cache"),
+            "min_device_expert_cache": r.min_device_expert_cache,
         })),
     )
 }
@@ -132,7 +147,7 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
         snapshot_ram,
         ws: WS_UNMEASURED,
     };
-    let r = golem_plan::plan(&m, &mach, &input);
+    let r = golem_plan::plan_at_frac(&m, &mach, &input, args.vram_experts_frac);
     let g = governing(&m, &r);
     if args.json {
         println!(
@@ -184,6 +199,7 @@ mod tests {
             ram: vec![],
             vram_headroom: -(1 << 30),
             ram_headroom: 0,
+            min_device_expert_cache: 0,
             feasible: false,
             largest_fitting_ubatch: Some(2048),
         };
@@ -195,5 +211,6 @@ mod tests {
             "{e}"
         );
         assert!(e.contains("\"vram_overrun\":1073741824"), "{e}");
+        assert!(e.contains("\"min_device_expert_cache\":0"), "{e}");
     }
 }

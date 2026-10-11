@@ -1156,6 +1156,7 @@ mod tests {
             t_ne: 8 << 30,
             shexp: 1 << 30,
             n_expert: 288,
+            top_k: 8,
             expert_layers: 42,
             max_plane_stride: 6_881_280,
             expert_bytes_total: 42 * 288 * 3 * 4_718_592,

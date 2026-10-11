@@ -29,14 +29,15 @@ fn cfg(model: &std::path::Path, ctx: u32, ub: u32) -> EngineConfig {
     }
 }
 
-/// Predicted device bytes the process adds: every VRAM term except ROCm's
-/// fixed overhead, which `hipMemGetInfo` before vs after does not see.
+/// `golem_plan::plan` at `free` VRAM. Feasibility uses
+/// `golem_plan::ROCM_OVERHEAD` like the engine's `check_plan`; the byte total
+/// excludes it, since `hipMemGetInfo` before vs after does not see it.
 fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, bool) {
     let mach = golem_plan::Machine {
         vram_total: free,
         ram_total: u64::MAX,
         ram_free: u64::MAX,
-        rocm_overhead: 0,
+        rocm_overhead: golem_plan::ROCM_OVERHEAD,
     };
     let i = golem_plan::PlanInput {
         ctx: c.n_ctx,
@@ -49,7 +50,12 @@ fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, b
         ws: golem_plan::WS_UNMEASURED,
     };
     let r = golem_plan::plan(m, &mach, &i);
-    (golem_plan::total(&r.vram) as i64, r.feasible)
+    // The engine holds K + 1 whole slabs of the cache term, not the term.
+    let cache = r.term("device_expert_cache");
+    let slab = m.slab_bytes_per_expert();
+    let held = (golem_plan::device_cache_k(cache, slab) + 1) * slab;
+    let bytes = golem_plan::total(&r.vram) - r.term("rocm_overhead") - cache + held;
+    (bytes as i64, r.feasible)
 }
 
 #[test]
@@ -85,6 +91,7 @@ fn t8_plan_matches_hip_used_vram() {
         .filter(|&(c, u)| predicted(&m, &cfg(&model, c, u), free0).1)
         .take(cap.min(60))
         .collect();
+    assert!(!points.is_empty(), "no feasible sweep point (cap {cap})");
     println!(
         "T8 sweep: {} points (cap {cap}), top ctx {top}",
         points.len()
@@ -95,7 +102,11 @@ fn t8_plan_matches_hip_used_vram() {
     for (ctx, ub) in points {
         let c = cfg(&model, ctx, ub);
         let (free_before, _) = device_vram().unwrap();
-        let (pred, _) = predicted(&m, &c, free_before);
+        let (pred, fits) = predicted(&m, &c, free_before);
+        assert!(
+            fits,
+            "ctx {ctx} ubatch {ub} no longer fits: free VRAM drifted {free0} → {free_before} B"
+        );
         let mut s = Session::new(&c).expect("load");
         let msgs = [ChatTurn {
             role: "user",

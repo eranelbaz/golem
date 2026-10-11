@@ -340,7 +340,7 @@ fn plan_for(
     mach: &golem_plan::Machine,
     k: &Knobs,
 ) -> golem_plan::PlanReport {
-    let mut input = golem_plan::PlanInput {
+    let input = golem_plan::PlanInput {
         ctx: config.n_ctx,
         parallel: config.parallel,
         prefill_ubatch: config.prefill_ubatch.min(config.n_ctx),
@@ -351,15 +351,11 @@ fn plan_for(
         ..Default::default()
     };
     let frac = if k.vram_experts_frac > 0.0 {
-        f64::from(k.vram_experts_frac)
+        k.vram_experts_frac
     } else {
         1.0
     };
-    if frac < 1.0 {
-        let full = golem_plan::plan(facts, mach, &input).term("device_expert_cache");
-        input.vram_experts = ((full as f64 * frac) as u64).max(1);
-    }
-    golem_plan::plan(facts, mach, &input)
+    golem_plan::plan_at_frac(facts, mach, &input, frac)
 }
 
 /// A candidate must fit and plan no more than the baseline.
@@ -370,6 +366,13 @@ fn plan_check(
     k: &Knobs,
     base: &golem_plan::PlanReport,
 ) -> Result<(), Box<dyn Error>> {
+    if !(0.0..=1.0).contains(&k.vram_experts_frac) {
+        return Err(format!(
+            "vram_experts_frac {} outside [0, 1] (0 = default)",
+            k.vram_experts_frac
+        )
+        .into());
+    }
     let r = plan_for(config, facts, mach, k);
     if let Some(v) = r.violation() {
         return Err(format!("plan infeasible: {v}").into());
@@ -472,8 +475,10 @@ fn default_axes(config: &EngineConfig) -> Vec<Axis> {
     }
     if config.manifest_path.is_some() && config.ram_experts_gib > 0 {
         axes.push(Axis::ODirect(vec![false, true]));
-        axes.push(Axis::IoDepth(vec![1, 2]));
+        // io_threads before io_depth: their gains overlap, so the larger one
+        // must be tried from the base point first.
         axes.push(Axis::IoThreads(vec![0, 4, 8]));
+        axes.push(Axis::IoDepth(vec![1, 2]));
     }
     if config.ram_experts_gib > 0 && config.device_cache_experts == 0 {
         axes.push(Axis::VramExpertsFrac(vec![1.0, 0.75, 0.5]));

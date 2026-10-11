@@ -120,6 +120,32 @@ fn ttft_gate_is_against_baseline_not_incumbent() {
     );
 }
 
+/// The first baseline run's hit rate is higher than every later run;
+/// a real win at the incumbent's hit rate must still be selected and confirmed.
+#[test]
+fn hit_rate_gate_is_against_incumbent_not_first_baseline() {
+    let base = Knobs {
+        io_threads: 2,
+        ..Knobs::default()
+    };
+    let axes = [Axis::IoThreads(vec![2, 4])];
+    let mut first = true;
+    let (best, _) = sweep(&base, &axes, &mut |k| {
+        let hit_rate = if std::mem::take(&mut first) {
+            0.906
+        } else {
+            0.9
+        };
+        Ok(Metrics {
+            hit_rate,
+            ..m(if k.io_threads == 4 { 11.0 } else { 10.0 })
+        })
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(best.io_threads, 4);
+}
+
 #[test]
 fn failing_candidate_is_skipped_not_fatal() {
     let base = Knobs {
