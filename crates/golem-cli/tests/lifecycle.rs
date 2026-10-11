@@ -33,7 +33,10 @@ fn ids(rt: &Path) -> Vec<String> {
 fn detach_list_stop_round_trip() {
     let rt = common::tempdir_env();
     let m = tiny_moe();
-    let out = golem(&rt, &["serve", &m, "--detach", "--port", "0"]);
+    let out = golem(
+        &rt,
+        &["serve", &m, "--detach", "--port", "0", "--allow-overcommit"],
+    );
     assert!(
         out.status.success(),
         "{}",
