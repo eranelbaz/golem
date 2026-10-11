@@ -118,7 +118,9 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     if args.test_tight_budget {
         mach.ram_total = inst.planned_ram + inst.planned_ram / 2;
         mach.ram_free = mach.ram_total + (4 << 30);
-        mach.vram_total = inst.planned_vram + inst.planned_vram / 2;
+        if inst.planned_vram > 0 {
+            mach.vram_total = inst.planned_vram + inst.planned_vram / 2;
+        }
     }
     let reg = Registry::open()?;
     let guard = reg.admit_and_register(&inst, &mach, false)?;
