@@ -72,6 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Upstream tests + unset-hooks byte-identity
         run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo run -p xtask -- gen-tiny-moe --out /tmp/tiny-moe.gguf
           cargo build -p golem-cli
           scripts/t4_gate.sh --upstream-tests target/debug/golem /tmp/tiny-moe.gguf

@@ -157,7 +157,7 @@ fn run_attaches_to_keyed_instance() {
     let m = tiny_moe();
     let out = common::golem_cmd(&rt)
         .env("GOLEM_API_KEY", "k3y")
-        .args(["serve", &m, "--detach"])
+        .args(["serve", &m, "--detach", "--allow-overcommit"])
         .output()
         .unwrap();
     assert!(
