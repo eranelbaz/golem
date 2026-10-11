@@ -95,7 +95,15 @@ fn run_attaches_to_compatible_instance_and_keep_leaves_server() {
 
     // Smaller ctx fits inside the running instance → attach, no new entry.
     let mut child = common::golem_cmd(&rt)
-        .args(["run", &m, "--ctx", "2048", "--n-predict", "4"])
+        .args([
+            "run",
+            &m,
+            "--ctx",
+            "2048",
+            "--n-predict",
+            "4",
+            "--allow-overcommit",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -118,7 +126,16 @@ fn run_attaches_to_compatible_instance_and_keep_leaves_server() {
     // Nothing running: --keep starts a detached server that outlives run.
     let out = golem(
         &rt,
-        &["run", &m, "--keep", "--prompt", "hi", "--n-predict", "2"],
+        &[
+            "run",
+            &m,
+            "--keep",
+            "--prompt",
+            "hi",
+            "--n-predict",
+            "2",
+            "--allow-overcommit",
+        ],
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
@@ -155,7 +172,15 @@ fn run_attaches_to_keyed_instance() {
         .to_owned();
     let out = common::golem_cmd(&rt)
         .env("GOLEM_API_KEY", "k3y")
-        .args(["run", &m, "--prompt", "hi", "--n-predict", "2"])
+        .args([
+            "run",
+            &m,
+            "--prompt",
+            "hi",
+            "--n-predict",
+            "2",
+            "--allow-overcommit",
+        ])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);

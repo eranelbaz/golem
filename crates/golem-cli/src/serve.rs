@@ -256,7 +256,11 @@ pub fn serve(
         &args.model,
         l.parallel,
         &layers,
-        sys.available_memory(),
+        if args.allow_overcommit {
+            u64::MAX
+        } else {
+            sys.available_memory()
+        },
     )?;
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;
     let model_name = match l.model_name {

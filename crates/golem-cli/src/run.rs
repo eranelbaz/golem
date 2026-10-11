@@ -43,7 +43,7 @@ pub struct RunArgs {
     /// Load in-process even when a running instance could serve this.
     #[arg(long)]
     pub new: bool,
-    /// Skip the O5 admission check against running instances.
+    /// Skip the O5 admission check against running instances and the RAM fit.
     #[arg(long)]
     pub allow_overcommit: bool,
     #[command(flatten)]
@@ -483,8 +483,12 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         .with_profile(&model, args.engine.no_optimize_profile);
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    let (config, requested_snapshot) =
-        engine_config(&args.engine, &model, 1, &layers, sys.available_memory())?;
+    let ram_free = if args.allow_overcommit {
+        u64::MAX
+    } else {
+        sys.available_memory()
+    };
+    let (config, requested_snapshot) = engine_config(&args.engine, &model, 1, &layers, ram_free)?;
     let eff = crate::serve::effective(&config, requested_snapshot)?;
     let reg = golem_registry::Registry::open()?;
     if !args.new && args.parity_dump.is_none() {
