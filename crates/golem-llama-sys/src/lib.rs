@@ -257,6 +257,34 @@ pub mod pinned {
         if r == 0 { Ok(()) } else { Err(r) }
     }
 
+    /// A live `hipHostRegister` of one range; `Drop` unregisters it. The
+    /// pointer is kept as an address so owners stay `Send`.
+    #[derive(Debug)]
+    pub struct HostRegistration(usize);
+
+    impl HostRegistration {
+        /// Registers `[ptr, ptr+len)` (see [`hip_host_register`]).
+        ///
+        /// # Safety
+        /// As [`hip_host_register`] (not already registered); the range must stay mapped
+        /// until this guard drops, and every device access to it must be
+        /// complete by then.
+        pub unsafe fn new(ptr: *mut u8, len: usize) -> Result<Self, std::ffi::c_int> {
+            // SAFETY: forwarded caller invariant.
+            unsafe { hip_host_register(ptr, len) }.map(|()| Self(ptr as usize))
+        }
+    }
+
+    impl Drop for HostRegistration {
+        fn drop(&mut self) {
+            // SAFETY: the exact pointer registered in `new`; `new`'s caller
+            // keeps the range mapped and device-idle until this drop.
+            if let Err(r) = unsafe { hip_host_unregister(self.0 as *mut u8) } {
+                eprintln!("hipHostUnregister({:#x}) failed: HIP result {r}", self.0);
+            }
+        }
+    }
+
     /// `(free, total)` bytes of the current HIP device (`hipMemGetInfo`);
     /// the substrate's device must be the process's current one. `None` when the HIP
     /// runtime reports an error — callers must then refuse to derive a device

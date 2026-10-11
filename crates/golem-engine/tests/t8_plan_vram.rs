@@ -73,11 +73,14 @@ fn t8_plan_matches_hip_used_vram() {
         .map_or(60, |v| v.parse().expect("GOLEM_T8_MAX_POINTS: integer"));
     let m = golem_plan::ModelFacts::from_gguf(&model).expect("header");
     let (free0, _) = device_vram().expect("HIP VRAM query");
+    // Points sit TOL inside the fit edge so normal drift between loads does
+    // not fail them; drift past TOL still does.
+    let free_sel = free0.saturating_sub(TOL as u64);
     // Largest ctx the plan admits at ubatch 512 (power of two), then halves.
     let top = (10..=20)
         .rev()
         .map(|p| 1u32 << p)
-        .find(|&c| predicted(&m, &cfg(&model, c, 512), free0).1)
+        .find(|&c| predicted(&m, &cfg(&model, c, 512), free_sel).1)
         .expect("no ctx fits");
     let points: Vec<(u32, u32)> = (0..4)
         .map(|h| top >> h)
@@ -87,7 +90,7 @@ fn t8_plan_matches_hip_used_vram() {
                 .filter(move |&u| u <= c)
                 .map(move |u| (c, u))
         })
-        .filter(|&(c, u)| predicted(&m, &cfg(&model, c, u), free0).1)
+        .filter(|&(c, u)| predicted(&m, &cfg(&model, c, u), free_sel).1)
         .take(cap.min(60))
         .collect();
     assert!(!points.is_empty(), "no feasible sweep point (cap {cap})");
@@ -125,7 +128,14 @@ fn t8_plan_matches_hip_used_vram() {
         let d = pred - actual;
         worst = worst.max(d.abs());
         println!("{ctx}\t{ub}\t{pred}\t{actual}\t{d}");
+        let (free_released, _) = device_vram().unwrap();
+        assert!(
+            free_before as i64 - free_released as i64 <= TOL,
+            "ctx {ctx} ubatch {ub}: Session drop left {} B of VRAM held ({free_before} → {free_released} B)",
+            free_before as i64 - free_released as i64
+        );
     }
+    println!("T8 max |predicted − actual| = {worst} B");
     assert!(
         worst <= TOL,
         "max |predicted − actual| = {worst} B > 256 MiB"
