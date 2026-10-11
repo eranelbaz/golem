@@ -74,7 +74,8 @@ fn t8_plan_matches_hip_used_vram() {
     let m = golem_plan::ModelFacts::from_gguf(&model).expect("header");
     let (free0, _) = device_vram().expect("HIP VRAM query");
     // Points sit TOL inside the fit edge so normal drift between loads does
-    // not fail them; drift past TOL still does.
+    // not fail them; drift past TOL still does. Target: 24 GiB VRAM, TOL
+    // 256 MiB ≈ 1.0%; observed drift 25671237632 → 25461522432 B = 209.7 MB < TOL.
     let free_sel = free0.saturating_sub(TOL as u64);
     // Largest ctx the plan admits at ubatch 512 (power of two), then halves.
     let top = (10..=20)
@@ -93,7 +94,12 @@ fn t8_plan_matches_hip_used_vram() {
         .filter(|&(c, u)| predicted(&m, &cfg(&model, c, u), free_sel).1)
         .take(cap.min(60))
         .collect();
-    assert!(!points.is_empty(), "no feasible sweep point (cap {cap})");
+    let min_points = cap.clamp(1, 20);
+    assert!(
+        points.len() >= min_points,
+        "{} feasible sweep points < {min_points} required (cap {cap})",
+        points.len()
+    );
     println!(
         "T8 sweep: {} points (cap {cap}), top ctx {top}",
         points.len()
@@ -124,6 +130,7 @@ fn t8_plan_matches_hip_used_vram() {
             .expect("one prefill");
         let (free_after, _) = device_vram().unwrap();
         drop(s);
+        golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
         let actual = free_before as i64 - free_after as i64;
         let d = pred - actual;
         worst = worst.max(d.abs());
@@ -133,6 +140,11 @@ fn t8_plan_matches_hip_used_vram() {
             free_before as i64 - free_released as i64 <= TOL,
             "ctx {ctx} ubatch {ub}: Session drop left {} B of VRAM held ({free_before} → {free_released} B)",
             free_before as i64 - free_released as i64
+        );
+        assert!(
+            free0 as i64 - free_released as i64 <= TOL,
+            "ctx {ctx} ubatch {ub}: cumulative VRAM leak {} B since start ({free0} → {free_released} B)",
+            free0 as i64 - free_released as i64
         );
     }
     println!("T8 max |predicted − actual| = {worst} B");

@@ -104,6 +104,9 @@ pub struct StreamState {
     n_experts: u32,
     inner: Mutex<Inner>,
     cv: Condvar,
+    /// The reader holds an `Arc<Self>`, so `Drop` never runs while it lives:
+    /// `stop` joins it explicitly, releasing the pool and arena with the session.
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// H2D expert bytes this module's pointers fed (the copy loop's copies).
     pub bytes: AtomicU64,
     /// Per-expert plane hits served from the pool.
@@ -164,6 +167,7 @@ impl StreamState {
                 stop: false,
             }),
             cv: Condvar::new(),
+            reader: Mutex::new(None),
             bytes: AtomicU64::new(0),
             pool_hits: AtomicU64::new(0),
             staged: AtomicU64::new(0),
@@ -186,10 +190,11 @@ impl StreamState {
 
     fn spawn_reader(self: &Arc<Self>) {
         let state = self.clone();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("golem-stream-reader".into())
             .spawn(move || state.reader_loop())
             .expect("spawn stream reader");
+        *self.reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     fn reader_loop(self: Arc<Self>) {
@@ -496,12 +501,20 @@ impl StreamState {
         }
     }
 
-    /// Stops the reader thread (session teardown; holds are empty once the
-    /// hooks are unregistered and copy_done ran).
+    /// Stops and joins the reader thread (session teardown; holds are empty
+    /// once the hooks are unregistered and copy_done ran).
     pub fn stop(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.stop = true;
-        self.cv.notify_all();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.stop = true;
+            self.cv.notify_all();
+        }
+        let handle = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle
+            && h.thread().id() != std::thread::current().id()
+        {
+            let _ = h.join();
+        }
     }
 }
 
