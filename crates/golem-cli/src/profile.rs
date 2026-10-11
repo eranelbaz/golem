@@ -376,10 +376,14 @@ pub fn sweep(
     let mut tried = vec![*base];
     let mut coin = rng_seed();
     let mut stopped = false;
+    // Hit rate given up across accepted steps; only confirm bounds it, so an
+    // unconfirmed winner must keep it within one step's 0.5 pp.
+    let mut drift = 0.0;
     'passes: for _ in 0..2 {
         let mut moved = false;
         for axis in axes {
             let start = best.0;
+            let axis_drift = drift;
             for cand in axis.variants(&start) {
                 if tried.contains(&cand) {
                     continue;
@@ -399,6 +403,7 @@ pub fn sweep(
                         // incumbent run.
                         let bar = if best.0 == start { inc } else { best.1 };
                         if wins(&c, &bar, &baseline) && wins(&c, &inc, &baseline) {
+                            drift = axis_drift + (inc.hit_rate - c.hit_rate).max(0.0);
                             best = (cand, c);
                         }
                     }
@@ -419,9 +424,20 @@ pub fn sweep(
     if best.0 == *base {
         return Ok(None);
     }
+    let unconfirmed = |why: &dyn std::fmt::Display| {
+        if drift > 0.005 {
+            eprintln!(
+                "golem optimize: unconfirmed winner dropped ({why}; hit rate −{:.1} pp)",
+                drift * 100.0
+            );
+            None
+        } else {
+            eprintln!("golem optimize: winner kept unconfirmed ({why})");
+            Some(best)
+        }
+    };
     if stopped {
-        eprintln!("golem optimize: winner kept unconfirmed (sweep stopped early)");
-        return Ok(Some(best));
+        return Ok(unconfirmed(&"sweep stopped early"));
     }
     let confirm = measure(&best.0).and_then(|w| Ok((w, measure(base)?)));
     match confirm {
@@ -430,10 +446,7 @@ pub fn sweep(
             eprintln!("golem optimize: winner not confirmed by the reverse-order rerun");
             Ok(None)
         }
-        Err(e) if e.is::<StopSweep>() => {
-            eprintln!("golem optimize: winner kept unconfirmed ({e})");
-            Ok(Some(best))
-        }
+        Err(e) if e.is::<StopSweep>() => Ok(unconfirmed(&e)),
         Err(e) => {
             eprintln!("golem optimize: confirmation failed: {e}");
             Ok(None)

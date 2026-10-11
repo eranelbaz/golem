@@ -50,11 +50,10 @@ fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, b
         ws: golem_plan::WS_UNMEASURED,
     };
     let r = golem_plan::plan(m, &mach, &i);
-    // The engine holds K + 1 whole slabs of the cache term, not the term.
-    let cache = r.term("device_expert_cache");
-    let slab = m.slab_bytes_per_expert();
-    let held = (golem_plan::device_cache_k(cache, slab) + 1) * slab;
-    let bytes = golem_plan::total(&r.vram) - r.term("rocm_overhead") - cache + held;
+    // Without the cache term: the engine holds K + 1 whole slabs, and its K
+    // is also bounded by free VRAM, so the caller adds the loaded K's bytes.
+    let bytes =
+        golem_plan::total(&r.vram) - r.term("rocm_overhead") - r.term("device_expert_cache");
     (bytes as i64, r.feasible)
 }
 
@@ -108,6 +107,12 @@ fn t8_plan_matches_hip_used_vram() {
             "ctx {ctx} ubatch {ub} no longer fits: free VRAM drifted {free0} → {free_before} B"
         );
         let mut s = Session::new(&c).expect("load");
+        assert!(
+            s.prefill_streaming(),
+            "ctx {ctx} ubatch {ub}: fit dropped prefill streaming"
+        );
+        let k = s.device_cache_experts().expect("derived device cache");
+        let pred = pred + (i64::from(k) + 1) * m.slab_bytes_per_expert() as i64;
         let msgs = [ChatTurn {
             role: "user",
             content: &prompt,

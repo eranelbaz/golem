@@ -796,7 +796,7 @@ pub struct SessionHooks {
     /// Model routed top-k (`expert_used_count`).
     pub top_k: u32,
     /// Prefill-stream state (§7.6); `None` when disabled.
-    stream: Option<Arc<StreamState>>,
+    pub(crate) stream: Option<Arc<StreamState>>,
     /// The C-side stream config stashed at enable (n_experts, max stride,
     /// routed_max): re-passed on every arm/disarm (the setter takes all).
     stream_cfg: Option<(i32, i32, f32)>,

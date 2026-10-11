@@ -11,7 +11,9 @@ mod profile;
 
 mod common;
 
-use profile::{Axis, FingerprintInput, Knobs, Metrics, Profile, applicable, fingerprint_of, sweep};
+use profile::{
+    Axis, FingerprintInput, Knobs, Metrics, Profile, StopSweep, applicable, fingerprint_of, sweep,
+};
 
 fn m(tok_s: f64) -> Metrics {
     Metrics {
@@ -144,6 +146,43 @@ fn hit_rate_gate_is_against_incumbent_not_first_baseline() {
     .unwrap()
     .unwrap();
     assert_eq!(best.io_threads, 4);
+}
+
+/// Two accepted steps each give up 0.4 pp of hit rate; with confirm cut off
+/// by a stop, the 0.8 pp total exceeds one step's bound and nothing is kept.
+#[test]
+fn unconfirmed_winner_bounds_compounded_hit_rate_drift() {
+    let axes = [Axis::IoThreads(vec![4]), Axis::IoDepth(vec![2])];
+    let rate = |k: &Knobs| {
+        0.9 - 0.004 * f64::from(u8::from(k.io_threads == 4) + u8::from(k.io_depth == 2))
+    };
+    let tok = |k: &Knobs| {
+        10.0 * 1.1f64.powi(i32::from(
+            u8::from(k.io_threads == 4) + u8::from(k.io_depth == 2),
+        ))
+    };
+    let run = |stop_at: usize| {
+        let mut n = 0;
+        let base = Knobs {
+            io_depth: 1,
+            ..Knobs::default()
+        };
+        sweep(&base, &axes, &mut |k| {
+            n += 1;
+            if n > stop_at {
+                return Err(Box::new(StopSweep("budget".into())));
+            }
+            Ok(Metrics {
+                hit_rate: rate(k),
+                ..m(tok(k))
+            })
+        })
+        .unwrap()
+    };
+    // Baseline + 2 pairs: io_threads=4 then io_depth=2 accepted, stop before confirm.
+    assert_eq!(run(5), None);
+    // Baseline + 1 pair: one 0.4 pp step stays within bound and is kept.
+    assert_eq!(run(3).map(|b| b.0.io_threads), Some(4));
 }
 
 #[test]

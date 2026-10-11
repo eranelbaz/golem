@@ -835,6 +835,12 @@ impl Session {
         self.inner.p3.as_ref().map(|p| p.device_cache_experts)
     }
 
+    /// Whether prefill streaming (§7.6) survived the device-cache fit; the
+    /// fit drops it when the stream slabs and a K ≥ top-k cache do not both fit.
+    pub fn prefill_streaming(&self) -> bool {
+        self.inner.p3.as_ref().is_some_and(|p| p.stream.is_some())
+    }
+
     /// P4 device expert-copy cache counters (§3.4): bytes copied into / skipped
     /// by the persistent device cache, evictions, and the derived skip ratio.
     /// `None` unless this session drives the pooled GPU split — the only P2
