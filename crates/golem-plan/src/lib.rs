@@ -44,6 +44,8 @@ pub struct ModelFacts {
     pub shexp: u64,
     /// Routed experts per layer.
     pub n_expert: u32,
+    /// Routed experts per token (`expert_used_count`).
+    pub top_k: u32,
     /// Live layers carrying routed-expert planes.
     pub expert_layers: u32,
     /// Largest per-expert plane stride (bytes of one expert in one plane).
@@ -80,6 +82,7 @@ impl ModelFacts {
             t_ne: 0,
             shexp: 0,
             n_expert: hp_u32(&kvs, "expert_count")?,
+            top_k: hp_u32(&kvs, "expert_used_count")?,
             expert_layers: 0,
             max_plane_stride: 0,
             expert_bytes_total: 0,
@@ -121,6 +124,21 @@ impl ModelFacts {
         m.expert_layers = expert_blk.iter().filter(|&&b| b).count() as u32;
         m.state_terms(&kvs, live.end as usize)?;
         Ok(m)
+    }
+
+    /// Device bytes one slab slot costs: one routed expert's planes in every
+    /// expert layer. Target: 185,478,414,336 / 288 = 644,022,272 B.
+    #[must_use]
+    pub fn slab_bytes_per_expert(&self) -> u64 {
+        self.expert_bytes_total
+            .div_ceil(u64::from(self.n_expert.max(1)))
+    }
+
+    /// Smallest `device_expert_cache` whose [`device_cache_k`] reaches
+    /// `top_k`. Target: 9 × 644 MB = 5.80 GB.
+    #[must_use]
+    pub fn min_device_expert_cache(&self) -> u64 {
+        (u64::from(self.top_k) + 1).saturating_mul(self.slab_bytes_per_expert())
     }
 
     /// KV per token and recurrent-state bytes, mirroring the vendored
@@ -200,6 +218,13 @@ pub const WS_UNMEASURED: WsModel = WsModel {
 /// Combined ROCm overhead on gfx1100, measured in M0 (2.64 GiB, m0-notes).
 pub const ROCM_OVERHEAD: u64 = 2_834_678_415;
 
+/// Per-layer device-slab experts `budget` bytes hold: `⌊budget / slab⌋ − 1`
+/// (ruling R3). Shared by the plan's feasibility and the engine's derived K.
+#[must_use]
+pub fn device_cache_k(budget: u64, slab_bytes_per_expert: u64) -> u64 {
+    (budget / slab_bytes_per_expert.max(1)).saturating_sub(1)
+}
+
 /// Candidate `--prefill-ubatch` values, largest first.
 const UBATCHES: [u32; 5] = [8192, 4096, 2048, 1024, 512];
 
@@ -256,9 +281,12 @@ pub struct PlanReport {
     pub vram_headroom: i64,
     /// `ram_free − Σ ram`.
     pub ram_headroom: i64,
-    /// Both headrooms ≥ 0.
+    /// [`ModelFacts::min_device_expert_cache`].
+    pub min_device_expert_cache: u64,
+    /// Both headrooms ≥ 0 and `device_expert_cache` ≥ its minimum.
     pub feasible: bool,
-    /// When VRAM is over: the largest candidate ubatch that fits, if any.
+    /// When VRAM is over or the derived cache is below its minimum: the
+    /// largest smaller candidate ubatch that fits, if any.
     pub largest_fitting_ubatch: Option<u32>,
 }
 
@@ -281,9 +309,18 @@ impl PlanReport {
                 gib(total(&self.vram)),
                 gib(vram_cap)
             ));
-            if let Some(u) = self.largest_fitting_ubatch {
-                out.push(format!("largest --prefill-ubatch that fits: {u}"));
-            }
+        }
+        let cache = self.term("device_expert_cache");
+        if cache < self.min_device_expert_cache {
+            out.push(format!(
+                "device_expert_cache {:.2} GiB < {:.2} GiB (top_k + 1 experts per layer); \
+                 lower --ctx or --parallel, or raise the expert-cache budget",
+                gib(cache),
+                gib(self.min_device_expert_cache)
+            ));
+        }
+        if let Some(u) = self.largest_fitting_ubatch {
+            out.push(format!("largest --prefill-ubatch that fits: {u}"));
         }
         if self.ram_headroom < 0 {
             out.push(format!(
@@ -369,6 +406,27 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
     t
 }
 
+/// [`plan`] with a derived device expert cache capped at `frac` of the
+/// allowance (`vram_experts_frac`); the returned `device_expert_cache` is the
+/// capped budget the runtime fits K against. An explicit `vram_experts`, 1.0
+/// and out-of-range values plan uncapped.
+#[must_use]
+pub fn plan_at_frac(m: &ModelFacts, mach: &Machine, i: &PlanInput, frac: f32) -> PlanReport {
+    let r = plan(m, mach, i);
+    if i.vram_experts > 0 || !(frac > 0.0 && frac < 1.0) {
+        return r;
+    }
+    let cap = (r.term("device_expert_cache") as f64 * f64::from(frac)) as u64;
+    plan(
+        m,
+        mach,
+        &PlanInput {
+            vram_experts: cap.max(1),
+            ..*i
+        },
+    )
+}
+
 /// The §10 memory model: one implementation for `golem plan` and the
 /// engine's load-time check (§6.4).
 #[must_use]
@@ -377,21 +435,32 @@ pub fn plan(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> PlanReport {
     let ram = ram_terms(m, mach, i);
     let vram_headroom = headroom(mach.vram_total, total(&vram));
     let ram_headroom = headroom(mach.ram_free, total(&ram));
-    let largest_fitting_ubatch = (vram_headroom < 0)
+    let min_device_expert_cache = m.min_device_expert_cache();
+    let cache_ok = |t: &[Term]| {
+        t.iter()
+            .any(|t| t.name == "device_expert_cache" && t.bytes >= min_device_expert_cache)
+    };
+    let fits = |t: &[Term]| total(t) <= mach.vram_total && cache_ok(t);
+    // A smaller ubatch shrinks `ws`, which grows a derived cache.
+    let short = !cache_ok(&vram) && i.vram_experts == 0;
+    let largest_fitting_ubatch = (vram_headroom < 0 || short)
         .then(|| {
             UBATCHES.into_iter().find(|&u| {
-                u < i.prefill_ubatch && {
-                    let j = PlanInput {
-                        prefill_ubatch: u,
-                        ..*i
-                    };
-                    total(&vram_terms(m, mach, &j)) <= mach.vram_total
-                }
+                u < i.prefill_ubatch
+                    && fits(&vram_terms(
+                        m,
+                        mach,
+                        &PlanInput {
+                            prefill_ubatch: u,
+                            ..*i
+                        },
+                    ))
             })
         })
         .flatten();
     PlanReport {
-        feasible: vram_headroom >= 0 && ram_headroom >= 0,
+        feasible: vram_headroom >= 0 && ram_headroom >= 0 && cache_ok(&vram),
+        min_device_expert_cache,
         vram,
         ram,
         vram_headroom,
@@ -468,6 +537,7 @@ mod tests {
             t_ne: 8 << 30,
             shexp: 1 << 30,
             n_expert: 288,
+            top_k: 8,
             expert_layers: 42,
             max_plane_stride: 6_881_280,
             expert_bytes_total: 42 * 288 * 3 * 4_718_592,
@@ -593,6 +663,125 @@ mod tests {
         );
         assert!(!set.feasible);
         assert!(set.vram_headroom < 0);
+    }
+
+    /// Target at ctx 32768, streamed, parallel 4: 9.64 t_ne + 2.58 kv +
+    /// 0.61 rs + 0.54 ws + 3.96 slabs + 2.83 ROCm = 20.2 GB of 25.8 → 5.61 GB
+    /// cache < 9 × 644 MB = 5.80 GB (K = 7 < top_k 8); parallel 1 → 7.99 GB.
+    #[test]
+    fn device_cache_k_is_whole_slabs_minus_one() {
+        assert_eq!(device_cache_k(9 * 644_022_272, 644_022_272), 8);
+        assert_eq!(device_cache_k(9 * 644_022_272 - 1, 644_022_272), 7);
+        assert_eq!(device_cache_k(0, 644_022_272), 0);
+        assert_eq!(device_cache_k(5, 0), 4);
+    }
+
+    /// Explicit 5.8 GB cache at ubatch 8192 overruns VRAM; 4096 fits the total
+    /// and a smaller explicit cache fitting is never suggested below min.
+    #[test]
+    fn ubatch_suggestion_respects_the_cache_minimum() {
+        let m = ModelFacts {
+            t_ne: 9_640_226_040,
+            expert_bytes_total: 185_478_414_336,
+            ..glm()
+        };
+        let i = PlanInput {
+            ctx: 32768,
+            parallel: 4,
+            prefill_ubatch: 8192,
+            prefill_stream: true,
+            ws: WS_UNMEASURED,
+            ..Default::default()
+        };
+        let r = plan(&m, &box24(), &i);
+        assert!(!r.feasible);
+        if let Some(u) = r.largest_fitting_ubatch {
+            assert!(
+                plan(
+                    &m,
+                    &box24(),
+                    &PlanInput {
+                        prefill_ubatch: u,
+                        ..i
+                    }
+                )
+                .feasible
+            );
+        }
+        let below = PlanInput {
+            vram_experts: 9 * 644_022_272 - 1,
+            prefill_ubatch: 8192,
+            ..i
+        };
+        let r = plan(&m, &box24(), &below);
+        assert_eq!(r.largest_fitting_ubatch, None, "{:?}", r.violation());
+    }
+
+    #[test]
+    fn derived_cache_below_top_k_is_infeasible() {
+        let m = ModelFacts {
+            t_ne: 9_640_226_040,
+            expert_bytes_total: 185_478_414_336,
+            ..glm()
+        };
+        let i = PlanInput {
+            ctx: 32768,
+            parallel: 4,
+            prefill_ubatch: 2048,
+            prefill_stream: true,
+            ws: WS_UNMEASURED,
+            ..Default::default()
+        };
+        let r = plan(&m, &box24(), &i);
+        assert!(r.vram_headroom >= 0);
+        assert!(!r.feasible);
+        let v = r.violation().unwrap();
+        assert!(v.starts_with("device_expert_cache "), "{v}");
+        assert!(plan(&m, &box24(), &PlanInput { parallel: 1, ..i }).feasible);
+        let explicit = PlanInput {
+            parallel: 1,
+            vram_experts: 9 * 644_022_272,
+            ..i
+        };
+        assert!(plan(&m, &box24(), &explicit).feasible);
+        let explicit = PlanInput {
+            vram_experts: 9 * 644_022_272 - 1,
+            ..explicit
+        };
+        assert!(!plan(&m, &box24(), &explicit).feasible);
+    }
+
+    /// Target at ctx 32768, parallel 1: 25.77 − (9.64 + 0.65 + 0.15 + 0.54 +
+    /// 3.96 + 2.83) = 7.99 GB derived cache; × 0.7 = 5.60 GB < 9 × 644 MB =
+    /// 5.80 GB → refused, × 0.75 = 6.00 GB fits.
+    #[test]
+    fn frac_caps_the_derived_cache_against_its_minimum() {
+        let m = ModelFacts {
+            t_ne: 9_640_226_040,
+            expert_bytes_total: 185_478_414_336,
+            ..glm()
+        };
+        let i = PlanInput {
+            ctx: 32768,
+            parallel: 1,
+            prefill_ubatch: 2048,
+            prefill_stream: true,
+            ws: WS_UNMEASURED,
+            ..Default::default()
+        };
+        let full = plan_at_frac(&m, &box24(), &i, 1.0);
+        assert_eq!(full, plan(&m, &box24(), &i));
+        for bad in [0.0, -0.5, f32::NAN, 1.5] {
+            assert_eq!(plan_at_frac(&m, &box24(), &i, bad), full, "{bad}");
+        }
+        let r = plan_at_frac(&m, &box24(), &i, 0.7);
+        assert!(!r.feasible, "{:?}", r.violation());
+        let r = plan_at_frac(&m, &box24(), &i, 0.75);
+        assert!(r.feasible);
+        assert_eq!(
+            r.term("device_expert_cache"),
+            (full.term("device_expert_cache") as f64 * 0.75) as u64
+        );
     }
 
     #[test]

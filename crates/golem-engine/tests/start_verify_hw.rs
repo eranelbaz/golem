@@ -38,10 +38,15 @@ fn hw_start_verify_sampled_vs_full_cold() {
             let pids = String::from_utf8_lossy(&users.stdout);
             assert!(pids.trim().is_empty(), "{p:?} mapped by pid(s) {pids}");
             let out = std::process::Command::new("fincore")
-                .args(["--raw", "--noheadings", "--output", "RES"])
+                .args(["--raw", "--bytes", "--noheadings", "--output", "RES"])
                 .arg(&p)
                 .output()
                 .expect("fincore");
+            assert!(
+                out.status.success(),
+                "fincore: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             let res = String::from_utf8_lossy(&out.stdout);
             assert_eq!(res.trim(), "0", "{p:?} resident bytes after eviction");
             println!("HW precondition {p:?}: fincore RES=0, no mapping pid");

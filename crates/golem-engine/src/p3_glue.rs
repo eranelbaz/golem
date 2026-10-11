@@ -796,7 +796,7 @@ pub struct SessionHooks {
     /// Model routed top-k (`expert_used_count`).
     pub top_k: u32,
     /// Prefill-stream state (§7.6); `None` when disabled.
-    stream: Option<Arc<StreamState>>,
+    pub(crate) stream: Option<Arc<StreamState>>,
     /// The C-side stream config stashed at enable (n_experts, max stride,
     /// routed_max): re-passed on every arm/disarm (the setter takes all).
     stream_cfg: Option<(i32, i32, f32)>,
@@ -1808,7 +1808,10 @@ fn class_layout(
 /// weights were all subtracted (or already allocated) before this runs;
 /// `VRAM_HEADROOM_BYTES` (1 GiB) covers allocator fragmentation and driver
 /// drift. Rejected below top-k — a routed set larger than K aborts
-/// mid-decode, it is never floored.
+/// mid-decode, it is never floored. `golem_plan::plan` refuses a
+/// `device_expert_cache` below top-k by the same [`golem_plan::device_cache_k`];
+/// the headroom is not in that minimum because free VRAM here still holds the
+/// plan's `rocm_overhead` term (2.83 GB > 1 GiB), so `plan_cap` binds first.
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 const VRAM_HEADROOM_BYTES: u64 = 1 << 30;
 
@@ -1819,8 +1822,11 @@ fn k_from_free_vram(
     slab_bytes_per_expert: u64,
     n_expert_used: u32,
 ) -> Result<u32, EngineError> {
-    let k = free.saturating_sub(VRAM_HEADROOM_BYTES).min(plan_cap) / slab_bytes_per_expert.max(1);
-    let k = k.saturating_sub(1).clamp(1, i32::MAX as u64);
+    let k = golem_plan::device_cache_k(
+        free.saturating_sub(VRAM_HEADROOM_BYTES).min(plan_cap),
+        slab_bytes_per_expert,
+    )
+    .clamp(1, i32::MAX as u64);
     if k < u64::from(n_expert_used) {
         return Err(EngineError::PoolInit(format!(
             "free VRAM {free} B (plan cap {plan_cap} B) supports a slab of only {k} experts per layer at \
