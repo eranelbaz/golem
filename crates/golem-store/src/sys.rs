@@ -54,6 +54,148 @@ pub fn open_direct(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// A set of logical CPU ids (R-15 pinning).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuSet(pub Vec<usize>);
+
+impl CpuSet {
+    /// Parses a sysfs cpu list (`0-7,16-23`).
+    pub fn parse_list(s: &str) -> Option<Self> {
+        let mut v = Vec::new();
+        for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+            match part.split_once('-') {
+                Some((a, b)) => v.extend(a.parse::<usize>().ok()?..=b.parse::<usize>().ok()?),
+                None => v.push(part.parse().ok()?),
+            }
+        }
+        (!v.is_empty()).then_some(Self(v))
+    }
+}
+
+/// Binds the calling thread to `set` (`sched_setaffinity(0, …)`); threads it
+/// spawns afterwards inherit the mask.
+pub fn pin_current_thread(set: &CpuSet) -> std::io::Result<()> {
+    // SAFETY: cpu_set_t is plain bits; zeroed is the empty set.
+    let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &c in &set.0 {
+        if c >= libc::CPU_SETSIZE as usize {
+            return Err(std::io::Error::other(format!("cpu {c} ≥ CPU_SETSIZE")));
+        }
+        // SAFETY: c < CPU_SETSIZE, checked above.
+        unsafe { libc::CPU_SET(c, &mut mask) };
+    }
+    // SAFETY: pid 0 = calling thread; `mask` is a live, initialized cpu_set_t
+    // of the size passed.
+    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Runs `f` with the calling thread's memory policy set to interleave over
+/// every online NUMA node (`MPOL_INTERLEAVE`), so pages it faults in (an
+/// mlocked arena) spread across nodes; the default policy is restored after.
+/// One node: `f` runs unchanged.
+pub fn with_numa_interleave<T>(f: impl FnOnce() -> T) -> std::io::Result<T> {
+    const MPOL_DEFAULT: libc::c_long = 0;
+    const MPOL_INTERLEAVE: libc::c_long = 3;
+    let online = std::fs::read_to_string("/sys/devices/system/node/online")
+        .ok()
+        .and_then(|s| CpuSet::parse_list(&s))
+        .map_or_else(Vec::new, |n| n.0);
+    if online.len() < 2 {
+        return Ok(f());
+    }
+    let mut mask = [0 as libc::c_ulong; 16];
+    let bits = libc::c_ulong::BITS as usize;
+    for n in online {
+        if n >= mask.len() * bits {
+            return Err(std::io::Error::other(format!(
+                "NUMA node {n} out of mask range"
+            )));
+        }
+        mask[n / bits] |= 1 << (n % bits);
+    }
+    // SAFETY: set_mempolicy(2) reads `mask` (live, `maxnode` bits long) and
+    // only changes this thread's allocation policy.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_INTERLEAVE,
+            mask.as_ptr(),
+            (mask.len() * bits) as libc::c_ulong,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let out = f();
+    // SAFETY: MPOL_DEFAULT takes no node mask.
+    unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_DEFAULT,
+            std::ptr::null::<libc::c_ulong>(),
+            0 as libc::c_ulong,
+        )
+    };
+    Ok(out)
+}
+
+/// R-15 CCD split from `(l3 size, shared_cpu_list)` pairs (one per CPU's
+/// `cache/index3`): `(v-cache CCD, other CCDs)`, or `None` when there is one
+/// L3 domain or no size difference (nothing to prefer).
+pub fn vcache_split(l3: &[(u64, String)]) -> Option<(CpuSet, CpuSet)> {
+    let mut domains: Vec<(u64, &str)> = Vec::new();
+    for (size, list) in l3 {
+        if !domains.iter().any(|(_, l)| l == list) {
+            domains.push((*size, list));
+        }
+    }
+    let max = domains.iter().map(|d| d.0).max()?;
+    if domains.len() < 2 || domains.iter().all(|d| d.0 == max) {
+        return None;
+    }
+    let mut big = Vec::new();
+    let mut rest = Vec::new();
+    for (size, list) in domains {
+        let cpus = CpuSet::parse_list(list)?.0;
+        if size == max { &mut big } else { &mut rest }.extend(cpus);
+    }
+    Some((CpuSet(big), CpuSet(rest)))
+}
+
+/// Reads every CPU's L3 `(size, shared_cpu_list)` from sysfs and applies
+/// [`vcache_split`].
+pub fn detect_vcache_split() -> Option<(CpuSet, CpuSet)> {
+    let mut l3 = Vec::new();
+    for e in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name
+            .strip_prefix("cpu")
+            .is_some_and(|n| n.parse::<u32>().is_ok())
+        {
+            continue;
+        }
+        let d = e.path().join("cache/index3");
+        let (Ok(size), Ok(list)) = (
+            std::fs::read_to_string(d.join("size")),
+            std::fs::read_to_string(d.join("shared_cpu_list")),
+        ) else {
+            continue;
+        };
+        let size = size.trim();
+        let Ok(kib) = size.strip_suffix('K').unwrap_or(size).parse::<u64>() else {
+            tracing::debug!("{name}: unparsable L3 size {size:?}; skipped");
+            continue;
+        };
+        l3.push((kib, list.trim().to_owned()));
+    }
+    vcache_split(&l3)
+}
+
 /// Free bytes available to this user on the filesystem holding `path`.
 pub fn available_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
@@ -80,6 +222,42 @@ mod tests {
         assert_eq!(page_span(100, 4096), (0, 8192), "straddles two pages");
         assert_eq!(page_span(4096 + 8, 10), (4096, 4096));
         assert_eq!(page_span(8191, 2), (4096, 8192));
+    }
+
+    #[test]
+    fn vcache_split_picks_the_larger_l3_and_noops_on_one_ccd() {
+        let two = [
+            (98304, "0-7,16-23".to_owned()),
+            (98304, "0-7,16-23".to_owned()),
+            (32768, "8-15,24-31".to_owned()),
+        ];
+        let (big, rest) = vcache_split(&two).unwrap();
+        assert_eq!(
+            big.0,
+            [(0..8).collect::<Vec<_>>(), (16..24).collect()].concat()
+        );
+        assert_eq!(rest.0.len(), 16);
+        assert!(vcache_split(&[(32768, "0-15".to_owned())]).is_none());
+        let same = [(32768, "0-7".to_owned()), (32768, "8-15".to_owned())];
+        assert!(vcache_split(&same).is_none(), "no V-cache CCD → no-op");
+    }
+
+    #[test]
+    fn pin_current_thread_restricts_affinity() {
+        std::thread::spawn(|| {
+            pin_current_thread(&CpuSet(vec![0])).unwrap();
+            // SAFETY: test-local; zeroed cpu_set_t is the empty set.
+            let mut m: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out-pointer of the passed size.
+            assert_eq!(
+                unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&m), &mut m) },
+                0
+            );
+            // SAFETY: reads bits of an initialized set.
+            assert_eq!(unsafe { libc::CPU_COUNT(&m) }, 1);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

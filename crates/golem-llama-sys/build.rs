@@ -90,13 +90,13 @@ fn main() {
     let pin_skipped = run_pin_gate(&repo_root);
     let binary_dir = build_substrate(&repo_root, resolved, &out_dir, pin_skipped);
 
-    if !pin_skipped {
-        if let Err(e) = pin_gate::verify_pin(
+    if !pin_skipped
+        && let Err(e) = pin_gate::verify_pin(
             &repo_root.join("vendor/llama.cpp"),
             &repo_root.join("vendor/VENDOR_SHA"),
-        ) {
-            panic!("pin gate RE-CHECK after the cmake build failed: {e}");
-        }
+        )
+    {
+        panic!("pin gate RE-CHECK after the cmake build failed: {e}");
     }
 
     println!(
@@ -105,6 +105,7 @@ fn main() {
     );
 
     let openmp_enabled = read_openmp_enabled(&binary_dir);
+    build_chat_shim(&manifest_dir, &repo_root);
     emit_link_directives(resolved, openmp_enabled, &binary_dir);
     generate_bindings(&repo_root, &out_dir);
 }
@@ -179,7 +180,13 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
-        .define("LLAMA_BUILD_COMMON", "OFF")
+        // `common` carries the chat layer (templates, tool-call grammars,
+        // parsers) behind shim/golem_chat.cpp; its HTTP/TLS and subprocess
+        // paths are never used.
+        .define("LLAMA_BUILD_COMMON", "ON")
+        .define("LLAMA_OPENSSL", "OFF")
+        .define("LLAMA_SUBPROCESS", "OFF")
+        .define("LLAMA_LLGUIDANCE", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_APP", "OFF")
         .define("GGML_BUILD_TESTS", "OFF")
@@ -187,7 +194,8 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         // ~106 GiB host allocation — infeasible on 93 GiB RAM. Both
         // substrate builds disable it (matches the baseline-001 recipe).
         .define("GGML_CPU_REPACK", "OFF")
-        .build_target("llama"); // not install: install builds common/tools/app transitively
+        // llama-common depends on llama; not install: install builds tools/app.
+        .build_target("llama-common");
     match backend {
         "cpu" => {
             cfg.define("GGML_HIP", "OFF");
@@ -218,6 +226,24 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
     cfg.build();
 
     build_root.join("build")
+}
+
+/// Compiles `shim/golem_chat.cpp` (C ABI over `common/chat.h`); linked before
+/// the substrate archives it calls into.
+fn build_chat_shim(manifest_dir: &Path, repo_root: &Path) {
+    let shim = manifest_dir.join("shim");
+    let vendor = repo_root.join("vendor/llama.cpp");
+    println!("cargo:rerun-if-changed={}", shim.display());
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .file(shim.join("golem_chat.cpp"))
+        .include(vendor.join("common"))
+        .include(vendor.join("include"))
+        .include(vendor.join("ggml/include"))
+        .include(vendor.join("vendor"))
+        .warnings(false)
+        .compile("golem_chat");
 }
 
 fn rocm_advisory_check(repo_root: &Path) {
@@ -255,6 +281,12 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
                 .expect("non-UTF-8 path to golem-hooks.h"),
         )
         .header(llama_header.to_str().expect("non-UTF-8 path to llama.h"))
+        .header(
+            repo_root
+                .join("crates/golem-llama-sys/shim/golem_chat.h")
+                .to_str()
+                .expect("non-UTF-8 path to golem_chat.h"),
+        )
         .clang_arg(format!("-I{}", vendor.join("include").display()))
         .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
         .allowlist_function("llama_.*")
@@ -376,12 +408,18 @@ fn read_openmp_enabled(binary_dir: &Path) -> bool {
 fn emit_link_directives(backend: &str, openmp_enabled: bool, binary_dir: &Path) {
     let archives: &[(&str, &str)] = match backend {
         "cpu" => &[
+            ("llama-common", "common"),
+            ("llama-common-base", "common"),
+            ("cpp-httplib", "vendor/cpp-httplib"),
             ("llama", "src"),
             ("ggml", "ggml/src"),
             ("ggml-cpu", "ggml/src"),
             ("ggml-base", "ggml/src"),
         ],
         "hip" => &[
+            ("llama-common", "common"),
+            ("llama-common-base", "common"),
+            ("cpp-httplib", "vendor/cpp-httplib"),
             ("llama", "src"),
             ("ggml", "ggml/src"),
             ("ggml-cpu", "ggml/src"),

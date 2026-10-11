@@ -42,7 +42,7 @@ if [ "$run_upstream" = 1 ]; then
     -E 'test-(download-model|thread-safety|save-load-state|state-restore-fragmented|tokenizers-ggml-vocabs|jinja)'
 fi
 "$bin" run --greedy "$model" --prompt "Hello" --n-predict 16 \
-  --parity-dump "$out" >/dev/null
+  --allow-overcommit --parity-dump "$out" >/dev/null
 if python3 "$base_dir/t4_gate_cmp.py" "$base" "$out"; then
   echo "t4-gate: PASS (unset-hooks dump matches pristine baseline: tokens exact, logits within tolerance)"
 else

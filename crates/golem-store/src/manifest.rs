@@ -47,6 +47,14 @@ pub struct ShardEntry {
     pub sha256: String,
     /// Replica ROOT dirs; shard file lives at `replicas[i]/file`.
     pub replicas: Vec<PathBuf>,
+    /// R-8 start-time check: SHA-256 of 16 × 1 MiB windows at `i·len/16`
+    /// ([`crate::import::sampled_sha256`]). Absent in pre-R-8 manifests →
+    /// size + mtime only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_sha256: Option<Vec<String>>,
+    /// Shard mtime (Unix seconds) recorded at import; absent → not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
 }
 
 /// Expert-offset index entry for MoE tensors.

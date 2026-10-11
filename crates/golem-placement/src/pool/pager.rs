@@ -744,6 +744,16 @@ impl ExpertPool {
         }
     }
 
+    /// Leases held by the batched step claims (released at `end_batch_step*`;
+    /// test/observability seam).
+    pub fn batch_leases(&self) -> usize {
+        self.batch_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .leases
+            .len()
+    }
+
     /// The key's outstanding pool lease count (test/observability seam).
     pub fn outstanding_leases(&self, layer: u32, expert: u32) -> u16 {
         self.residency.lease_count(layer, expert)
@@ -783,6 +793,18 @@ impl ExpertPool {
             self.demand_inflight.fetch_add(1, Ordering::Relaxed);
             DemandGuard(&self.demand_inflight)
         })
+    }
+
+    /// Fraction of pool slots holding a unit (one free-list lock; called
+    /// at the metrics cadence, never per expert).
+    pub fn fill(&self) -> f64 {
+        let total = self.arena.slot_count();
+        let free = self.residency.free_slot_count();
+        if total == 0 {
+            0.0
+        } else {
+            1.0 - free as f64 / f64::from(total)
+        }
     }
 
     /// Number of demand page-ins currently in flight (§6.5 gate input).
@@ -1096,11 +1118,11 @@ mod tests {
         ) -> io::Result<()> {
             let k = key(4, N_EXPERTS, layer, expert).unwrap();
             let mut errors = self.errors.lock().unwrap();
-            if let Some(n) = errors.get_mut(&k) {
-                if *n > 0 {
-                    *n -= 1;
-                    return Err(io::Error::other("injected source failure"));
-                }
+            if let Some(n) = errors.get_mut(&k)
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(io::Error::other("injected source failure"));
             }
             drop(errors);
             assert_eq!(into.len() - head, self.stride);

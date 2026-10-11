@@ -287,6 +287,31 @@ struct HookState {
     /// Whether stream chunks are active (drives the routing readback's
     /// read-ahead warm); toggled per chunk by `Session`.
     stream_armed: AtomicBool,
+    /// The active turn's cancel flag (null = no turn). Stored by
+    /// [`StreamAbortGuard`] (`Release`), loaded per streamed plane by
+    /// `stream_source` on the decode thread (`Acquire`, ABI v11).
+    abort: AtomicPtr<AtomicBool>,
+    /// Test seam: absolute stream plane count at which `stream_source` sets
+    /// the turn's cancel flag (0 = off).
+    test_cancel_plane: AtomicU64,
+    /// Test seam: the next ensure call marks every replica unreadable
+    /// before its page-in reads, so the read itself fails.
+    test_fail_storage_in_read: AtomicBool,
+}
+
+/// One turn's registration of its cancel flag in `HookState.abort`.
+pub(crate) struct StreamAbortGuard {
+    state: Arc<HookState>,
+    /// Keeps the pointee alive until the pointer is nulled.
+    _cancel: Arc<AtomicBool>,
+}
+
+impl Drop for StreamAbortGuard {
+    fn drop(&mut self) {
+        self.state
+            .abort
+            .store(std::ptr::null_mut(), Ordering::Release);
+    }
 }
 
 /// Experts predicted beyond the routed top-k (§6.5): 8 + 4 = 12 per layer.
@@ -631,6 +656,12 @@ pub(crate) fn session_opened() {
     LIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Live `Session` count in this process (teardown observability: a server
+/// shutdown must leave 0).
+pub fn live_sessions() -> usize {
+    LIVE_SESSIONS.load(Ordering::SeqCst)
+}
+
 /// Marks a dropped session (called by `Session::drop`).
 pub(crate) fn session_closed() {
     let prev = LIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst);
@@ -760,6 +791,8 @@ pub struct SessionHooks {
     pub device_cache_experts: u32,
     /// Pending derived-K fit; `None` once fitted or with an explicit K.
     fit: Option<DeviceFit>,
+    /// `golem_slab_alloc_failures` already handled.
+    slab_failures_seen: u64,
     /// Model routed top-k (`expert_used_count`).
     pub top_k: u32,
     /// Prefill-stream state (§7.6); `None` when disabled.
@@ -786,6 +819,33 @@ impl SessionHooks {
     /// calls the free function; direct-`enable` harnesses call this).
     pub fn advance_decode_step(&self) {
         self.state.policy.step.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Fraction of RAM-pool slots holding a unit.
+    pub fn pool_fill(&self) -> f64 {
+        self.state.pool.fill()
+    }
+
+    /// Store-backed source health (§5.2/§11); `None` on the GGUF pread path.
+    pub fn storage_health(&self) -> Option<golem_store::InstanceHealth> {
+        self.state.store.as_ref().map(|s| s.health())
+    }
+
+    /// Test seam: marks every replica of every shard unreadable.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_for_test(&self) {
+        self.state.fail_storage();
+    }
+
+    /// Test seam: the next `ensure_host_resident` kills every replica
+    /// inside its page-in, so the in-flight read fails.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_in_read_for_test(&self) {
+        self.state
+            .test_fail_storage_in_read
+            .store(true, Ordering::Relaxed);
     }
 
     /// §6.5 prefetch and prediction counters.
@@ -857,7 +917,7 @@ impl SessionHooks {
             return Ok(());
         };
         let k_of = |budget: u64| {
-            k_from_free_vram(budget, fit.slab_bytes_per_expert, self.top_k)
+            k_from_free_vram(budget, fit.plan_cap, fit.slab_bytes_per_expert, self.top_k)
                 .map(|k| k.min(fit.k_bound))
         };
         let k = match k_of(free.saturating_sub(fit.stream_slab_vram)) {
@@ -881,6 +941,51 @@ impl SessionHooks {
         unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
         self.device_cache_experts = k;
         Ok(())
+    }
+
+    /// Caps the pending derived-K fit at the §10 plan's `device_expert_cache`
+    /// bytes. No-op for an explicit K.
+    pub(crate) fn cap_device_cache(&mut self, bytes: u64) {
+        if let Some(f) = self.fit.as_mut() {
+            f.plan_cap = bytes;
+        }
+    }
+
+    /// After a `llama_decode` −2: when C reports a new device-slab allocation
+    /// failure (ABI v12), frees every slab, halves K (never below top-k) and
+    /// returns it; `None` when the −2 was not a slab failure. The next compute
+    /// reallocates the smaller slabs; the session serves degraded. A failure
+    /// with K already at top-k cannot shrink further → `BackendUnavailable`
+    /// (fatal: one routed layer no longer fits on the device).
+    pub(crate) fn shrink_after_slab_failure(&mut self) -> Result<Option<u32>, EngineError> {
+        let ctx = self.ctx_ptr();
+        // SAFETY: FFI counter read on the live ctx.
+        let failures = unsafe { raw::golem_slab_alloc_failures(ctx) };
+        if failures == self.slab_failures_seen {
+            return Ok(None);
+        }
+        self.slab_failures_seen = failures;
+        // SAFETY: FFI on the live ctx between computes (the failed decode
+        // was synchronized; no slab in flight).
+        unsafe { raw::golem_reset_device_cache(ctx) };
+        self.device_cache_reset();
+        if self.device_cache_experts <= self.top_k {
+            return Err(EngineError::BackendUnavailable(format!(
+                "device expert-cache slab allocation failed at the K = top-k = {} floor",
+                self.top_k
+            )));
+        }
+        let k = (self.device_cache_experts / 2).max(self.top_k);
+        // SAFETY: FFI setter on the live ctx between computes.
+        unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
+        tracing::warn!(
+            from = self.device_cache_experts,
+            to = k,
+            "device expert-cache slab allocation failed (VRAM taken after load); \
+             cache reset and shrunk, serving degraded"
+        );
+        self.device_cache_experts = k;
+        Ok(Some(k))
     }
 
     /// Whether prefill streaming is enabled for this session.
@@ -920,6 +1025,30 @@ impl SessionHooks {
         }
     }
 
+    /// Points the stream-source abort check at `cancel` for one turn; the
+    /// guard nulls it on drop. Owns clones of both Arcs, so it borrows
+    /// nothing from the session.
+    pub(crate) fn stream_abort_guard(&self, cancel: &Arc<AtomicBool>) -> StreamAbortGuard {
+        self.state
+            .abort
+            .store(Arc::as_ptr(cancel).cast_mut(), Ordering::Release);
+        StreamAbortGuard {
+            state: self.state.clone(),
+            _cancel: cancel.clone(),
+        }
+    }
+
+    /// Test seam: sets the active turn's cancel flag from inside the
+    /// `n`-th `stream_source` call (1-based, counted from now), so the
+    /// abort fires mid-ubatch; `0` disables.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn cancel_at_stream_plane_for_test(&self, n: u64) {
+        let base = self.stream_stats().map_or(0, |s| s.planes);
+        let at = if n == 0 { 0 } else { base + n };
+        self.state.test_cancel_plane.store(at, Ordering::Relaxed);
+    }
+
     /// Drops every staging slot and pool lease the stream chunks still
     /// hold (a failed decode never reaches copy_done's backstop). Call only
     /// with no compute in flight.
@@ -927,6 +1056,11 @@ impl SessionHooks {
         if let Some(s) = &self.stream {
             s.release_all();
         }
+    }
+
+    /// Leases the pool's batched step claims still hold (0 between turns).
+    pub fn pool_batch_leases(&self) -> usize {
+        self.state.pool.batch_leases()
     }
 
     /// Cumulative stream counters (test/observability seam).
@@ -1246,11 +1380,20 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     let (source, store): (Arc<dyn ExpertSource>, Option<Arc<StoreExpertSource>>) =
         match &config.manifest_path {
             Some(manifest_path) => {
-                let queue = Arc::new(ChunkQueue::new(config.io_threads.unwrap_or(0)));
+                let queue = Arc::new(
+                    ChunkQueue::new(config.io_threads.unwrap_or(0), config.io_cpuset.clone())
+                        .with_io_depth(config.io_depth as usize),
+                );
                 let store = Arc::new(
                     StoreExpertSource::open(manifest_path, queue)
                         .map_err(|e| EngineError::PoolInit(e.to_string()))?,
                 );
+                if config.o_direct {
+                    for r in store.registry().shards().iter().flat_map(|s| &s.replicas) {
+                        r.require_direct()
+                            .map_err(|e| EngineError::PoolInit(format!("o_direct: {e}")))?;
+                    }
+                }
                 let source: Arc<dyn ExpertSource> = store.clone();
                 (source, Some(store))
             }
@@ -1316,8 +1459,14 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     let classes = geo.classes();
     // C clamps the slab to n_experts, so that is the per-layer staging bound.
     let layout = class_layout(&classes, pool_bytes, k.min(geo.n_experts))?;
-    let arena = golem_placement::pool::Arena::new(&layout)
-        .map_err(|e| EngineError::PoolInit(e.to_string()))?;
+    let new_arena = || golem_placement::pool::Arena::new(&layout);
+    let arena = if config.numa_interleave {
+        golem_store::sys::with_numa_interleave(new_arena)
+            .map_err(|e| EngineError::PoolInit(format!("numa_interleave: {e}")))?
+    } else {
+        new_arena()
+    }
+    .map_err(|e| EngineError::PoolInit(e.to_string()))?;
     // Layer → class index, aligned with `layout`/`classes` ordering.
     let mut class_of_layer = vec![0u8; n_layers as usize];
     for (c, (_, layers)) in classes.iter().enumerate() {
@@ -1473,6 +1622,9 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         ),
         stream: stream.clone(),
         stream_armed: AtomicBool::new(false),
+        abort: AtomicPtr::new(std::ptr::null_mut()),
+        test_cancel_plane: AtomicU64::new(0),
+        test_fail_storage_in_read: AtomicBool::new(false),
     });
     if config.prefetch != PrefetchMode::Off {
         // SAFETY: FFI setter on the live ctx, before the first graph build;
@@ -1486,11 +1638,13 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             )
         };
     }
-    let prefetch = state
-        .pred
-        .queue
-        .clone()
-        .map(|q| spawn_prefetch(state.pool.clone(), q as Arc<dyn AccessFeed>));
+    let prefetch = state.pred.queue.clone().map(|q| {
+        spawn_prefetch(
+            state.pool.clone(),
+            q as Arc<dyn AccessFeed>,
+            config.io_cpuset.clone(),
+        )
+    });
     // Order publisher: 250 µs poll — the order may lag ≥ 1 step by design;
     // the copy_done flush bounds the worst case without blocking.
     let publisher = spawn_order_publisher(state.clone(), std::time::Duration::from_micros(250));
@@ -1534,10 +1688,12 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         state,
         ctx_keep: hooked_ctx_keep,
         device_cache_experts: k_start,
+        slab_failures_seen: 0,
         fit: derived_k.then_some(DeviceFit {
             k_bound: k,
             slab_bytes_per_expert: slab,
             stream_slab_vram,
+            plan_cap: u64::MAX,
         }),
         top_k: n_expert_used,
         stream: stream.clone(),
@@ -1576,7 +1732,7 @@ fn derive_device_cache_experts(
     #[cfg(golem_backend_hip)]
     if let Some((free, _total)) = golem_llama_sys::pinned::free_device_mem() {
         return Ok((
-            k_from_free_vram(free as u64, slab_bytes_per_expert, n_expert_used)?,
+            k_from_free_vram(free as u64, u64::MAX, slab_bytes_per_expert, n_expert_used)?,
             true,
         ));
     }
@@ -1595,6 +1751,9 @@ struct DeviceFit {
     /// Both prefill-stream slabs (0 without streaming); they allocate
     /// lazily, so the post-load free VRAM does not net them out yet.
     stream_slab_vram: u64,
+    /// The §10 plan's `device_expert_cache` bytes ([`SessionHooks::cap_device_cache`]);
+    /// `u64::MAX` = uncapped.
+    plan_cap: u64,
 }
 
 /// Device bytes one slab slot costs across the model: Σ_layers unit bytes —
@@ -1643,7 +1802,9 @@ fn class_layout(
 }
 
 /// Derived K from free VRAM against the exact budget (ruling R3):
-/// `⌊free / slab⌋ − 1` — the stream slabs, KV, `ws` and the non-expert
+/// `⌊min(free − headroom, plan_cap) / slab⌋ − 1`, so K never exceeds the
+/// §10 plan's `device_expert_cache` term nor what is actually free — the
+/// stream slabs, KV, `ws` and the non-expert
 /// weights were all subtracted (or already allocated) before this runs;
 /// `VRAM_HEADROOM_BYTES` (1 GiB) covers allocator fragmentation and driver
 /// drift. Rejected below top-k — a routed set larger than K aborts
@@ -1654,14 +1815,15 @@ const VRAM_HEADROOM_BYTES: u64 = 1 << 30;
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 fn k_from_free_vram(
     free: u64,
+    plan_cap: u64,
     slab_bytes_per_expert: u64,
     n_expert_used: u32,
 ) -> Result<u32, EngineError> {
-    let k = free.saturating_sub(VRAM_HEADROOM_BYTES) / slab_bytes_per_expert.max(1);
+    let k = free.saturating_sub(VRAM_HEADROOM_BYTES).min(plan_cap) / slab_bytes_per_expert.max(1);
     let k = k.saturating_sub(1).clamp(1, i32::MAX as u64);
     if k < u64::from(n_expert_used) {
         return Err(EngineError::PoolInit(format!(
-            "free VRAM {free} B supports a slab of only {k} experts per layer at \
+            "free VRAM {free} B (plan cap {plan_cap} B) supports a slab of only {k} experts per layer at \
              {slab_bytes_per_expert} B per routed expert (Σ unit bytes), below \
              expert_used_count {n_expert_used} — even single-token decode would abort; \
              free VRAM or lower the resident set"
@@ -1680,9 +1842,107 @@ fn kind_from_code(code: i32) -> Option<ExpertKind> {
     }
 }
 
-/// Loud terminal state for FFI-adjacent contract violations (the void ABI
-/// leaves no non-silent failure path; corrupt-weight
-/// decode is worse than a dead process — documented, deliberate).
+/// The state-snapshot byte store (§7.1): one mlocked [`golem_placement::pool::Arena`],
+/// GPU-registered on HIP builds (§3.5 — pageable H2D is a bug), unregistered
+/// in `Drop` before the arena unmaps.
+pub struct PinnedArena {
+    mem: PinnedMem,
+}
+
+enum PinnedMem {
+    Locked(golem_placement::pool::Arena),
+    #[cfg(any(test, feature = "test-support"))]
+    Heap(Vec<u8>),
+}
+
+impl PinnedArena {
+    /// Maps, locks and (HIP) registers `len` bytes; any failure refuses the
+    /// load rather than degrading to pageable memory.
+    pub fn new(len: usize) -> Result<Self, EngineError> {
+        let arena = golem_placement::pool::Arena::new_bytes(len)
+            .map_err(|e| EngineError::PoolInit(format!("snapshot arena: {e}")))?;
+        #[cfg(golem_backend_hip)]
+        {
+            let (ptr, len) = arena.as_ptr_range();
+            // SAFETY: the arena is a live, page-aligned, solely-owned mapping
+            // of exactly `len` bytes, not yet registered; unregister runs in
+            // `Drop` before the arena unmaps.
+            if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
+                return Err(EngineError::PoolInit(format!(
+                    "hipHostRegister failed on the {len}-byte snapshot arena (HIP result {r})"
+                )));
+            }
+        }
+        Ok(Self {
+            mem: PinnedMem::Locked(arena),
+        })
+    }
+
+    /// Unpinned heap bytes for cache-logic unit tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn heap_for_test(len: usize) -> Self {
+        Self {
+            mem: PinnedMem::Heap(vec![0; len]),
+        }
+    }
+
+    /// Usable bytes.
+    pub fn len(&self) -> usize {
+        match &self.mem {
+            PinnedMem::Locked(a) => a.as_ptr_range().1,
+            #[cfg(any(test, feature = "test-support"))]
+            PinnedMem::Heap(v) => v.len(),
+        }
+    }
+
+    /// True when the arena holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Shared view of the whole arena.
+    pub fn bytes(&self) -> &[u8] {
+        match &self.mem {
+            PinnedMem::Locked(a) => {
+                let (ptr, len) = a.as_ptr_range();
+                // SAFETY: the arena owns `[ptr, ptr+len)` for its lifetime and
+                // hands out no other view; `&self` excludes `bytes_mut`.
+                unsafe { std::slice::from_raw_parts(ptr, len) }
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            PinnedMem::Heap(v) => v,
+        }
+    }
+
+    /// Exclusive view of the whole arena.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.mem {
+            PinnedMem::Locked(a) => {
+                let (ptr, len) = a.as_ptr_range();
+                // SAFETY: as `bytes`; `&mut self` makes this the only view.
+                unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            PinnedMem::Heap(v) => v,
+        }
+    }
+}
+
+impl Drop for PinnedArena {
+    fn drop(&mut self) {
+        #[cfg(golem_backend_hip)]
+        #[allow(irrefutable_let_patterns)] // `Heap` exists only in test builds
+        if let PinnedMem::Locked(a) = &self.mem {
+            // SAFETY: the exact pointer registered in `new`; no view outlives
+            // `&mut self`, and every restore H2D synchronized before returning.
+            let _ = unsafe { golem_llama_sys::pinned::hip_host_unregister(a.as_ptr_range().0) };
+        }
+    }
+}
+
+/// Loud terminal state for FFI-adjacent contract violations (corrupt-weight
+/// decode is worse than a dead process — documented, deliberate). Storage
+/// loss is not one: it fails the compute through the ABI v13 ensure code.
 pub(crate) fn p3_fatal(context: String) -> ! {
     // stderr is the one channel always available in an abort path (tracing
     // may have no subscriber installed).
@@ -1726,7 +1986,9 @@ unsafe fn state_of<'a>(payload: *mut c_void) -> &'a HookState {
 ///
 /// # Contract
 /// A null tensor, a negative `n_miss`, or an out-of-range
-/// `(kind, id)` is a contract violation → logged + `abort()`.
+/// `(kind, id)` is a contract violation → logged + `abort()`. A source read
+/// failure (every replica unreadable, §5.2) returns 1 (ABI v13): C fails the
+/// compute (`llama_decode` −3) and the store health reads `FatalIo`.
 // The C ABI fixes the signature; the pointer contract is documented above
 // and enforced by the guarded body.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -1737,15 +1999,15 @@ pub extern "C" fn ensure_host_resident(
     miss_ids: *const i32,
     n_miss: i32,
     out_ptrs: *mut *const c_void,
-) {
+) -> i32 {
     guarded("ensure_host_resident", || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         let Some(entry) = h.entry_for(tensor) else {
-            return; // non-expert tensor: upstream behavior
+            return 0; // non-expert tensor: upstream behavior
         };
         if n_miss <= 0 {
-            return; // nothing missed this segment
+            return 0; // nothing missed this segment
         }
         if miss_kinds.is_null() || miss_ids.is_null() {
             p3_fatal("P3: ensure_host_resident called with null miss list".into());
@@ -1789,18 +2051,28 @@ pub extern "C" fn ensure_host_resident(
         // §11: a few `Instant::now()` per layer is the sanctioned hot-path cost.
         // The scratch mutex stays held across the call: the decode thread is
         // its only contender (stated invariant), so this serializes nothing.
+        if h.test_fail_storage_in_read.swap(false, Ordering::Relaxed) {
+            h.fail_storage();
+        }
         let t0 = std::time::Instant::now();
         let paged = h.pool.ensure_batch(entry.layer, &scratch, out);
         drop(scratch);
         h.p3_wait_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         h.ensure_calls.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = paged {
-            p3_fatal(format!(
+        match paged {
+            Ok(()) => {}
+            // Storage loss is an operational state, not a contract breach:
+            // fail the compute; the caller reads the store health.
+            Err(e @ golem_placement::pool::PoolError::Source { .. }) => {
+                tracing::error!(layer = entry.layer, n_miss = n, "P3 page-in failed: {e}");
+                return 1;
+            }
+            Err(e) => p3_fatal(format!(
                 "P3 page-in failed (layer {}, n_miss {n}): {e}; \
                  aborting rather than decoding on garbage",
                 entry.layer
-            ));
+            )),
         }
 
         // Counters visibility: one info line per 1000 slow paths (real metrics
@@ -1814,6 +2086,7 @@ pub extern "C" fn ensure_host_resident(
                 "P3 slow-path progress"
             );
         }
+        0
     })
 }
 
@@ -1859,9 +2132,11 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
     });
 }
 
-/// The prefill-stream byte-source hook (ABI v10, design §7.6): one call per
+/// The prefill-stream byte-source hook (ABI v11, design §7.6): one call per
 /// streamed plane from the copy loop; translates the raw blk into the
 /// pool's dense-lead-adjusted layer and forwards to the stream state.
+/// Returns 1 (abort the compute) when the active turn's cancel flag is set,
+/// so a cancel lands within one plane of a streamed ubatch.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn stream_source(
     payload: *mut c_void,
@@ -1871,10 +2146,23 @@ pub extern "C" fn stream_source(
     ids: *const i32,
     n_ids: i32,
     out_ptrs: *mut *const c_void,
-) {
+) -> i32 {
     guarded("stream_source", || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
+        let flag = h.abort.load(Ordering::Acquire);
+        // SAFETY: non-null only while a `StreamAbortGuard` holds the
+        // `Arc<AtomicBool>` it points into (nulled in its `Drop`).
+        let cancel = (!flag.is_null()).then(|| unsafe { &*flag });
+        if let (Some(c), Some(s)) = (cancel, &h.stream) {
+            let at = h.test_cancel_plane.load(Ordering::Relaxed);
+            if at != 0 && s.stats().planes + 1 >= at {
+                c.store(true, Ordering::Relaxed);
+            }
+        }
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return 1;
+        }
         let Some(s) = &h.stream else {
             p3_fatal("stream_source without stream state (streaming not enabled)".into());
         };
@@ -1893,7 +2181,10 @@ pub extern "C" fn stream_source(
             )
         };
         s.source(blk - h.dense_lead as i32, kind, seq, ids, out);
-    });
+        // Re-checked after the (possibly blocking) fill: C's abort path
+        // releases this seq too, so the plane's leases never leak.
+        i32::from(cancel.is_some_and(|c| c.load(Ordering::Relaxed)))
+    })
 }
 
 /// The prefill-stream release hook (ABI v10): C drops the seq−2 plane's
@@ -2142,15 +2433,26 @@ pub extern "C" fn routing(
         }
         // Prefill-stream read-ahead (§7.6.3): this layer's ids are known —
         // warm its up/down planes and the next layer's whole gate plane.
-        if h.stream_armed.load(Ordering::Relaxed) {
-            if let Some(s) = &h.stream {
-                s.warm(layer as u32, ids);
-            }
+        if h.stream_armed.load(Ordering::Relaxed)
+            && let Some(s) = &h.stream
+        {
+            s.warm(layer as u32, ids);
         }
     })
 }
 
 impl HookState {
+    /// Marks every replica of every store shard unreadable (fault seam).
+    fn fail_storage(&self) {
+        if let Some(s) = &self.store {
+            for sh in s.registry().shards() {
+                for r in &sh.replicas {
+                    r.mark_degraded();
+                }
+            }
+        }
+    }
+
     /// Publishes the scored policy snapshot for the next compute's D2H floor
     /// decisions (exclusive residency, O10): every key's §6.2 decayed score
     /// at the current step, built into one fresh snapshot. Once per decode
@@ -2451,14 +2753,20 @@ mod tests {
         // Ruling R3 (exact budget): K = ⌊(free − 1 GiB headroom) / 644 MB⌋ − 1.
         // (2 × 6.657 GB − 1 GiB) / 644 MB = 19.0 → K = 18.
         assert_eq!(
-            k_from_free_vram(2 * 6_657_000_000, geo_bytes, 8).unwrap(),
+            k_from_free_vram(2 * 6_657_000_000, u64::MAX, geo_bytes, 8).unwrap(),
             18
         );
-        assert!(k_from_free_vram(1 << 30, geo_bytes, 8).is_err());
+        assert!(k_from_free_vram(1 << 30, u64::MAX, geo_bytes, 8).is_err());
         // Huge free VRAM stays within the i32 ABI (≤ 0 reads as "full slab" in C).
         assert_eq!(
-            k_from_free_vram(u64::MAX, geo_bytes, 8).unwrap(),
+            k_from_free_vram(u64::MAX, u64::MAX, geo_bytes, 8).unwrap(),
             i32::MAX as u32
+        );
+        // The §10 plan caps K below the free VRAM: a 6 GiB device_expert_cache
+        // term is ⌊6 GiB / 644 MB⌋ − 1 = 9, though 13.3 GB free allows 18.
+        assert_eq!(
+            k_from_free_vram(2 * 6_657_000_000, 6 << 30, geo_bytes, 8).unwrap(),
+            9
         );
     }
 

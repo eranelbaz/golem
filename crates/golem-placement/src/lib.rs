@@ -262,10 +262,10 @@ impl Policy {
         if self.journal.is_none() {
             return;
         }
-        if self.start_record(step) {
-            if let Some(p) = self.pending.as_mut() {
-                p.accesses.push(key);
-            }
+        if self.start_record(step)
+            && let Some(p) = self.pending.as_mut()
+        {
+            p.accesses.push(key);
         }
     }
 
@@ -273,10 +273,10 @@ impl Policy {
         if self.journal.is_none() {
             return;
         }
-        if self.start_record(step) {
-            if let Some(p) = self.pending.as_mut() {
-                p.transitions.push((key, tier, present));
-            }
+        if self.start_record(step)
+            && let Some(p) = self.pending.as_mut()
+        {
+            p.transitions.push((key, tier, present));
         }
     }
 
@@ -306,12 +306,11 @@ impl Policy {
     /// Push the pending record when non-empty; drop it otherwise (records
     /// exist only for steps with at least one access or transition).
     fn flush_pending(&mut self) {
-        if let Some(p) = self.pending.take() {
-            if !p.accesses.is_empty() || !p.transitions.is_empty() {
-                if let Some(j) = self.journal.as_mut() {
-                    j.push(p);
-                }
-            }
+        if let Some(p) = self.pending.take()
+            && (!p.accesses.is_empty() || !p.transitions.is_empty())
+            && let Some(j) = self.journal.as_mut()
+        {
+            j.push(p);
         }
     }
 

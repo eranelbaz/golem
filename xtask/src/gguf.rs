@@ -1,21 +1,22 @@
 //! Minimal GGUF v3 writer (little-endian, 32-byte tensor alignment).
 //!
 //! Scope: models only the metadata value types the tiny-moe generator writes
-//! (U32/F32/Str scalars and I32/F32/Str arrays) — not a general GGUF serializer.
+//! (Bool/U32/F32/Str scalars and I32/F32/Str arrays) — not a general GGUF serializer.
 
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::Path;
 
 use golem_gguf::{
-    GGML_TYPE_F32, TYPE_ARRAY as GGUF_TYPE_ARR, TYPE_F32 as GGUF_TYPE_F32,
-    TYPE_I32 as GGUF_TYPE_I32, TYPE_STR as GGUF_TYPE_STR, TYPE_U16 as GGUF_TYPE_U16,
-    TYPE_U32 as GGUF_TYPE_U32,
+    GGML_TYPE_F32, TYPE_ARRAY as GGUF_TYPE_ARR, TYPE_BOOL as GGUF_TYPE_BOOL,
+    TYPE_F32 as GGUF_TYPE_F32, TYPE_I32 as GGUF_TYPE_I32, TYPE_STR as GGUF_TYPE_STR,
+    TYPE_U16 as GGUF_TYPE_U16, TYPE_U32 as GGUF_TYPE_U32,
 };
 
 const ALIGN: u64 = 32;
 
 pub enum GgufValue {
+    Bool(bool),
     U16(u16),
     U32(u32),
     I32(i32),
@@ -29,6 +30,7 @@ pub enum GgufValue {
 impl GgufValue {
     fn tag(&self) -> u32 {
         match self {
+            GgufValue::Bool(_) => GGUF_TYPE_BOOL,
             GgufValue::U16(_) => GGUF_TYPE_U16,
             GgufValue::U32(_) => GGUF_TYPE_U32,
             GgufValue::I32(_) => GGUF_TYPE_I32,
@@ -59,6 +61,7 @@ fn put_kv(out: &mut Vec<u8>, kv: &GgufKv) {
     put_str(out, &kv.key);
     out.extend_from_slice(&kv.value.tag().to_le_bytes());
     match &kv.value {
+        GgufValue::Bool(v) => out.push(u8::from(*v)),
         GgufValue::U16(v) => out.extend_from_slice(&v.to_le_bytes()),
         GgufValue::U32(v) => out.extend_from_slice(&v.to_le_bytes()),
         GgufValue::I32(v) => out.extend_from_slice(&v.to_le_bytes()),

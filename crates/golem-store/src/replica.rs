@@ -98,6 +98,9 @@ pub struct ReplicaSlot {
     /// Cleared on the first direct-read failure (H-9 runtime fallback, not a
     /// degrade); the slot then stays buffered + `DONTNEED`.
     direct_ok: AtomicBool,
+    /// Set by [`ReplicaSlot::require_direct`]: a read that cannot go direct
+    /// fails instead of falling back to buffered.
+    direct_only: AtomicBool,
     /// Cleared after the first `DONTNEED` failure so the warn fires once per
     /// slot, not once per read (a per-read warn floods the log).
     warned_dontneed: AtomicBool,
@@ -163,6 +166,19 @@ impl ReplicaSlot {
         self.direct.is_some()
     }
 
+    /// `--o-direct`: from now on every read goes `O_DIRECT` or fails (no
+    /// buffered fallback). Refused when the open-time probe found no handle.
+    pub fn require_direct(&self) -> std::io::Result<()> {
+        if self.direct.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{}: O_DIRECT unavailable", self.path.display()),
+            ));
+        }
+        self.direct_only.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Test-only view: whether a direct handle exists at all.
     #[cfg(test)]
     fn has_direct(&self) -> bool {
@@ -174,36 +190,47 @@ impl ReplicaSlot {
     /// a one-way fallback to buffered + `DONTNEED` — never a degrade. The
     /// buffered fallback never populates the page cache.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        let aligned = offset % DIRECT_ALIGN == 0
-            && buf.len() as u64 % DIRECT_ALIGN == 0
-            && buf.as_ptr() as u64 % DIRECT_ALIGN == 0;
-        if aligned && self.direct_ok() {
-            if let Some(d) = &self.direct {
-                if let Err(e) = d.read_full(offset, buf) {
-                    if self.direct_ok.swap(false, Ordering::Relaxed) {
-                        tracing::warn!(
-                            path = %self.path.display(),
-                            error = %e,
-                            "O_DIRECT replica read failed; slot falls back to buffered + DONTNEED"
-                        );
-                    }
-                } else {
-                    self.served_chunks.fetch_add(1, Ordering::Relaxed);
-                    self.served_direct.fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
+        let aligned = offset.is_multiple_of(DIRECT_ALIGN)
+            && (buf.len() as u64).is_multiple_of(DIRECT_ALIGN)
+            && (buf.as_ptr() as u64).is_multiple_of(DIRECT_ALIGN);
+        let only = self.direct_only.load(Ordering::Relaxed);
+        if only && !aligned {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "O_DIRECT required but the read is not 4 KiB-aligned",
+            ));
+        }
+        if aligned
+            && (only || self.direct_ok())
+            && let Some(d) = &self.direct
+        {
+            if let Err(e) = d.read_full(offset, buf) {
+                if only {
+                    return Err(e);
                 }
+                if self.direct_ok.swap(false, Ordering::Relaxed) {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %e,
+                        "O_DIRECT replica read failed; slot falls back to buffered + DONTNEED"
+                    );
+                }
+            } else {
+                self.served_chunks.fetch_add(1, Ordering::Relaxed);
+                self.served_direct.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
             }
         }
         self.buffered.read_full(offset, buf)?;
         self.served_chunks.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self.buffered.drop_cache(offset, buf.len()) {
-            if self.warned_dontneed.swap(false, Ordering::Relaxed) {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "POSIX_FADV_DONTNEED failed; page-cache pressure only"
-                );
-            }
+        if let Err(e) = self.buffered.drop_cache(offset, buf.len())
+            && self.warned_dontneed.swap(false, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "POSIX_FADV_DONTNEED failed; page-cache pressure only"
+            );
         }
         Ok(())
     }
@@ -275,6 +302,7 @@ impl ReplicaRegistry {
                     direct,
                     buffered: Box::new(file),
                     direct_ok: AtomicBool::new(true),
+                    direct_only: AtomicBool::new(false),
                     warned_dontneed: AtomicBool::new(true),
                     health: AtomicU8::new(ReplicaHealth::Healthy as u8),
                     errors: AtomicU64::new(0),
@@ -393,14 +421,13 @@ pub fn parent_device_name(partition: &str) -> Option<String> {
         return Some(partition.to_owned());
     }
     // nvme/mmcblk namespace partitions carry `p<N>` after a device index.
-    if let Some((head, tail)) = partition.rsplit_once('p') {
-        if !head.is_empty()
-            && !tail.is_empty()
-            && tail.bytes().all(|b| b.is_ascii_digit())
-            && head.bytes().any(|b| b.is_ascii_digit())
-        {
-            return Some(head.to_owned());
-        }
+    if let Some((head, tail)) = partition.rsplit_once('p')
+        && !head.is_empty()
+        && !tail.is_empty()
+        && tail.bytes().all(|b| b.is_ascii_digit())
+        && head.bytes().any(|b| b.is_ascii_digit())
+    {
+        return Some(head.to_owned());
     }
     let base = partition.trim_end_matches(|b: char| b.is_ascii_digit());
     if base.is_empty() || !base.bytes().any(|b| b.is_ascii_alphabetic()) {
@@ -446,6 +473,7 @@ mod tests {
                 bytes: bytes as u64,
                 sha256: "0".repeat(64),
                 replicas: vec![dir.to_path_buf()],
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -514,6 +542,7 @@ mod tests {
             })),
             buffered: FakeReads::buffered().0,
             direct_ok: AtomicBool::new(true),
+            direct_only: AtomicBool::new(false),
             warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
@@ -541,6 +570,7 @@ mod tests {
             direct: None,
             buffered: FakeReads::buffered().0,
             direct_ok: AtomicBool::new(false),
+            direct_only: AtomicBool::new(false),
             warned_dontneed: AtomicBool::new(true),
             health: AtomicU8::new(ReplicaHealth::Healthy as u8),
             errors: AtomicU64::new(0),
@@ -589,6 +619,7 @@ mod tests {
                 bytes: 64,
                 sha256: "0".repeat(64),
                 replicas: vec![shard_dir.clone(), shard_dir.clone()],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -612,6 +643,7 @@ mod tests {
                 bytes: 64,
                 sha256: "0".repeat(64),
                 replicas: vec![shard_dir],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -637,6 +669,7 @@ mod tests {
                 bytes: 64,
                 sha256: "0".repeat(64),
                 replicas: vec![shard_dir],
+                ..Default::default()
             }],
             ..Default::default()
         };

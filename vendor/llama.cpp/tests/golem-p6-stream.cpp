@@ -10,9 +10,13 @@
 //   4. Slab reuse releases: filling seq 2 syncs and calls stream_release(0)
 //      before its copies (the seq-2 contract).
 //   5. Disarming restores the pooled path verbatim.
+//   6. ABI v11 abort: the source returning 1 at plane k fails the compute
+//      with GGML_STATUS_ABORTED and every issued seq is released (lease and
+//      staging counters back to 0).
 #include "golem-hook-context.hpp"
 #include "golem-test-sched.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <signal.h>
@@ -41,6 +45,10 @@ struct SState {
     uint64_t last_seq = 0;
     std::vector<int32_t> last_ids;
     std::vector<uint64_t> released;
+    // Outstanding (sourced, unreleased) seqs: stands in for the engine's
+    // pool leases + staging slots.
+    std::vector<uint64_t> held;
+    int abort_at = -1; // source call index that returns 1
     // Per-expert plane bytes the source hands out: plane p of expert e holds
     // the float pattern (e + 1) * 100 + p.
     std::vector<float> bytes;
@@ -62,10 +70,13 @@ struct SState {
     }
 };
 
-void s_source(void * p, int32_t blk, int32_t kind, uint64_t seq, const int32_t * ids,
+int32_t s_source(void * p, int32_t blk, int32_t kind, uint64_t seq, const int32_t * ids,
               int32_t n, const void ** out) {
     auto * s = (SState *) p;
-    s->source_calls.fetch_add(1);
+    if (s->source_calls.fetch_add(1) == s->abort_at) {
+        return 1;
+    }
+    s->held.push_back(seq);
     s->last_blk = blk;
     s->last_kind = kind;
     s->last_seq = seq;
@@ -73,15 +84,19 @@ void s_source(void * p, int32_t blk, int32_t kind, uint64_t seq, const int32_t *
     for (int32_t i = 0; i < n; ++i) {
         out[i] = s->plane_ptr(kind, ids[i]);
     }
+    return 0;
 }
 
 void s_release(void * p, uint64_t seq) {
     auto * s = (SState *) p;
     s->release_calls.fetch_add(1);
     s->released.push_back(seq);
+    s->held.erase(std::remove_if(s->held.begin(), s->held.end(),
+                                 [seq](uint64_t h) { return h <= seq; }),
+                  s->held.end());
 }
 
-void s_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi,
+int32_t s_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi,
               int32_t n, const void ** out) {
     auto * s = (SState *) p;
     s->ensure_calls.fetch_add(1);
@@ -90,6 +105,7 @@ void s_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi,
     for (int32_t i = 0; i < n; ++i) {
         out[i] = s->plane_ptr(mk[i], mi[i]);
     }
+    return 0;
 }
 
 void s_routing(void *, int32_t, const void *, const int32_t *, int64_t, int32_t) {}
@@ -188,6 +204,38 @@ int main() {
             golem_unregister_hooks(h3);
             golem_reset_device_cache(c3);
             golem_ctx_free(c3);
+        }
+
+        // leg 6: abort at plane k = 2 of 3 (two planes issued first).
+        st.source_calls.store(0);
+        st.released.clear();
+        st.held.clear();
+        st.abort_at = 2;
+        {
+            ExpertSched es6;
+            es6.build(3);
+            golem_ctx_t c6 = golem_ctx_create(golem_test::N_LAYERS, N_EXP);
+            auto * h6 = golem_register_hooks(c6, s_ensure, s_routing, s_copy_done,
+                                             NULL, NULL, s_source, s_release, &st);
+            golem_sched_set_ctx(es6.sched, c6);
+            golem_set_device_cache_experts(c6, 2);
+            golem_set_prefill_stream(c6, 1, N_EXP, 4096, 0.85f);
+            const ggml_status rc = ggml_backend_sched_graph_compute(es6.sched, es6.gf);
+            REQUIRE(rc == GGML_STATUS_ABORTED, "abort must fail the compute (status %d)", (int) rc);
+            REQUIRE(st.source_calls.load() == 3, "planes 0,1 sourced, plane 2 aborted (got %d)",
+                    st.source_calls.load());
+            REQUIRE(st.held.empty(), "leases/staging outstanding after abort: %zu", st.held.size());
+            REQUIRE(!st.released.empty() && st.released.back() == 2,
+                    "release must cover the aborted seq");
+            // The ctx stays usable: the next compute runs to completion.
+            st.abort_at = -1;
+            st.source_calls.store(0);
+            REQUIRE(ggml_backend_sched_graph_compute(es6.sched, es6.gf) == GGML_STATUS_SUCCESS,
+                    "compute after abort");
+            golem_sched_detach_ctx(es6.sched);
+            golem_unregister_hooks(h6);
+            golem_reset_device_cache(c6);
+            golem_ctx_free(c6);
         }
 
         // leg 5: disarmed -> pooled path verbatim.

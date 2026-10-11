@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 golem-gguf = { path = "../golem-gguf" }
+golem-plan = { path = "../golem-plan" }
 golem-llama-sys = { path = "../golem-llama-sys" }
 golem-placement = { path = "../golem-placement" }
 golem-store = { path = "../golem-store" }
@@ -17,11 +18,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2.workspace = true
+sysinfo.workspace = true
 
 [features]
 hip-tests = []
+test-support = []
 
 [dev-dependencies]
+# Integration tests call the `*_for_test` seams.
+golem-engine = { path = ".", features = ["test-support"] }
 xtask = { path = "../../xtask" }
 libc = { workspace = true }
 tracing-subscriber = { workspace = true }

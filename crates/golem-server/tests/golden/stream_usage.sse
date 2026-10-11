@@ -1,0 +1,8 @@
+{"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"ID","model":"tiny-moe","object":"chat.completion.chunk"}
+{"choices":[{"delta":{"content":"\r"},"finish_reason":null,"index":0}],"created":0,"id":"ID","model":"tiny-moe","object":"chat.completion.chunk"}
+{"choices":[{"delta":{"content":"�"},"finish_reason":null,"index":0}],"created":0,"id":"ID","model":"tiny-moe","object":"chat.completion.chunk"}
+{"choices":[{"delta":{"content":"�"},"finish_reason":null,"index":0}],"created":0,"id":"ID","model":"tiny-moe","object":"chat.completion.chunk"}
+{"choices":[{"delta":{"content":"�"},"finish_reason":null,"index":0}],"created":0,"id":"ID","model":"tiny-moe","object":"chat.completion.chunk"}
+{"choices":[{"delta":{},"finish_reason":"length","index":0}],"created":0,"id":"ID","model":"tiny-moe","object":"chat.completion.chunk"}
+{"choices":[],"created":0,"id":"ID","model":"tiny-moe","object":"chat.completion.chunk","usage":{"completion_tokens":4,"prompt_tokens":56,"total_tokens":60}}
+[DONE]

@@ -2211,6 +2211,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 golem_miss_kinds.clear();
                 golem_miss_ids.clear();
                 golem_evicts.clear();
+                bool golem_slab_failed = false;
                 for (int j = input_id; j < split->n_inputs; ++j) {
                     struct ggml_tensor * inp = split->inputs[j];
                     const int kind = golem_expert_stem_kind(inp->name);
@@ -2327,15 +2328,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 st.slab = ggml_new_tensor_3d(st.ctx, inp->type,
                                     inp->ne[0], inp->ne[1], (int64_t) K + 1);
                                 GGML_ASSERT(st.slab != nullptr);
-                                st.buf = ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
-                                GGML_ASSERT(st.buf != nullptr);
-                                GGML_ASSERT(st.slab->nb[2] == expert_size_j);
-                                ggml_backend_buffer_clear(st.buf, 0);
-                                st.K = K;
-                                st.expert_size = expert_size_j;
-                                // The slab's device bytes are gone: this plane must
-                                // re-copy everything on its next step.
-                                golem::golem_layer_invalidate(L, kind - 1);
+                                // ABI v12: a slab that no longer fits (VRAM taken
+                                // after load) fails the compute, never the process;
+                                // the engine resets the cache and lowers K.
+                                const bool inject = gctx->slab_fail_inject.load(std::memory_order_relaxed) > 0 &&
+                                                    gctx->slab_fail_inject.fetch_sub(1, std::memory_order_relaxed) > 0;
+                                st.buf = inject ? nullptr : ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
+                                if (st.buf == nullptr) {
+                                    ggml_free(st.ctx);
+                                    st.ctx = nullptr;
+                                    st.slab = nullptr;
+                                    st.K = 0;
+                                    golem::golem_layer_invalidate(L, kind - 1);
+                                    gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+                                    golem_slab_failed = true;
+                                } else {
+                                    GGML_ASSERT(st.slab->nb[2] == expert_size_j);
+                                    ggml_backend_buffer_clear(st.buf, 0);
+                                    st.K = K;
+                                    st.expert_size = expert_size_j;
+                                    // The slab's device bytes are gone: this plane must
+                                    // re-copy everything on its next step.
+                                    golem::golem_layer_invalidate(L, kind - 1);
+                                }
+                            }
+                            if (golem_slab_failed) {
+                                break;
                             }
                             // Remapped-ids device tensor: resized on ids-shape
                             // change (slot validity is independent of it).
@@ -2359,7 +2377,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     node2->src[2]->ne[0], node2->src[2]->ne[1]);
                                 GGML_ASSERT(st.ids_dev != nullptr);
                                 st.ids_buf = ggml_backend_alloc_ctx_tensors(st.ids_ctx, split_backend);
-                                GGML_ASSERT(st.ids_buf != nullptr);
+                                if (st.ids_buf == nullptr) {
+                                    // Same ABI v12 path as the slab: fail the compute.
+                                    ggml_free(st.ids_ctx);
+                                    st.ids_ctx = nullptr;
+                                    st.ids_dev = nullptr;
+                                    st.ids_ne0 = st.ids_ne1 = 0;
+                                    gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+                                    golem_slab_failed = true;
+                                    break;
+                                }
                                 st.ids_ne0 = node2->src[2]->ne[0];
                                 st.ids_ne1 = node2->src[2]->ne[1];
                                 // Pinned staging for the H2D below: (re)allocated
@@ -2404,6 +2431,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             golem_miss_ids.push_back(id3);
                         }
                     }
+                }
+                if (golem_slab_failed) {
+                    // Nothing of this layer was issued yet; drain what
+                    // earlier layers queued, then fail the compute
+                    // (llama_decode -2). The slot tables already stepped
+                    // are stale until the engine resets the cache.
+                    golem_restore_ids();
+                    for (int i = 0; i < sched->n_backends; i++) {
+                        ggml_backend_synchronize(sched->backends[i]);
+                    }
+                    if (!golem_evict_d2h.empty()) {
+                        golem_evict_abandon_unfinished();
+                    }
+                    golem_in_flight_done(gctx);
+                    return GGML_STATUS_ALLOC_FAILED;
                 }
                 // Exclusive residency (O10): hand the layer's fully-valid
                 // evictions to the pool in ONE batched call — it returns D2H
@@ -2456,10 +2498,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (!golem_miss_ids.empty()) {
                     golem_miss_out.resize(golem_miss_ids.size());
                     std::fill(golem_miss_out.begin(), golem_miss_out.end(), nullptr);
+                    int32_t ensure_rc = 0;
                     {
                         golem_cb_guard cb;
-                        gctx->ensure(gctx->payload, input, golem_miss_kinds.data(), golem_miss_ids.data(),
-                                     (int32_t) golem_miss_ids.size(), golem_miss_out.data());
+                        ensure_rc = gctx->ensure(gctx->payload, input, golem_miss_kinds.data(), golem_miss_ids.data(),
+                                                 (int32_t) golem_miss_ids.size(), golem_miss_out.data());
+                    }
+                    if (ensure_rc != 0) {
+                        // ABI v13: the misses could not be paged in; drain
+                        // what earlier layers queued and fail the compute.
+                        golem_restore_ids();
+                        for (int i = 0; i < sched->n_backends; i++) {
+                            ggml_backend_synchronize(sched->backends[i]);
+                        }
+                        if (!golem_evict_d2h.empty()) {
+                            golem_evict_abandon_unfinished();
+                        }
+                        golem_in_flight_done(gctx);
+                        return GGML_STATUS_FAILED;
                     }
                     for (size_t i5 = 0; i5 < golem_miss_out.size(); ++i5) {
                         GGML_ASSERT(golem_miss_out[i5] != NULL);
@@ -2654,12 +2710,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             golem_stream_ids = plan.routed; // sorted copy
                         }
                         golem_stream_ptrs.assign(golem_stream_ids.size(), nullptr);
+                        int32_t src_rc;
                         {
                             golem_cb_guard cb;
-                            gctx->stream_source(gctx->payload, blk_s, kind_s, seq,
+                            src_rc = gctx->stream_source(gctx->payload, blk_s, kind_s, seq,
                                                 golem_stream_ids.data(),
                                                 (int32_t) golem_stream_ids.size(),
                                                 golem_stream_ptrs.data());
+                        }
+                        if (src_rc != 0) {
+                            // ABI v11 abort: drain this split's issued H2D,
+                            // hand back every issued seq (leases + staging),
+                            // and fail the compute; the graph never runs.
+                            golem_restore_ids();
+                            for (int i = 0; i < sched->n_backends; i++) {
+                                ggml_backend_synchronize(sched->backends[i]);
+                            }
+                            if (gctx->stream_release != NULL) {
+                                golem_cb_guard cb;
+                                gctx->stream_release(gctx->payload, seq);
+                            }
+                            gctx->stream_used_in_split[0] = false;
+                            gctx->stream_used_in_split[1] = false;
+                            if (!golem_evict_d2h.empty()) {
+                                golem_evict_abandon_unfinished();
+                            }
+                            golem_in_flight_done(gctx);
+                            return GGML_STATUS_ABORTED;
                         }
                         for (size_t i6 = 0; i6 < golem_stream_ptrs.size(); ++i6) {
                             GGML_ASSERT(golem_stream_ptrs[i6] != NULL);
@@ -3823,6 +3900,16 @@ int golem_policy_order_push(golem_ctx_t ctx, int32_t blk, int32_t kind,
 void golem_policy_order_epoch_advance(golem_ctx_t ctx) {
     if (ctx != NULL) {
         ctx->epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+uint64_t golem_slab_alloc_failures(golem_ctx_t ctx) {
+    return ctx == NULL ? 0 : ctx->slab_alloc_failures.load(std::memory_order_relaxed);
+}
+
+void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n) {
+    if (ctx != NULL) {
+        ctx->slab_fail_inject.store(n, std::memory_order_relaxed);
     }
 }
 

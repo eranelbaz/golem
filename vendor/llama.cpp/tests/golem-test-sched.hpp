@@ -59,7 +59,7 @@ inline void pool_init() {
 inline std::atomic<int> & join_sleep_ms() { static std::atomic<int> ms{0}; return ms; }
 inline golem_hook_handle_t & abort_handle() { static golem_hook_handle_t h = nullptr; return h; }
 
-inline void h_ensure(void * p, const void * tensor, const int32_t * mk, const int32_t * mi,
+inline int32_t h_ensure(void * p, const void * tensor, const int32_t * mk, const int32_t * mi,
                      int32_t n, const void ** out) {
     auto * s = (HState *) p;
     s->ensure_calls.fetch_add(1);
@@ -77,11 +77,13 @@ inline void h_ensure(void * p, const void * tensor, const int32_t * mk, const in
     (void) tensor;
     std::this_thread::sleep_for(std::chrono::milliseconds(join_sleep_ms().load()));
     s->cb_returned.store(true);
+    return 0;
 }
 
-inline void h_abort_ensure(void *, const void *, const int32_t *, const int32_t *,
+inline int32_t h_abort_ensure(void *, const void *, const int32_t *, const int32_t *,
                            int32_t, const void **) {
     golem_unregister_hooks(abort_handle()); // must GGML_ABORT (join waits for the calling step)
+    return 0;
 }
 
 inline void h_routing(void * p, int32_t blk, const void * tensor, const int32_t * dense,

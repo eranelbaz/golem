@@ -116,6 +116,10 @@ pub struct ChunkQueue {
     /// An explicit override wins over the derived per-drive count (D-12
     /// bounds the default at 1–2 per drive; the operator's flag does not).
     io_threads: usize,
+    /// Derived reader threads per drive (D-12: 1–2); 0 behaves as 1.
+    io_depth: usize,
+    /// R-15: CPUs each drain reader pins itself to at spawn.
+    io_cpuset: Option<crate::sys::CpuSet>,
     /// Cumulative disk time (ns) and bytes served by this queue's drains
     /// (§11 timing): per-chunk atomics on the slow path are acceptable; the
     /// timing consumer takes (swap-to-zero) snapshots per decode step.
@@ -131,15 +135,26 @@ pub struct ChunkQueue {
 
 impl ChunkQueue {
     /// New queue; `io_threads` caps the drain's reader threads (0 = derive
-    /// one per physical drive hosting an eligible replica, §5.2/D-12).
-    pub fn new(io_threads: usize) -> Self {
+    /// one per physical drive hosting an eligible replica, §5.2/D-12);
+    /// `io_cpuset` pins every reader thread (R-15, off the V-cache CCD).
+    pub fn new(io_threads: usize, io_cpuset: Option<crate::sys::CpuSet>) -> Self {
         Self {
             inner: Mutex::new(QueueInner::default()),
             io_threads,
+            io_depth: 1,
+            io_cpuset,
             disk_ns: AtomicU64::new(0),
             disk_bytes: AtomicU64::new(0),
             degraded_reads: AtomicU64::new(0),
         }
+    }
+
+    /// Derived reader threads per drive (`--io-depth`, D-12); an explicit
+    /// `io_threads` still wins.
+    #[must_use]
+    pub fn with_io_depth(mut self, depth: usize) -> Self {
+        self.io_depth = depth.max(1);
+        self
     }
 
     /// Cumulative in-drain replica degradation events (§5.2): snapshot
@@ -683,7 +698,7 @@ fn drain_reads(
     let workers = (if queue.io_threads > 0 {
         queue.io_threads
     } else {
-        drives.max(1)
+        drives.max(1) * queue.io_depth
     })
     .min(list.len().max(1));
 
@@ -697,6 +712,11 @@ fn drain_reads(
             // more chunks.
             let home = if drives == 0 { 0 } else { w % drives };
             s.spawn(move || {
+                if let Some(set) = &queue.io_cpuset
+                    && let Err(e) = crate::sys::pin_current_thread(set)
+                {
+                    tracing::warn!("io thread pinning: {e}");
+                }
                 loop {
                     // Pop a job (any drive's thread may serve it — the slice
                     // travels with the job), or exit when everything settled.
@@ -904,6 +924,7 @@ mod tests {
                 bytes: SHARD_BYTES as u64,
                 sha256: "0".repeat(64),
                 replicas,
+                ..Default::default()
             });
         }
         let manifest = crate::manifest::ModelManifest {
@@ -931,6 +952,7 @@ mod tests {
                 bytes: SHARD_BYTES as u64,
                 sha256: "0".repeat(64),
                 replicas: replicas.clone(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -990,24 +1012,24 @@ mod tests {
             if let Some(flag) = &self.wait_for_pair {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-                    if let Some(c) = &self.conc {
-                        if c.active.load(Ordering::SeqCst) >= 2 {
-                            flag.store(true, Ordering::SeqCst);
-                            break;
-                        }
+                    if let Some(c) = &self.conc
+                        && c.active.load(Ordering::SeqCst) >= 2
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
-            if let Some(g) = &self.gate {
-                if let Some(w) = g.wait_until {
-                    while g.done.load(Ordering::SeqCst) < w {
-                        assert!(
-                            start.elapsed() < std::time::Duration::from_secs(30),
-                            "gate deadline exceeded: fast replica stalled"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
+            if let Some(g) = &self.gate
+                && let Some(w) = g.wait_until
+            {
+                while g.done.load(Ordering::SeqCst) < w {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(30),
+                        "gate deadline exceeded: fast replica stalled"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
             // usize::MAX = always fail (never decremented).
@@ -1018,10 +1040,10 @@ mod tests {
             }
             self.fail_nth.fetch_sub(1, Ordering::SeqCst);
             self.inner.read_at(offset, buf)?;
-            if let Some(g) = &self.gate {
-                if g.bump {
-                    g.done.fetch_add(1, Ordering::SeqCst);
-                }
+            if let Some(g) = &self.gate
+                && g.bump
+            {
+                g.done.fetch_add(1, Ordering::SeqCst);
             }
             Ok(())
         }
@@ -1150,7 +1172,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(0));
+        let queue = Arc::new(ChunkQueue::new(0, None));
         // Aligned covering regions (§5.4): both spans cover 0..4096; the
         // logical windows sit at the head-scratch offsets (0 and 1024).
         let mut d0 = vec![0u8; 4096];
@@ -1196,7 +1218,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(0));
+        let queue = Arc::new(ChunkQueue::new(0, None));
         let mut good = vec![0u8; 4096];
         let mut bad = vec![0u8; 4096];
         let mut batch = queue.batch();
@@ -1248,7 +1270,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(0));
+        let queue = Arc::new(ChunkQueue::new(0, None));
         let mut dead = vec![0u8; 4096];
         let mut bad = vec![0u8; 4096];
         let mut batch = queue.batch();
@@ -1315,7 +1337,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let mut dst = vec![0u8; SHARD_BYTES];
         read_whole(&queue, &sources, &mut dst).wait().unwrap();
         assert_eq!(dst, pattern(0, SHARD_BYTES));
@@ -1357,7 +1379,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let plan = plan_aligned(0, SHARD_BYTES);
         let mut demand_dst = vec![0u8; SHARD_BYTES];
         let mut prefetch_dst = vec![0u8; SHARD_BYTES];
@@ -1411,6 +1433,7 @@ mod tests {
                 bytes: bytes as u64,
                 sha256: "0".repeat(64),
                 replicas,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1429,7 +1452,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(0)); // 0 = derived, one worker per drive
+        let queue = Arc::new(ChunkQueue::new(0, None)); // 0 = derived, one worker per drive
         let mut dst = vec![0u8; bytes];
         queue
             .enqueue(ReadJob {
@@ -1479,6 +1502,7 @@ mod tests {
                 bytes: bytes as u64,
                 sha256: "0".repeat(64),
                 replicas,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1506,7 +1530,7 @@ mod tests {
             gates: vec![Some(fast_gate), Some(gate)],
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(0)); // derived: one worker per drive
+        let queue = Arc::new(ChunkQueue::new(0, None)); // derived: one worker per drive
         let mut dst = vec![0u8; bytes];
         queue
             .enqueue(ReadJob {
@@ -1555,7 +1579,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let covering = plan_aligned(0, SHARD_BYTES)
             .iter()
             .map(|c| c.1)
@@ -1591,6 +1615,7 @@ mod tests {
                 bytes: bytes as u64,
                 sha256: "0".repeat(64),
                 replicas,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1609,7 +1634,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: Some(Arc::clone(&pair)),
         };
-        let queue = Arc::new(ChunkQueue::new(4));
+        let queue = Arc::new(ChunkQueue::new(4, None));
         let mut dst = vec![0u8; bytes];
         queue
             .enqueue(ReadJob {
@@ -1655,7 +1680,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let mut dst_a = vec![0u8; SHARD_BYTES];
         let mut dst_b = vec![0u8; SHARD_BYTES];
         let a = read_whole(&queue, &sources, &mut dst_a);
@@ -1698,7 +1723,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let mut short = vec![0u8; SHARD_BYTES - 1];
         let handle = read_whole(&queue, &sources, &mut short);
         let err = handle.wait().unwrap_err();
@@ -1723,7 +1748,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let chunks = plan_aligned(0, SHARD_BYTES).len();
         let mut dst_a = vec![0u8; SHARD_BYTES];
         let mut dst_b = vec![0u8; SHARD_BYTES];
@@ -1757,6 +1782,7 @@ mod tests {
                 bytes: bytes as u64,
                 sha256: "0".repeat(64),
                 replicas,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1773,7 +1799,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let mut dst = vec![0u8; SHARD_BYTES];
         let err = read_whole(&queue, &sources, &mut dst).wait().unwrap_err();
         assert!(matches!(err, StoreError::Invalid { .. }), "got {err:?}");
@@ -1799,7 +1825,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         let mut dst = vec![0u8; SHARD_BYTES];
         let result = read_whole(&queue, &sources, &mut dst).wait();
         match result {
@@ -1828,7 +1854,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(4));
+        let queue = Arc::new(ChunkQueue::new(4, None));
         let mut dst = vec![0u8; SHARD_BYTES];
         read_whole(&queue, &sources, &mut dst).wait().unwrap();
         assert_eq!(dst, pattern(0, SHARD_BYTES));
@@ -1856,7 +1882,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(1));
+        let queue = Arc::new(ChunkQueue::new(1, None));
         // Read [512, 512+2048): covering region is [0, 4096).
         let covering = plan_aligned(512, 2048).iter().map(|c| c.1).sum::<usize>();
         assert_eq!(covering, 4096);
@@ -1899,7 +1925,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(2));
+        let queue = Arc::new(ChunkQueue::new(2, None));
         let mut dst = vec![0u8; SHARD_BYTES];
         let result = read_whole(&queue, &sources, &mut dst).wait();
         match result {
@@ -1934,7 +1960,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         });
-        let queue = Arc::new(ChunkQueue::new(4));
+        let queue = Arc::new(ChunkQueue::new(4, None));
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         const THREADS: usize = 4;
         const READS: usize = 16;

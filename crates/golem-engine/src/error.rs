@@ -27,12 +27,26 @@ pub enum EngineError {
     /// llama_chat_apply_template returned a negative code.
     #[error("llama_chat_apply_template failed with code {0}")]
     TemplateApply(i32),
+    /// The chat layer (common/chat.h shim) rejected a render or parse.
+    #[error("chat template: {0}")]
+    ChatTemplate(String),
     /// llama_tokenize returned a negative code.
     #[error("llama_tokenize failed with code {0}")]
     Tokenize(i32),
     /// llama_decode returned nonzero (positive: no KV slot / aborted; negative: fatal).
     #[error("llama_decode failed with code {0}")]
     Decode(i32),
+    /// Prompt does not fit the per-sequence context (`llama_n_ctx_seq`).
+    #[error("prompt is {prompt} tokens; context holds {n_ctx}")]
+    ContextOverflow {
+        /// Prompt length in tokens.
+        prompt: u32,
+        /// `llama_n_ctx_seq` of the live context.
+        n_ctx: u32,
+    },
+    /// llama_sampler_chain_init returned null.
+    #[error("llama_sampler_chain_init returned null")]
+    SamplerInit,
     /// llama_get_logits_ith returned null after a successful decode — the
     /// substrate broke the logits-output FFI contract.
     #[error("llama_get_logits_ith returned null after a successful decode")]
@@ -53,6 +67,18 @@ pub enum EngineError {
     /// `golem_backend_unavailable`): refused rather than a silent CPU fallback.
     #[error("GPU backend unavailable for expert math: {0}")]
     BackendUnavailable(String),
+    /// The §10 memory model refuses the configuration at load (§6.4).
+    #[error("golem_plan_infeasible: {}", .0.violation().unwrap_or_default())]
+    PlanInfeasible(Box<golem_plan::PlanReport>),
+    /// A device-cache slab allocation failed after load (`llama_decode`
+    /// −2): the turn fails, the cache is reset and shrunk to the carried K,
+    /// and the session keeps serving degraded.
+    #[error("device expert cache allocation failed; shrunk to K = {0} experts per layer")]
+    DeviceCacheDegraded(u32),
+    /// Every replica of a model shard is unreadable (§5.2 fatal I/O): the
+    /// page-in failed mid-decode; no later decode can succeed.
+    #[error("every replica of a model shard is unreadable")]
+    StorageUnavailable,
 }
 
 #[cfg(test)]

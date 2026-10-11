@@ -238,7 +238,7 @@ pub fn ggml_type_block(ggml_type: u32) -> Option<(u64, u64)> {
 #[must_use]
 pub fn ggml_row_bytes(ggml_type: u32, ne0: u64) -> Option<u64> {
     let (blck, size) = ggml_type_block(ggml_type)?;
-    if ne0 % blck != 0 {
+    if !ne0.is_multiple_of(blck) {
         return None;
     }
     (ne0 / blck).checked_mul(size)
@@ -304,10 +304,10 @@ impl ExpertKind {
         }
         let base = name.strip_suffix(".weight").unwrap_or(name);
         for kind in Self::ALL {
-            if let Some(prefix) = base.strip_suffix(kind.stem()) {
-                if prefix.is_empty() || prefix.ends_with('.') {
-                    return Some(kind);
-                }
+            if let Some(prefix) = base.strip_suffix(kind.stem())
+                && (prefix.is_empty() || prefix.ends_with('.'))
+            {
+                return Some(kind);
             }
         }
         None
@@ -353,17 +353,16 @@ fn walk_kvs(r: &mut (impl Read + Seek), n_kv: u64) -> Result<(u64, Vec<(String, 
             out.push((key, KvVal::Int(a)));
             continue;
         }
+        if let Some(v) = read_int(r, tag)? {
+            out.push((key, KvVal::Int(v)));
+            continue;
+        }
         let val = match tag {
-            TYPE_U8 => KvVal::Int(u64::from(read_u8(r)?)),
-            TYPE_I8 => KvVal::Int(read_u8(r)? as i8 as u64),
-            TYPE_U16 => KvVal::Int(u64::from(read_u16(r)?)),
-            TYPE_I16 => KvVal::Int(read_u16(r)? as i16 as i64 as u64),
-            TYPE_U32 => KvVal::Int(u64::from(read_u32(r)?)),
-            TYPE_I32 => KvVal::Int(read_u32(r)? as i32 as i64 as u64),
-            TYPE_U64 => KvVal::Int(read_u64(r)?),
-            TYPE_I64 => KvVal::Int(read_u64(r)? as i64 as u64),
-            TYPE_BOOL => KvVal::Int(u64::from(read_u8(r)? != 0)),
             TYPE_STR => KvVal::Str(read_string(r)?),
+            TYPE_ARRAY => match read_int_array(r)? {
+                Some(v) => KvVal::IntArr(v),
+                None => continue,
+            },
             _ => {
                 skip_value(r, tag)?;
                 continue;
@@ -372,6 +371,55 @@ fn walk_kvs(r: &mut (impl Read + Seek), n_kv: u64) -> Result<(u64, Vec<(String, 
         out.push((key, val));
     }
     Ok((alignment, out))
+}
+
+/// Reads one integer-like value of type `tag`, widened; `None` (nothing
+/// consumed) for non-integer tags.
+fn read_int(r: &mut impl Read, tag: u32) -> Result<Option<u64>, Error> {
+    Ok(Some(match tag {
+        TYPE_U8 => u64::from(read_u8(r)?),
+        TYPE_I8 => read_u8(r)? as i8 as u64,
+        TYPE_U16 => u64::from(read_u16(r)?),
+        TYPE_I16 => read_u16(r)? as i16 as i64 as u64,
+        TYPE_U32 => u64::from(read_u32(r)?),
+        TYPE_I32 => read_u32(r)? as i32 as i64 as u64,
+        TYPE_U64 => read_u64(r)?,
+        TYPE_I64 => read_u64(r)? as i64 as u64,
+        TYPE_BOOL => u64::from(read_u8(r)? != 0),
+        _ => return Ok(None),
+    }))
+}
+
+/// Reads an array payload (after its `TYPE_ARRAY` tag): integer elements
+/// widened like scalars; any other element type is skipped (`None`).
+fn read_int_array(r: &mut impl Read) -> Result<Option<Vec<u64>>, Error> {
+    let elem = read_u32(r)?;
+    if elem == TYPE_ARRAY {
+        return Err(Error::Invalid(
+            "nested GGUF arrays are not supported".into(),
+        ));
+    }
+    let n = read_u64(r)?;
+    let mut out = Vec::new();
+    for _ in 0..n {
+        match read_int(r, elem)? {
+            Some(v) => out.push(v),
+            None => skip_value(r, elem)?,
+        }
+    }
+    Ok((out.len() as u64 == n).then_some(out))
+}
+
+/// Looks up an arch-prefixed integer-or-array KV, expanded to `n` per-layer
+/// values (a scalar applies to every layer, as llama.cpp's `get_key_or_arr`).
+pub fn arch_kv_per_layer(kvs: &[(String, KvVal)], suffix: &str, n: usize) -> Option<Vec<u64>> {
+    let arch = kv_str(kvs, "general.architecture")?;
+    let key = format!("{arch}.{suffix}");
+    match &kvs.iter().find(|(k, _)| *k == key)?.1 {
+        KvVal::Int(v) => Some(vec![*v; n]),
+        KvVal::IntArr(v) if v.len() >= n => Some(v[..n].to_vec()),
+        _ => None,
+    }
 }
 
 /// Reads the tensor-table rows following the KV block.
@@ -410,6 +458,9 @@ pub enum KvVal {
     Int(u64),
     /// A string value.
     Str(String),
+    /// An integer array, widened (per-layer hparams such as
+    /// `attention.head_count_kv`).
+    IntArr(Vec<u64>),
 }
 
 /// Reads the KV block as `(key, value)` pairs for the integer/string values
@@ -593,6 +644,27 @@ mod tests {
             ExpertKind::from_tensor_name("blk.0.ffn_gate_up_exps.weight"),
             None
         );
+    }
+
+    #[test]
+    fn int_arrays_widen_and_expand_per_layer() {
+        // array<i32, [0, 1]>, then array<f32, [1.0]> (skipped).
+        let mut b = TYPE_I32.to_le_bytes().to_vec();
+        b.extend(2u64.to_le_bytes());
+        b.extend(0i32.to_le_bytes());
+        b.extend(1i32.to_le_bytes());
+        assert_eq!(read_int_array(&mut &b[..]).unwrap(), Some(vec![0, 1]));
+        let mut f = TYPE_F32.to_le_bytes().to_vec();
+        f.extend(1u64.to_le_bytes());
+        f.extend(1f32.to_le_bytes());
+        assert_eq!(read_int_array(&mut &f[..]).unwrap(), None);
+
+        let arch = ("general.architecture".to_owned(), KvVal::Str("a".into()));
+        let kvs = [arch.clone(), ("a.h".into(), KvVal::IntArr(vec![0, 1, 2]))];
+        assert_eq!(arch_kv_per_layer(&kvs, "h", 2), Some(vec![0, 1]));
+        assert_eq!(arch_kv_per_layer(&kvs, "h", 4), None);
+        let kvs = [arch, ("a.h".into(), KvVal::Int(7))];
+        assert_eq!(arch_kv_per_layer(&kvs, "h", 2), Some(vec![7, 7]));
     }
 
     #[test]

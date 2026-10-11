@@ -1,22 +1,26 @@
 //! Model + context lifecycle (tech design §7): backend init, load with
 //! fail-fast sanity checks, RAII teardown, the §4.3 decode self-check probe,
 //! chat-template resolution (model metadata, else the chatml fallback), and
-//! the single-slot greedy decode loop (`Session::chat_turn`).
+//! the per-turn entry points (`Session::turn`, driving `slot::step`).
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 
 use golem_llama_sys::raw;
 use golem_llama_sys::{Backend, substrate_backend};
 use golem_placement::pool::P3Stats;
 
+use crate::chat::{ChatTemplates, Rendered};
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::gguf;
 use crate::p3_glue;
 use crate::parity::{self, ParityStep};
 use crate::sanity;
+use crate::slot::{self, FinishReason, SamplingParams, SlotState, TurnOutcome, TurnRequest};
+use crate::snapshot::{SnapshotCache, SnapshotStats};
 
 /// Owned `llama_model` handle; `Drop` calls `llama_model_free`.
 pub(crate) struct Model {
@@ -236,7 +240,13 @@ pub(crate) fn load_with_hooks(
     };
     // SAFETY: returns llama.cpp's default context params by value.
     let mut params = unsafe { raw::llama_context_default_params() };
-    params.n_ctx = config.n_ctx;
+    // One seq per slot. llama.cpp splits n_ctx across sequences
+    // (n_ctx_seq = n_ctx / n_seq_max, llama-context.cpp), so each slot gets
+    // the full configured window only at n_ctx × parallel; per-seq KV
+    // (kv_unified = false) keeps one slot's cache from starving another.
+    params.n_ctx = config.n_ctx.saturating_mul(config.parallel.max(1));
+    params.n_seq_max = config.parallel.max(1);
+    params.kv_unified = false;
     params.n_batch = n_batch.max(n_ubatch);
     params.n_ubatch = n_ubatch;
     params.n_threads = config.threads as i32;
@@ -440,14 +450,6 @@ fn argmax_of(logits: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Chatml template copied from the `llm_chat_apply_template` CHATML branch of
-/// `vendor/llama.cpp/src/llama-chat.cpp` (the `ss <<` sequence rendered as the
-/// canonical jinja-style string; same literal as the vendor's own
-/// test-chat-template.cpp chatml case). llama.cpp detects chatml by the
-/// `<|im_start|>` substring and renders from its hardcoded branch, so this
-/// string is a detection key, never a parsed template.
-pub(crate) const FALLBACK_CHAT_TEMPLATE: &str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
-
 /// One message of a chat conversation.
 pub struct ChatTurn<'a> {
     /// Speaker role the chat template understands (`"system"`, `"user"`,
@@ -457,38 +459,76 @@ pub struct ChatTurn<'a> {
     pub content: &'a str,
 }
 
-/// CString pair backing one `raw::llama_chat_message` for the duration of a
-/// template-apply call.
-struct ChatMessageFFI {
-    role: CString,
-    content: CString,
+/// Builds the session's chat templates and validates them with a 1-message
+/// probe render; also returns the default template source.
+fn probe_templates(
+    loaded: &LoadedModel,
+    config: &EngineConfig,
+) -> Result<(ChatTemplates, String), EngineError> {
+    let over = config.chat_template.as_deref();
+    let chat = ChatTemplates::from_model(loaded.model().as_ptr(), over)?;
+    let probe = chat.render(
+        r#"[{"role":"user","content":"ping"}]"#,
+        None,
+        None,
+        false,
+        None,
+    )?;
+    if probe.prompt.is_empty() {
+        return Err(EngineError::TemplateUnavailable);
+    }
+    let src = over.map(str::to_owned);
+    Ok((
+        chat,
+        src.or_else(|| loaded.model().chat_template())
+            .unwrap_or_default(),
+    ))
 }
 
-fn ffi_messages(messages: &[ChatTurn<'_>]) -> Result<Vec<ChatMessageFFI>, EngineError> {
-    messages
-        .iter()
-        .map(|m| {
-            Ok(ChatMessageFFI {
-                role: CString::new(m.role).map_err(|_| {
-                    EngineError::InvalidModel("chat message role contains NUL".into())
-                })?,
-                content: CString::new(m.content).map_err(|_| {
-                    EngineError::InvalidModel("chat message content contains NUL".into())
-                })?,
-            })
-        })
-        .collect()
+/// Renders `req`'s transcript (raw JSON, else its `ChatTurn`s) and tools.
+fn render(chat: &ChatTemplates, req: &TurnRequest<'_>) -> Result<Rendered, EngineError> {
+    let built;
+    let messages = match req.messages_json {
+        Some(m) => m,
+        None => {
+            built = serde_json::Value::Array(
+                req.messages
+                    .iter()
+                    .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                    .collect(),
+            )
+            .to_string();
+            &built
+        }
+    };
+    chat.render(
+        messages,
+        req.tools_json,
+        req.tool_choice,
+        req.reasoning_inline,
+        req.reasoning_effort,
+    )
 }
 
-/// A loaded model bound to its resolved chat template, driving one decode slot
-/// (stateless per turn — every `chat_turn` re-prefills the full transcript).
-/// Field order is load-bearing: `loaded` (llama_free) drops BEFORE `p3`
-/// (unregister already done in `Drop`; ctx free + pool drop here) — the
-/// §3.4 teardown order.
+/// A loaded model bound to its resolved chat template, driving its decode
+/// slots; a turn restores the previous prompt's state snapshot when enabled
+/// (§7.1), else re-prefills the full transcript.
+/// Field order is load-bearing: `slots` (sampler chains) drop BEFORE the
+/// llama ctx inside `inner`.
 pub struct Session {
+    slots: Vec<SlotState>,
+    inner: SessionInner,
+}
+
+/// Everything but the slots. Field order is load-bearing: `loaded`
+/// (llama_free) drops BEFORE `p3` (unregister already done in
+/// `Session::drop`; ctx free + pool drop here) — the §3.4 teardown order.
+pub(crate) struct SessionInner {
     loaded: LoadedModel,
     config: EngineConfig,
-    template: CString,
+    chat: ChatTemplates,
+    /// Default template source (reasoning-marker detection).
+    template: String,
     last_prompt_tokens: Vec<raw::llama_token>,
     /// P3 pool state when the RAM expert pool is enabled (nonzero
     /// `ram_experts_gib`); `None` keeps flagless runs pristine (hooks unset,
@@ -505,6 +545,27 @@ pub struct Session {
     /// [`check_experts_on_gpu`] and [`check_pool_engaged`] and its first
     /// decode step passed [`check_experts_on_gpu`].
     pool_verified: bool,
+    /// Prompt-prefill state snapshots (§7.1); `None` when disabled.
+    snapshots: Option<SnapshotCache>,
+    /// Test seam: the turn's cancel flag is set after this many prefill
+    /// chunks decoded (0 = off).
+    pub(crate) test_cancel_after_chunks: u32,
+    /// The one `llama_batch` every step fills (capacity `llama_n_batch`),
+    /// allocated at load: no per-turn or per-step batch allocation.
+    batch: Batch,
+    batch_cap: usize,
+    /// Aggregate cancel read by the context's abort callback (registered
+    /// once at construction, cleared in `Session::drop`).
+    pub(crate) abort: Arc<AbortSet>,
+    /// Round-robin start slot for the next step (fairness across slots).
+    pub(crate) rr: usize,
+    /// Decode steps since the last streamed chunk (`slot::STREAM_EVERY`).
+    pub(crate) decode_since_stream: u32,
+    /// K of the last batched slab degradation, until the scheduler reports it.
+    pub(crate) degraded: Option<u32>,
+    /// Test seam: the n-th generation step (1-based, counted from when it is
+    /// set) fails with `Decode(1)` before reaching `llama_decode` (0 = off).
+    test_fail_gen_step: u32,
 }
 
 impl Drop for Session {
@@ -514,14 +575,17 @@ impl Drop for Session {
         // ctx attach refcount) → `golem_ctx_free` (inside SessionHooks::drop,
         // aborts while the refcount ≠ 0) → pool/prefetch drop. `p3` is
         // declared after `loaded`, so its drop runs after `llama_free`.
-        if let Some(_p3) = self.p3.as_ref() {
+        if let Some(_p3) = self.inner.p3.as_ref() {
             // SAFETY: the model is live until `loaded` drops below; NULL
             // detaches so no later context can reach the freed ctx.
             unsafe {
-                raw::llama_golem_model_attach(self.loaded.model().as_ptr(), std::ptr::null_mut())
+                raw::llama_golem_model_attach(
+                    self.inner.loaded.model().as_ptr(),
+                    std::ptr::null_mut(),
+                )
             };
         }
-        if let Some(p3) = self.p3.as_mut() {
+        if let Some(p3) = self.inner.p3.as_mut() {
             // Reclaim the device slab set while the substrate backend is
             // still alive — freeing those buffers after `llama_free` would be
             // a use-after-free (the ctx_free dc-empty assert enforces it).
@@ -540,6 +604,15 @@ impl Drop for Session {
             // may touch the pool while the context tears down.
             p3.unregister();
         }
+        // SAFETY: ctx is live; the set the callback points at is still owned
+        // by `inner` and dropped after this.
+        unsafe {
+            raw::llama_set_abort_callback(
+                self.inner.loaded.ctx().as_ptr(),
+                None,
+                std::ptr::null_mut(),
+            )
+        };
         // Pairs with session_opened in `new`; keeps the live-session counter
         // exact.
         p3_glue::session_closed();
@@ -561,6 +634,9 @@ impl Session {
         // pooled or not — are legal: the hooks are per-model (ABI v5).
         // Streaming stages from the RAM expert pool (§7.6); without one it
         // would silently fall back to the per-token path.
+        if config.parallel == 0 {
+            return Err(EngineError::InvalidConfig("parallel must be >= 1".into()));
+        }
         if config.prefill_stream && config.ram_experts_gib == 0 {
             return Err(EngineError::InvalidConfig(
                 "prefill_stream requires the RAM expert pool (ram_experts_gib > 0)".into(),
@@ -569,12 +645,54 @@ impl Session {
         if config.ram_experts_gib > 0 {
             p3_glue::refuse_if_pool_session_live()?;
         }
+        // The vendored scheduler issues pooled H2D on the compute stream
+        // between the split's event wait and its compute; no copy stream
+        // exists to overlap it on.
+        if config.async_h2d {
+            return Err(EngineError::InvalidConfig(
+                "async_h2d: no dedicated H2D copy stream in this substrate".into(),
+            ));
+        }
+        if config.o_direct && (config.manifest_path.is_none() || config.ram_experts_gib == 0) {
+            return Err(EngineError::InvalidConfig(
+                "o_direct needs the store-backed pool (a manifest and ram_experts_gib > 0)".into(),
+            ));
+        }
+        if !(config.vram_experts_frac > 0.0 && config.vram_experts_frac <= 1.0) {
+            return Err(EngineError::InvalidConfig(format!(
+                "vram_experts_frac {} outside (0, 1]",
+                config.vram_experts_frac
+            )));
+        }
+        if let Some(set) = &config.decode_cpuset {
+            match golem_store::sys::pin_current_thread(set) {
+                Ok(()) => {}
+                Err(e) if config.pin_auto => tracing::warn!("decode thread pinning: {e}"),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        match &config.manifest_path {
+            Some(m) => {
+                for w in crate::verify::verify_model(&config.model_path, m, config.full_verify)? {
+                    tracing::warn!("{w}");
+                }
+            }
+            None => tracing::warn!("no manifest: start-time model verification (R-8) skipped"),
+        }
         // P3 (§3.4): build the RAM expert pool + create the per-model ctx
         // BEFORE the model loads — the ctx must attach to the llama_model
         // before `llama_init_from_model` so its first `sched_reserve` sees
         // the hooks (cpy shrink). If the load fails, the guards drop cleanly.
+        let report = load_plan(config)?;
         let mut p3 = if config.ram_experts_gib > 0 {
-            Some(p3_glue::enable(config)?)
+            let mut p = p3_glue::enable(config)?;
+            if let Some(r) = &report {
+                p.cap_device_cache(
+                    (r.term("device_expert_cache") as f64 * f64::from(config.vram_experts_frac))
+                        as u64,
+                );
+            }
+            Some(p)
         } else {
             None
         };
@@ -590,37 +708,39 @@ impl Session {
         if let Some(p) = p3.as_mut() {
             p.fit_device_cache()?;
         }
-        let template_src = loaded
-            .model()
-            .chat_template()
-            .unwrap_or_else(|| FALLBACK_CHAT_TEMPLATE.to_owned());
-        // Interior NUL would truncate the template at the FFI boundary: unusable.
-        let template = CString::new(template_src).map_err(|_| EngineError::TemplateUnavailable)?;
+        let (chat, template) = probe_templates(&loaded, config)?;
 
-        let probe = ffi_messages(&[ChatTurn {
-            role: "user",
-            content: "ping",
-        }])?;
-        // SAFETY: template is a live CString; probe CStrings outlive the call.
-        if unsafe { apply_template(&template, &probe, true) }?.is_empty() {
-            return Err(EngineError::TemplateUnavailable);
-        }
-
-        // P3 guards came from `enable` above; nothing to build here.
+        let snapshots = snapshot_cache(config, &loaded)?;
+        let (batch, batch_cap, abort) = shared_batch(&loaded, config);
 
         Ok({
             p3_glue::session_opened();
             Session {
-                loaded,
-                config: config.clone(),
-                template,
-                last_prompt_tokens: Vec::new(),
-                p3,
-                timing: config
-                    .timing_csv
-                    .as_ref()
-                    .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
-                pool_verified: false,
+                slots: (0..config.parallel)
+                    .map(|i| SlotState::new(i as i32, config.n_predict))
+                    .collect(),
+                inner: SessionInner {
+                    loaded,
+                    config: config.clone(),
+                    chat,
+                    template,
+                    last_prompt_tokens: Vec::new(),
+                    p3,
+                    timing: config
+                        .timing_csv
+                        .as_ref()
+                        .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
+                    pool_verified: false,
+                    snapshots,
+                    test_cancel_after_chunks: 0,
+                    batch,
+                    batch_cap,
+                    abort,
+                    rr: 0,
+                    decode_since_stream: 0,
+                    degraded: None,
+                    test_fail_gen_step: 0,
+                },
             }
         })
     }
@@ -636,32 +756,36 @@ impl Session {
     ) -> Result<Self, EngineError> {
         let _guard = construction_lock();
         let loaded = load_with_hooks(config, Some(ctx))?;
-        let template_src = loaded
-            .model()
-            .chat_template()
-            .unwrap_or_else(|| FALLBACK_CHAT_TEMPLATE.to_owned());
-        let template = CString::new(template_src).map_err(|_| EngineError::TemplateUnavailable)?;
-        let probe = ffi_messages(&[ChatTurn {
-            role: "user",
-            content: "ping",
-        }])?;
-        // SAFETY: template is a live CString; probe CStrings outlive the call.
-        if unsafe { apply_template(&template, &probe, true) }?.is_empty() {
-            return Err(EngineError::TemplateUnavailable);
-        }
+        let (chat, template) = probe_templates(&loaded, config)?;
+        let (batch, batch_cap, abort) = shared_batch(&loaded, config);
         Ok({
             p3_glue::session_opened();
             Session {
-                loaded,
-                config: config.clone(),
-                template,
-                last_prompt_tokens: Vec::new(),
-                p3: None,
-                timing: config
-                    .timing_csv
-                    .as_ref()
-                    .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
-                pool_verified: false,
+                slots: (0..config.parallel)
+                    .map(|i| SlotState::new(i as i32, config.n_predict))
+                    .collect(),
+                inner: SessionInner {
+                    loaded,
+                    config: config.clone(),
+                    chat,
+                    template,
+                    last_prompt_tokens: Vec::new(),
+                    p3: None,
+                    timing: config
+                        .timing_csv
+                        .as_ref()
+                        .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
+                    pool_verified: false,
+                    snapshots: None,
+                    test_cancel_after_chunks: 0,
+                    batch,
+                    batch_cap,
+                    abort,
+                    rr: 0,
+                    decode_since_stream: 0,
+                    degraded: None,
+                    test_fail_gen_step: 0,
+                },
             }
         })
     }
@@ -670,14 +794,14 @@ impl Session {
     /// session; `None` when the pool is off (the default). Demand and prefetch
     /// page-ins are counted separately (design §6.6).
     pub fn p3_stats(&self) -> Option<&P3Stats> {
-        self.p3.as_ref().map(|p| p.stats.as_ref())
+        self.inner.p3.as_ref().map(|p| p.stats.as_ref())
     }
 
     /// The session's hook guards (test/observability seam: stream counters,
     /// trampoline call counts, prefill-stream arming). `None` when the pool
     /// is off.
     pub fn p3_hooks(&self) -> Option<&crate::p3_glue::SessionHooks> {
-        self.p3.as_ref()
+        self.inner.p3.as_ref()
     }
 
     /// The session's per-model hook context pointer (ABI v5), for test seams
@@ -685,13 +809,13 @@ impl Session {
     /// `None` when the pool is off.
     #[cfg_attr(not(feature = "hip-tests"), allow(dead_code))]
     pub fn p3_ctx_ptr(&self) -> Option<raw::golem_ctx_t> {
-        self.p3.as_ref().map(|p| p.ctx_ptr())
+        self.inner.p3.as_ref().map(|p| p.ctx_ptr())
     }
 
     /// The tokenized prompt of the most recent `chat_turn` (post-render,
     /// post-special-tokens).
     pub fn last_prompt_tokens(&self) -> &[i32] {
-        &self.last_prompt_tokens
+        &self.inner.last_prompt_tokens
     }
 
     /// True when the session's config requests GPU offload (`n_gpu_layers > 0`):
@@ -700,18 +824,18 @@ impl Session {
     /// config's intent, not llama.cpp's runtime placement — a CPU-only
     /// substrate reports `true` with zero devices to offload onto.
     pub fn offloaded(&self) -> bool {
-        self.config.n_gpu_layers > 0
+        self.inner.offloaded()
     }
 
     /// §6.5 prefetch/prediction counters; `None` without the RAM expert pool.
     pub fn prefetch_stats(&self) -> Option<crate::p3_glue::PrefetchStats> {
-        self.p3.as_ref().map(|p| p.prefetch_stats())
+        self.inner.p3.as_ref().map(|p| p.prefetch_stats())
     }
 
     /// Resolved P2 slot count per layer (explicit or derived from free VRAM);
     /// `None` without the RAM expert pool.
     pub fn device_cache_experts(&self) -> Option<u32> {
-        self.p3.as_ref().map(|p| p.device_cache_experts)
+        self.inner.p3.as_ref().map(|p| p.device_cache_experts)
     }
 
     /// P4 device expert-copy cache counters (§3.4): bytes copied into / skipped
@@ -719,13 +843,13 @@ impl Session {
     /// `None` unless this session drives the pooled GPU split — the only P2
     /// call-site (hooks registered + offload requested).
     pub fn device_cache_stats(&self) -> Option<DeviceCacheStats> {
-        if !self.offloaded() || self.p3.is_none() {
+        if !self.offloaded() || self.inner.p3.is_none() {
             return None;
         }
         // SAFETY: FFI getter with this session's live ctx; the returned
         // pointer is ctx-owned (alive while the hooks are registered).
         let block = unsafe {
-            raw::golem_get_device_cache_stats(self.p3.as_ref().expect("p3 present").ctx_ptr())
+            raw::golem_get_device_cache_stats(self.inner.p3.as_ref().expect("p3 present").ctx_ptr())
         };
         assert!(
             !block.is_null(),
@@ -739,11 +863,62 @@ impl Session {
         Some(DeviceCacheStats::new(load(0), load(1), load(2)))
     }
 
+    /// Expert `MUL_MAT_ID` nodes the scheduler placed on a CPU backend
+    /// (process-cumulative, I2: must stay 0 on HIP builds). Process-global
+    /// like [`expert_placement`].
+    pub fn expert_mul_mat_id_off_gpu(&self) -> u64 {
+        expert_placement().on_cpu
+    }
+
+    /// Locked RAM: expert pool (mlocked + GPU-registered) plus the
+    /// snapshot arena.
+    pub fn locked_ram_bytes(&self) -> u64 {
+        let pool = if self.inner.p3.is_some() {
+            self.inner.config.ram_experts_gib << 30
+        } else {
+            0
+        };
+        pool + self
+            .inner
+            .snapshots
+            .as_ref()
+            .map_or(0, SnapshotCache::arena_bytes)
+    }
+
+    /// Fraction of RAM-pool slots in use; `None` without the pool.
+    pub fn pool_fill(&self) -> Option<f64> {
+        self.inner.p3.as_ref().map(|p| p.pool_fill())
+    }
+
+    /// Store-backed source health; `None` without a manifest-backed pool.
+    pub fn storage_health(&self) -> Option<golem_store::InstanceHealth> {
+        self.inner.p3.as_ref().and_then(|p| p.storage_health())
+    }
+
+    /// Test seam: marks every store replica unreadable.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_for_test(&self) {
+        if let Some(p) = &self.inner.p3 {
+            p.fail_storage_for_test();
+        }
+    }
+
+    /// Test seam: the next page-in marks every replica unreadable before
+    /// its reads, so the in-flight read fails.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_in_read_for_test(&self) {
+        if let Some(p) = &self.inner.p3 {
+            p.fail_storage_in_read_for_test();
+        }
+    }
+
     /// Flushes the §11 per-step rows into `w` without destroying the
     /// recorder — every turn records (a `take`-style drain would leave turns
     /// 2+ empty). No-op when the timing CSV is disabled.
     pub fn write_timing(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        match self.timing.as_mut() {
+        match self.inner.timing.as_mut() {
             Some(t) => t.flush(w),
             None => Ok(()),
         }
@@ -755,37 +930,25 @@ impl Session {
     /// last flush; the ring clears for the next turn. No-op when the routing
     /// trace is disabled (config) or the pool is off (no routing readbacks).
     pub fn write_routing_trace(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        match self.p3.as_ref() {
+        match self.inner.p3.as_ref() {
             Some(p3) => p3.write_routing_trace(w),
             None => Ok(()),
         }
     }
 
-    /// Runs one chat turn: renders `messages` with the session template,
-    /// clears the KV cache, re-prefills the full transcript in chunks, then
-    /// greedily generates until EOG, `n_ctx - 1` positions, or `n_predict`
-    /// tokens (`n_predict == 0` samples and generates nothing: the turn is
-    /// prefill-only and returns 0). Piece bytes stream through `emit` as they
-    /// complete UTF-8 characters (verbatim — no space stripping); buffered
-    /// residue is flushed through `emit` even when the turn fails. Returns
-    /// tokens generated.
+    /// Runs one chat turn greedily with the session-wide `n_predict`
+    /// (a [`TurnRequest`] with default sampling and no `max_tokens`). Piece
+    /// bytes stream through `emit` as they complete UTF-8 characters
+    /// (verbatim — no space stripping); buffered residue is flushed through
+    /// `emit` even when the turn fails. Returns tokens generated.
     pub fn chat_turn(
         &mut self,
         messages: &[ChatTurn<'_>],
         emit: &mut dyn FnMut(&str),
     ) -> Result<u32, EngineError> {
-        let mut pending = Vec::new();
-        match self.chat_turn_inner(&mut pending, messages, emit, None) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                let mut tail = String::new();
-                flush_utf8_tail(&mut pending, &mut tail);
-                if !tail.is_empty() {
-                    emit(&tail);
-                }
-                Err(e)
-            }
-        }
+        Ok(self
+            .turn(&TurnRequest::new(messages), emit)?
+            .completion_tokens)
     }
 
     /// Runs one chat turn exactly like [`Session::chat_turn`] (same
@@ -802,43 +965,337 @@ impl Session {
         steps: &mut Vec<ParityStep>,
     ) -> Result<u32, EngineError> {
         steps.clear();
-        let mut pending = Vec::new();
-        let mut sink = |_: &str| {};
-        self.chat_turn_inner(&mut pending, messages, &mut sink, Some(steps))
+        self.slots[0].parity = Some(std::mem::take(steps));
+        let out = self.turn(&TurnRequest::new(messages), &mut |_| {});
+        *steps = self.slots[0].parity.take().unwrap_or_default();
+        Ok(out?.completion_tokens)
     }
 
-    fn chat_turn_inner(
+    /// Snapshot restores attempted (a prefix hit); 0 when snapshots are off.
+    pub fn snapshot_hits(&self) -> u64 {
+        self.snapshot_stats().map_or(0, |s| s.hits)
+    }
+
+    /// Snapshot cache counters; `None` when snapshots are off.
+    pub fn snapshot_stats(&self) -> Option<SnapshotStats> {
+        self.inner.snapshots.as_ref().map(SnapshotCache::stats)
+    }
+
+    /// Test seam: truncates every stored snapshot so its next restore is
+    /// rejected by `llama_state_seq_set_data`.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn corrupt_snapshots_for_test(&mut self) {
+        if let Some(c) = self.inner.snapshots.as_mut() {
+            c.truncate_all_for_test();
+        }
+    }
+
+    /// Renders `req` through the chat layer; pass the result back via
+    /// [`TurnRequest::rendered`] to keep its [`crate::OutputParser`] for
+    /// parsing the generated text.
+    pub fn render(&self, req: &TurnRequest<'_>) -> Result<Rendered, EngineError> {
+        render(&self.inner.chat, req)
+    }
+
+    /// Reasoning-marker splitter for the session's chat template (§8.1
+    /// `reasoning_content`); `None` when the template has no markers.
+    pub fn reasoning_splitter(&self) -> Option<crate::reasoning::ReasoningSplitter> {
+        crate::reasoning::ReasoningSplitter::from_template(&self.inner.template)
+    }
+
+    /// Test seam: every later turn sets its own cancel flag right after
+    /// prefill chunk `n` decodes (0 disables).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn cancel_after_prefill_chunks_for_test(&mut self, n: u32) {
+        self.inner.test_cancel_after_chunks = n;
+    }
+
+    /// Test seam: highest position held for `seq` in the KV/recurrent memory,
+    /// `-1` when the sequence is empty.
+    #[doc(hidden)]
+    pub fn seq_pos_max(&self, seq: i32) -> i32 {
+        // SAFETY: ctx is live for `&self`; `&self` excludes a concurrent turn,
+        // so no decode is in flight; the query only reads memory metadata.
+        unsafe {
+            raw::llama_memory_seq_pos_max(
+                raw::llama_get_memory(self.inner.loaded.ctx().as_ptr()),
+                seq,
+            )
+        }
+    }
+
+    /// Runs one turn on slot 0: renders `req.messages`, drops the slot's
+    /// sequence, restores the longest snapshotted prompt prefix (§7.1) and
+    /// prefills the rest in chunks, then samples per
+    /// `req.sampling` until EOG, a stop string, `max_tokens` (default
+    /// `config.n_predict`, clamped to the context left after the prompt),
+    /// `n_ctx_seq - 1` positions, or cancel. Every `Err`/`Cancelled` exit
+    /// drops the sequence (`llama_memory_seq_rm`): recurrent state cannot be
+    /// rewound (§2.5).
+    pub fn turn(
         &mut self,
-        pending: &mut Vec<u8>,
-        messages: &[ChatTurn<'_>],
+        req: &TurnRequest<'_>,
         emit: &mut dyn FnMut(&str),
-        mut steps: Option<&mut Vec<ParityStep>>,
-    ) -> Result<u32, EngineError> {
-        let msgs = ffi_messages(messages)?;
-        // SAFETY: template and msgs CStrings are alive for the duration of the call.
-        let rendered = unsafe { apply_template(&self.template, &msgs, true)? };
+    ) -> Result<TurnOutcome, EngineError> {
+        let mut res = self.drive(req, emit);
+        // Every decode of a live session (prefill chunks, generation steps)
+        // runs inside `drive`, so this is the one slab-failure recovery site;
+        // load's self-check decode fails the load instead.
+        if let Err(e) = res {
+            res = Err(self.inner.recover_slab(e));
+        }
+        if res.is_err() {
+            self.slots[0].flush_text(emit);
+            self.slots[0].abort();
+        }
+        res
+    }
 
-        // Stateless per turn: full-transcript re-prefill.
-        let ctx = self.loaded.ctx();
-        // SAFETY: llama_get_memory returns the context's live memory handle; the
-        // context is idle between turns, the documented llama_memory_clear use.
-        unsafe { raw::llama_memory_clear(raw::llama_get_memory(ctx.as_ptr()), true) };
+    fn drive(
+        &mut self,
+        req: &TurnRequest<'_>,
+        emit: &mut dyn FnMut(&str),
+    ) -> Result<TurnOutcome, EngineError> {
+        let guard = self.inner.begin(&mut self.slots[0], req)?;
+        let finish = loop {
+            if let Some(f) = self.slots[0].finished() {
+                break f;
+            }
+            slot::step(
+                Core {
+                    session: &mut self.inner,
+                    slots: &mut self.slots[..1],
+                },
+                &mut |_, t| emit(t),
+                false,
+            )?;
+        };
+        if finish == FinishReason::Cancelled {
+            drop(guard);
+            tracing::info!(slot = self.slots[0].seq, "cancel: sequence removed");
+        } else {
+            guard.disarm();
+        }
+        match self.slots[0].take_result() {
+            Some(r) => r,
+            None => unreachable!("loop exits on Done"),
+        }
+    }
 
-        let vocab = self.loaded.model().vocab();
-        // add_special = true: the fallback chatml renders no BOS text, so this
-        // yields exactly one BOS.
-        // SAFETY: vocab is live; rendered is valid for its byte length.
-        let prompt = unsafe { tokenize_prompt(vocab, &rendered, true, true)? };
+    /// Test seam: the `n`-th generation batch from now (1-based) fails as if
+    /// `llama_decode` returned 1, without running it (0 disables).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_generation_step_for_test(&mut self, n: u32) {
+        self.inner.test_fail_gen_step = n;
+    }
+
+    /// `llama_n_ctx_seq`: the context window each slot gets.
+    pub fn n_ctx_seq(&self) -> u32 {
+        self.inner.n_ctx_seq()
+    }
+
+    pub(crate) fn parts(&mut self) -> (&mut SessionInner, &mut [SlotState]) {
+        (&mut self.inner, &mut self.slots)
+    }
+}
+
+/// The session state `slot::step` drives, paired with the slots it advances;
+/// built per call, no allocation.
+pub(crate) struct Core<'s> {
+    pub(crate) session: &'s mut SessionInner,
+    pub(crate) slots: &'s mut [SlotState],
+}
+
+/// Per-turn FFI state of one slot: tokenized prompt, prefill progress and the
+/// I2 runtime-proof window. The token batch itself is the session's
+/// (`SessionInner::batch`), shared by every slot.
+pub(crate) struct TurnFfi {
+    pub(crate) prompt: Vec<raw::llama_token>,
+    /// Prompt tokens already in the sequence (restored prefix + prefilled).
+    pub(crate) n_past: usize,
+    /// Prefill chunks decoded this turn (test seam counter).
+    pub(crate) chunks: u32,
+    pub(crate) chunk_cap: usize,
+    pub(crate) n_ubatch: usize,
+    pub(crate) streaming: bool,
+    n_vocab: usize,
+    pub(crate) verify: bool,
+    placement_before: ExpertPlacement,
+    traffic_before: u64,
+    /// Re-prefill of `prompt ++ generated` after a failed batch: no snapshot.
+    pub(crate) replay: bool,
+}
+
+/// Aggregate cancel for the session's `llama_set_abort_callback`: a step's
+/// compute aborts only when every sequence in its batch is cancelled. Slots
+/// are fixed per batch, so this is a preallocated pointer array, refilled
+/// per step with no allocation; all fields atomic (C reads it mid-decode).
+pub(crate) struct AbortSet {
+    flags: Box<[std::sync::atomic::AtomicPtr<AtomicBool>]>,
+    len: std::sync::atomic::AtomicUsize,
+}
+
+impl AbortSet {
+    fn new(n: usize) -> Self {
+        Self {
+            flags: (0..n)
+                .map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+                .collect(),
+            len: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Arms the set with this step's flags; any participant without a flag
+    /// can never be cancelled, so the set stays empty (never aborts).
+    /// Callers keep the `Arc`s alive (slot-owned) until `clear`.
+    pub(crate) fn arm<'a>(&self, flags: impl Iterator<Item = Option<&'a Arc<AtomicBool>>>) {
+        let mut n = 0;
+        for f in flags {
+            let Some(f) = f else {
+                self.len.store(0, Ordering::Release);
+                return;
+            };
+            if n < self.flags.len() {
+                self.flags[n].store(Arc::as_ptr(f).cast_mut(), Ordering::Relaxed);
+                n += 1;
+            }
+        }
+        self.len.store(n, Ordering::Release);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.len.store(0, Ordering::Release);
+    }
+
+    fn all_cancelled(&self) -> bool {
+        let n = self.len.load(Ordering::Acquire);
+        n > 0
+            && self.flags[..n].iter().all(|p| {
+                // SAFETY: armed pointers come from `Arc`s the slots hold
+                // until `clear` (called after the decode returns).
+                unsafe { &*p.load(Ordering::Relaxed) }.load(Ordering::Relaxed)
+            })
+    }
+}
+
+/// `ggml_abort_callback` trampoline: `data` is the session's [`AbortSet`].
+unsafe extern "C" fn abort_requested(data: *mut std::ffi::c_void) -> bool {
+    // SAFETY: `data` is `Arc::as_ptr` of `SessionInner::abort`, which
+    // outlives the context (the callback is cleared in `Session::drop`).
+    unsafe { &*(data as *const AbortSet) }.all_cancelled()
+}
+
+/// Drops sequence `seq` from the KV/recurrent memory on drop unless disarmed.
+/// Holds the raw handle (both fields `Copy`) so it never borrows the session.
+pub(crate) struct SeqResetGuard {
+    mem: raw::llama_memory_t,
+    seq: raw::llama_seq_id,
+    armed: bool,
+}
+
+impl SeqResetGuard {
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SeqResetGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: mem is the live context's memory handle; the guard is a
+            // local of `Session::drive`, which holds `&mut Session` (ctx alive)
+            // for the guard's whole lifetime; no decode is in flight (every
+            // decode path synchronizes before returning).
+            unsafe { raw::llama_memory_seq_rm(self.mem, self.seq, -1, -1) };
+        }
+    }
+}
+
+impl SessionInner {
+    /// Renders + tokenizes `req` and arms slot 0 via [`SessionInner::arm`].
+    fn begin(
+        &mut self,
+        slot: &mut SlotState,
+        req: &TurnRequest<'_>,
+    ) -> Result<SeqResetGuard, EngineError> {
+        let own;
+        let rendered = match req.rendered {
+            Some(r) => r,
+            None => {
+                own = render(&self.chat, req)?;
+                &own
+            }
+        };
+        let prompt = self.tokenize(&rendered.prompt)?;
+        self.arm(
+            slot,
+            prompt,
+            &req.sampling,
+            Some(rendered),
+            req.stop,
+            req.max_tokens,
+            req.cancel.clone(),
+        )
+    }
+
+    /// Tokenizes a rendered prompt. add_special = true: the chat layer strips
+    /// a leading BOS text when the vocab adds BOS (common/chat.cpp), and GLM's
+    /// `[gMASK]<sop>` is template text with no vocab BOS, so this yields at
+    /// most one BOS.
+    pub(crate) fn tokenize(&self, text: &str) -> Result<Vec<raw::llama_token>, EngineError> {
+        // SAFETY: vocab is live; text is valid for its byte length.
+        let prompt = unsafe { tokenize_prompt(self.loaded.model().vocab(), text, true, true)? };
         if prompt.is_empty() {
             return Err(EngineError::Tokenize(0));
         }
-        self.last_prompt_tokens = prompt.clone();
-        let prompt_len = prompt.len();
+        Ok(prompt)
+    }
 
-        let n_ctx = self.config.n_ctx as usize;
+    /// Drops the slot's sequence (never the whole memory — other slots live
+    /// there), restores a snapshot prefix (the cache is shared by all slots),
+    /// applies the per-sequence context guard, builds the slot's sampler
+    /// (with `rendered`'s tool-call grammar) and arms it for `step`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arm(
+        &mut self,
+        slot: &mut SlotState,
+        prompt: Vec<raw::llama_token>,
+        sampling: &SamplingParams,
+        rendered: Option<&Rendered>,
+        stop: &[String],
+        max_tokens: Option<u32>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<SeqResetGuard, EngineError> {
+        let ctx = self.loaded.ctx();
+        // SAFETY: ctx is live; no decode is in flight between steps.
+        let mem = unsafe { raw::llama_get_memory(ctx.as_ptr()) };
+        // SAFETY: as above; removes only this slot's sequence.
+        unsafe { raw::llama_memory_seq_rm(mem, slot.seq, -1, -1) };
+        let guard = SeqResetGuard {
+            mem,
+            seq: slot.seq,
+            armed: true,
+        };
+        self.last_prompt_tokens.clone_from(&prompt);
+        let restored = self.restore_prefix(mem, slot.seq, &prompt);
+        let prompt_len = prompt.len() as u32;
+        let n_ctx_seq = self.n_ctx_seq();
+        if prompt_len >= n_ctx_seq {
+            return Err(EngineError::ContextOverflow {
+                prompt: prompt_len,
+                n_ctx: n_ctx_seq,
+            });
+        }
+        let limit = max_tokens
+            .unwrap_or(self.config.n_predict)
+            .min(n_ctx_seq - prompt_len);
+
         let chunk_cap = prefill_chunk_cap(
             self.config.batch_tokens as usize,
-            n_ctx,
+            n_ctx_seq as usize,
             self.p3.as_ref().map(|p| (p.device_cache_experts, p.top_k)),
         );
         if chunk_cap == 0 {
@@ -847,36 +1304,252 @@ impl Session {
             return Err(EngineError::Decode(1));
         }
         // One llama_decode must carry exactly one ubatch (the C lease-release
-        // contract, §2.4): n_ubatch is a load-time constant (§4.2), fetched once.
-        // SAFETY: ctx is a live context.
-        let n_ubatch = unsafe { raw::llama_n_ubatch(ctx.as_ptr()) } as usize;
+        // contract, §2.4).
+        let n_ubatch = self.n_ubatch();
         // Prefill streaming (§7.6): whole-plane ubatches above the
         // --prefill-stream-min tail threshold; the per-token cap below it.
         let streaming = self.p3.as_ref().is_some_and(|p| p.stream_enabled());
-        let batch_cap = chunk_cap.max(if streaming { n_ubatch } else { 0 });
+        let vocab = self.loaded.model().vocab();
+        // Parity recording and penalties need the vocab size (validated
+        // non-negative by the load-time decode self-check probe).
+        // SAFETY: vocab is live.
+        let n_vocab = unsafe { raw::llama_vocab_n_tokens(vocab) };
+        let n_vocab_us = usize::try_from(n_vocab)
+            .map_err(|_| EngineError::InvalidModel("vocab size is negative".to_owned()))?;
 
-        let mut batch = Batch::init(batch_cap as i32, 0, 1);
-        // §6.2: prefill routes nearly every expert; keep it out of recency.
+        let grammar = match rendered {
+            Some(r) if !r.grammar.is_empty() => r.parser.grammar_sampler(vocab)?,
+            _ => None,
+        };
+        let armed = slot::Armed {
+            sampler: Sampler::from_params(sampling, n_vocab, grammar)?,
+            ffi: TurnFfi {
+                prompt,
+                n_past: restored,
+                chunks: 0,
+                chunk_cap: chunk_cap.min(n_ubatch),
+                n_ubatch,
+                streaming,
+                n_vocab: n_vocab_us,
+                verify: false,
+                placement_before: ExpertPlacement::default(),
+                traffic_before: 0,
+                replay: false,
+            },
+        };
+        slot.start(stop, cancel, sampling, prompt_len, limit, armed);
+        Ok(guard)
+    }
+
+    /// After a sequence was dropped: restore the longest snapshotted prefix
+    /// of `prompt` into `seq` (0 on miss).
+    pub(crate) fn restore_into(
+        &mut self,
+        seq: raw::llama_seq_id,
+        prompt: &[raw::llama_token],
+    ) -> usize {
+        // SAFETY: ctx is live and idle.
+        let mem = unsafe { raw::llama_get_memory(self.loaded.ctx().as_ptr()) };
+        self.restore_prefix(mem, seq, prompt)
+    }
+
+    /// Restores the longest snapshotted strict prefix of `prompt` into `seq`
+    /// (§7.1); returns how many prompt tokens it covers (0 on miss). A
+    /// rejected restore drops the seq and the entry and falls back to a full
+    /// prefill — a delta is never decoded on top of a failed restore.
+    fn restore_prefix(
+        &mut self,
+        mem: raw::llama_memory_t,
+        seq: raw::llama_seq_id,
+        prompt: &[raw::llama_token],
+    ) -> usize {
+        let Some(cache) = self.snapshots.as_mut() else {
+            return 0;
+        };
+        let Some((n, bytes)) = cache.longest_prefix(prompt) else {
+            return 0;
+        };
+        let ctx = self.loaded.ctx().as_ptr();
+        // SAFETY: ctx is live and idle; `bytes` is a live arena range of
+        // exactly `bytes.len()` bytes produced by `llama_state_seq_get_data`
+        // on this model + context shape.
+        let read = unsafe { raw::llama_state_seq_set_data(ctx, bytes.as_ptr(), bytes.len(), seq) };
+        if read != 0 && read == bytes.len() {
+            return n;
+        }
+        tracing::warn!(
+            read,
+            expected = bytes.len(),
+            "snapshot restore rejected; full prefill"
+        );
+        // SAFETY: as in `begin`; clears whatever the failed read left.
+        unsafe { raw::llama_memory_seq_rm(mem, seq, -1, -1) };
+        cache.invalidate(n, prompt);
+        0
+    }
+
+    /// Snapshots `seq` right after a clean prompt prefill, keyed by the
+    /// prompt tokens (§7.1: the next turn's render shares exactly this
+    /// prefix). Once per turn, off the per-token path.
+    pub(crate) fn snapshot_prompt(&mut self, ffi: &TurnFfi, seq: raw::llama_seq_id) {
+        let Some(cache) = self.snapshots.as_mut() else {
+            return;
+        };
+        let ctx = self.loaded.ctx().as_ptr();
+        // SAFETY: ctx is live; the prefill synchronized before returning.
+        let size = unsafe { raw::llama_state_seq_get_size(ctx, seq) };
+        let Some(dst) = cache.reserve(&ffi.prompt, size) else {
+            return;
+        };
+        // SAFETY: `dst` is an exclusive arena range of exactly `size` bytes.
+        let wrote = unsafe { raw::llama_state_seq_get_data(ctx, dst.as_mut_ptr(), size, seq) };
+        if wrote == size {
+            cache.commit();
+        } else {
+            cache.abort_short_write();
+        }
+    }
+
+    /// Context window per sequence as llama.cpp sized it (padded/trimmed —
+    /// never recomputed from config).
+    pub(crate) fn n_ctx_seq(&self) -> u32 {
+        // SAFETY: ctx is live.
+        unsafe { raw::llama_n_ctx_seq(self.loaded.ctx().as_ptr()) }
+    }
+
+    /// Opens a slot's prefill (its first chunk): arms the I2 runtime-proof
+    /// window and drops stale routing-trace records from a failed prior turn.
+    pub(crate) fn prefill_begin(&self, ffi: &mut TurnFfi) {
         // I2 runtime proof window: this turn's prefill and first batch-1 decode
         // (the op-offload threshold is per ubatch, so both shapes are checked).
-        let verify = !self.pool_verified
+        ffi.verify = !self.pool_verified
             && self.p3.is_some()
             && self.offloaded()
             && substrate_backend() == Backend::Hip;
-        let placement_before = expert_placement();
-        // Streamed planes are expert copies served on the GPU split too
-        // (stream_source fires only from that copy loop, §7.6).
-        let traffic_of = |p: &p3_glue::SessionHooks| {
-            pool_traffic(&p.stats) + p.stream_stats().map_or(0, |s| s.planes)
-        };
-        let traffic_before = self.p3.as_ref().map_or(0, traffic_of);
+        ffi.placement_before = expert_placement();
+        ffi.traffic_before = self.p3.as_ref().map_or(0, prefill_traffic);
         if let Some(p3) = self.p3.as_ref() {
-            // Stale-record guard: a failed prior turn's routing records are
-            // dropped (the header survives for the real file flush) before
-            // this turn's prefill records (phase `pf`) start.
             p3.drain_routing_trace();
         }
-        let prefill = p3_glue::PrefillScope::enter();
+    }
+
+    /// Closes a slot's prefill (after its final chunk): the I2 checks.
+    pub(crate) fn prefill_end(&self, ffi: &TurnFfi) -> Result<(), EngineError> {
+        if ffi.verify {
+            check_experts_on_gpu(ffi.placement_before, expert_placement())?;
+            if let Some(p3) = &self.p3 {
+                check_pool_engaged(ffi.traffic_before, prefill_traffic(p3))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// After a slot's first generation step: the decode half of the I2 proof.
+    pub(crate) fn verify_decode(&mut self, ffi: &TurnFfi) -> Result<(), EngineError> {
+        if ffi.verify && !self.pool_verified {
+            check_experts_on_gpu(ffi.placement_before, expert_placement())?;
+            self.pool_verified = true;
+        }
+        Ok(())
+    }
+
+    /// Next chunk length for a slot's prefill and whether it streams (§7.6),
+    /// given `n_gen` generation tokens already in the batch. Stream chunks
+    /// are whole ubatches and always run alone; a routed-only chunk shares
+    /// the ubatch with the generation tokens and, pooled, the routed-set
+    /// budget `chunk_cap` (= K / top_k tokens) too.
+    pub(crate) fn next_chunk(&self, ffi: &TurnFfi, n_gen: usize) -> (usize, bool) {
+        let remaining = ffi.prompt.len() - ffi.n_past;
+        if ffi.streaming && remaining >= self.config.prefill_stream_min as usize {
+            return (remaining.min(ffi.n_ubatch), true);
+        }
+        let room = ffi
+            .chunk_cap
+            .saturating_sub(n_gen)
+            .min(ffi.n_ubatch - n_gen.min(ffi.n_ubatch));
+        (remaining.min(room), false)
+    }
+
+    pub(crate) fn batch_clear(&mut self) {
+        self.batch.inner.n_tokens = 0;
+    }
+
+    /// Appends one token to the shared batch; returns its logits row.
+    pub(crate) fn batch_push(
+        &mut self,
+        tok: raw::llama_token,
+        pos: usize,
+        seq: raw::llama_seq_id,
+        logits: bool,
+    ) -> Result<i32, EngineError> {
+        let i = self.batch.inner.n_tokens as usize;
+        if i >= self.batch_cap {
+            return Err(EngineError::InvalidConfig(format!(
+                "step overflows the {}-token batch",
+                self.batch_cap
+            )));
+        }
+        // SAFETY: i < batch_cap slots allocated by Batch::init; the slot is
+        // fully written before any decode observes it.
+        unsafe {
+            fill_slot(
+                &mut self.batch.inner,
+                i,
+                tok,
+                pos as raw::llama_pos,
+                seq,
+                logits,
+            )
+        };
+        self.batch.inner.n_tokens += 1;
+        Ok(i as i32)
+    }
+
+    /// Prompt tokens of a slot's next chunk into the batch; logits only on
+    /// the prompt's last token (it bootstraps generation). Returns that row.
+    pub(crate) fn push_chunk(
+        &mut self,
+        ffi: &TurnFfi,
+        seq: raw::llama_seq_id,
+        len: usize,
+    ) -> Result<i32, EngineError> {
+        let end = ffi.n_past + len;
+        let mut row = -1;
+        for p in ffi.n_past..end {
+            row = self.batch_push(ffi.prompt[p], p, seq, p + 1 == ffi.prompt.len())?;
+        }
+        Ok(row)
+    }
+
+    /// One `llama_decode` of the filled batch (one ubatch, the lease-release
+    /// contract §2.4). `stream`: the batch is one streamed prefill chunk,
+    /// alone (§7.6), whose source abort points at its slot's cancel flag
+    /// (`Some(None)`: a streamed chunk without one). `gen` generation
+    /// tokens make it a policy step with a §11 timing row (`step` 0-based);
+    /// a pure prefill batch is not (§6.2: it routes nearly every expert).
+    /// `Ok(false)` when the abort callback aborted the compute (every
+    /// participant cancelled).
+    pub(crate) fn run_batch(
+        &mut self,
+        stream: Option<Option<&Arc<AtomicBool>>>,
+        n_gen: u32,
+        step: u64,
+        t0: std::time::Instant,
+    ) -> Result<bool, EngineError> {
+        let n = self.batch.inner.n_tokens as usize;
+        let n_ubatch = self.n_ubatch();
+        if n == 0 || n > n_ubatch {
+            return Err(EngineError::InvalidConfig(format!(
+                "step of {n} tokens is not one {n_ubatch}-token ubatch"
+            )));
+        }
+        if n_gen > 0 && self.test_fail_gen_step > 0 {
+            self.test_fail_gen_step -= 1;
+            if self.test_fail_gen_step == 0 {
+                return Err(EngineError::Decode(1));
+            }
+        }
+        let _scope = (n_gen == 0).then(p3_glue::PrefillScope::enter);
         // Stream chunks arm the C flag + read-ahead and pause the prefetcher;
         // the guard disarms/resumes on every exit path (§7.6.4).
         struct StreamGuard<'a>(&'a p3_glue::SessionHooks);
@@ -887,240 +1560,220 @@ impl Session {
                 self.0.release_stream();
             }
         }
-        let _stream_guard = self.p3.as_ref().map(StreamGuard);
-        let stream_min = self.config.prefill_stream_min as usize;
-        let mut n_past: usize = 0;
-        let mut last_chunk_len = 0;
-        while n_past < prompt_len {
-            let remaining = prompt_len - n_past;
-            let stream_chunk = streaming && remaining >= stream_min;
-            let len = if stream_chunk {
-                remaining.min(n_ubatch)
-            } else {
-                remaining.min(chunk_cap)
-            };
-            if let Some(p3) = &self.p3 {
-                p3.set_prefill_stream(stream_chunk);
+        let (_stream_guard, _stream_abort) = match (stream, self.p3.as_ref()) {
+            (Some(cancel), Some(p3)) => {
+                p3.set_prefill_stream(true);
+                (
+                    Some(StreamGuard(p3)),
+                    cancel.map(|c| p3.stream_abort_guard(c)),
+                )
             }
-            let is_final_chunk = n_past + len == prompt_len;
-            {
-                // SAFETY: slots 0..len are within the chunk_cap-sized allocation;
-                // every used slot is fully written before decode (llama_batch_init
-                // mallocs and does not zero).
-                let b = &mut batch.inner;
-                for (i, &t) in prompt[n_past..n_past + len].iter().enumerate() {
-                    // Logits only on the final token of the final chunk: that
-                    // sample bootstraps generation; intermediate tokens never need it.
-                    // SAFETY: i < len <= batch_cap slots allocated by Batch::init.
-                    unsafe {
-                        fill_slot(
-                            b,
-                            i,
-                            t,
-                            (n_past + i) as raw::llama_pos,
-                            is_final_chunk && i + 1 == len,
-                        );
-                    }
-                }
-                b.n_tokens = len as i32;
-            }
-            debug_assert!(
-                len <= n_ubatch,
-                "prefill chunk must be exactly one ubatch (lease-release contract, §2.4)"
-            );
-            // SAFETY: ctx is a live context; batch slots 0..n_tokens fully written.
-            let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
-            if code != 0 {
-                // 1 = no KV slot left (ctx too small for the prompt); the rest fatal alike.
-                // Synchronize first: the failed decode may have launched a compute
-                // whose expert-copy leases release only at the next compute.
-                // SAFETY: ctx is live.
-                unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-                return Err(EngineError::Decode(code));
-            }
-            // §6.2: prefill chunks are NOT policy steps — a prefill ubatch
-            // routes nearly every expert and would flatten the scores, so
-            // only the generation decodes below advance the step.
-            // synchronize (see decode helper above).
+            _ => (None, None),
+        };
+        let ctx = self.loaded.ctx();
+        // SAFETY: ctx is a live context; batch slots 0..n_tokens fully written.
+        let code = unsafe { raw::llama_decode(ctx.as_ptr(), self.batch.inner) };
+        if code != 0 {
+            // Synchronize first: the failed decode may have launched a compute
+            // whose expert-copy leases release only at the next compute.
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-            n_past += len;
-            last_chunk_len = len;
-        }
-        drop(prefill);
-        // Disarm before the generation decodes (the guard is the backstop).
-        if let Some(p3) = &self.p3 {
-            p3.set_prefill_stream(false);
-        }
-
-        if verify {
-            check_experts_on_gpu(placement_before, expert_placement())?;
-            if let Some(p3) = &self.p3 {
-                check_pool_engaged(traffic_before, traffic_of(p3))?;
-            }
-        }
-
-        if self.config.n_predict == 0 {
-            return Ok(0);
-        }
-
-        // Parity recording needs the logits row length, which is the vocab size
-        // (validated non-negative by the load-time decode self-check probe).
-        // SAFETY: vocab is live.
-        let n_vocab = usize::try_from(unsafe { raw::llama_vocab_n_tokens(vocab) })
-            .map_err(|_| EngineError::InvalidModel("vocab size is negative".to_owned()))?;
-
-        // Greedy sampler chain; the chain owns the greedy sampler and frees it.
-        let sampler = Sampler::greedy();
-
-        // SAFETY: sampler chain and ctx are live; the final decode emitted logits
-        // for slot last_chunk_len - 1.
-        let mut tok = unsafe {
-            raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), (last_chunk_len - 1) as i32)
-        };
-        if let Some(steps) = steps.as_mut() {
-            // Generation step 0: the bootstrap sample off the final prompt-token
-            // logits. The token is the sampler's output; fetch the same row's
-            // top-2 alongside (pure read — no decode behavior change).
-            // SAFETY: the successful final-chunk decode emitted logits for slot
-            // last_chunk_len - 1; n_vocab is that row's length.
-            let (top1, top2) = unsafe {
-                parity::top2_logits_ith(ctx.as_ptr(), (last_chunk_len - 1) as i32, n_vocab)
+            // 2 = aborted: the callback/stream source fire only on cancel.
+            return if code == 2 {
+                Ok(false)
+            } else {
+                Err(EngineError::Decode(code))
             };
+        }
+        if n_gen > 0 {
+            p3_glue::advance_decode_step();
+        }
+        // The lease-release contract: synchronize before the next compute.
+        // SAFETY: ctx is live.
+        unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+        if n_gen > 0
+            && let Some(t) = self.timing.as_mut()
+        {
+            // §11 step boundary: snapshot (and reset) the P3/store
+            // accumulators into this step's row. H2D and policy stay
+            // unmeasured (no fork event pair / no P2 instrumentation).
+            let io = p3_glue::take_step_io_stats();
+            let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
+            t.row(crate::timing::StepTiming {
+                step,
+                tokens: n_gen,
+                wall_ms: t0.elapsed().as_secs_f64() * 1_000.0,
+                p3_wait_ms: ns2ms(io.p3_wait_ns),
+                disk_worker_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
+                disk_bytes: io.disk_bytes.unwrap_or(0),
+                h2d_ms: f64::NAN,
+                h2d_bytes: 0,
+                policy_ms: f64::NAN,
+            });
+        }
+        Ok(true)
+    }
+
+    fn n_ubatch(&self) -> usize {
+        // SAFETY: ctx is a live context; n_ubatch is a load-time constant (§4.2).
+        unsafe { raw::llama_n_ubatch(self.loaded.ctx().as_ptr()) as usize }
+    }
+
+    /// Drops `seq` from the KV/recurrent memory (cancel, failed batch).
+    pub(crate) fn seq_rm(&self, seq: raw::llama_seq_id) {
+        // SAFETY: ctx is live and idle (every decode synchronizes before
+        // returning); removes only this sequence.
+        unsafe {
+            raw::llama_memory_seq_rm(
+                raw::llama_get_memory(self.loaded.ctx().as_ptr()),
+                seq,
+                -1,
+                -1,
+            )
+        };
+    }
+
+    /// Whether the store-backed source reports `FatalIo` (§5.2).
+    pub(crate) fn storage_lost(&self) -> bool {
+        self.p3
+            .as_ref()
+            .and_then(|p| p.storage_health())
+            .is_some_and(|h| h == golem_store::InstanceHealth::FatalIo)
+    }
+
+    /// Slab-failure recovery (§2.4): a `Decode(-2)` shrinks the device
+    /// cache; maps to `DeviceCacheDegraded` when K changed.
+    pub(crate) fn recover_slab(&mut self, e: EngineError) -> EngineError {
+        if let EngineError::Decode(-2) = e
+            && let Some(p) = self.p3.as_mut()
+        {
+            return match p.shrink_after_slab_failure() {
+                Ok(Some(k)) => EngineError::DeviceCacheDegraded(k),
+                Ok(None) => e,
+                Err(e) => e,
+            };
+        }
+        e
+    }
+
+    /// Resets the per-step accumulators right before the first generation
+    /// decode, so prefill activity and stale rows never bleed into step 0.
+    pub(crate) fn start_decode(&mut self) -> Result<(), EngineError> {
+        if let Some(t) = self.timing.as_mut() {
+            t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
+        }
+        let _ = p3_glue::take_step_io_stats();
+        Ok(())
+    }
+
+    /// Samples from logits row `idx`, recording a [`ParityStep`] at
+    /// `position` when `parity` is set.
+    pub(crate) fn sample(
+        &self,
+        sampler: &Sampler,
+        ffi: &TurnFfi,
+        idx: i32,
+        parity: Option<&mut Vec<ParityStep>>,
+        position: u32,
+    ) -> raw::llama_token {
+        let ctx = self.loaded.ctx();
+        // SAFETY: sampler chain and ctx are live; the preceding successful
+        // decode emitted logits for row idx.
+        let token = unsafe { raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), idx) };
+        if let Some(steps) = parity {
+            // Pure read of the same row — no decode behavior change.
+            // SAFETY: row idx holds n_vocab logits (as above).
+            let (top1, top2) = unsafe { parity::top2_logits_ith(ctx.as_ptr(), idx, ffi.n_vocab) };
             steps.push(ParityStep {
-                position: 0,
-                token: tok,
+                position,
+                token,
                 top1,
                 top2,
             });
         }
+        token
+    }
 
-        let mut generated: u32 = 0;
-        let mut scratch = String::new();
-        if let Some(t) = self.timing.as_mut() {
-            t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
-        }
-        // Prefill activity must not bleed into step 0's row: take-and-discard
-        // the P3/store accumulators right before the decode loop (also
-        // prevents an EOG-exited turn from bleeding into the next one).
-        let _ = p3_glue::take_step_io_stats();
-        loop {
-            // §11: step wall time starts at the loop head (emit + decode).
-            let step_t0 = std::time::Instant::now();
-            // SAFETY: vocab is live; tok is a valid token id from the sampler.
-            if unsafe { raw::llama_vocab_is_eog(vocab, tok) } {
-                // EOG is never decoded, so it has no row: every decode step
-                // (0-based, numbered below) already wrote its row before the
-                // follow-up sample. The pre-loop accumulator reset above
-                // keeps this exit from bleeding into the next turn.
-                break;
-            }
-            // SAFETY: vocab is live; tok is a valid token id from the sampler.
-            let piece = unsafe { token_piece(vocab, tok) };
-            emit_valid_prefix(pending, &mut scratch, &piece);
-            if !scratch.is_empty() {
-                emit(&scratch);
-                scratch.clear();
-            }
-            generated += 1;
-            // One KV slot stays free (chunk_cap ≤ min(batch_tokens, n_ctx - 1));
-            // never decode at pos >= n_ctx - 1.
-            if n_past >= n_ctx - 1 || generated >= self.config.n_predict {
-                break;
-            }
-            {
-                let b = &mut batch.inner;
-                // SAFETY: slot 0 exists (chunk_cap >= 1); fully written before decode.
-                unsafe { fill_slot(b, 0, tok, n_past as raw::llama_pos, true) };
-                b.n_tokens = 1;
-            }
-            debug_assert!(
-                batch.inner.n_tokens as usize <= n_ubatch,
-                "one decode step = one ubatch (lease-release contract, §2.4)"
-            );
-            // SAFETY: same invariants as the prefill decode.
-            let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
-            if code != 0 {
-                // Synchronize first: see the prefill decode's error path.
-                // SAFETY: ctx is live.
-                unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-                return Err(EngineError::Decode(code));
-            }
-            p3_glue::advance_decode_step();
-            // synchronize (see decode helper above).
-            // SAFETY: ctx is live.
-            unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-            n_past += 1;
-            if let Some(t) = self.timing.as_mut() {
-                // §11 step boundary: snapshot (and reset) the P3/store
-                // accumulators into this step's row. H2D and policy stay
-                // unmeasured (no fork event pair / no P2 instrumentation).
-                let io = p3_glue::take_step_io_stats();
-                let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
-                t.row(crate::timing::StepTiming {
-                    // 0-based: `generated` was incremented for this step's
-                    // emit above, matching the StepTiming::step doc.
-                    step: generated as u64 - 1,
-                    tokens: 1,
-                    wall_ms: step_t0.elapsed().as_secs_f64() * 1_000.0,
-                    p3_wait_ms: ns2ms(io.p3_wait_ns),
-                    disk_worker_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
-                    disk_bytes: io.disk_bytes.unwrap_or(0),
-                    h2d_ms: f64::NAN,
-                    h2d_bytes: 0,
-                    policy_ms: f64::NAN,
-                });
-            }
-            if verify && !self.pool_verified {
-                check_experts_on_gpu(placement_before, expert_placement())?;
-                self.pool_verified = true;
-            }
-            // SAFETY: sampler chain and ctx are live; the decode emitted logits for slot 0.
-            tok = unsafe { raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), 0) };
-            if let Some(steps) = steps.as_mut() {
-                // `generated` counts prior non-EOG samples, which is exactly the
-                // 0-based index of the sample just taken.
-                // SAFETY: the successful single-token decode emitted logits for slot 0.
-                let (top1, top2) = unsafe { parity::top2_logits_ith(ctx.as_ptr(), 0, n_vocab) };
-                steps.push(ParityStep {
-                    position: generated,
-                    token: tok,
-                    top1,
-                    top2,
-                });
-            }
-        }
-        // Turn end: flush whatever bytes remain buffered (n_predict can cut a
-        // multi-byte character in half — lossy-drain that residue).
-        flush_utf8_tail(pending, &mut scratch);
-        if !scratch.is_empty() {
-            emit(&scratch);
-        }
-        Ok(generated)
+    pub(crate) fn is_eog(&self, tok: raw::llama_token) -> bool {
+        // SAFETY: vocab is live; tok is a valid token id from the sampler.
+        unsafe { raw::llama_vocab_is_eog(self.loaded.model().vocab(), tok) }
+    }
+
+    pub(crate) fn piece(&self, tok: raw::llama_token) -> Vec<u8> {
+        // SAFETY: vocab is live; tok is a valid token id from the sampler.
+        unsafe { token_piece(self.loaded.model().vocab(), tok) }
+    }
+
+    fn offloaded(&self) -> bool {
+        self.config.n_gpu_layers > 0
     }
 }
 
-/// Owned greedy sampler chain; `Drop` calls `llama_sampler_free`, which frees
-/// the samplers added to the chain.
-struct Sampler {
+/// Owned sampler chain; `Drop` calls `llama_sampler_free`, which frees the
+/// samplers added to the chain.
+pub(crate) struct Sampler {
     ptr: *mut raw::llama_sampler,
 }
 
 impl Sampler {
-    /// `llama_sampler_chain_init(llama_sampler_chain_default_params())` + greedy.
-    fn greedy() -> Self {
+    /// Chain per `p`: penalties (when either is nonzero — applied in greedy
+    /// mode too), the request's tool-call `grammar` (owned sampler, moved
+    /// into the chain), then greedy for `temperature <= 0`, else
+    /// top_k (if > 0) → top_p → temp → dist(seed).
+    pub(crate) fn from_params(
+        p: &SamplingParams,
+        n_vocab: i32,
+        grammar: Option<*mut raw::llama_sampler>,
+    ) -> Result<Self, EngineError> {
         // SAFETY: returns llama.cpp's default sampler-chain params by value.
         let params = unsafe { raw::llama_sampler_chain_default_params() };
         // SAFETY: params are defaults; freed exactly once in Drop via llama_sampler_free.
         let chain = unsafe { raw::llama_sampler_chain_init(params) };
         if chain.is_null() {
-            // Broken FFI invariant, not a model rejection.
-            panic!("llama_sampler_chain_init returned null");
+            if let Some(g) = grammar {
+                // SAFETY: owned, never added to a chain.
+                unsafe { raw::llama_sampler_free(g) };
+            }
+            return Err(EngineError::SamplerInit);
         }
-        // SAFETY: chain is a live sampler chain; init_greedy ownership transfers
-        // to the chain (freed with it).
-        unsafe { raw::llama_sampler_chain_add(chain, raw::llama_sampler_init_greedy()) };
-        Sampler { ptr: chain }
+        let s = Sampler { ptr: chain };
+        let add = |smpl: *mut raw::llama_sampler| {
+            // SAFETY: chain is a live sampler chain; smpl ownership transfers
+            // to the chain (freed with it).
+            unsafe { raw::llama_sampler_chain_add(chain, smpl) }
+        };
+        if p.frequency_penalty != 0.0 || p.presence_penalty != 0.0 {
+            // SAFETY: plain constructor; ownership passes to the chain.
+            add(unsafe {
+                raw::llama_sampler_init_penalties(
+                    n_vocab,
+                    64,
+                    1.0,
+                    p.frequency_penalty,
+                    p.presence_penalty,
+                )
+            });
+        }
+        if let Some(g) = grammar {
+            add(g);
+        }
+        if p.temperature <= 0.0 {
+            // SAFETY: plain constructor; ownership passes to the chain.
+            add(unsafe { raw::llama_sampler_init_greedy() });
+            return Ok(s);
+        }
+        if p.top_k > 0 {
+            let k = i32::try_from(p.top_k).unwrap_or(i32::MAX);
+            // SAFETY: plain constructor; ownership passes to the chain.
+            add(unsafe { raw::llama_sampler_init_top_k(k) });
+        }
+        // SAFETY: plain constructors; ownership passes to the chain.
+        add(unsafe { raw::llama_sampler_init_top_p(p.top_p, 1) });
+        // SAFETY: as above.
+        add(unsafe { raw::llama_sampler_init_temp(p.temperature) });
+        // SAFETY: as above.
+        add(unsafe { raw::llama_sampler_init_dist(p.seed) });
+        Ok(s)
     }
 
     fn as_ptr(&self) -> *mut raw::llama_sampler {
@@ -1144,7 +1797,7 @@ impl Drop for Sampler {
 /// U+FFFD (`from_utf8_lossy` semantics). Byte-buffered because a
 /// byte-fallback vocab legitimately splits multi-byte characters across pieces;
 /// per-piece lossy conversion would corrupt them.
-fn emit_valid_prefix(pending: &mut Vec<u8>, out: &mut String, bytes: &[u8]) {
+pub(crate) fn emit_valid_prefix(pending: &mut Vec<u8>, out: &mut String, bytes: &[u8]) {
     pending.extend_from_slice(bytes);
     loop {
         match std::str::from_utf8(pending) {
@@ -1173,7 +1826,7 @@ fn emit_valid_prefix(pending: &mut Vec<u8>, out: &mut String, bytes: &[u8]) {
 /// Turn-end flush: complete any character pending on a real boundary, then
 /// lossily drain the residue (a multi-byte character truncated mid-sequence
 /// can never complete).
-fn flush_utf8_tail(pending: &mut Vec<u8>, out: &mut String) {
+pub(crate) fn flush_utf8_tail(pending: &mut Vec<u8>, out: &mut String) {
     emit_valid_prefix(pending, out, &[]);
     if !pending.is_empty() {
         out.push_str(&String::from_utf8_lossy(pending));
@@ -1181,8 +1834,8 @@ fn flush_utf8_tail(pending: &mut Vec<u8>, out: &mut String) {
     }
 }
 
-/// Writes one slot of the malloc'd batch buffer: token, position, single-sequence
-/// id 0, and the logits flag. llama_batch_init mallocs and does not zero, so
+/// Writes one slot of the malloc'd batch buffer: token, position, single
+/// sequence id `seq`, and the logits flag. llama_batch_init mallocs and does not zero, so
 /// every used slot must be written before decode.
 ///
 /// # Safety
@@ -1192,6 +1845,7 @@ unsafe fn fill_slot(
     i: usize,
     token: i32,
     pos: raw::llama_pos,
+    seq: raw::llama_seq_id,
     wants_logits: bool,
 ) {
     // SAFETY: caller guarantees i is below the allocated n_tokens; each field of
@@ -1200,68 +1854,9 @@ unsafe fn fill_slot(
         *b.token.add(i) = token;
         *b.pos.add(i) = pos;
         *b.n_seq_id.add(i) = 1;
-        **b.seq_id.add(i) = 0;
+        **b.seq_id.add(i) = seq;
         *b.logits.add(i) = if wants_logits { 1 } else { 0 };
     }
-}
-
-/// Applies the chat template: sizing call with a null buffer (documented pattern,
-/// returns the total byte count), then the real call into a zeroed `count + 1`
-/// buffer (+1 because `strncpy` does not NUL-terminate an exact-size render).
-///
-/// # Safety
-/// `tmpl` must be a valid NUL-terminated CString, and every `ChatMessageFFI` in
-/// `msgs` must stay alive for the duration of the call.
-unsafe fn apply_template(
-    tmpl: &CStr,
-    msgs: &[ChatMessageFFI],
-    add_ass: bool,
-) -> Result<String, EngineError> {
-    // Pointers into msgs' CStrings; they outlive both FFI calls below.
-    let chat: Vec<raw::llama_chat_message> = msgs
-        .iter()
-        .map(|m| raw::llama_chat_message {
-            role: m.role.as_ptr(),
-            content: m.content.as_ptr(),
-        })
-        .collect();
-    let n_msg = chat.len();
-    // SAFETY: tmpl and chat point to live NUL-terminated data; null/0 buffer is
-    // the documented sizing call (returns the total number of bytes needed,
-    // negative on detection/apply failure).
-    let n = unsafe {
-        raw::llama_chat_apply_template(
-            tmpl.as_ptr(),
-            chat.as_ptr(),
-            n_msg,
-            add_ass,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if n < 0 {
-        return Err(EngineError::TemplateApply(n));
-    }
-    let mut buf = vec![0u8; usize::try_from(n).unwrap_or(0) + 1];
-    // SAFETY: buf is n+1 zeroed bytes and length n matches the sizing result.
-    let written = unsafe {
-        raw::llama_chat_apply_template(
-            tmpl.as_ptr(),
-            chat.as_ptr(),
-            n_msg,
-            add_ass,
-            buf.as_mut_ptr().cast(),
-            n,
-        )
-    };
-    if written < 0 {
-        return Err(EngineError::TemplateApply(written));
-    }
-    // SAFETY: buf is NUL-terminated (zeroed +1 byte; at most `written` render bytes).
-    let s = unsafe { CStr::from_ptr(buf.as_ptr().cast()) }
-        .to_string_lossy()
-        .into_owned();
-    Ok(s)
 }
 
 /// Tokenizes `text` (two-pass: null-buffer sizing call, whose negative return is
@@ -1341,6 +1936,12 @@ unsafe fn token_piece(vocab: *const raw::llama_vocab, token: raw::llama_token) -
 }
 
 /// Expert copies the pool has served (demand page-ins + fast hits), cumulative.
+/// Pool copies plus streamed planes: streamed planes are expert copies served
+/// on the GPU split too (`stream_source` fires only from that copy loop, §7.6).
+fn prefill_traffic(p: &p3_glue::SessionHooks) -> u64 {
+    pool_traffic(&p.stats) + p.stream_stats().map_or(0, |s| s.planes)
+}
+
 fn pool_traffic(stats: &P3Stats) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     stats.demand_slow_pageins.load(Relaxed) + stats.fast_hits.load(Relaxed)
@@ -1369,7 +1970,7 @@ fn check_pool_engaged(before: u64, now: u64) -> Result<(), EngineError> {
 /// cumulative for the process (counted once per graph build, P1
 /// `golem_get_expert_placement_stats`). Two independent loads, not a
 /// consistent snapshot: compare deltas over a window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExpertPlacement {
     /// Expert `MUL_MAT_ID` nodes assigned to a GPU backend (cumulative).
     pub on_gpu: u64,
@@ -1459,6 +2060,148 @@ fn skip_ratio(bytes_copied: u64, bytes_skipped: u64) -> f64 {
     }
 }
 
+/// The §10 plan inputs for this config (`ws` unmeasured until T8). The
+/// context ubatch mirrors `load_with_hooks`; an explicit K prices its slab
+/// as `(K + 1) × Σ_layers unit bytes` — target 9 × 644,022,272 B = 5.4 GiB
+/// at K = 8.
+fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::PlanInput {
+    let ubatch = if config.prefill_stream {
+        match config.prefill_ubatch {
+            0 => 2048,
+            u => u,
+        }
+    } else {
+        config.batch_tokens
+    };
+    let per_expert = m.expert_bytes_total / u64::from(m.n_expert.max(1));
+    golem_plan::PlanInput {
+        ctx: config.n_ctx,
+        parallel: config.parallel,
+        prefill_ubatch: ubatch.min(config.n_ctx),
+        prefill_stream: config.prefill_stream,
+        vram_experts: match config.device_cache_experts {
+            0 => 0,
+            k => (u64::from(k) + 1) * per_expert,
+        },
+        ram_experts: config.ram_experts_gib << 30,
+        snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
+        ws: golem_plan::WS_UNMEASURED,
+    }
+}
+
+/// Load-time §10 VRAM feasibility (§6.4), same `golem_plan::plan` as
+/// `golem plan`, against the VRAM free before the load. RAM admission is
+/// the CLI's `fit_ram` over the same `ram_terms`, so RAM is not re-judged
+/// here. Err = `PlanInfeasible` with the failing inequality.
+fn check_plan(
+    config: &EngineConfig,
+    m: &golem_plan::ModelFacts,
+    vram_free: u64,
+) -> Result<golem_plan::PlanReport, EngineError> {
+    let mach = golem_plan::Machine {
+        vram_total: vram_free,
+        ram_total: u64::MAX,
+        ram_free: u64::MAX,
+        rocm_overhead: golem_plan::ROCM_OVERHEAD,
+    };
+    let r = golem_plan::plan(m, &mach, &plan_input(config, m));
+    if r.feasible {
+        Ok(r)
+    } else {
+        Err(EngineError::PlanInfeasible(Box::new(r)))
+    }
+}
+
+/// `(free, total)` device VRAM on a GPU build (`hipMemGetInfo`); `None`
+/// on CPU builds or when the runtime reports an error.
+pub fn device_vram() -> Option<(u64, u64)> {
+    #[cfg(golem_backend_hip)]
+    return golem_llama_sys::pinned::free_device_mem().map(|(f, t)| (f as u64, t as u64));
+    #[cfg(not(golem_backend_hip))]
+    None
+}
+
+/// Runs [`check_plan`] for a pooled session on a GPU build; `None` when the
+/// pool is off (the §10 tiers do not apply) or no VRAM reading exists.
+fn load_plan(config: &EngineConfig) -> Result<Option<golem_plan::PlanReport>, EngineError> {
+    if config.ram_experts_gib == 0 {
+        return Ok(None);
+    }
+    let Some((free, _)) = device_vram() else {
+        return Ok(None);
+    };
+    let facts = match config.model_facts {
+        Some(f) => f,
+        None => golem_plan::ModelFacts::from_gguf(&config.model_path)
+            .map_err(|e| EngineError::InvalidModel(format!("plan: {e}")))?,
+    };
+    check_plan(config, &facts, free).map(Some)
+}
+
+/// Builds the snapshot cache (§7.1) per `config.snapshot_ram_bytes`.
+/// Floor = `parallel × snapshot_bytes(n_ctx)`: one full-context snapshot per
+/// slot — below it long chats silently lose reuse, so smaller budgets are
+/// refused. Target: 145.56 MiB + 19,712 B × 100k ≈ 2.0 GiB at parallel 1.
+fn snapshot_cache(
+    config: &EngineConfig,
+    loaded: &LoadedModel,
+) -> Result<Option<SnapshotCache>, EngineError> {
+    if config.snapshot_ram_bytes == Some(0) {
+        return Ok(None);
+    }
+    let facts = match config.model_facts {
+        Some(f) => f,
+        None => golem_plan::ModelFacts::from_gguf(&config.model_path)
+            .map_err(|e| EngineError::InvalidModel(format!("snapshot sizing: {e}")))?,
+    };
+    let (floor, default) = golem_plan::snapshot_arena(&facts, config.parallel, config.n_ctx);
+    let bytes = match config.snapshot_ram_bytes {
+        None => default,
+        Some(n) if n < floor => {
+            return Err(EngineError::InvalidConfig(format!(
+                "snapshot_ram_bytes {n} < floor {floor} (parallel {} × one {}-token snapshot)",
+                config.parallel, config.n_ctx
+            )));
+        }
+        Some(n) => n,
+    };
+    let len = usize::try_from(bytes)
+        .map_err(|_| EngineError::InvalidConfig("snapshot_ram_bytes > usize".into()))?;
+    let model_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        config.model_path.hash(&mut h);
+        config.n_ctx.hash(&mut h);
+        // SAFETY: ctx is live.
+        unsafe { raw::llama_n_ubatch(loaded.ctx().as_ptr()) }.hash(&mut h);
+        h.finish()
+    };
+    Ok(Some(SnapshotCache::new(
+        p3_glue::PinnedArena::new(len)?,
+        model_key,
+        config.n_ctx as usize,
+    )))
+}
+
+/// The session's one batch: `llama_n_batch` token slots (≥ every chunk and
+/// every decode step, both capped at one ubatch), one seq id per token.
+fn shared_batch(loaded: &LoadedModel, config: &EngineConfig) -> (Batch, usize, Arc<AbortSet>) {
+    // SAFETY: ctx is live.
+    let n = (unsafe { raw::llama_n_batch(loaded.ctx().as_ptr()) } as usize)
+        .max(config.parallel as usize);
+    let abort = Arc::new(AbortSet::new(config.parallel as usize));
+    // SAFETY: ctx is live and idle; the set outlives the context's use of
+    // it (`Session::drop` clears the callback before `abort` drops).
+    unsafe {
+        raw::llama_set_abort_callback(
+            loaded.ctx().as_ptr(),
+            Some(abort_requested),
+            Arc::as_ptr(&abort) as *mut std::ffi::c_void,
+        )
+    };
+    (Batch::init(n as i32, 0, 1), n, abort)
+}
+
 /// Prefill chunk length in tokens. Base cap `min(batch_tokens, n_ctx - 1)`:
 /// one KV slot stays free so the first generated token always has a position
 /// to decode into. With the expert pool on (§2.4), also capped at
@@ -1479,6 +2222,49 @@ fn prefill_chunk_cap(batch_tokens: usize, n_ctx: usize, pool: Option<(u32, u32)>
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    fn glm() -> golem_plan::ModelFacts {
+        golem_plan::ModelFacts {
+            t_ne: 9_640_226_040,
+            shexp: 1_123_024_896,
+            n_expert: 288,
+            expert_layers: 42,
+            max_plane_stride: 6_881_280,
+            expert_bytes_total: 185_478_414_336,
+            kv_per_token: 19_712,
+            rs_bytes: 152_633_344,
+            sparse_attn_layers: 11,
+        }
+    }
+
+    /// Target, 24 GiB free: 100k ctx + streamed 2048 ubatch + explicit K = 8
+    /// (9 × 644 MB = 5.4 GiB) is 8.98 + 1.84 + 0.14 + 0.5 + 5.4 + 3.69 + 2.64
+    /// ≈ 23.2 GiB → fits; K = 12 (7.8 GiB) → 25.6 GiB, refused.
+    #[test]
+    fn load_check_refuses_an_overcommitted_k() {
+        let mut cfg = EngineConfig {
+            n_ctx: 100_000,
+            ram_experts_gib: 57,
+            prefill_stream: true,
+            device_cache_experts: 8,
+            ..EngineConfig::default()
+        };
+        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        assert_eq!(r.term("device_expert_cache"), 9 * 644_022_272);
+        assert_eq!(r.term("stream_slabs"), 3_963_617_280);
+        cfg.device_cache_experts = 12;
+        let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
+        assert!(
+            matches!(&e, EngineError::PlanInfeasible(r) if !r.feasible),
+            "{e}"
+        );
+        assert!(e.to_string().contains("> 24.0 GiB"), "{e}");
+        // Derived K: the cache term is whatever the other terms leave.
+        cfg.device_cache_experts = 0;
+        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        assert_eq!(r.vram_headroom, 0);
+        assert!(r.term("device_expert_cache") > 6 << 30);
+    }
 
     #[test]
     fn skip_ratio_math() {
@@ -1539,12 +2325,36 @@ mod tests {
         assert!(forces_expert_offload(&pooled));
     }
 
+    /// One rendering path (§8.1): the shim's no-tools render of the tiny-moe
+    /// fallback (chatml) equals the old `llama_chat_apply_template` render.
     #[test]
-    fn fallback_template_contains_chatml_marker() {
-        // llama.cpp detects chatml by the <|im_start|> substring (llama-chat.cpp
-        // llm_chat_detect_template); the fallback must carry it.
-        assert!(FALLBACK_CHAT_TEMPLATE.contains("<|im_start|>"));
-        assert!(FALLBACK_CHAT_TEMPLATE.contains("<|im_end|>"));
+    fn shim_no_tools_render_matches_legacy_template_apply() {
+        let cfg = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let s = Session::new(&cfg).expect("tiny-moe loads");
+        let turns = [
+            ChatTurn {
+                role: "system",
+                content: "be brief",
+            },
+            ChatTurn {
+                role: "user",
+                content: "hello",
+            },
+            ChatTurn {
+                role: "assistant",
+                content: "hi there",
+            },
+            ChatTurn {
+                role: "user",
+                content: "again",
+            },
+        ];
+        let shim = s.render(&TurnRequest::new(&turns)).unwrap().prompt;
+        let legacy = legacy_apply_template(c"chatml", &turns, true);
+        assert_eq!(shim, legacy);
     }
 
     #[test]
@@ -1698,10 +2508,12 @@ mod tests {
             ..EngineConfig::default()
         };
         let mut s = Session::new(&cfg).expect("pooled CPU session loads tiny-moe");
-        let (k, top_k) =
-            s.p3.as_ref()
-                .map(|p| (p.device_cache_experts, p.top_k))
-                .expect("pool enabled for this session");
+        let (k, top_k) = s
+            .inner
+            .p3
+            .as_ref()
+            .map(|p| (p.device_cache_experts, p.top_k))
+            .expect("pool enabled for this session");
         let cap = prefill_chunk_cap(
             cfg.batch_tokens as usize,
             cfg.n_ctx as usize,
@@ -1725,5 +2537,62 @@ mod tests {
             0,
             "multi-chunk prefill must not advance the policy step (§6.2)"
         );
+    }
+
+    /// Applies the chat template: sizing call with a null buffer (documented pattern,
+    /// returns the total byte count), then the real call into a zeroed `count + 1`
+    /// buffer (+1 because `strncpy` does not NUL-terminate an exact-size render).
+    ///
+    /// The pre-shim render path, kept as the no-tools parity oracle.
+    fn legacy_apply_template(tmpl: &CStr, turns: &[ChatTurn<'_>], add_ass: bool) -> String {
+        let owned: Vec<(CString, CString)> = turns
+            .iter()
+            .map(|t| {
+                (
+                    CString::new(t.role).unwrap(),
+                    CString::new(t.content).unwrap(),
+                )
+            })
+            .collect();
+        // Pointers into `owned`; they outlive both FFI calls below.
+        let chat: Vec<raw::llama_chat_message> = owned
+            .iter()
+            .map(|(r, c)| raw::llama_chat_message {
+                role: r.as_ptr(),
+                content: c.as_ptr(),
+            })
+            .collect();
+        let n_msg = chat.len();
+        // SAFETY: tmpl and chat point to live NUL-terminated data; null/0 buffer is
+        // the documented sizing call (returns the total number of bytes needed,
+        // negative on detection/apply failure).
+        let n = unsafe {
+            raw::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                chat.as_ptr(),
+                n_msg,
+                add_ass,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(n >= 0, "llama_chat_apply_template sizing failed: {n}");
+        let mut buf = vec![0u8; usize::try_from(n).unwrap_or(0) + 1];
+        // SAFETY: buf is n+1 zeroed bytes and length n matches the sizing result.
+        let written = unsafe {
+            raw::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                chat.as_ptr(),
+                n_msg,
+                add_ass,
+                buf.as_mut_ptr().cast(),
+                n,
+            )
+        };
+        assert!(written >= 0, "llama_chat_apply_template failed: {written}");
+        // SAFETY: buf is NUL-terminated (zeroed +1 byte; at most `written` render bytes).
+        unsafe { CStr::from_ptr(buf.as_ptr().cast()) }
+            .to_string_lossy()
+            .into_owned()
     }
 }

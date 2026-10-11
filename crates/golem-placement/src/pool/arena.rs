@@ -190,6 +190,15 @@ impl Arena {
         })
     }
 
+    /// One undivided locked region of at least `len` bytes (page-rounded):
+    /// the state-snapshot store (§7.1) shares the pool's mmap + mlock path.
+    pub fn new_bytes(len: usize) -> Result<Self, ArenaError> {
+        Self::new(&[SlotClass {
+            slot_size: len,
+            slots: 1,
+        }])
+    }
+
     /// Base pointer and byte length of the whole arena, for GPU pinning
     /// (§3.5) and metrics; the arena keeps ownership.
     pub fn as_ptr_range(&self) -> (*mut u8, usize) {
@@ -360,5 +369,12 @@ mod tests {
         assert_eq!(a.offset_of(3), 3 * 4096, "class 1 starts after class 0");
         assert_eq!(a.offset_of(4), 3 * 4096 + 6144);
         assert_eq!(a.offset_of(4) + 6144, a.len, "last slot ends the arena");
+    }
+
+    #[test]
+    fn new_bytes_is_one_page_rounded_region() {
+        let a = Arena::new_bytes(5000).expect("mlock may fail on low RLIMIT_MEMLOCK");
+        assert_eq!(a.as_ptr_range().1, 2 * PAGE);
+        assert!(Arena::new_bytes(0).is_err());
     }
 }

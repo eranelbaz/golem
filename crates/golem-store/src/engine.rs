@@ -99,7 +99,7 @@ impl IoEngine {
     /// Never (the queue validates nothing here); a zero cap means derived.
     pub fn new(threads: usize) -> Self {
         Self {
-            queue: Arc::new(ChunkQueue::new(threads)),
+            queue: Arc::new(ChunkQueue::new(threads, None)),
         }
     }
 
@@ -203,6 +203,7 @@ mod tests {
                 bytes: SHARD_BYTES as u64,
                 sha256: "0".repeat(64),
                 replicas,
+                ..Default::default()
             }],
             ..Default::default()
         };

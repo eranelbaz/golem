@@ -171,6 +171,25 @@ fn import_builds_valid_manifest_with_crc_and_mirror() {
         std::fs::canonicalize(&r).unwrap(),
     ];
     assert!(m.shards.iter().all(|s| s.replicas == want));
+    for s in &m.shards {
+        let p = src.join(&s.file);
+        assert_eq!(
+            s.sampled_sha256.as_deref(),
+            Some(&golem_store::import::sampled_sha256(&p).unwrap()[..])
+        );
+        assert_eq!(s.sampled_sha256.as_ref().unwrap().len(), 16);
+        let mt = |p: &Path| {
+            std::fs::metadata(p)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(s.mtime, Some(mt(&p)));
+        assert_eq!(mt(&r.join(&s.file)), mt(&p), "replica mtime = source");
+    }
 }
 
 #[test]

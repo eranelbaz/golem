@@ -1,8 +1,13 @@
 //! HTTP API contract: OpenAI-compatible types, the Golem error envelope, and
 //! the request field policy (tech design §8).
-//!
-//! Scaffold: the error envelope is complete per design §8.4; the
-//! full request/response type set and the field-policy table land in M4.1.
+
+pub mod chat;
+pub mod policy;
+
+pub use chat::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    MessageContent, ModelList, Usage,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +88,16 @@ impl ErrorEnvelope {
         }
     }
 }
+
+/// JSON form, for CLI output and logs (one envelope everywhere, §8.4).
+impl std::fmt::Display for ErrorEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let json = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        f.write_str(&json)
+    }
+}
+
+impl std::error::Error for ErrorEnvelope {}
 
 #[cfg(test)]
 mod tests {

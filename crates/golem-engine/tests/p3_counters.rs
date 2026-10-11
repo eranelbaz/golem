@@ -47,7 +47,7 @@ fn drive_step(hooks: &SessionHooks, gate: *mut raw::ggml_tensor) {
         2,
         xt::N_EXPERTS,
     );
-    p3_glue::ensure_host_resident(
+    let rc = p3_glue::ensure_host_resident(
         payload,
         gate.cast(),
         kinds.as_ptr(),
@@ -55,6 +55,7 @@ fn drive_step(hooks: &SessionHooks, gate: *mut raw::ggml_tensor) {
         3,
         out.as_mut_ptr().cast(),
     );
+    assert_eq!(rc, 0, "ensure paged in");
     p3_glue::copy_done(payload);
     assert!(out.iter().all(|p| !p.is_null()), "all planes filled");
 }

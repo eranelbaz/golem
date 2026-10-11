@@ -146,7 +146,7 @@ static void pool_init() {
     g_pool.assign(plane * 3 * N_EXP, (char) 0x5a);
 }
 
-static void h_ensure(void * p, const void * tensor, const int32_t * mk, const int32_t * mi,
+static int32_t h_ensure(void * p, const void * tensor, const int32_t * mk, const int32_t * mi,
                      int32_t n, const void ** out) {
     auto * s = (HState *) p;
     s->ensure_calls.fetch_add(1);
@@ -162,11 +162,13 @@ static void h_ensure(void * p, const void * tensor, const int32_t * mk, const in
     g_cb_entered.store(true);
     std::this_thread::sleep_for(std::chrono::milliseconds(g_join_sleep_ms.load()));
     s->cb_returned.store(true);
+    return 0;
 }
 
-static void h_abort_ensure(void *, const void *, const int32_t *, const int32_t *,
+static int32_t h_abort_ensure(void *, const void *, const int32_t *, const int32_t *,
                            int32_t, const void **) {
     golem_unregister_hooks(g_h_abort); // must GGML_ABORT (join waits for the calling step)
+    return 0;
 }
 
 static void h_routing(void * p, int32_t blk, const void * tensor, const int32_t * dense,
@@ -187,7 +189,7 @@ int main() {
         printf("FAIL: abi %d != header %d\n", golem_hooks_abi_version(), GOLEM_HOOKS_ABI_VERSION);
         return 1;
     }
-    REQUIRE(GOLEM_HOOKS_ABI_VERSION == 10, "abi v10 expected");
+    REQUIRE(GOLEM_HOOKS_ABI_VERSION == 13, "abi v13 expected");
     pool_init();
 
     {   // --- leg 1: placement counters (unchanged semantics, global stats) ---

@@ -11,11 +11,15 @@ pub struct EngineConfig {
     pub n_ctx: u32,
     /// Maximum tokens per llama_decode batch.
     pub batch_tokens: u32,
-    /// Maximum tokens to generate per completion.
+    /// Maximum tokens to generate per completion (a request's `max_tokens`
+    /// overrides it).
     pub n_predict: u32,
-    /// Decode threads (§7.2 as amended: logical CPUs / 2, min 1 — CPU-side
-    /// ops still run on these: sampling, the non-offloaded tail, tokenizer,
-    /// ids readback).
+    /// Decode slots (concurrent sequences). Only 1 is accepted until the
+    /// multi-slot scheduler lands.
+    pub parallel: u32,
+    /// CPU threadpool size (§7.2 as amended by R-15: physical cores / 2,
+    /// min 1 — CPU-side ops still run on these: sampling, the non-offloaded
+    /// tail, tokenizer, ids readback). Target: 16 physical cores → 8.
     pub threads: u32,
     /// Model layers to offload to the GPU (`llama_model_params::n_gpu_layers`,
     /// llama.h): 0 keeps the whole model on CPU — the CI-leg default.
@@ -42,6 +46,24 @@ pub struct EngineConfig {
     /// Store reader threads per drain (§5.4 `--io-threads`); `None` derives
     /// one thread per physical drive hosting an eligible replica.
     pub io_threads: Option<usize>,
+    /// Derived store reader threads per physical drive (§5.2, D-12: 1–2);
+    /// 0 = 1. Ignored when `io_threads` is set.
+    pub io_depth: u32,
+    /// Interleave the RAM expert pool's pages across every NUMA node
+    /// (`MPOL_INTERLEAVE` while the arena faults in); `false` keeps the
+    /// first-touch policy. A no-op on one node.
+    pub numa_interleave: bool,
+    /// Store reads must go `O_DIRECT` (§5.4): a replica without a direct
+    /// handle, or a direct read failure, fails the read instead of falling
+    /// back to buffered + `DONTNEED`. Needs a manifest. `false` keeps the
+    /// probe-and-fall-back behaviour.
+    pub o_direct: bool,
+    /// Pooled expert H2D on a dedicated copy stream overlapping compute.
+    /// Not implemented by the vendored scheduler: `true` is refused at load.
+    pub async_h2d: bool,
+    /// Share of the §10 planner's `device_expert_cache` allowance the
+    /// derived K may use (1.0 = all of it). No effect with an explicit K.
+    pub vram_experts_frac: f32,
     /// Model manifest (§4.2) for the store-backed expert source: when set,
     /// the P3 slow path reads expert planes from the manifest's replica set
     /// through the shared chunk queue; `None` (the default) reads the single
@@ -51,6 +73,9 @@ pub struct EngineConfig {
     /// timings are recorded and flushed at turn end; `None` (the default)
     /// records nothing.
     pub timing_csv: Option<PathBuf>,
+    /// Jinja chat template overriding the model's own (`None`: model
+    /// metadata, else chatml).
+    pub chat_template: Option<String>,
     /// Routing-trace destination (§11 timing-CSV pattern): when set, every
     /// routing readback is appended to a preallocated per-step ring and
     /// flushed at turn end as `step\tphase\tlayer\tid,id,...` under a
@@ -88,6 +113,35 @@ pub struct EngineConfig {
     /// of the ubatch's routed experts a plane streams whole instead of
     /// routed-only (BMoE's 0.85; Golem measures its own crossover).
     pub prefill_stream_routed_max: f32,
+    /// State-snapshot arena bytes (§7.1): `Some(0)` disables snapshots (and
+    /// the floor rule); `None` = planner default `max(2 GiB, 2 × floor)`;
+    /// any other value must be ≥ the floor `parallel × snapshot_bytes(n_ctx)`
+    /// (one full-context snapshot per slot) or the load is refused.
+    pub snapshot_ram_bytes: Option<u64>,
+    /// Header facts the caller already parsed (snapshot floor sizing);
+    /// `None` = the engine reads them from `model_path`.
+    pub model_facts: Option<golem_plan::ModelFacts>,
+    /// R-15: CPUs the store read queue and prefetch threads pin themselves
+    /// to at spawn (the non-V-cache CCD); `None` leaves them unpinned.
+    pub io_cpuset: Option<golem_store::sys::CpuSet>,
+    /// R-15: CPUs the thread calling `Session::new` pins itself to before
+    /// anything loads (the V-cache CCD), so ggml's threadpool and every
+    /// load-time thread inherit it; `None` leaves affinity untouched.
+    pub decode_cpuset: Option<golem_store::sys::CpuSet>,
+    /// The cpusets came from `--pin auto` detection: a decode pin failure
+    /// warns and continues instead of failing the load.
+    pub pin_auto: bool,
+    /// R-8 start check: full SHA-256 of every shard instead of the sampled
+    /// windows (`--full-verify`). The check runs only with a manifest.
+    pub full_verify: bool,
+}
+
+/// R-15 default CPU threadpool: physical cores / 2 (min 1), logical / 2
+/// when the physical count is unknown.
+pub fn default_threads() -> u32 {
+    let phys = sysinfo::System::new().physical_core_count();
+    let n = phys.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+    (n / 2).max(1) as u32
 }
 
 /// RAM/VRAM expert residency policy (§6.3 O10, `--residency`).
@@ -130,15 +184,19 @@ impl Default for EngineConfig {
             n_ctx: 256,
             batch_tokens: 512,
             n_predict: 64,
-            threads: std::thread::available_parallelism()
-                .map(|n| (n.get() / 2).max(1) as u32)
-                .unwrap_or(1),
+            parallel: 1,
+            threads: default_threads(),
             n_gpu_layers: 0,
             flash_attn_on: false,
             cpu_moe_layers: None,
             ram_experts_gib: 0,
             device_cache_experts: 0,
             io_threads: None,
+            io_depth: 0,
+            numa_interleave: false,
+            o_direct: false,
+            async_h2d: false,
+            vram_experts_frac: 1.0,
             manifest_path: None,
             timing_csv: None,
             routing_trace: None,
@@ -150,6 +208,48 @@ impl Default for EngineConfig {
             prefill_ubatch: 2048,
             prefill_stream_min: 256,
             prefill_stream_routed_max: 0.85,
+            // Off by default: only the CLI asks for the planner-sized arena.
+            snapshot_ram_bytes: Some(0),
+            model_facts: None,
+            chat_template: None,
+            io_cpuset: None,
+            decode_cpuset: None,
+            pin_auto: false,
+            full_verify: false,
+        }
+    }
+}
+
+impl std::str::FromStr for Residency {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "inclusive" => Ok(Self::Inclusive),
+            "exclusive" => Ok(Self::Exclusive),
+            _ => Err(format!("want inclusive or exclusive, got {s:?}")),
+        }
+    }
+}
+
+impl std::str::FromStr for PrefetchMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "off" => Ok(Self::Off),
+            "protect" => Ok(Self::Protect),
+            "read" => Ok(Self::Read),
+            _ => Err(format!("want off, protect or read, got {s:?}")),
+        }
+    }
+}
+
+impl std::str::FromStr for VramOrder {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "score" => Ok(Self::Score),
+            "recency" => Ok(Self::Recency),
+            _ => Err(format!("want score or recency, got {s:?}")),
         }
     }
 }
@@ -165,6 +265,9 @@ mod tests {
         assert_eq!(c.batch_tokens, 512);
         assert_eq!(c.n_predict, 64);
         assert!(c.threads >= 1, "threadpool never empty");
+        if let Some(p) = sysinfo::System::new().physical_core_count() {
+            assert_eq!(c.threads, (p / 2).max(1) as u32, "R-15: physical / 2");
+        }
         assert_eq!(c.model_path, PathBuf::new());
         assert_eq!(
             c.n_gpu_layers, 0,

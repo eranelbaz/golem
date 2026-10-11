@@ -41,6 +41,9 @@ pub struct StreamStats {
     pub staged: u64,
     /// stream_source calls (one per streamed plane).
     pub planes: u64,
+    /// Planes currently holding pool leases or a staging slot (sourced and
+    /// not yet released).
+    pub held: u64,
 }
 
 struct Task {
@@ -484,6 +487,12 @@ impl StreamState {
             pool_hits: self.pool_hits.load(Ordering::Relaxed),
             staged: self.staged.load(Ordering::Relaxed),
             planes: self.planes.load(Ordering::Relaxed),
+            held: self
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .holds
+                .len() as u64,
         }
     }
 

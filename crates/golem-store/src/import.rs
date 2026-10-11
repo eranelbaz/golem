@@ -330,13 +330,13 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
         }
     }
 
-    if let Some(want) = want_tensors {
-        if total_tensors != want {
-            return Err(source(
-                &first_path,
-                format!("split.tensors.count {want} != {total_tensors} tensors across shards"),
-            ));
-        }
+    if let Some(want) = want_tensors
+        && total_tensors != want
+    {
+        return Err(source(
+            &first_path,
+            format!("split.tensors.count {want} != {total_tensors} tensors across shards"),
+        ));
     }
     planes.sort_by(|a, b| (&a.layer, &a.tensor).cmp(&(&b.layer, &b.tensor)));
     if let Some(dup) = planes.windows(2).find(|w| w[0].tensor == w[1].tensor) {
@@ -882,6 +882,38 @@ pub fn verify_replica(path: &Path, want_sha: &str, chunk: usize) -> Result<(), I
     }
 }
 
+/// R-8 sample count and window: 16 × 1 MiB per shard.
+pub const SAMPLES: u64 = 16;
+/// R-8 sample window bytes.
+pub const SAMPLE_BYTES: u64 = 1 << 20;
+
+/// SHA-256 hex of each window `[i·(len−1 MiB)/15, +1 MiB)` of `path`: the
+/// first starts at 0 and the last ends at EOF (a file under 1 MiB is one
+/// window repeated). Pages dropped after each read so expert bytes stay out
+/// of the page cache. Target: 6 shards × 16 MiB = 96 MiB read at start vs
+/// 186 GiB for a full hash. The one window function for import and verify.
+pub fn sampled_sha256(path: &Path) -> Result<Vec<String>, ImportError> {
+    use std::os::unix::fs::FileExt;
+    let io = |e| ImportError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    };
+    let f = std::fs::File::open(path).map_err(io)?;
+    let len = f.metadata().map_err(io)?.len();
+    let mut buf = vec![0u8; SAMPLE_BYTES as usize];
+    (0..SAMPLES)
+        .map(|i| {
+            let off = i * len.saturating_sub(SAMPLE_BYTES) / (SAMPLES - 1);
+            let n = SAMPLE_BYTES.min(len - off) as usize;
+            f.read_exact_at(&mut buf[..n], off).map_err(io)?;
+            if !crate::sys::drop_page_cache(&f, off, n) {
+                warn_dontneed(path);
+            }
+            Ok(sha256_hex(&buf[..n]))
+        })
+        .collect()
+}
+
 /// `golem import` inputs (§5.5).
 #[derive(Debug, Clone, Default)]
 pub struct ImportRequest {
@@ -1062,21 +1094,33 @@ pub fn import(req: &ImportRequest) -> Result<ImportOutcome, ImportError> {
     roots.push(src.clone());
     roots.extend(replicas.iter().cloned());
     let warnings = crate::replica::shared_device_pairs(&roots);
-    let shards = scan
-        .shards
-        .iter()
-        .enumerate()
-        .map(|(i, s)| ShardEntry {
-            file: s
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+    let mut shards = Vec::with_capacity(scan.shards.len());
+    for (i, s) in scan.shards.iter().enumerate() {
+        let file = s.file_name().unwrap_or_default();
+        // R-8: one mtime for every copy, so the start-time check holds on
+        // whichever replica the instance loads.
+        let mtime = scan.stamps[i].1;
+        for r in &replicas {
+            let p = r.join(file);
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .and_then(|f| f.set_modified(mtime))
+                .map_err(|e| ImportError::Io { path: p, source: e })?;
+        }
+        shards.push(ShardEntry {
+            file: file.to_string_lossy().into_owned(),
             bytes: digests.bytes[i],
             sha256: digests.sha256[i].clone(),
             replicas: roots.clone(),
-        })
-        .collect();
+            sampled_sha256: Some(sampled_sha256(s)?),
+            mtime: Some(
+                mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+        });
+    }
     let expert_index = scan
         .planes
         .iter()

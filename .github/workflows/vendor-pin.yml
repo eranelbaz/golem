@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Triggers above cannot double-run (push is main-only, PRs fire only
 # pull_request); this group cancels superseded PR runs but never a main run.
@@ -13,6 +14,7 @@ concurrency:
 
 jobs:
   pin:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

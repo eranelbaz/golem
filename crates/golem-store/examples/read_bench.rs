@@ -122,7 +122,7 @@ fn run() -> Result<(), golem_store::StoreError> {
         });
     }
     let registry = ReplicaRegistry::open(&manifest)?;
-    let queue = Arc::new(ChunkQueue::new(args.io_threads)); // 0 = one reader thread per physical drive (§5.2); 2 = two per drive (D-12)
+    let queue = Arc::new(ChunkQueue::new(args.io_threads, None)); // 0 = one reader thread per physical drive (§5.2); 2 = two per drive (D-12)
 
     // Startup hygiene (H-9): a replica whose open-time probe failed serves
     // buffered from byte 0 — its GB/s is a page-cache number, not a disk one.

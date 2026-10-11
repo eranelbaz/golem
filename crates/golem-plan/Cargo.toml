@@ -9,3 +9,11 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+golem-gguf = { path = "../golem-gguf" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+xtask = { path = "../../xtask" }

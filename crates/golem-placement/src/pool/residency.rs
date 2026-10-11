@@ -786,6 +786,11 @@ impl ResidencyMap {
         wake.cv.notify_all();
     }
 
+    /// Free slots across all classes.
+    pub(crate) fn free_slot_count(&self) -> usize {
+        self.free_slots.lock().unwrap().iter().map(Vec::len).sum()
+    }
+
     /// The slot a resident key currently occupies, if any (diag/prefetch seam:
     /// pairs with [`Self::release_resident`] for callers that hold no claim
     /// token). `None` while mid-fill — the slot is not readable yet.
