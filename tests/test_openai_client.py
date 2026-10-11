@@ -3,9 +3,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 
+GOLEM = next((p for p in (REPO / "target/release/golem", REPO / "target/debug/golem") if p.exists()), None)
+
 def test_openai_client_non_streaming(tiny_moe_path, tmp_path):
+    assert GOLEM, "build golem first (cargo build -p golem-cli)"
     log = tmp_path / "serve.log"
-    p = subprocess.Popen([str(REPO / "target/release/golem"),"serve",str(tiny_moe_path),"--port","0"], stderr=log.open("w"))
+    p = subprocess.Popen([str(GOLEM),"serve",str(tiny_moe_path),"--port","0","--allow-overcommit"], stderr=log.open("w"))
     try:
         deadline = time.monotonic() + 120
         while not (m := re.search(r"listening on 127\.0\.0\.1:(\d+)", log.read_text())):

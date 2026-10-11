@@ -55,7 +55,7 @@ jobs:
         run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-placement --features loom
       # Parity-suite tests drive the real xtask comparator, so they must run
       # after the workspace build (target/debug/xtask; no cargo-run fallback).
-      - run: python3 -m pip install --quiet 'pytest==8.4.2'
+      - run: python3 -m pip install --quiet 'pytest==8.4.2' openai
       - run: python3 -m pytest tests -q
       - uses: EmbarkStudios/cargo-deny-action@v2
 
