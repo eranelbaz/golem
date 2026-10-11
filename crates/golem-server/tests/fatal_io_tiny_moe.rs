@@ -66,7 +66,9 @@ async fn all_replicas_unreadable_is_fatal_io_503() {
 }
 
 /// The replicas die inside the page-in itself (ABI v13 ensure failure):
-/// the process survives and the request still gets the 503.
+/// the process survives and the request still gets the 503. Needs a GPU
+/// split: the page-in runs on the miss-list path CPU builds never reach.
+#[cfg(feature = "hip-tests")]
 #[tokio::test(flavor = "multi_thread")]
 async fn replicas_lost_during_read_is_fatal_io_503() {
     fatal_io_503(TestHooks::fail_storage_during_read()).await;

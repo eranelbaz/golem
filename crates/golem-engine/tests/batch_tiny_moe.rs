@@ -321,6 +321,7 @@ fn streamed_chunk_never_mixed_with_decode_tokens() {
     }
 }
 
+#[cfg(feature = "hip-tests")]
 #[test]
 fn long_joiner_chunk_takes_stream_path_short_takes_routed_only() {
     for (min, want_stream) in [(1, true), (u32::MAX, false)] {

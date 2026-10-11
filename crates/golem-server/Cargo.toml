@@ -11,6 +11,8 @@ publish = false
 workspace = true
 
 [features]
+# Gates tests that need a GPU split (same gate as golem-engine's `hip-tests`).
+hip-tests = []
 # Fixture path + fault injection for the integration tests.
 test-support = ["dep:xtask", "dep:tracing-subscriber", "dep:tower", "golem-engine/test-support"]
 
