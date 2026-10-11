@@ -6,7 +6,7 @@ mod common; // path resolution copy: engine tests/ modules aren't importable acr
 fn run_greedy_one_shot_completes() {
     let model = common::tiny_moe_path();
     let out = common::golem_isolated()
-        .args(["run", "--greedy"])
+        .args(["run", "--greedy", "--allow-overcommit"])
         .arg(&model)
         .args(["--prompt", "hello", "--n-predict", "8"])
         .output()
@@ -27,7 +27,7 @@ fn repl_accumulates_history_until_reset() {
     use std::io::Write as _;
     let model = common::tiny_moe_path();
     let mut child = common::golem_isolated()
-        .args(["run", "--greedy"])
+        .args(["run", "--greedy", "--allow-overcommit"])
         .arg(&model)
         .args(["--n-predict", "4", "--timing-csv", "/dev/stdout"])
         .stdin(std::process::Stdio::piped())

@@ -21,6 +21,7 @@ fn run_greedy_args(ram_experts_gib: &str, extra: &[&str]) -> std::process::Outpu
         .args([
             "run",
             "--greedy",
+            "--allow-overcommit",
             "--n-predict",
             "32",
             "--n-gpu-layers",

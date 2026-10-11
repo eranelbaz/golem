@@ -11,7 +11,7 @@ fn sigterm_during_stream_exits_cleanly() {
     let mut child = common::golem_isolated()
         .arg("serve")
         .arg(common::tiny_moe_path())
-        .args(["--port", "0", "--ctx", "4096"])
+        .args(["--port", "0", "--ctx", "4096", "--allow-overcommit"])
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
