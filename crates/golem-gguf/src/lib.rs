@@ -208,6 +208,26 @@ pub const GGML_TYPE_Q4_K: u32 = 12;
 pub const GGML_TYPE_Q5_K: u32 = 13;
 /// 6-bit K-quant, block 256.
 pub const GGML_TYPE_Q6_K: u32 = 14;
+/// 2.06-bit i-quant, block 256.
+pub const GGML_TYPE_IQ2_XXS: u32 = 16;
+/// 2.31-bit i-quant, block 256.
+pub const GGML_TYPE_IQ2_XS: u32 = 17;
+/// 3.06-bit i-quant, block 256.
+pub const GGML_TYPE_IQ3_XXS: u32 = 18;
+/// 1.56-bit i-quant, block 256.
+pub const GGML_TYPE_IQ1_S: u32 = 19;
+/// 4-bit non-linear i-quant, block 32.
+pub const GGML_TYPE_IQ4_NL: u32 = 20;
+/// 3.44-bit i-quant, block 256.
+pub const GGML_TYPE_IQ3_S: u32 = 21;
+/// 2.5-bit i-quant, block 256.
+pub const GGML_TYPE_IQ2_S: u32 = 22;
+/// 4.25-bit i-quant, block 256.
+pub const GGML_TYPE_IQ4_XS: u32 = 23;
+/// 1.75-bit i-quant, block 256.
+pub const GGML_TYPE_IQ1_M: u32 = 29;
+/// bfloat16.
+pub const GGML_TYPE_BF16: u32 = 30;
 
 /// (`elements_per_block`, `bytes_per_block`) for the types the pool reads.
 /// `None` for types without a fixed block layout.
@@ -227,6 +247,16 @@ pub fn ggml_type_block(ggml_type: u32) -> Option<(u64, u64)> {
         GGML_TYPE_Q4_K => (256, 144),
         GGML_TYPE_Q5_K => (256, 176),
         GGML_TYPE_Q6_K => (256, 210),
+        GGML_TYPE_IQ2_XXS => (256, 66),
+        GGML_TYPE_IQ2_XS => (256, 74),
+        GGML_TYPE_IQ3_XXS => (256, 98),
+        GGML_TYPE_IQ1_S => (256, 50),
+        GGML_TYPE_IQ4_NL => (32, 18),
+        GGML_TYPE_IQ3_S => (256, 110),
+        GGML_TYPE_IQ2_S => (256, 82),
+        GGML_TYPE_IQ4_XS => (256, 136),
+        GGML_TYPE_IQ1_M => (256, 56),
+        GGML_TYPE_BF16 => (1, 2),
         _ => return None,
     };
     Some((blck, size))
