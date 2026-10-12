@@ -19,8 +19,8 @@ fn hooks_header_resolves_from_vendor_tree() {
         "hook registration missing"
     );
     assert!(
-        text.contains("#define GOLEM_HOOKS_ABI_VERSION 13"),
-        "hook ABI must be v13 (v12 slab alloc failure + v13 ensure failure)"
+        text.contains("#define GOLEM_HOOKS_ABI_VERSION 14"),
+        "hook ABI must be v14 (v12 slab alloc failure + v13 ensure failure + v14 resident bytes)"
     );
     for sym in [
         "golem_evict_abandon_fn",

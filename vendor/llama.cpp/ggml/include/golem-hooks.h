@@ -35,7 +35,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 13
+#define GOLEM_HOOKS_ABI_VERSION 14
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -256,6 +256,12 @@ int32_t golem_device_cache_experts(golem_ctx_t ctx);
 uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
 /* Test seam: the next n slab (re)allocations fail as if out of VRAM. */
 void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
+/* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
+ * remapped-ids tensors (*slab_bytes) and prefill-stream slabs
+ * (*stream_bytes). Slabs allocate lazily, so this is what is resident, not
+ * the K + 1 reservation. Call between computes (stream slabs are mutated
+ * outside dc_mutex). Zeros for a NULL ctx; either out pointer may be NULL. */
+void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t *slab_bytes, uint64_t *stream_bytes);
 
 /* Clear the ctx's device cache maps — the invalidation seam (also the
  * cold-start lever). Also frees the prefill-stream slabs. */

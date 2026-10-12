@@ -1163,6 +1163,7 @@ mod tests {
             kv_per_token: 19_712,
             rs_bytes: 152_630_000,
             sparse_attn_layers: 11,
+            dense_below_ctx: 2_052,
         }
     }
 

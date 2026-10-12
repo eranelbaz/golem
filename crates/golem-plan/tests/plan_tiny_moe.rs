@@ -11,6 +11,7 @@ fn table_bytes(path: &Path) -> u64 {
     tensor_entries(&mut File::open(path).unwrap())
         .unwrap()
         .iter()
+        .filter(|t| t.name != golem_plan::TOKEN_EMBD)
         .map(|t| {
             ggml_row_bytes(t.ggml_type, t.dims[0]).unwrap()
                 * t.dims[1..].iter().map(|&d| d.max(1)).product::<u64>()
@@ -30,6 +31,7 @@ fn tiny_moe_facts() {
     // glm4moe: every layer is full attention, f16 K and V.
     assert_eq!(m.sparse_attn_layers, dims::N_LAYER);
     assert_eq!(m.rs_bytes, 0);
+    assert_eq!(m.dense_below_ctx, 0, "no indexer");
     let per_layer = 2 * u64::from(dims::HEAD_DIM * dims::N_HEAD_KV) * 2;
     assert_eq!(m.kv_per_token, u64::from(m.sparse_attn_layers) * per_layer);
 }
@@ -56,6 +58,7 @@ fn tiny_hybrid_facts() {
 
     let attn = dims::HEAD_COUNT_KV.iter().filter(|&&h| h > 0).count() as u32;
     assert_eq!(m.sparse_attn_layers, attn);
+    assert_eq!(m.dense_below_ctx, dims::INDEXER_TOP_K + dims::INDEXER_KPOOL);
     // MLA is K-only; the pooling indexer caches 3 heads per cell; f16.
     let per_layer = u64::from(dims::KEY_LENGTH + 3 * dims::INDEXER_KEY_LENGTH) * 2;
     assert_eq!(m.kv_per_token, u64::from(attn) * per_layer);
