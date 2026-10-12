@@ -2063,7 +2063,7 @@ fn skip_ratio(bytes_copied: u64, bytes_skipped: u64) -> f64 {
     }
 }
 
-/// The §10 plan inputs for this config (`ws` unmeasured until T8). The
+/// The §10 plan inputs for this config (`ws` = fitted `WS_MEASURED`). The
 /// context ubatch mirrors `load_with_hooks`; an explicit K prices its slab
 /// as `(K + 1) × Σ_layers unit bytes` — target 9 × 644,022,272 B = 5.4 GiB
 /// at K = 8.
@@ -2088,7 +2088,7 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
         },
         ram_experts: config.ram_experts_gib << 30,
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
-        ws: golem_plan::WS_UNMEASURED,
+        ws: golem_plan::WS_MEASURED,
     }
 }
 
@@ -2241,15 +2241,19 @@ mod tests {
         }
     }
 
-    /// Target, 24 GiB free: 100k ctx + streamed 2048 ubatch + explicit K = 8
-    /// (9 × 644 MB = 5.4 GiB) is 8.98 + 1.84 + 0.14 + 0.5 + 5.4 + 3.69 + 2.64
-    /// ≈ 23.2 GiB → fits; K = 12 (7.8 GiB) → 25.6 GiB, refused.
+    /// Target, 24 GiB free: 100k ctx + streamed 512 ubatch (fitted ws 0.79
+    /// GiB) + explicit K = 8 (9 × 644 MB = 5.4 GiB) is 8.98 + 1.84 + 0.14 +
+    /// 0.79 + 5.4 + 3.69 + 2.64 ≈ 23.5 GiB → fits; K = 12 (7.8 GiB) →
+    /// 25.9 GiB, refused.
     #[test]
     fn load_check_refuses_an_overcommitted_k() {
         let mut cfg = EngineConfig {
             n_ctx: 100_000,
             ram_experts_gib: 57,
             prefill_stream: true,
+            // ubatch 512 keeps the fitted ws (810 MiB) from eating the
+            // explicit K = 8 cache at this ctx.
+            prefill_ubatch: 512,
             device_cache_experts: 8,
             ..EngineConfig::default()
         };
@@ -2267,8 +2271,10 @@ mod tests {
         cfg.device_cache_experts = 0;
         let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
         assert_eq!(r.vram_headroom, 0);
-        assert!(r.term("device_expert_cache") > 6 << 30);
-        // Half of that 6.6 GB cache holds K = 4 < top_k 8.
+        // ctx 100k at ubatch 512: fitted ws 0.79 GiB; 24 GiB − (8.98 t_ne +
+        // 1.84 kv + 0.14 rs + 0.79 ws + 3.69 slabs + 2.64 ROCm) ≈ 5.92 GiB.
+        assert!(r.term("device_expert_cache") > 5 << 30);
+        // Half of that 5.92 GiB cache holds K = 3 < top_k 8.
         cfg.vram_experts_frac = 0.5;
         let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
         assert!(e.to_string().contains("device_expert_cache "), "{e}");

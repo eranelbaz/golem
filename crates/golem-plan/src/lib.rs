@@ -199,21 +199,63 @@ pub struct Machine {
     pub rocm_overhead: u64,
 }
 
-/// Prefill workspace model, fitted from measured points.
+/// Prefill workspace model, fitted from the measured T8 sweep on gfx1100
+/// (docs/baselines/m4.6-plan-t8.md). The compute buffer is the larger of a
+/// ctx-dominated and a ubatch-dominated regime, hence max.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WsModel {
-    /// Fixed part (512 MiB until measured).
+    /// Fixed part of the ctx-dominated regime.
     pub base: u64,
-    /// Bytes per ubatch token.
+    /// Bytes per ctx token in the ctx-dominated regime.
+    pub per_ctx_token: u64,
+    /// Bytes per ubatch token in the ubatch-dominated regime.
     pub per_ubatch_token: u64,
 }
 
-/// `ws` until the T8 hardware sweep fits it (§12, M4.6): the §10 512 MiB
-/// starting point, slope **unmeasured** (0). Placeholder, not a measurement.
-pub const WS_UNMEASURED: WsModel = WsModel {
-    base: 512 << 20,
-    per_ubatch_token: 0,
+impl WsModel {
+    /// Workspace bytes at this ctx × ubatch: `max(base + a·ctx, b·ubatch)`.
+    #[must_use]
+    pub fn bytes(&self, ctx: u32, ubatch: u32) -> u64 {
+        self.base
+            .saturating_add(self.per_ctx_token.saturating_mul(u64::from(ctx)))
+            .max(self.per_ubatch_token.saturating_mul(u64::from(ubatch)))
+    }
+}
+
+/// Fitted on RX 7900 XTX, GLM-5.3-Flash UD-Q4_K_XL (§12, T8): base 320 MiB,
+/// fitted ctx slope 5 138 B/token (ubatch-512 row), ubatch slope 1 105 975
+/// B/token (ctx 65536 row, linear through zero at 1.0547 MiB/token). All
+/// six measured points within 256 MiB of the model; worst +198 MiB at ctx
+/// 4096 / ubatch 512, where the ubatch branch over-predicts the flat
+/// small-ctx compute buffer. Fit domain: ubatch ≥ 512.
+pub const WS_MEASURED: WsModel = WsModel {
+    base: 320 << 20,
+    per_ctx_token: 5_138,
+    per_ubatch_token: 1_105_975,
 };
+
+/// The six T8 measured compute-buffer points (ctx, ubatch, bytes).
+#[cfg(test)]
+const T8_MEASURED: [(u32, u32, u64); 6] = [
+    (4_096, 512, 359_137_280),
+    (65_536, 512, 633_685_934),
+    (65_536, 1_024, 1_132_818_596),
+    (65_536, 2_048, 2_265_312_133),
+    (65_536, 4_096, 4_530_299_208),
+    (131_072, 512, 1_003_109_745),
+];
+
+/// Fit regression: `WS_MEASURED` reproduces every T8 point within 256 MiB.
+#[test]
+fn ws_fitted_model_matches_t8_points() {
+    for (ctx, ub, actual) in T8_MEASURED {
+        let pred = WS_MEASURED.bytes(ctx, ub);
+        assert!(
+            pred.abs_diff(actual) <= 256 << 20,
+            "ctx {ctx} ubatch {ub}: predicted {pred}, actual {actual}"
+        );
+    }
+}
 
 /// Combined ROCm overhead on gfx1100, measured in M0 (2.64 GiB, m0-notes).
 pub const ROCM_OVERHEAD: u64 = 2_834_678_415;
@@ -350,8 +392,8 @@ fn headroom(cap: u64, used: u64) -> i64 {
 }
 
 /// VRAM tier (§10). Target at ctx 100k, parallel 1, ubatch 2048, unset
-/// cache: 8.98 GiB t_ne + 1.84 GiB kv + 0.14 GiB rs + 0.5 GiB ws + 3.69 GiB
-/// slabs + 2.64 GiB ROCm = 17.8 GiB → 6.2 GiB device expert cache.
+/// cache: 8.98 GiB t_ne + 1.84 GiB kv + 0.14 GiB rs + 2.11 GiB ws + 3.69 GiB
+/// slabs + 2.64 GiB ROCm = 19.4 GiB → 4.6 GiB device expert cache.
 #[must_use]
 pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
     let par = u64::from(i.parallel);
@@ -377,10 +419,7 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
         },
         Term {
             name: "ws",
-            bytes: i.ws.base.saturating_add(
-                i.ws.per_ubatch_token
-                    .saturating_mul(u64::from(i.prefill_ubatch)),
-            ),
+            bytes: i.ws.bytes(i.ctx, i.prefill_ubatch),
         },
         Term {
             name: "stream_slabs",
@@ -607,6 +646,7 @@ mod tests {
     fn oversized_ubatch_refused_with_largest_fitting_suggestion() {
         let ws = WsModel {
             base: 512 << 20,
+            per_ctx_token: 0,
             per_ubatch_token: 1 << 20,
         };
         let r = plan(
@@ -647,7 +687,7 @@ mod tests {
         let i = PlanInput {
             ctx: 4096,
             parallel: 1,
-            ws: WS_UNMEASURED,
+            ws: WS_MEASURED,
             ..Default::default()
         };
         let r = plan(&glm(), &box24(), &i);
@@ -666,8 +706,9 @@ mod tests {
     }
 
     /// Target at ctx 32768, streamed, parallel 4: 9.64 t_ne + 2.58 kv +
-    /// 0.61 rs + 0.54 ws + 3.96 slabs + 2.83 ROCm = 20.2 GB of 25.8 → 5.61 GB
-    /// cache < 9 × 644 MB = 5.80 GB (K = 7 < top_k 8); parallel 1 → 7.99 GB.
+    /// 0.61 rs + 2.27 ws (fitted, ubatch 2048) + 3.96 slabs + 2.83 ROCm =
+    /// 21.9 GB of 25.8 → 3.87 GB cache < 9 × 644 MB = 5.80 GB (K = 5
+    /// below top_k 8); parallel 1 → 6.27 GB.
     #[test]
     fn device_cache_k_is_whole_slabs_minus_one() {
         assert_eq!(device_cache_k(9 * 644_022_272, 644_022_272), 8);
@@ -690,7 +731,7 @@ mod tests {
             parallel: 4,
             prefill_ubatch: 8192,
             prefill_stream: true,
-            ws: WS_UNMEASURED,
+            ws: WS_MEASURED,
             ..Default::default()
         };
         let r = plan(&m, &box24(), &i);
@@ -729,7 +770,7 @@ mod tests {
             parallel: 4,
             prefill_ubatch: 2048,
             prefill_stream: true,
-            ws: WS_UNMEASURED,
+            ws: WS_MEASURED,
             ..Default::default()
         };
         let r = plan(&m, &box24(), &i);
@@ -751,9 +792,10 @@ mod tests {
         assert!(!plan(&m, &box24(), &explicit).feasible);
     }
 
-    /// Target at ctx 32768, parallel 1: 25.77 − (9.64 + 0.65 + 0.15 + 0.54 +
-    /// 3.96 + 2.83) = 7.99 GB derived cache; × 0.7 = 5.60 GB < 9 × 644 MB =
-    /// 5.80 GB → refused, × 0.75 = 6.00 GB fits.
+    /// Target at ctx 32768, parallel 1: 25.77 − (9.64 + 0.65 + 0.15 + 2.27 +
+    /// 3.96 + 2.83) = 6.27 GB derived cache with the fitted ws of 2.27 GB at
+    /// ubatch 2048. Fraction × 0.7 gives 4.39 GB < 9 × 644 MB = 5.80 GB →
+    /// refused; × 0.95 gives 5.95 GB, which fits.
     #[test]
     fn frac_caps_the_derived_cache_against_its_minimum() {
         let m = ModelFacts {
@@ -766,7 +808,7 @@ mod tests {
             parallel: 1,
             prefill_ubatch: 2048,
             prefill_stream: true,
-            ws: WS_UNMEASURED,
+            ws: WS_MEASURED,
             ..Default::default()
         };
         let full = plan_at_frac(&m, &box24(), &i, 1.0);
@@ -776,11 +818,15 @@ mod tests {
         }
         let r = plan_at_frac(&m, &box24(), &i, 0.7);
         assert!(!r.feasible, "{:?}", r.violation());
-        let r = plan_at_frac(&m, &box24(), &i, 0.75);
+        let r = plan_at_frac(&m, &box24(), &i, 0.95);
         assert!(r.feasible);
-        assert_eq!(
-            r.term("device_expert_cache"),
-            (full.term("device_expert_cache") as f64 * 0.75) as u64
+        // plan_at_frac caps the cache in f64, then the term is clamped to
+        // what the other terms leave, so the two can differ by a few bytes.
+        let want = (full.term("device_expert_cache") as f64 * 0.95) as u64;
+        assert!(
+            r.term("device_expert_cache").abs_diff(want) < 128,
+            "{} vs {want}",
+            r.term("device_expert_cache")
         );
     }
 
