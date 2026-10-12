@@ -835,6 +835,22 @@ impl Session {
         self.inner.p3.as_ref().map(|p| p.device_cache_experts)
     }
 
+    /// Device bytes the expert cache holds right now: `(slabs + remapped ids,
+    /// prefill-stream slabs)`, summed from C's live buffers (§3.4, §7.6);
+    /// `None` unless this session drives the pooled GPU split.
+    pub fn device_cache_resident_bytes(&self) -> Option<(u64, u64)> {
+        if !self.offloaded() {
+            return None;
+        }
+        let p = self.inner.p3.as_ref()?;
+        let (mut slab, mut stream) = (0u64, 0u64);
+        // SAFETY: live ctx while p3 holds the hooks; `Session` is !Sync, so
+        // `&self` means no compute is in flight (C reads stream slabs
+        // unlocked); the out pointers are valid locals.
+        unsafe { raw::golem_device_cache_resident_bytes(p.ctx_ptr(), &mut slab, &mut stream) };
+        Some((slab, stream))
+    }
+
     /// Whether prefill streaming (§7.6) survived the device-cache fit; the
     /// fit drops it when the stream slabs and a K ≥ top-k cache do not both fit.
     pub fn prefill_streaming(&self) -> bool {
@@ -2228,7 +2244,7 @@ mod tests {
 
     fn glm() -> golem_plan::ModelFacts {
         golem_plan::ModelFacts {
-            t_ne: 9_640_226_040,
+            t_ne: 8_966_188_280,
             shexp: 1_123_024_896,
             n_expert: 288,
             top_k: 8,
@@ -2242,9 +2258,9 @@ mod tests {
     }
 
     /// Target, 24 GiB free: 100k ctx + streamed 512 ubatch (fitted ws 0.79
-    /// GiB) + explicit K = 8 (9 × 644 MB = 5.4 GiB) is 8.98 + 1.84 + 0.14 +
-    /// 0.79 + 5.4 + 3.69 + 2.64 ≈ 23.5 GiB → fits; K = 12 (7.8 GiB) →
-    /// 25.9 GiB, refused.
+    /// GiB) + explicit K = 8 (9 × 644 MB = 5.4 GiB) is 8.35 + 1.84 + 0.14 +
+    /// 0.79 + 5.4 + 3.69 + 2.64 ≈ 22.9 GiB → fits; K = 12 (7.8 GiB) →
+    /// 25.3 GiB, refused.
     #[test]
     fn load_check_refuses_an_overcommitted_k() {
         let mut cfg = EngineConfig {
@@ -2271,10 +2287,10 @@ mod tests {
         cfg.device_cache_experts = 0;
         let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
         assert_eq!(r.vram_headroom, 0);
-        // ctx 100k at ubatch 512: fitted ws 0.79 GiB; 24 GiB − (8.98 t_ne +
-        // 1.84 kv + 0.14 rs + 0.79 ws + 3.69 slabs + 2.64 ROCm) ≈ 5.92 GiB.
+        // ctx 100k at ubatch 512: fitted ws 0.79 GiB; 24 GiB − (8.35 t_ne +
+        // 1.84 kv + 0.14 rs + 0.79 ws + 3.69 slabs + 2.64 ROCm) ≈ 6.55 GiB.
         assert!(r.term("device_expert_cache") > 5 << 30);
-        // Half of that 5.92 GiB cache holds K = 3 < top_k 8.
+        // Half of that 6.55 GiB cache holds K = 4 < top_k 8.
         cfg.vram_experts_frac = 0.5;
         let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
         assert!(e.to_string().contains("device_expert_cache "), "{e}");

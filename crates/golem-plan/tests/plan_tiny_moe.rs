@@ -11,6 +11,7 @@ fn table_bytes(path: &Path) -> u64 {
     tensor_entries(&mut File::open(path).unwrap())
         .unwrap()
         .iter()
+        .filter(|t| t.name != "token_embd.weight")
         .map(|t| {
             ggml_row_bytes(t.ggml_type, t.dims[0]).unwrap()
                 * t.dims[1..].iter().map(|&d| d.max(1)).product::<u64>()

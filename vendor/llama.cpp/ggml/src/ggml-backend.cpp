@@ -3913,6 +3913,33 @@ void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n) {
     }
 }
 
+void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t * slab_bytes, uint64_t * stream_bytes) {
+    uint64_t slab = 0;
+    uint64_t stream = 0;
+    if (ctx != NULL) {
+        std::lock_guard<std::mutex> lk(ctx->dc_mutex);
+        for (const auto & kv : ctx->dc) {
+            if (kv.second.buf != nullptr) {
+                slab += ggml_backend_buffer_get_size(kv.second.buf);
+            }
+            if (kv.second.ids_buf != nullptr) {
+                slab += ggml_backend_buffer_get_size(kv.second.ids_buf);
+            }
+        }
+        for (const auto & sl : ctx->stream_slabs) {
+            if (sl.buf != nullptr) {
+                stream += ggml_backend_buffer_get_size(sl.buf);
+            }
+        }
+    }
+    if (slab_bytes != NULL) {
+        *slab_bytes = slab;
+    }
+    if (stream_bytes != NULL) {
+        *stream_bytes = stream;
+    }
+}
+
 void golem_set_device_cache_experts(golem_ctx_t ctx, int32_t k) {
     if (ctx != NULL) {
         ctx->k_cfg.store(k, std::memory_order_relaxed);

@@ -45,7 +45,7 @@ pub fn hooks_abi_version() -> i32 {
 // handle-returning register, batched ensure, triple-buffered order push).
 // A header drift past v6 must fail this build, not silently re-shape the
 // guards.
-const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 13);
+const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 14);
 
 /// Per-model hook context (ABI v5): owns a `golem_ctx_t` from
 /// `golem_ctx_create` and frees it on drop. `golem_ctx_free` aborts while
