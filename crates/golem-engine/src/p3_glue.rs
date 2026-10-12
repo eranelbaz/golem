@@ -768,6 +768,12 @@ pub fn hooks_registered() -> bool {
 /// (the ABI v5 contract): unregister-join → clear the ctx window + stop the
 /// publisher → ctx free (inside the sys RAII guard).
 pub struct SessionHooks {
+    /// HIP registrations of the pool arena and the stream staging ring.
+    /// Declared first: unregistered before any field can drop the last
+    /// arena owner, so the range is never unmapped while registered (a
+    /// stale registration on a reused VA faults the next session's H2D).
+    #[cfg(golem_backend_hip)]
+    _pinned: Vec<golem_llama_sys::pinned::HostRegistration>,
     /// §6.5 prefetch thread (`--prefetch read` only). Stopped before the
     /// hooks are torn down so its pool feed cannot outlive the pool state.
     prefetch: Option<PrefetchHandle>,
@@ -1477,28 +1483,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         }
     }
 
-    // Design §3.5: mlock alone leaves the H2D copy pageable —
-    // driver bounce buffers, ~half of PCIe bandwidth, not truly async, and
-    // PCIe is the §2.4 bottleneck. Register the arena with the HIP runtime;
-    // a failed registration is a startup failure, never a silent downgrade.
     #[cfg(golem_backend_hip)]
-    {
-        let (ptr, len) = arena.as_ptr_range();
-        // SAFETY: the arena is a live, page-aligned, solely-owned mapping of
-        // exactly `len` bytes (mmap + mlock above); registration happens
-        // before any slot is handed out and unregister rides the pool's drop
-        // (the session teardown unregisters the hooks first, so no callback
-        // can touch a deregistered arena).
-        if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
-            return Err(EngineError::PoolInit(format!(
-                "hipHostRegister failed on the {len}-byte expert pool (HIP result {r})"
-            )));
-        }
-        tracing::info!(
-            gib = len as f64 / (1 << 30) as f64,
-            "expert pool GPU-pinned"
-        );
-    }
+    let pool_range = arena.as_ptr_range();
 
     // Empty policy snapshot (nothing pinned/protected) until a
     // placement-backed snapshot builder feeds the pool (§6.6).
@@ -1514,28 +1500,46 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
     // Prefill-stream state (§7.6, ruling R3 kept streaming on): the pinned
-    // staging ring + reader thread. Registration is a startup failure, not
-    // a silent pageable downgrade (§3.5, same as the pool arena).
+    // staging ring + reader thread (GPU-registered with the pool arena below).
     let stream = if stream_enabled {
         let slot_bytes = geo.n_experts as usize * max_plane_stride as usize;
         let st = StreamState::new(pool.clone(), source.clone(), slot_bytes)
             .map_err(|e| EngineError::PoolInit(format!("stream staging ring: {e}")))?;
-        #[cfg(golem_backend_hip)]
-        {
-            let (ptr, len) = st.arena_ptr_range();
-            // SAFETY: the ring is a live, page-aligned, solely-owned mlocked
-            // mapping of exactly `len` bytes; registration happens before
-            // any slot is handed out and unregister rides the state's drop.
-            if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
-                return Err(EngineError::PoolInit(format!(
-                    "hipHostRegister failed on the {len}-byte prefill-stream staging ring \
-                     (HIP result {r})"
-                )));
-            }
-        }
         Some(st)
     } else {
         None
+    };
+
+    // Design §3.5: mlock alone leaves the H2D copy pageable — driver bounce
+    // buffers, ~half of PCIe bandwidth, not truly async, and PCIe is the
+    // §2.4 bottleneck. A failed registration is a startup failure, never a
+    // silent downgrade. Declared after `pool`/`stream` so an early return
+    // unregisters before either arena unmaps.
+    #[cfg(golem_backend_hip)]
+    let pinned = {
+        let mut ranges = vec![("expert pool", pool_range)];
+        if let Some(st) = &stream {
+            ranges.push(("prefill-stream staging ring", st.arena_ptr_range()));
+        }
+        let mut regs = Vec::with_capacity(ranges.len());
+        for (what, (ptr, len)) in ranges {
+            // SAFETY: a live, page-aligned, solely-owned mlocked mapping of
+            // exactly `len` bytes, kept mapped by `pool`/`stream` while the
+            // registration lives; no slot has been handed to the device yet.
+            // The registration drops with `SessionHooks`; its drop
+            // synchronizes the device before unregistering, so a drop
+            // without a prior `llama_free` cannot race in-flight DMA.
+            let reg = unsafe { golem_llama_sys::pinned::HostRegistration::new(ptr, len) }.map_err(
+                |r| {
+                    EngineError::PoolInit(format!(
+                        "hipHostRegister failed on the {len}-byte {what} (HIP result {r})"
+                    ))
+                },
+            )?;
+            regs.push(reg);
+            tracing::info!(gib = len as f64 / (1 << 30) as f64, "{what} GPU-pinned");
+        }
+        regs
     };
 
     // Per-model hook context (ABI v5). n_layers covers the full blk range —
@@ -1681,6 +1685,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         "P3 RAM expert pool registered (per-model ctx, hooks set)"
     );
     Ok(SessionHooks {
+        #[cfg(golem_backend_hip)]
+        _pinned: pinned,
         prefetch,
         publisher,
         hooked: Some(hooked),
@@ -1849,9 +1855,12 @@ fn kind_from_code(code: i32) -> Option<ExpertKind> {
 }
 
 /// The state-snapshot byte store (§7.1): one mlocked [`golem_placement::pool::Arena`],
-/// GPU-registered on HIP builds (§3.5 — pageable H2D is a bug), unregistered
-/// in `Drop` before the arena unmaps.
+/// GPU-registered on HIP builds (§3.5 — pageable H2D is a bug).
 pub struct PinnedArena {
+    /// Declared before `mem`: fields drop in order, so the range is
+    /// unregistered before the arena unmaps. `None` only for heap test arenas.
+    #[cfg(golem_backend_hip)]
+    _reg: Option<golem_llama_sys::pinned::HostRegistration>,
     mem: PinnedMem,
 }
 
@@ -1868,18 +1877,20 @@ impl PinnedArena {
         let arena = golem_placement::pool::Arena::new_bytes(len)
             .map_err(|e| EngineError::PoolInit(format!("snapshot arena: {e}")))?;
         #[cfg(golem_backend_hip)]
-        {
+        let reg = {
             let (ptr, len) = arena.as_ptr_range();
             // SAFETY: the arena is a live, page-aligned, solely-owned mapping
-            // of exactly `len` bytes, not yet registered; unregister runs in
-            // `Drop` before the arena unmaps.
-            if let Err(r) = unsafe { golem_llama_sys::pinned::hip_host_register(ptr, len) } {
-                return Err(EngineError::PoolInit(format!(
+            // of exactly `len` bytes, not yet registered; `_reg` drops before
+            // `mem` unmaps, and its drop synchronizes the device first.
+            unsafe { golem_llama_sys::pinned::HostRegistration::new(ptr, len) }.map_err(|r| {
+                EngineError::PoolInit(format!(
                     "hipHostRegister failed on the {len}-byte snapshot arena (HIP result {r})"
-                )));
-            }
-        }
+                ))
+            })?
+        };
         Ok(Self {
+            #[cfg(golem_backend_hip)]
+            _reg: Some(reg),
             mem: PinnedMem::Locked(arena),
         })
     }
@@ -1888,6 +1899,8 @@ impl PinnedArena {
     #[cfg(any(test, feature = "test-support"))]
     pub fn heap_for_test(len: usize) -> Self {
         Self {
+            #[cfg(golem_backend_hip)]
+            _reg: None,
             mem: PinnedMem::Heap(vec![0; len]),
         }
     }
@@ -1930,18 +1943,6 @@ impl PinnedArena {
             }
             #[cfg(any(test, feature = "test-support"))]
             PinnedMem::Heap(v) => v,
-        }
-    }
-}
-
-impl Drop for PinnedArena {
-    fn drop(&mut self) {
-        #[cfg(golem_backend_hip)]
-        #[allow(irrefutable_let_patterns)] // `Heap` exists only in test builds
-        if let PinnedMem::Locked(a) = &self.mem {
-            // SAFETY: the exact pointer registered in `new`; no view outlives
-            // `&mut self`, and every restore H2D synchronized before returning.
-            let _ = unsafe { golem_llama_sys::pinned::hip_host_unregister(a.as_ptr_range().0) };
         }
     }
 }

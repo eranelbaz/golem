@@ -233,6 +233,7 @@ pub mod pinned {
             flags: std::ffi::c_uint,
         ) -> std::ffi::c_int;
         fn hipHostUnregister(host_ptr: *mut std::ffi::c_void) -> std::ffi::c_int;
+        fn hipDeviceSynchronize() -> std::ffi::c_int;
     }
 
     /// Registers `[ptr, ptr+len)` as pinned. Errors surfaced verbatim (HIP
@@ -254,6 +255,47 @@ pub mod pinned {
     pub unsafe fn hip_host_unregister(ptr: *mut u8) -> Result<(), std::ffi::c_int> {
         // SAFETY: caller upholds the exact-pointer/no-live-consumer invariant.
         let r = unsafe { hipHostUnregister(ptr as *mut _) };
+        if r == 0 { Ok(()) } else { Err(r) }
+    }
+
+    /// A live `hipHostRegister` of one range; `Drop` unregisters it. The
+    /// pointer is kept as an address so owners stay `Send`.
+    #[derive(Debug)]
+    pub struct HostRegistration(usize);
+
+    impl HostRegistration {
+        /// Registers `[ptr, ptr+len)` (see [`hip_host_register`]).
+        ///
+        /// # Safety
+        /// As [`hip_host_register`] (not already registered); the range must stay mapped
+        /// until this guard drops. In-flight device access need not be complete:
+        /// the drop synchronizes the current device before unregistering.
+        pub unsafe fn new(ptr: *mut u8, len: usize) -> Result<Self, std::ffi::c_int> {
+            // SAFETY: forwarded caller invariant.
+            unsafe { hip_host_register(ptr, len) }.map(|()| Self(ptr as usize))
+        }
+    }
+
+    impl Drop for HostRegistration {
+        fn drop(&mut self) {
+            // Drain in-flight DMA from the range before it loses pinned-ness
+            // (and, in the owner's drop order, its mapping).
+            if let Err(r) = device_synchronize() {
+                eprintln!("hipDeviceSynchronize failed: HIP result {r}");
+            }
+            // SAFETY: the exact pointer registered in `new`, still mapped
+            // (`new`'s caller), and the device is synchronized above.
+            if let Err(r) = unsafe { hip_host_unregister(self.0 as *mut u8) } {
+                eprintln!("hipHostUnregister({:#x}) failed: HIP result {r}", self.0);
+            }
+        }
+    }
+
+    /// `hipDeviceSynchronize`: blocks until all work on the current device
+    /// has completed.
+    pub fn device_synchronize() -> Result<(), std::ffi::c_int> {
+        // SAFETY: plain runtime call, no invariants.
+        let r = unsafe { hipDeviceSynchronize() };
         if r == 0 { Ok(()) } else { Err(r) }
     }
 
