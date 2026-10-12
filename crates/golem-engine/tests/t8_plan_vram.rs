@@ -4,15 +4,17 @@
 //! point. Opt-in hardware leg (GOLEM_HW=1, GOLEM_HW_MODEL = shard 1 of
 //! GLM-5.3-Flash UD-Q4_K_XL): each point is a full real-model load. Budget
 //! ≤ 60 loads; `GOLEM_T8_MAX_POINTS` caps the sweep (record the cap in
-//! docs/baselines/m4.6-plan-t8.md). Fit `golem_plan::WsModel` from this
-//! table's `ws` column before tightening the bound.
+//! docs/baselines/m4.6-plan-t8.md). `golem_plan::WS_MEASURED` is fitted from
+//! that baseline's compute-buffer table; this sweep re-checks the fit and
+//! the total-delta bound.
 #![cfg(feature = "hip-tests")]
 use golem_engine::config::EngineConfig;
 use golem_engine::session::{ChatTurn, Session, device_vram};
 use golem_engine::slot::TurnRequest;
 
 const TOL: i64 = 256 << 20;
-const UBATCHES: [u32; 5] = [512, 1024, 2048, 4096, 8192];
+const UBATCHES: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
+const CTXS: [u32; 7] = [2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072];
 
 fn cfg(model: &std::path::Path, ctx: u32, ub: u32) -> EngineConfig {
     EngineConfig {
@@ -47,7 +49,7 @@ fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, b
         vram_experts: 0,
         ram_experts: c.ram_experts_gib << 30,
         snapshot_ram: 0,
-        ws: golem_plan::WS_UNMEASURED,
+        ws: golem_plan::WS_MEASURED,
     };
     let r = golem_plan::plan(m, &mach, &i);
     // Without the cache term: the engine holds K + 1 whole slabs, and its K
@@ -77,14 +79,9 @@ fn t8_plan_matches_hip_used_vram() {
     // not fail them; drift past TOL still does. Target: 24 GiB VRAM, TOL
     // 256 MiB ≈ 1.0%; observed drift 25671237632 → 25461522432 B = 209.7 MB < TOL.
     let free_sel = free0.saturating_sub(TOL as u64);
-    // Largest ctx the plan admits at ubatch 512 (power of two), then halves.
-    let top = (10..=20)
+    let points: Vec<(u32, u32)> = CTXS
+        .into_iter()
         .rev()
-        .map(|p| 1u32 << p)
-        .find(|&c| predicted(&m, &cfg(&model, c, 512), free_sel).1)
-        .expect("no ctx fits");
-    let points: Vec<(u32, u32)> = (0..4)
-        .map(|h| top >> h)
         .flat_map(|c| {
             UBATCHES
                 .into_iter()
@@ -101,13 +98,17 @@ fn t8_plan_matches_hip_used_vram() {
         points.len()
     );
     println!(
-        "T8 sweep: {} points (cap {cap}), top ctx {top}",
+        "T8 sweep: {} points (cap {cap}) over ctx {CTXS:?} × ubatch {UBATCHES:?}",
         points.len()
     );
-    let prompt = "the quick brown fox jumps over the lazy dog ".repeat(240);
+    // ~1 token/word; sized per point so the prompt always fits the grid ctx
+    // (2048 → 179 repeats ≈ 1 611 words ≈ 1 620 tokens; capped at 240
+    // repeats ≈ 2 173 tokens above that).
+    let sentence = "the quick brown fox jumps over the lazy dog ";
     let mut worst = 0i64;
-    println!("ctx\tubatch\tpredicted\tactual\tdelta");
+    println!("ctx\tubatch\tpredicted\tactual\tdelta\tws_residual");
     for (ctx, ub) in points {
+        let prompt = sentence.repeat(((ctx as usize).saturating_sub(256) / 10).min(240));
         let c = cfg(&model, ctx, ub);
         let (free_before, _) = device_vram().unwrap();
         let (pred, fits) = predicted(&m, &c, free_before);
@@ -132,9 +133,12 @@ fn t8_plan_matches_hip_used_vram() {
         drop(s);
         golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
         let actual = free_before as i64 - free_after as i64;
+        // Implied ws term: actual minus every non-ws predicted term. This is
+        // the plan's scatter, not llama's compute-buffer log.
+        let ws_residual = actual - (pred - golem_plan::WS_MEASURED.bytes(ctx, ub) as i64);
         let d = pred - actual;
         worst = worst.max(d.abs());
-        println!("{ctx}\t{ub}\t{pred}\t{actual}\t{d}");
+        println!("{ctx}\t{ub}\t{pred}\t{actual}\t{d}\t{ws_residual}");
         let (free_released, _) = device_vram().unwrap();
         assert!(
             free_before as i64 - free_released as i64 <= TOL,

@@ -562,7 +562,7 @@ VRAM =
 + kv_per_token · ctx · parallel            KV cache, 11 sparse-attention layers only (amended 2026-09-29, R-1)
 + rs_bytes · parallel                     recurrent state, 34 linear-attention layers (constant per sequence; 145.56 MiB measured)
 + shexp_bytes                             shared experts, VRAM-resident (R-3; part of T_ne, listed so it is never tiered)
-+ ws                                       decode/prefill workspace (subsidy measured in M0; starts at 512 MiB)
++ ws                                       decode/prefill workspace (fitted on gfx1100: max(320 MiB + 5 138 B·ctx, 1 105 975 B·ubatch); m4.6-plan-t8)
 + staging                                  max b_e · 1.5 (P2 copy padding guard, §3.6)
 + device_expert_cache                      ≤ --vram-experts-gib, as slot slab K × stride per (layer, kind), §3.4 P2 (floors dropped, O3)
 + stream_slabs                             2 × n_expert × max plane stride, prefill layer streaming (§7.6; 3.69 GiB on the target)
@@ -752,7 +752,12 @@ Every finding from the design/code reviews (2026-09-29 onward) is either fixed i
 - P23: `Policy::pass` stays unconsumed: production VRAM is per-layer forced-admission slabs, so only its score math is used (`--vram-order score`, §6.3, M3.7). Not replayed.
 
 **Design / architecture:**
-- **R-1 (§2.5, §10):** `golem plan` must derive memory from the hybrid architecture, per layer type: recurrent state × parallel, plus KV for the 11 attention layers only. The §12.3 ctx sweep is still picked blind. Owner: M4.6. *Status (M4, #32):* `golem_plan::plan` derives KV over the attention layers and recurrent state × parallel from the header (target: 19,712 B/token, 145.56 MiB); `golem plan` and the engine's load-time check share it. The T8 hardware sweep (`t8_plan_vram.rs`) and the measured `ws` fit are written but not yet run — open until `docs/baselines/m4.6-plan-t8.md` carries the table.
+- **R-1 (§2.5, §10):** `golem plan` must derive memory from the hybrid architecture, per layer type: recurrent state × parallel, plus KV for the 11 attention layers only. The §12.3 ctx sweep is still picked blind. Owner: M4.6. *Status (M4, #32):* `golem_plan::plan` derives KV over the attention layers and recurrent state × parallel from the header (target: 19,712 B/token, 145.56 MiB); `golem plan` and the engine's load-time check share it. The T8 hardware sweep (`t8_plan_vram.rs`) has run (PR #118 and the #122
+acceptance run); `golem_plan::WS_MEASURED` is fitted from the measured
+compute buffer (see `docs/baselines/m4.6-plan-t8.md`). The ws fit holds
+within 256 MiB at all fitted points, but the total-delta gate on the
+widened grid is still open — the residual scatter is non-ws (device-cache
+residency accounting), tracked in that baseline.
 - **R-4 (§7.1):** every `chat_turn` re-prefills the whole transcript (`session.rs`, `llama_memory_clear` per turn). The fix is state snapshot/restore. *Status (M4, #54):* implemented — prompt-prefill snapshots in a pinned arena, restore + delta prefill (`snapshot.rs`); byte-identical on tiny-moe and tiny-hybrid. Real model (`docs/baselines/m4.8-snapshots.md`): turn-5 TTFT 49.6–52.6 s → 9.9–10.1 s cold, 49.4–54.7 s → 9.8 s warm; greedy output not byte-identical on vs off (open).
 - **R-5 / H-10 (§3.4 P1):** hooks, device-cache map, budget and stats are process-global. The fix is a per-model `golem_ctx*` and an unregister that waits for in-flight callbacks. Mitigated today by refusing a second session or a re-enable.
 - **R-6 (§2.3 step 4):** the per-tensor `policy_query` and per-expert `notify_access` callbacks should become one ids-tensor read per MoE layer per step, with the eviction order pushed to C as context-owned data. The per-call cost is already allocation- and lock-free (M-1).

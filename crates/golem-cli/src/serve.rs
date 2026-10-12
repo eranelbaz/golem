@@ -177,7 +177,7 @@ pub fn instance(
         prefill_stream: config.prefill_stream,
         ram_experts: config.ram_experts_gib << 30,
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
-        ws: golem_plan::WS_UNMEASURED,
+        ws: golem_plan::WS_MEASURED,
         ..Default::default()
     };
     let planned_vram = if config.n_gpu_layers > 0 && substrate_backend() == Backend::Hip {

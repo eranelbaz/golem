@@ -347,7 +347,7 @@ fn plan_for(
         prefill_stream: config.prefill_stream,
         ram_experts: config.ram_experts_gib << 30,
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
-        ws: golem_plan::WS_UNMEASURED,
+        ws: golem_plan::WS_MEASURED,
         ..Default::default()
     };
     let frac = if k.vram_experts_frac > 0.0 {

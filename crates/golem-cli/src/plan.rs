@@ -6,7 +6,7 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use golem_api::{ErrorCode, ErrorEnvelope};
-use golem_plan::{Machine, ModelFacts, PlanInput, PlanReport, Term, WS_UNMEASURED, total};
+use golem_plan::{Machine, ModelFacts, PlanInput, PlanReport, Term, WS_MEASURED, total};
 
 /// Disk read bandwidth across both drives, measured in M3.3 (4.73 GB/s,
 /// docs/baselines/m3.3-store-bench.md); prices the cold-expert latency.
@@ -145,7 +145,7 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
         vram_experts: bytes(args.vram_experts_gib),
         ram_experts: bytes(args.ram_experts_gib),
         snapshot_ram,
-        ws: WS_UNMEASURED,
+        ws: WS_MEASURED,
     };
     let r = golem_plan::plan_at_frac(&m, &mach, &input, args.vram_experts_frac);
     let g = governing(&m, &r);
@@ -169,8 +169,10 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
             g.cold_expert_ms
         );
         println!(
-            "ws: unmeasured placeholder ({} MiB base, 0 B/token) until the T8 sweep",
-            WS_UNMEASURED.base >> 20
+            "ws: fitted on gfx1100 ({} MiB base, {} B/ctx token, {} B/ubatch token)",
+            WS_MEASURED.base >> 20,
+            WS_MEASURED.per_ctx_token,
+            WS_MEASURED.per_ubatch_token
         );
         println!(
             "verdict: {}",
