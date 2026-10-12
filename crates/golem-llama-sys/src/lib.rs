@@ -43,7 +43,7 @@ pub fn hooks_abi_version() -> i32 {
 
 // The RAII surface below is written against ABI v5 (per-model `golem_ctx`,
 // handle-returning register, batched ensure, triple-buffered order push).
-// A header drift past v6 must fail this build, not silently re-shape the
+// A header drift past v14 must fail this build, not silently re-shape the
 // guards.
 const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 14);
 

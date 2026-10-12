@@ -35,6 +35,9 @@ pub enum PlanError {
     Invalid(String),
 }
 
+/// Input-embedding tensor; llama keeps it on the CPU, so it is not VRAM.
+pub const TOKEN_EMBD: &str = "token_embd.weight";
+
 /// Header-derived model facts the memory model needs (§10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ModelFacts {
@@ -59,6 +62,9 @@ pub struct ModelFacts {
     pub rs_bytes: u64,
     /// Live attention (non-recurrent) layers.
     pub sparse_attn_layers: u32,
+    /// ctx below which llama skips indexer scoring (`n_ctx > top_k + kpool
+    /// − 1`) and attention runs dense; 0 without an indexer.
+    pub dense_below_ctx: u32,
 }
 
 impl ModelFacts {
@@ -90,6 +96,7 @@ impl ModelFacts {
             kv_per_token: 0,
             rs_bytes: 0,
             sparse_attn_layers: 0,
+            dense_below_ctx: 0,
         };
         let mut expert_blk = vec![false; live.end as usize];
         for i in 0..count {
@@ -115,7 +122,7 @@ impl ModelFacts {
                     }
                     // llama pins the input embedding to the CPU (dev_input);
                     // never VRAM. Target: 674,037,760 B Q8_0.
-                    _ if t.name == "token_embd.weight" => {}
+                    _ if t.name == TOKEN_EMBD => {}
                     _ => {
                         m.t_ne += bytes;
                         if t.name.contains("_shexp") {
@@ -164,6 +171,12 @@ impl ModelFacts {
             1
         };
         let idx = idx_heads * opt("attention.indexer.key_length");
+        let kpool = opt("attention.indexer.kpool");
+        self.dense_below_ctx = if kpool > 0 {
+            u32::try_from(opt("attention.indexer.top_k") + kpool).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
         let d_inner = opt("attention.head_count") * opt("kda.head_dim");
         let conv = 3 * opt("ssm.conv_kernel").saturating_sub(1) * d_inner;
         let ssm = opt("kda.head_dim") * d_inner;
@@ -214,10 +227,7 @@ pub struct WsModel {
     pub per_ctx_token: u64,
     /// Bytes per ubatch token in the ubatch-dominated regime.
     pub per_ubatch_token: u64,
-    /// ctx below which the indexer is off (llama: `n_ctx > n_select`) and
-    /// attention runs dense; 0 = never.
-    pub dense_below_ctx: u32,
-    /// Bytes per ubatch token in the dense-attention regime.
+    /// Bytes per ubatch token below [`ModelFacts::dense_below_ctx`].
     pub dense_per_ubatch_token: u64,
 }
 
@@ -225,8 +235,8 @@ impl WsModel {
     /// Workspace bytes at this ctx × ubatch: `max(base + a·ctx, b·ubatch)`,
     /// with the dense slope for `b` when `ctx < dense_below_ctx`.
     #[must_use]
-    pub fn bytes(&self, ctx: u32, ubatch: u32) -> u64 {
-        let b = if ctx < self.dense_below_ctx {
+    pub fn bytes(&self, ctx: u32, ubatch: u32, dense_below_ctx: u32) -> u64 {
+        let b = if ctx < dense_below_ctx {
             self.dense_per_ubatch_token
         } else {
             self.per_ubatch_token
@@ -240,17 +250,17 @@ impl WsModel {
 /// Fitted on RX 7900 XTX, GLM-5.3-Flash UD-Q4_K_XL (§12, T8): base 320 MiB,
 /// fitted ctx slope 5 138 B/token (ubatch-512 row), ubatch slope 1 105 975
 /// B/token (ctx 65536 row, linear through zero at 1.0547 MiB/token). All
-/// six measured points within 256 MiB of the model; worst +198 MiB at ctx
+/// eight measured points within 256 MiB of the model; worst +198 MiB at ctx
 /// 4096 / ubatch 512, where the ubatch branch over-predicts the flat
-/// small-ctx compute buffer. Fit domain: ubatch ≥ 512. At ctx ≤ 2051
-/// (indexer top_k 2048 + kpool 4 − 1) llama skips indexer scoring: ctx 2048
-/// logged 685.00 / 1370.00 MiB at ubatch 1024 / 2048 = 701 445 B/token,
-/// where the sparse slope over-predicted 2048 by +790 MiB.
+/// small-ctx compute buffer. Fit domain: ubatch ≥ 512. Dense slope: below
+/// ctx 2052 (indexer top_k 2048 + kpool 4) llama skips indexer scoring;
+/// ctx 2048 logged 685.00 / 1370.00 MiB at ubatch 1024 / 2048 = 701 445
+/// B/token, where the sparse slope over-predicted 2048 by +790 MiB. Dense
+/// fit domain: those two points.
 pub const WS_MEASURED: WsModel = WsModel {
     base: 320 << 20,
     per_ctx_token: 5_138,
     per_ubatch_token: 1_105_975,
-    dense_below_ctx: 2_052,
     dense_per_ubatch_token: 701_445,
 };
 
@@ -271,7 +281,7 @@ const T8_MEASURED: [(u32, u32, u64); 8] = [
 #[test]
 fn ws_fitted_model_matches_t8_points() {
     for (ctx, ub, actual) in T8_MEASURED {
-        let pred = WS_MEASURED.bytes(ctx, ub);
+        let pred = WS_MEASURED.bytes(ctx, ub, 2_052);
         assert!(
             pred.abs_diff(actual) <= 256 << 20,
             "ctx {ctx} ubatch {ub}: predicted {pred}, actual {actual}"
@@ -441,7 +451,7 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
         },
         Term {
             name: "ws",
-            bytes: i.ws.bytes(i.ctx, i.prefill_ubatch),
+            bytes: i.ws.bytes(i.ctx, i.prefill_ubatch, m.dense_below_ctx),
         },
         Term {
             name: "stream_slabs",
@@ -605,6 +615,7 @@ mod tests {
             kv_per_token: 19_712,
             rs_bytes: 152_630_000,
             sparse_attn_layers: 11,
+            dense_below_ctx: 2_052,
         }
     }
     fn box24() -> Machine {
@@ -670,7 +681,7 @@ mod tests {
             base: 512 << 20,
             per_ctx_token: 0,
             per_ubatch_token: 1 << 20,
-            ..WsModel::default()
+            dense_per_ubatch_token: 1 << 20,
         };
         let r = plan(
             &glm(),

@@ -14,7 +14,7 @@ use golem_engine::slot::TurnRequest;
 
 const TOL: i64 = 256 << 20;
 // Total-delta gate. Every logged term matches (#123), but allocator/runtime
-// overhead outside them is 200–310 MB per point. Target: 24 GiB VRAM,
+// overhead outside them is 200–310 MB per point (docs/baselines/m4.6-plan-t8.md). Target: 24 GiB VRAM,
 // 512 MiB ≈ 2.1%; worst measured −312 MB at ctx 65536 / ubatch 2048.
 const TOTAL_TOL: i64 = 512 << 20;
 const UBATCHES: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
@@ -147,9 +147,20 @@ fn t8_plan_matches_hip_used_vram() {
         drop(s);
         golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
         let actual = free_before as i64 - free_after as i64;
+        // The per-term attribution, gated: stream slabs exact, cache slabs
+        // the K + 1 reservation plus remapped-ids tensors (16 KiB measured).
+        assert_eq!(
+            stream_res, stream_pred,
+            "ctx {ctx} ubatch {ub}: stream slabs"
+        );
+        assert!(
+            slab_res > 0 && (slab_res as i64 - cache_pred).abs() <= 1 << 20,
+            "ctx {ctx} ubatch {ub}: resident slabs {slab_res} vs predicted {cache_pred}"
+        );
         // Implied ws term: actual minus every non-ws predicted term. This is
         // the plan's scatter, not llama's compute-buffer log.
-        let ws_residual = actual - (pred - golem_plan::WS_MEASURED.bytes(ctx, ub) as i64);
+        let ws_residual =
+            actual - (pred - golem_plan::WS_MEASURED.bytes(ctx, ub, m.dense_below_ctx) as i64);
         let d = pred - actual;
         worst = worst.max(d.abs());
         println!(

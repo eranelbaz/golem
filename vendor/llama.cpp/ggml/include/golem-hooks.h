@@ -259,8 +259,8 @@ void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
 /* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
  * remapped-ids tensors (*slab_bytes) and prefill-stream slabs
  * (*stream_bytes). Slabs allocate lazily, so this is what is resident, not
- * the K + 1 reservation. Call between computes (stream slabs are not under
- * dc_mutex). Zeros for a NULL ctx; either out pointer may be NULL. */
+ * the K + 1 reservation. Call between computes (stream slabs are mutated
+ * outside dc_mutex). Zeros for a NULL ctx; either out pointer may be NULL. */
 void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t *slab_bytes, uint64_t *stream_bytes);
 
 /* Clear the ctx's device cache maps — the invalidation seam (also the

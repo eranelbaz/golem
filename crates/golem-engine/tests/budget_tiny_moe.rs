@@ -87,7 +87,14 @@ fn budget_k4_evicts_and_stays_on_gpu() {
 
     let after = session.device_cache_stats().unwrap();
     let (slab_res, _) = session.device_cache_resident_bytes().unwrap();
-    assert!(slab_res > 0, "decode left no resident device slab bytes");
+    let facts = golem_plan::ModelFacts::from_gguf(&common::offload::offload_config().model_path)
+        .expect("fixture facts");
+    // K + 1 slots per expert layer; the ids tensors are a few KiB on top.
+    let reserve = 5 * facts.slab_bytes_per_expert();
+    assert!(
+        slab_res > 0 && slab_res <= reserve + (1 << 20),
+        "resident slab bytes {slab_res} outside (0, {reserve} + ids]"
+    );
     let copied = after.bytes_copied - before.bytes_copied;
     let evictions = after.evictions - before.evictions;
     let skipped = after.bytes_skipped - before.bytes_skipped;
