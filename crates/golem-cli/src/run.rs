@@ -523,7 +523,8 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         .unwrap_or_default();
     // Before the entry exists: a SIGTERM from `golem stop` always returns
     // through the normal §3.4 drops, and a second signal still kills a
-    // wedged load.
+    // wedged load. Session::new doesn't poll the flag, so a signal during
+    // model load is honoured once it finishes; `stop` SIGKILLs after TEARDOWN.
     let shutdown = crate::sys::install_shutdown()?;
     let guard = crate::serve::register(
         &reg,
@@ -1070,10 +1071,19 @@ fn attach(
         .endpoint
         .strip_prefix("http://")
         .ok_or_else(|| format!("instance {} has no HTTP endpoint", i.id))?;
+    let shutdown = crate::sys::install_shutdown()?;
     let mut history: Vec<serde_json::Value> = Vec::new();
     let turn = |history: &mut Vec<serde_json::Value>, text: String| {
         history.push(serde_json::json!({"role": "user", "content": text}));
-        let reply = stream_chat(addr, &i.id, &i.model, history, n_predict, api_key)?;
+        let reply = stream_chat(
+            addr,
+            &i.id,
+            &i.model,
+            history,
+            n_predict,
+            api_key,
+            &shutdown.cancel,
+        )?;
         history.push(serde_json::json!({"role": "assistant", "content": reply}));
         println!();
         Ok::<_, Box<dyn Error>>(())
@@ -1081,7 +1091,6 @@ fn attach(
     if let Some(p) = prompt {
         return turn(&mut history, p.to_owned());
     }
-    let shutdown = crate::sys::install_shutdown()?;
     let mut lines = shutdown.stdin_lines();
     eprintln!("golem: multi-turn chat; /reset clears history, /exit quits");
     while let Some(line) = lines.next_line()? {
@@ -1105,7 +1114,8 @@ fn attach(
 
 /// One streamed chat completion; prints content deltas as they arrive and
 /// returns the full reply. HTTP/1.0 keeps the body un-chunked and
-/// close-delimited, so SSE lines arrive intact.
+/// close-delimited, so SSE lines arrive intact. Once `cancel` is set the
+/// connection is dropped between lines; the server cancels on disconnect.
 fn stream_chat(
     addr: &str,
     id: &str,
@@ -1113,6 +1123,7 @@ fn stream_chat(
     messages: &[serde_json::Value],
     n_predict: u32,
     api_key: Option<&str>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<String, Box<dyn Error>> {
     // `run` is greedy; the server's OpenAI default is temperature 1.
     let body = serde_json::json!({
@@ -1148,6 +1159,9 @@ fn stream_chat(
     let mut reply = String::new();
     for line in lines {
         let line = line?;
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
         };
@@ -1231,19 +1245,56 @@ mod tests {
              data: {\"error\":{\"code\":\"golem_busy\",\"message\":\"server draining\"}}\n\n\
              data: [DONE]\n\n",
         );
-        let e = stream_chat(&addr, "i1", "m", &[], 2, None).unwrap_err();
+        let e = stream_chat(&addr, "i1", "m", &[], 2, None, &Default::default()).unwrap_err();
         assert!(e.to_string().contains("server draining"), "{e}");
+    }
+
+    /// A set cancel flag drops a slow stream instead of waiting for `[DONE]`.
+    #[test]
+    fn stream_chat_returns_promptly_when_cancelled() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
+            for _ in 0..100 {
+                let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
+                if s.write_all(frame.as_bytes()).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        let t = std::time::Instant::now();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let reply = stream_chat(&addr, "i1", "m", &[], 2, None, &cancel).unwrap();
+        assert_eq!(reply, "");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
     fn stream_chat_401_names_the_key_settings() {
         let resp = "HTTP/1.0 401 Unauthorized\r\n\r\n{\"error\":{}}";
-        let e = stream_chat(&canned(resp), "i1", "m", &[], 2, None).unwrap_err();
+        let e =
+            stream_chat(&canned(resp), "i1", "m", &[], 2, None, &Default::default()).unwrap_err();
         assert_eq!(
             e.to_string(),
             "instance i1 requires an API key; set GOLEM_API_KEY or api_key in golem.toml"
         );
-        let e = stream_chat(&canned(resp), "i1", "m", &[], 2, Some("k")).unwrap_err();
+        let e = stream_chat(
+            &canned(resp),
+            "i1",
+            "m",
+            &[],
+            2,
+            Some("k"),
+            &Default::default(),
+        )
+        .unwrap_err();
         assert!(
             e.to_string()
                 .ends_with("golem.toml (the configured key was rejected)"),

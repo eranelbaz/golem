@@ -301,7 +301,6 @@ fn stop_in_process_run_with_idle_stdin_exits_normally() {
 /// reader serves buffered complete lines before polling stdin again.
 #[test]
 fn run_repl_answers_two_lines_piped_at_once() {
-    use std::io::BufRead;
     let rt = common::tempdir_env();
     let mut child = common::golem_cmd(&rt)
         .args([
@@ -313,34 +312,43 @@ fn run_repl_answers_two_lines_piped_at_once() {
             "--allow-overcommit",
         ])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"hi\nhello\n").unwrap();
-    let stdout = child.stdout.take().unwrap();
+    // The prompt is printed before each read: the third one means the
+    // second turn finished, whatever the replies contain.
+    let mut stderr = child.stderr.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for l in std::io::BufReader::new(stdout).lines() {
-            let _ = tx.send(l);
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = std::io::Read::read(&mut stderr, &mut buf) {
+            let _ = tx.send(buf[..n].to_vec());
         }
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut replies = 0;
-    while replies < 2 {
+    let mut err = Vec::new();
+    let prompts = |e: &[u8]| String::from_utf8_lossy(e).matches("golem> ").count();
+    while prompts(&err) < 3 {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(left) {
-            Ok(_) => replies += 1,
+            Ok(chunk) => err.extend(chunk),
             Err(_) => break,
         }
     }
     drop(stdin);
-    if replies < 2 {
+    let answered = prompts(&err) >= 3;
+    if !answered {
         let _ = child.kill();
     }
     let status = child.wait().unwrap();
-    assert_eq!(replies, 2, "second piped line not answered");
+    assert!(
+        answered,
+        "second piped line not answered: {}",
+        String::from_utf8_lossy(&err)
+    );
     assert!(status.success());
 }
 
