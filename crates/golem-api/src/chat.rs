@@ -150,7 +150,8 @@ pub struct FunctionCall {
     /// Function name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Arguments as a JSON string (possibly partial when streamed).
+    /// Arguments as a JSON string (possibly partial when streamed); always
+    /// serialised, even empty, because OpenAI clients expect the key.
     #[serde(default)]
     pub arguments: String,
 }
@@ -231,7 +232,8 @@ pub struct ChunkChoice {
     pub index: u32,
     /// Incremental message.
     pub delta: Delta,
-    /// Set on the last content chunk.
+    /// Set on the last content chunk; an explicit `null` before it is the
+    /// OpenAI wire format.
     pub finish_reason: Option<FinishReason>,
 }
 

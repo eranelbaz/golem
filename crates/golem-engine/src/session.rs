@@ -32,20 +32,6 @@ impl Model {
         self.ptr
     }
 
-    /// Embedded chat template, `None` when the model ships none.
-    pub(crate) fn chat_template(&self) -> Option<String> {
-        // SAFETY: self.ptr is a live llama_model from llama_model_load_from_file;
-        // null name selects the default template (vendor/llama.cpp/include/llama.h).
-        let p = unsafe { raw::llama_model_chat_template(self.ptr, std::ptr::null()) };
-        if p.is_null() {
-            None
-        } else {
-            // SAFETY: llama.cpp returns a pointer to a NUL-terminated buffer
-            // owned by the model, valid for the model's lifetime.
-            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-        }
-    }
-
     /// Vocabulary handle for tokenization and logits sizing; lifetime tied to the model.
     pub(crate) fn vocab(&self) -> *const raw::llama_vocab {
         // SAFETY: self.ptr is a live llama_model; the vocab outlives the model.
@@ -517,11 +503,11 @@ pub struct ChatTurn<'a> {
 }
 
 /// Builds the session's chat templates and validates them with a 1-message
-/// probe render; also returns the default template source.
+/// probe render.
 fn probe_templates(
     loaded: &LoadedModel,
     config: &EngineConfig,
-) -> Result<(ChatTemplates, String), EngineError> {
+) -> Result<ChatTemplates, EngineError> {
     let over = config.chat_template.as_deref();
     let chat = ChatTemplates::from_model(loaded.model().as_ptr(), over)?;
     let probe = chat.render(
@@ -534,12 +520,7 @@ fn probe_templates(
     if probe.prompt.is_empty() {
         return Err(EngineError::TemplateUnavailable);
     }
-    let src = over.map(str::to_owned);
-    Ok((
-        chat,
-        src.or_else(|| loaded.model().chat_template())
-            .unwrap_or_default(),
-    ))
+    Ok(chat)
 }
 
 /// Renders `req`'s transcript (raw JSON, else its `ChatTurn`s) and tools.
@@ -584,8 +565,6 @@ pub(crate) struct SessionInner {
     loaded: LoadedModel,
     config: EngineConfig,
     chat: ChatTemplates,
-    /// Default template source (reasoning-marker detection).
-    template: String,
     last_prompt_tokens: Vec<raw::llama_token>,
     /// P3 pool state when the RAM expert pool is enabled (nonzero
     /// `ram_experts_gib`); `None` keeps flagless runs pristine (hooks unset,
@@ -763,7 +742,7 @@ impl Session {
         if let Some(p) = p3.as_mut() {
             p.fit_device_cache()?;
         }
-        let (chat, template) = probe_templates(&loaded, config)?;
+        let chat = probe_templates(&loaded, config)?;
 
         let snapshots = snapshot_cache(config)?;
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
@@ -778,7 +757,6 @@ impl Session {
                     loaded,
                     config: config.clone(),
                     chat,
-                    template,
                     last_prompt_tokens: Vec::new(),
                     p3,
                     timing: config
@@ -812,7 +790,7 @@ impl Session {
     ) -> Result<Self, EngineError> {
         let _guard = construction_lock();
         let loaded = load_with_hooks(config, Some(ctx))?;
-        let (chat, template) = probe_templates(&loaded, config)?;
+        let chat = probe_templates(&loaded, config)?;
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
         Ok({
             p3_glue::session_opened();
@@ -824,7 +802,6 @@ impl Session {
                     loaded,
                     config: config.clone(),
                     chat,
-                    template,
                     last_prompt_tokens: Vec::new(),
                     p3: None,
                     timing: config
@@ -1098,12 +1075,6 @@ impl Session {
     /// parsing the generated text.
     pub fn render(&self, req: &TurnRequest<'_>) -> Result<Rendered, EngineError> {
         render(&self.inner.chat, req)
-    }
-
-    /// Reasoning-marker splitter for the session's chat template (§8.1
-    /// `reasoning_content`); `None` when the template has no markers.
-    pub fn reasoning_splitter(&self) -> Option<crate::reasoning::ReasoningSplitter> {
-        crate::reasoning::ReasoningSplitter::from_template(&self.inner.template)
     }
 
     /// Test seam: every later turn sets its own cancel flag right after

@@ -119,6 +119,29 @@ fn model_mismatch_n_and_multimodal() {
         ErrorCode::InvalidRequest,
         "u32::MAX is LLAMA_DEFAULT_SEED (random)"
     );
+    for (field, bad) in [
+        ("temperature", json!(2.5)),
+        ("temperature", json!(-0.1)),
+        ("temperature", json!(1e39)),
+        ("top_p", json!(1.5)),
+        ("top_p", json!(1e39)),
+        ("frequency_penalty", json!(-2.5)),
+        ("frequency_penalty", json!(-1e39)),
+        ("presence_penalty", json!(3)),
+        ("presence_penalty", json!(1e39)),
+    ] {
+        let mut r = base();
+        r[field] = bad.clone();
+        let e = validate(&r, "tiny-moe").unwrap_err().error;
+        assert_eq!(e.code, ErrorCode::InvalidRequest, "{field}={bad}");
+        assert!(e.message.contains(field), "{}", e.message);
+    }
+    let mut r = base();
+    r["temperature"] = json!(2);
+    r["top_p"] = json!(0);
+    r["frequency_penalty"] = json!(-2);
+    r["presence_penalty"] = json!(2);
+    validate(&r, "tiny-moe").unwrap();
     let mut r = base();
     r["tools"] = json!([{"type":"function","function":{"name":"f"}}]);
     r["tool_choice"] = json!({"type":"function","function":{"name":"g"}});

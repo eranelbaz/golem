@@ -12,8 +12,8 @@ use golem_api::chat::{FunctionCall, Stop, ToolCall};
 use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent};
 use golem_engine::config::EngineConfig;
 use golem_engine::{
-    ChatTurn, EngineError, FinishReason, OutputParser, Piece, ReasoningSplitter, SamplingParams,
-    Scheduler, Session, SlotEvent, SlotJob, TurnOutcome,
+    ChatTurn, EngineError, FinishReason, OutputParser, SamplingParams, Scheduler, Session,
+    SlotEvent, SlotJob, TurnOutcome,
 };
 use golem_llama_sys::raw::LLAMA_DEFAULT_SEED;
 
@@ -39,7 +39,7 @@ pub struct Job {
 /// `--reasoning`: where text between the template's reasoning markers goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReasoningMode {
-    /// Markers and reasoning stay in `content` (splitter bypassed).
+    /// Markers and reasoning stay in `content` (parser bypassed).
     Inline,
     /// Reasoning goes to `reasoning_content`; markers are dropped.
     #[default]
@@ -372,7 +372,7 @@ struct SlotRun {
     job: Job,
     /// Reserved before any text so the terminal event is never dropped.
     permit: tokio::sync::mpsc::OwnedPermit<Event>,
-    splitter: Option<ReasoningSplitter>,
+    /// Parses the text when the slot keeps its render's parser.
     tools: Option<ToolStream>,
     /// Cancelled because the event channel was full (client too slow),
     /// not because the client left.
@@ -400,26 +400,11 @@ impl SlotRun {
     }
 
     fn piece(&mut self, parser: Option<&OutputParser>, t: &str) {
-        let (job, splitter, tools, slow) = (
-            &self.job,
-            &mut self.splitter,
-            &mut self.tools,
-            &self.slow_client,
-        );
+        let (job, tools, slow) = (&self.job, &mut self.tools, &self.slow_client);
         let send = |ev: Event| try_deliver(job, slow, ev);
-        if let (Some(ts), Some(p)) = (tools.as_mut(), parser) {
-            ts.push(p, t, true, &send);
-            return;
-        }
-        let mut send_piece = |p: Piece| {
-            send(match p {
-                Piece::Content(t) => Event::Text(t.into()),
-                Piece::Reasoning(t) => Event::Reasoning(t.into()),
-            })
-        };
-        match splitter {
-            Some(s) => s.push(t, &mut send_piece),
-            None => send_piece(Piece::Content(t)),
+        match (tools.as_mut(), parser) {
+            (Some(ts), Some(p)) => ts.push(p, t, true, &send),
+            _ => send(Event::Text(t.into())),
         }
     }
 }
@@ -658,12 +643,23 @@ fn admit(
         Some(Stop::One(s)) => vec![s.clone()],
         Some(Stop::Many(v)) => v.clone(),
     };
+    let seed = match req.seed.map(u32::try_from) {
+        None => LLAMA_DEFAULT_SEED,
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
+            permit.send(Event::Failed(ErrorEnvelope::new(
+                ErrorCode::InvalidRequest,
+                format!("`seed`: {e}"),
+            )));
+            return Err(false);
+        }
+    };
     // OpenAI defaults, not `SamplingParams::default()` (greedy).
     let sampling = SamplingParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.unwrap_or(0),
-        seed: req.seed.map_or(LLAMA_DEFAULT_SEED, |s| s as u32),
+        seed,
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
     };
@@ -700,18 +696,15 @@ fn admit(
             return Err(false);
         }
     };
-    let splitter = match job.reasoning {
-        ReasoningMode::Separate if !tool_mode => sch.session().reasoning_splitter(),
-        _ => None,
-    };
+    let parsed = tool_mode || job.reasoning == ReasoningMode::Separate;
     let slot_job = SlotJob {
         tokens,
         sampling,
         max_tokens: req.max_tokens,
         stop,
         cancel: job.cancel.clone(),
-        // Only tool-mode renders carry a grammar the sampler must apply.
-        rendered: tool_mode.then_some(rendered),
+        // Kept for its parser; only tool-mode renders carry a grammar.
+        rendered: parsed.then_some(rendered),
     };
     let Ok(id) = sch.admit(slot_job) else {
         unreachable!("admit runs only while a slot is free");
@@ -719,8 +712,7 @@ fn admit(
     runs[id] = Some(SlotRun {
         job,
         permit,
-        splitter,
-        tools: tool_mode.then(ToolStream::new),
+        tools: parsed.then(ToolStream::new),
         slow_client: std::cell::Cell::new(false),
         admitted: Instant::now(),
         first_piece: None,
@@ -815,20 +807,11 @@ fn finish(
 ) {
     let SlotRun {
         job,
-        splitter,
         tools,
         slow_client,
         ..
     } = &mut run;
     let send = |ev: Event| try_deliver(job, slow_client, ev);
-    if let Some(s) = splitter {
-        s.finish(&mut |p: Piece| {
-            send(match p {
-                Piece::Content(t) => Event::Text(t.into()),
-                Piece::Reasoning(t) => Event::Reasoning(t.into()),
-            })
-        });
-    }
     let called = match (tools.as_mut(), sch.parser(id)) {
         (Some(ts), Some(p)) => {
             ts.push(p, "", false, &send);
@@ -931,8 +914,10 @@ fn log_turn(run: &SlotRun, event: &Event) {
 
 /// Turns the growing generated text into OpenAI deltas by re-parsing it with
 /// the request's chat-layer parser (`partial` until the turn ends) and
-/// emitting what each parse added. Re-parsing is O(text) per piece — one
-/// parse per token at ≤ ~10 tok/s on the target, off the per-expert path.
+/// emitting what each parse added. A parse is O(text), so a piece that
+/// cannot open a marker or end in parser-trimmed whitespace, arriving while
+/// the last parse ended verbatim on one section with nothing held, extends
+/// that section without one; the final parse always runs.
 struct ToolStream {
     text: String,
     content: String,
@@ -940,6 +925,13 @@ struct ToolStream {
     /// Per announced call: arguments sent so far.
     args: Vec<String>,
     calls: usize,
+    /// Section (`true` = reasoning) whose text ends `text` verbatim.
+    tail: Option<bool>,
+    fast: bool,
+    #[cfg(test)]
+    parses: usize,
+    #[cfg(test)]
+    always_parse: bool,
 }
 
 impl ToolStream {
@@ -950,26 +942,57 @@ impl ToolStream {
             reasoning: String::new(),
             args: Vec::new(),
             calls: 0,
+            tail: None,
+            fast: false,
+            #[cfg(test)]
+            parses: 0,
+            #[cfg(test)]
+            always_parse: false,
         }
     }
 
     fn push(&mut self, parser: &OutputParser, piece: &str, partial: bool, send: &dyn Fn(Event)) {
         self.text.push_str(piece);
+        let plain = !piece.ends_with(' ')
+            && !piece.is_empty()
+            && piece.chars().all(|c| c == ' ' || c.is_alphanumeric());
+        #[cfg(test)]
+        let plain = plain && !self.always_parse;
+        if let Some(r) = self.tail.filter(|_| partial && plain) {
+            self.fast = true;
+            if r {
+                self.reasoning.push_str(piece);
+                send(Event::Reasoning(piece.into()));
+            } else {
+                self.content.push_str(piece);
+                send(Event::Text(piece.into()));
+            }
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.parses += 1;
+        }
+        self.tail = None;
         let msg = match parser.parse(&self.text, partial) {
             Ok(msg) => msg,
             Err(_) if partial => return,
             // Unparseable final text is still the model's answer: emit what
             // was not yet sent as content.
-            Err(_) => serde_json::json!({ "content": self.text }),
+            Err(_) => {
+                self.fast = false;
+                serde_json::json!({ "content": self.text })
+            }
         };
         let field = |k: &str| msg[k].as_str().unwrap_or_default().to_owned();
+        let (content, reasoning) = (field("content"), field("reasoning_content"));
         for (seen, now, ev) in [
             (
                 &mut self.reasoning,
-                field("reasoning_content"),
+                reasoning.clone(),
                 Event::Reasoning as fn(String) -> Event,
             ),
-            (&mut self.content, field("content"), Event::Text),
+            (&mut self.content, content.clone(), Event::Text),
         ] {
             // A partial parse can only grow; anything else is a re-parse we
             // cannot retract, so it is held until the text settles. The final
@@ -1020,6 +1043,19 @@ impl ToolStream {
                 }));
                 *seen = args.into();
             }
+        }
+        debug_assert!(
+            partial || !self.fast || (self.content == content && self.reasoning == reasoning),
+            "final parse diverged from the incrementally streamed text"
+        );
+        let held = self.content != content || self.reasoning != reasoning;
+        if partial && !held && calls.is_empty() {
+            let ends = |s: &str| !s.is_empty() && self.text.ends_with(s);
+            self.tail = match (ends(&content), ends(&reasoning)) {
+                (true, false) => Some(false),
+                (false, true) if content.is_empty() => Some(true),
+                _ => None,
+            };
         }
     }
 }
@@ -1213,6 +1249,132 @@ mod tests {
         ts.push(&r.parser, "", false, &send);
         assert_eq!(*out.borrow(), "bad\0text");
         assert_eq!(ts.calls, 0);
+    }
+
+    const QWEN3: &str =
+        include_str!("../../../vendor/llama.cpp/models/templates/Qwen-Qwen3-0.6B.jinja");
+    const GLM_TOOLS: &str = r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#;
+
+    fn render(src: &str, tools: Option<&str>) -> golem_engine::Rendered {
+        golem_engine::ChatTemplates::from_source(src)
+            .unwrap()
+            .render(
+                r#"[{"role":"user","content":"hi"}]"#,
+                tools,
+                None,
+                false,
+                None,
+            )
+            .unwrap()
+    }
+
+    /// Streams `pieces` then the final parse; returns the events (call ids
+    /// masked) and the number of parses.
+    fn stream(r: &golem_engine::Rendered, pieces: &[&str], always: bool) -> (Vec<String>, usize) {
+        let out = std::cell::RefCell::new(Vec::new());
+        let send = |ev: Event| {
+            let ev = match ev {
+                Event::ToolCall(mut c) => {
+                    c.id = c.id.map(|_| "ID".into());
+                    Event::ToolCall(c)
+                }
+                ev => ev,
+            };
+            out.borrow_mut().push(format!("{ev:?}"));
+        };
+        let mut ts = ToolStream::new();
+        ts.always_parse = always;
+        for p in pieces {
+            ts.push(&r.parser, p, true, &send);
+        }
+        ts.push(&r.parser, "", false, &send);
+        (out.into_inner(), ts.parses)
+    }
+
+    /// Random splits stream exactly the events of a parse per piece.
+    #[test]
+    fn incremental_stream_matches_reparse_oracle_issue_93() {
+        let transcripts = [
+            "plain text with 42 words",
+            "think about it</think>the answer is 7",
+            "r \n</think>\n\n answer \n",
+            "plan</think>calling<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+            "é 日本語 ü</think>ß 中文 ok",
+            "a <</think>b <",
+            "x <tool x> y</think>z <toolx> w",
+        ];
+        let mut seed = 0x9e37_79b9_u64;
+        for tools in [None, Some(GLM_TOOLS)] {
+            let r = render(GLM, tools);
+            for text in transcripts {
+                let chars: Vec<(usize, char)> = text.char_indices().collect();
+                for _ in 0..40 {
+                    let mut pieces = Vec::new();
+                    let mut i = 0;
+                    while i < chars.len() {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        let n = 1 + (seed >> 33) as usize % 4;
+                        let end = chars.get(i + n).map_or(text.len(), |c| c.0);
+                        pieces.push(&text[chars[i].0..end]);
+                        i += n;
+                    }
+                    assert_eq!(
+                        stream(&r, &pieces, false).0,
+                        stream(&r, &pieces, true).0,
+                        "{tools:?} {pieces:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_pieces_skip_most_parses_issue_93() {
+        let pieces = vec![" w"; 1000];
+        for r in [render(GLM, None), render(QWEN3, None)] {
+            let (events, parses) = stream(&r, &pieces, false);
+            assert_eq!(events, stream(&r, &pieces, true).0);
+            assert!(parses < 10, "{parses} parses");
+        }
+    }
+
+    fn split(r: &golem_engine::Rendered, pieces: &[&str]) -> (String, String) {
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for ev in stream(r, pieces, false).0 {
+            if let Some(t) = ev.strip_prefix("Reasoning(") {
+                reasoning.push_str(&serde_json::from_str::<String>(&t[..t.len() - 1]).unwrap());
+            } else if let Some(t) = ev.strip_prefix("Text(") {
+                content.push_str(&serde_json::from_str::<String>(&t[..t.len() - 1]).unwrap());
+            }
+        }
+        (reasoning, content)
+    }
+
+    #[test]
+    fn splits_across_token_boundaries() {
+        let r = render(QWEN3, None);
+        for cut in 1..12 {
+            let text = "<think>plan it</think>answer";
+            let pieces: Vec<&str> = text
+                .as_bytes()
+                .chunks(cut)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect();
+            let (r, c) = split(&r, &pieces);
+            assert_eq!((r.as_str(), c.as_str()), ("plan it", "answer"), "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn false_marker_prefix_and_multibyte_tail_are_content() {
+        let r = render(QWEN3, None);
+        assert_eq!(
+            split(&r, &["a<th", "ing ", "é<", "x"]),
+            (String::new(), "a<thing é<x".into())
+        );
+        // Unclosed reasoning flushes as reasoning; state resets per turn.
+        assert_eq!(split(&r, &["<think>half"]), ("half".into(), String::new()));
+        assert_eq!(split(&r, &["plain"]), (String::new(), "plain".into()));
     }
 
     #[test]

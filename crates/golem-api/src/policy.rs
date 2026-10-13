@@ -126,6 +126,19 @@ pub fn validate(
                 .into(),
         ));
     }
+    for (name, v, lo, hi) in [
+        ("temperature", req.temperature, 0.0, 2.0),
+        ("top_p", req.top_p, 0.0, 1.0),
+        ("frequency_penalty", req.frequency_penalty, -2.0, 2.0),
+        ("presence_penalty", req.presence_penalty, -2.0, 2.0),
+    ] {
+        if v.is_some_and(|v| !v.is_finite() || !(lo..=hi).contains(&v)) {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                format!("`{name}` must be a finite number in [{lo}, {hi}]"),
+            ));
+        }
+    }
     let fn_name = |v: &serde_json::Value| {
         v.pointer("/function/name")
             .and_then(|n| n.as_str())
