@@ -2775,6 +2775,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 i7 = j7 + 1;
                             }
                         }
+                        gctx->dc_stats.stream_experts_copied.fetch_add(golem_stream_ids.size(), std::memory_order_relaxed);
                         sl.used = true;
                         gctx->stream_used_in_split[seq & 1] = true;
                     } else if (golem_planned && plan.mode == 1) {
@@ -2861,6 +2862,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 (size_t) plan.pending[k4].first * expert_size, expert_size);
                         }
                         gctx->dc_stats.bytes_copied.fetch_add(plan.dc.copied * expert_size, std::memory_order_relaxed);
+                        gctx->dc_stats.cache_experts_copied.fetch_add(plan.dc.copied, std::memory_order_relaxed);
                         gctx->dc_stats.bytes_skipped.fetch_add(plan.dc.skipped * expert_size, std::memory_order_relaxed);
                         gctx->dc_stats.evictions.fetch_add(plan.dc.evicted, std::memory_order_relaxed);
                     } else {

@@ -163,3 +163,47 @@ fn budget_k8_warm_turn_has_zero_window_counters() {
          {before:?} → {after:?}"
     );
 }
+
+#[test]
+fn cache_h2d_copies_match_routed_misses_and_bytes() {
+    // K = n_expert never evicts, so after a reset every distinct routed
+    // (layer, expert) is copied exactly once: 3 planes each.
+    let dir = std::env::temp_dir().join(format!("golem-h2d-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = config(N_EXPERT);
+    cfg.routing_trace = Some(dir.join("trace.tsv"));
+    let mut session = Session::new(&cfg).expect("pooled offload session with K = n_expert");
+    let _ = greedy_tokens(&mut session, PROMPTS[0]);
+    // SAFETY: as in budget_k4_evicts_and_stays_on_gpu.
+    unsafe {
+        golem_llama_sys::raw::golem_reset_device_cache(
+            session.p3_ctx_ptr().expect("pooled session ⇒ live ctx"),
+        )
+    };
+    session.p3_hooks().unwrap().drain_routing_trace();
+    let before = session.device_cache_stats().unwrap();
+    let _ = greedy_tokens(&mut session, PROMPTS[2]);
+    let after = session.device_cache_stats().unwrap();
+
+    let mut trace = Vec::new();
+    session.write_routing_trace(&mut trace).unwrap();
+    let mut routed = std::collections::BTreeSet::new();
+    for row in String::from_utf8(trace).unwrap().lines().skip(1) {
+        let cols: Vec<&str> = row.split('\t').collect();
+        for id in cols[3].split(',') {
+            routed.insert((cols[2].to_owned(), id.to_owned()));
+        }
+    }
+    let facts = golem_plan::ModelFacts::from_gguf(&cfg.model_path).expect("fixture facts");
+    assert_eq!(facts.expert_layers, 1, "oracle assumes one expert layer");
+    let copies = after.cache_copies - before.cache_copies;
+    assert!(!routed.is_empty(), "turn routed nothing");
+    assert_eq!(copies, routed.len() as u64 * 3, "routed pairs {routed:?}");
+    // One expert layer: a slab slot is exactly one expert's three planes.
+    assert_eq!(
+        after.bytes_copied - before.bytes_copied,
+        routed.len() as u64 * facts.slab_bytes_per_expert()
+    );
+    assert_eq!(after.stream_copies, 0, "non-streamed config streamed");
+    let _ = std::fs::remove_dir_all(&dir);
+}

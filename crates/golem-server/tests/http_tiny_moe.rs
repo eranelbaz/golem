@@ -342,8 +342,17 @@ async fn metrics_parse_as_prometheus_text() {
     // on HIP builds the series is emitted and must be 0; on CPU it is omitted (on_cpu is nonzero there)
     #[cfg(golem_backend_hip)]
     assert!(body.contains("golem_expert_mul_mat_id_off_gpu_total 0"));
+    #[cfg(golem_backend_hip)]
+    assert!(
+        body.contains("golem_expert_mul_mat_id_total{device=\"cpu\"} 0"),
+        "{body}"
+    );
     #[cfg(not(golem_backend_hip))]
     assert!(!body.contains("golem_expert_mul_mat_id_off_gpu_total"));
+    #[cfg(not(golem_backend_hip))]
+    assert!(!body.contains("golem_expert_mul_mat_id_total"));
+    // Non-pooled: no device cache, so no fake-zero copy series.
+    assert!(!body.contains("golem_expert_h2d_copies_total"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

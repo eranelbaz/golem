@@ -12,7 +12,8 @@
 // fail a compute when the store cannot page the misses in; v14 reports
 // resident device bytes; v15: golem_inject_slab_alloc_failure exists only
 // under GOLEM_TEST_SUPPORT; stream source may return
-// GOLEM_STREAM_SRC_STORAGE_LOST (compute fails)). Part of the vendored ggml include tree; the ABI is
+// GOLEM_STREAM_SRC_STORAGE_LOST (compute fails); device-cache stats gain h2d
+// expert copies). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.

@@ -37,6 +37,8 @@ pub(crate) fn code_index(c: ErrorCode) -> usize {
 pub struct MetricsSnapshot {
     /// P4 device cache: bytes copied / skipped, evictions (pooled GPU only).
     pub device_cache: Option<(u64, u64, u64)>,
+    /// Expert planes copied host→device: device-cache fills, streamed prefill.
+    pub h2d_copies: Option<(u64, u64)>,
     /// P3: demand page-ins, fast hits, evictions, bytes paged, source errors.
     pub p3: Option<[u64; 5]>,
     /// §6.5: prefetch page-ins, hits, wasted bytes.
@@ -44,9 +46,9 @@ pub struct MetricsSnapshot {
     /// §7.1 snapshot cache: hits, misses, restore failures, evictions,
     /// dropped oversize, used bytes.
     pub snapshots: Option<[u64; 6]>,
-    /// Process-cumulative expert `MUL_MAT_ID` nodes placed on a CPU (I2);
-    /// `None` unless the session offloads (only then must it stay 0).
-    pub off_gpu: Option<u64>,
+    /// Process-cumulative expert `MUL_MAT_ID` nodes placed (on GPU, on CPU);
+    /// `None` unless the session offloads (only then must CPU stay 0, I2).
+    pub placement: Option<(u64, u64)>,
     /// Expert pool + snapshot arena bytes, mlocked.
     pub locked_ram_bytes: u64,
     /// Device free bytes (`hipMemGetInfo`); `None` off HIP.
@@ -64,9 +66,11 @@ pub struct MetricsSnapshot {
 impl MetricsSnapshot {
     /// Reads every counter from `s` (decode thread, between steps).
     pub(crate) fn refresh(&mut self, s: &Session, slot_tokens: &[u64]) {
-        self.device_cache = s
-            .device_cache_stats()
+        let dc = s.device_cache_stats();
+        self.device_cache = dc
+            .as_ref()
             .map(|d| (d.bytes_copied, d.bytes_skipped, d.evictions));
+        self.h2d_copies = dc.map(|d| (d.cache_copies, d.stream_copies));
         self.p3 = s.p3_stats().map(|p| {
             [
                 p.demand_slow_pageins.load(Ordering::Relaxed),
@@ -89,7 +93,9 @@ impl MetricsSnapshot {
                 x.used_bytes,
             ]
         });
-        self.off_gpu = s.offloaded().then(|| s.expert_mul_mat_id_off_gpu());
+        self.placement = s
+            .offloaded()
+            .then(|| (s.expert_mul_mat_id_on_gpu(), s.expert_mul_mat_id_off_gpu()));
         self.locked_ram_bytes = s.locked_ram_bytes();
         let vram = device_mem();
         self.vram_free = vram.map(|v| v.0);
@@ -122,6 +128,7 @@ fn device_mem() -> Option<(u64, u64)> {
 pub(crate) fn render(h: &HealthState) -> String {
     let m = *h.metrics.lock().unwrap_or_else(|p| p.into_inner());
     let mut o = String::with_capacity(4096);
+    let mut labeled = String::new();
     let mut g = |name: &str, kind: &str, help: &str, v: f64| {
         let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}");
     };
@@ -143,6 +150,14 @@ pub(crate) fn render(h: &HealthState) -> String {
             "counter",
             "P4 device cache evictions",
             ev as f64,
+        );
+    }
+    if let Some((cache, stream)) = m.h2d_copies {
+        let _ = writeln!(
+            labeled,
+            "# HELP golem_expert_h2d_copies_total routed expert planes copied host→device, by device-cache fill or streamed prefill\n# TYPE golem_expert_h2d_copies_total counter\n\
+             golem_expert_h2d_copies_total{{path=\"cache\"}} {cache}\n\
+             golem_expert_h2d_copies_total{{path=\"stream\"}} {stream}"
         );
     }
     if let Some([demand, fast, ev, paged, errs]) = m.p3 {
@@ -237,12 +252,18 @@ pub(crate) fn render(h: &HealthState) -> String {
     // I2: CPU builds (and non-offloaded sessions) place expert MUL_MAT_ID
     // on the CPU by construction.
     #[cfg(golem_backend_hip)]
-    if let Some(n) = m.off_gpu {
+    if let Some((on_gpu, on_cpu)) = m.placement {
         g(
             "golem_expert_mul_mat_id_off_gpu_total",
             "counter",
-            "Expert MUL_MAT_ID nodes placed off the GPU (must be 0)",
-            n as f64,
+            "Expert MUL_MAT_ID nodes placed off the GPU (must be 0); deprecated alias of golem_expert_mul_mat_id_total{device=\"cpu\"}",
+            on_cpu as f64,
+        );
+        let _ = writeln!(
+            labeled,
+            "# HELP golem_expert_mul_mat_id_total Expert MUL_MAT_ID graph nodes by placed device\n# TYPE golem_expert_mul_mat_id_total counter\n\
+             golem_expert_mul_mat_id_total{{device=\"gpu\"}} {on_gpu}\n\
+             golem_expert_mul_mat_id_total{{device=\"cpu\"}} {on_cpu}"
         );
     }
     g(
@@ -271,6 +292,7 @@ pub(crate) fn render(h: &HealthState) -> String {
         "Jobs on the decode worker",
         h.in_flight_count() as f64,
     );
+    o.push_str(&labeled);
     let _ = writeln!(
         o,
         "# HELP golem_errors_total Error responses by code\n# TYPE golem_errors_total counter"

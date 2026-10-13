@@ -935,11 +935,18 @@ impl Session {
             "golem_get_device_cache_stats returned null"
         );
         // SAFETY: layout contract from the C++ definition (bindgen renders
-        // the struct opaque): 3 contiguous lock-free u64 counters in member
-        // order bytes_copied, bytes_skipped, evictions.
-        let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 3]>() };
+        // the struct opaque): 5 contiguous lock-free u64 counters in member
+        // order bytes_copied, bytes_skipped, evictions, cache_experts_copied,
+        // stream_experts_copied (pinned by static_assert/offsetof there).
+        let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 5]>() };
         let load = |i: usize| counters[i].load(std::sync::atomic::Ordering::Relaxed);
-        Some(DeviceCacheStats::new(load(0), load(1), load(2)))
+        Some(DeviceCacheStats::new(
+            load(0),
+            load(1),
+            load(2),
+            load(3),
+            load(4),
+        ))
     }
 
     /// Expert `MUL_MAT_ID` nodes the scheduler placed on a CPU backend
@@ -947,6 +954,12 @@ impl Session {
     /// like [`expert_placement`].
     pub fn expert_mul_mat_id_off_gpu(&self) -> u64 {
         expert_placement().on_cpu
+    }
+
+    /// Expert `MUL_MAT_ID` nodes the scheduler placed on a GPU backend
+    /// (process-cumulative, process-global like [`expert_placement`]).
+    pub fn expert_mul_mat_id_on_gpu(&self) -> u64 {
+        expert_placement().on_gpu
     }
 
     /// Locked RAM: expert pool (mlocked + GPU-registered) plus the
@@ -2124,16 +2137,28 @@ pub struct DeviceCacheStats {
     pub bytes_skipped: u64,
     /// Cached experts evicted under the soft budget.
     pub evictions: u64,
+    /// Expert planes copied host→device into the device cache.
+    pub cache_copies: u64,
+    /// Expert planes copied host→device by streamed prefill.
+    pub stream_copies: u64,
     /// `bytes_skipped / (bytes_skipped + bytes_copied)`; 0.0 with no traffic.
     pub skip_ratio: f64,
 }
 
 impl DeviceCacheStats {
-    fn new(bytes_copied: u64, bytes_skipped: u64, evictions: u64) -> Self {
+    fn new(
+        bytes_copied: u64,
+        bytes_skipped: u64,
+        evictions: u64,
+        cache_copies: u64,
+        stream_copies: u64,
+    ) -> Self {
         Self {
             bytes_copied,
             bytes_skipped,
             evictions,
+            cache_copies,
+            stream_copies,
             skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
         }
     }
@@ -2360,10 +2385,11 @@ mod tests {
         assert_eq!(skip_ratio(3, 0), 0.0, "all copied ⇒ 0.0");
         assert_eq!(skip_ratio(0, 5), 1.0, "all skipped ⇒ 1.0");
         assert_eq!(skip_ratio(1, 3), 0.75);
-        let stats = DeviceCacheStats::new(1, 3, 7);
+        let stats = DeviceCacheStats::new(1, 3, 7, 2, 4);
         assert_eq!(stats.bytes_copied, 1);
         assert_eq!(stats.bytes_skipped, 3);
         assert_eq!(stats.evictions, 7);
+        assert_eq!((stats.cache_copies, stats.stream_copies), (2, 4));
         assert_eq!(stats.skip_ratio, 0.75);
     }
 

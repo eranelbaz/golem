@@ -137,3 +137,62 @@ async fn fatal_io_503_with(
         .unwrap();
     assert_eq!(body_json(r).await["state"], "fatal-io");
 }
+
+/// Pooled offloaded session: after one chat turn the H2D copy series is
+/// exported and the cache path moved (HIP only; CPU never copies H2D).
+#[cfg(golem_backend_hip)]
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_export_expert_h2d_copies() {
+    let (model, manifest) = fixture();
+    let cfg = golem_engine::config::EngineConfig {
+        model_path: model,
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        manifest_path: Some(manifest),
+        n_gpu_layers: 99,
+        cpu_moe_layers: Some(99),
+        ..golem_server::test_engine_config()
+    };
+    let app = router_with_hooks(cfg, TestHooks::default()).await;
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model":"tiny-moe","messages":[{"role":"user","content":"hi"}],
+                        "max_tokens":8,"temperature":0})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = app
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = String::from_utf8(
+        axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let cache: u64 = body
+        .lines()
+        .find_map(|l| l.strip_prefix("golem_expert_h2d_copies_total{path=\"cache\"} "))
+        .unwrap_or_else(|| panic!("{body}"))
+        .parse()
+        .unwrap();
+    assert!(cache > 0, "{body}");
+    assert!(
+        body.contains("golem_expert_h2d_copies_total{path=\"stream\"} "),
+        "{body}"
+    );
+    assert!(
+        body.contains("golem_expert_mul_mat_id_total{device=\"cpu\"} 0"),
+        "{body}"
+    );
+}

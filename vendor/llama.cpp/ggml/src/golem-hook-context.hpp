@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -29,14 +30,19 @@ struct ggml_tensor;
 struct ggml_backend_buffer;
 struct ggml_backend_event;
 
-// P4 counters; layout mirrors the Rust [AtomicU64; 3] FFI cast (the
+// P4 counters; layout mirrors the Rust [AtomicU64; 5] FFI cast (the
 // placement stats are process-global and stay in ggml-backend.cpp).
 struct golem_device_cache_stats {
     std::atomic<uint64_t> bytes_copied; // host->device expert bytes written
     std::atomic<uint64_t> bytes_skipped; // bytes skipped because bit-valid
     std::atomic<uint64_t> evictions; // experts invalidated to stay under budget
+    std::atomic<uint64_t> cache_experts_copied; // expert planes copied into the device cache
+    std::atomic<uint64_t> stream_experts_copied; // expert planes copied by streamed prefill
 };
-static_assert(sizeof(golem_device_cache_stats) == 3 * sizeof(uint64_t), "golem_device_cache_stats layout must match the Rust [AtomicU64; 3] FFI cast");
+static_assert(sizeof(golem_device_cache_stats) == 5 * sizeof(uint64_t), "golem_device_cache_stats layout must match the Rust [AtomicU64; 5] FFI cast");
+static_assert(offsetof(golem_device_cache_stats, cache_experts_copied) == 3 * sizeof(uint64_t) &&
+              offsetof(golem_device_cache_stats, stream_experts_copied) == 4 * sizeof(uint64_t),
+              "golem_device_cache_stats member order must match the Rust FFI cast");
 static_assert(std::atomic<uint64_t>::is_always_lock_free && alignof(std::atomic<uint64_t>) == alignof(uint64_t),
               "counters are read from Rust as plain AtomicU64: lock-free and u64-aligned");
 
