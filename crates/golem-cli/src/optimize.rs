@@ -50,8 +50,8 @@ pub struct OptimizeArgs {
     #[arg(long, default_value_t = 120)]
     pub max_minutes: u64,
     /// Override the swept axes: `knob=v1,v2;knob=...` over threads,
-    /// numa_interleave, o_direct, io_threads, io_depth, vram_experts_frac
-    /// (`async_h2d` is refused).
+    /// numa_interleave, o_direct, io_threads, io_depth, vram_experts_frac,
+    /// async_h2d.
     #[arg(long)]
     pub axes: Option<String>,
     /// Internal: measure one knob set (JSON) and print its metrics.
@@ -454,11 +454,7 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
                 "o_direct" => Axis::ODirect(vals(v)?),
                 "io_threads" => Axis::IoThreads(vals(v)?),
                 "io_depth" => Axis::IoDepth(vals(v)?),
-                "async_h2d" => {
-                    return Err("async_h2d is not sweepable: the engine refuses it at load \
-                                (no dedicated copy stream)"
-                        .into());
-                }
+                "async_h2d" => Axis::AsyncH2d(vals(v)?),
                 "vram_experts_frac" => Axis::VramExpertsFrac(vals(v)?),
                 other => return Err(format!("unknown knob {other:?}").into()),
             })
@@ -467,8 +463,8 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
 }
 
 /// The swept axes for this machine. NUMA only with > 1 node, `O_DIRECT`
-/// and I/O only with a store-backed pool; `async_h2d` is absent (the
-/// substrate refuses it). Target: 16 physical cores → threads {8, 12, 16}.
+/// and I/O only with a store-backed pool; `async_h2d` is opt-in via
+/// `--axes` (no measured win yet). Target: 16 physical cores → threads {8, 12, 16}.
 fn default_axes(config: &EngineConfig) -> Vec<Axis> {
     let phys = sysinfo::System::new().physical_core_count().unwrap_or(2) as u32;
     let mut threads = vec![(phys / 2).max(1), (phys * 3 / 4).max(1), phys.max(1)];
@@ -519,6 +515,7 @@ fn fold_defaults(axes: &mut [Axis], config: &EngineConfig) {
             Axis::IoThreads(v) => fold(v, |x| Some(x) == config.io_threads, 0),
             Axis::IoDepth(v) => fold(v, |x| x == config.io_depth.max(1), 0),
             Axis::VramExpertsFrac(v) => fold(v, |x| x == config.vram_experts_frac, 0.0),
+            Axis::AsyncH2d(v) => fold(v, |x| x == config.async_h2d, false),
         }
     }
 }

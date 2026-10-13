@@ -112,6 +112,119 @@ void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
     ctx->stream_on.store(on, std::memory_order_release);
 }
 
+int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on) {
+    if (ctx == NULL) {
+        return -1;
+    }
+    // Upstream concurrent-stream forking (GGML_CUDA_GRAPH_OPT=1) uses the
+    // stream indices the copy stream lives on.
+    const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+    if (on && env != nullptr && atoi(env) == 1) {
+        return -1;
+    }
+    ctx->async_h2d = on ? 1 : 0;
+    return 0;
+}
+
+// Blocks until the copy stream is idle. Every release of H2D sources (pool
+// leases, stream staging, evict destinations) and every slab free runs after
+// this: ggml_backend_synchronize covers the compute stream only.
+static void golem_drain_copy_stream(golem_ctx_t ctx) {
+    if (ctx != NULL && ctx->cs_backend != nullptr) {
+        ctx->cs->sync(ctx->cs_backend);
+    }
+}
+
+static void golem_cs_free(golem_ctx_t ctx) {
+    if (ctx->cs == nullptr) {
+        return;
+    }
+    if (ctx->cs_backend != nullptr) {
+        ctx->cs->sync(ctx->cs_backend);
+    }
+    ctx->cs->event_free(ctx->cs_ev_ready);
+    ctx->cs->event_free(ctx->cs_ev_done);
+    for (int i = 0; i < golem_ctx::GOLEM_CS_RING; ++i) {
+        if (ctx->cs_t0[i] != nullptr) {
+            ctx->cs->event_free(ctx->cs_t0[i]);
+            ctx->cs->event_free(ctx->cs_t1[i]);
+            ctx->cs_t0[i] = ctx->cs_t1[i] = nullptr;
+        }
+    }
+    ctx->cs_ev_ready = ctx->cs_ev_done = nullptr;
+    ctx->cs_backend = nullptr;
+    ctx->cs = nullptr;
+    ctx->cs_t_n = 0;
+    ctx->cs_t_overflow = false;
+}
+
+// Orders the copy stream after everything already queued on the split
+// backend's compute stream (prior computes reading the destination, O10
+// eviction D2H of the slots about to be refilled). Called before each
+// plane's copy-stream H2D batch; `first` opens the split's timing pair.
+static void golem_cs_begin(golem_ctx_t ctx, ggml_backend_t be, bool first) {
+    if (ctx->cs_backend == nullptr) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
+        ctx->cs = (const golem_copy_stream_iface *) ggml_backend_reg_get_proc_address(reg, "golem_copy_stream_iface");
+        if (ctx->cs == nullptr) {
+            GGML_ABORT("golem async_h2d on a backend without a copy stream");
+        }
+        ctx->cs_backend = be;
+        ctx->cs_ev_ready = ctx->cs->event_new(be, 0);
+        ctx->cs_ev_done = ctx->cs->event_new(be, 0);
+        for (int i = 0; i < golem_ctx::GOLEM_CS_RING; ++i) {
+            ctx->cs_t0[i] = ctx->cs->event_new(be, 1);
+            ctx->cs_t1[i] = ctx->cs->event_new(be, 1);
+        }
+    }
+    GGML_ASSERT(ctx->cs_backend == be && "golem async_h2d: one device backend per ctx");
+    ctx->cs->record_compute(be, ctx->cs_ev_ready);
+    ctx->cs->copy_wait(be, ctx->cs_ev_ready);
+    if (first) {
+        if (ctx->cs_t_n < golem_ctx::GOLEM_CS_RING) {
+            ctx->cs->record_copy(be, ctx->cs_t0[ctx->cs_t_n]);
+        } else {
+            ctx->cs_t_overflow = true;
+        }
+    }
+}
+
+static void golem_cs_set(golem_ctx_t ctx, ggml_tensor * t, const void * src, size_t off, size_t len) {
+    GGML_ASSERT(t->data != NULL && off + len <= ggml_nbytes(t) && "tensor write out of bounds");
+    ctx->cs->set_async(ctx->cs_backend, t, src, off, len);
+    ctx->cs_bytes += len;
+}
+
+// Closes a copying split: the compute stream waits for every H2D the split
+// queued on the copy stream before the split's graph reads it.
+static void golem_cs_join(golem_ctx_t ctx) {
+    ggml_backend_t be = ctx->cs_backend;
+    if (ctx->cs_t_n < golem_ctx::GOLEM_CS_RING) {
+        ctx->cs->record_copy(be, ctx->cs_t1[ctx->cs_t_n]);
+        ctx->cs_t_n++;
+    }
+    ctx->cs->record_copy(be, ctx->cs_ev_done);
+    ctx->cs->compute_wait(be, ctx->cs_ev_done);
+}
+
+int32_t golem_take_h2d_timing(golem_ctx_t ctx, double * ms, uint64_t * bytes) {
+    if (ctx == NULL || !ctx->async_h2d) {
+        return 0;
+    }
+    golem_drain_copy_stream(ctx);
+    double total = 0.0;
+    for (int32_t i = 0; i < ctx->cs_t_n; ++i) {
+        total += ctx->cs->elapsed_ms(ctx->cs_t0[i], ctx->cs_t1[i]);
+    }
+    const bool ok = !ctx->cs_t_overflow;
+    *ms = total;
+    *bytes = ctx->cs_bytes;
+    ctx->cs_t_n = 0;
+    ctx->cs_t_overflow = false;
+    ctx->cs_bytes = 0;
+    return ok ? 1 : 0;
+}
+
 // Frees the prefill-stream slabs + events (device buffers: the owner must run
 // this while the backend is alive -- golem_reset_device_cache).
 static void golem_stream_slabs_free(golem_ctx_t ctx) {
@@ -142,6 +255,7 @@ void golem_reset_device_cache(golem_ctx_t ctx) {
     if (ctx == NULL) {
         return;
     }
+    golem_cs_free(ctx);
     golem_stream_slabs_free(ctx);
     std::lock_guard<std::mutex> lk(ctx->dc_mutex);
     // The invalidation seam is also the reclamation point (model reload):
@@ -1897,6 +2011,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        golem_drain_copy_stream(gctx);
         golem_cb_guard cb;
         gctx->copy_done(gctx->payload);
     }
@@ -2035,6 +2150,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        // async_h2d: did this split queue pooled H2D on the copy stream
+        // (joined into the compute stream before the split's graph).
+        bool golem_cs_used = false;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2445,6 +2563,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     for (int i = 0; i < sched->n_backends; i++) {
                         ggml_backend_synchronize(sched->backends[i]);
                     }
+                    golem_drain_copy_stream(gctx);
                     if (!golem_evict_d2h.empty()) {
                         golem_evict_abandon_unfinished();
                     }
@@ -2515,6 +2634,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int i = 0; i < sched->n_backends; i++) {
                             ggml_backend_synchronize(sched->backends[i]);
                         }
+                        golem_drain_copy_stream(gctx);
                         if (!golem_evict_d2h.empty()) {
                             golem_evict_abandon_unfinished();
                         }
@@ -2619,6 +2739,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // bytes). A slot is exactly expert_size whenever
                             // expert_size is the pool's max stride, so reading
                             // past it could leave the arena mapping entirely.
+                            if (gctx->async_h2d) {
+                                golem_cs_begin(gctx, split_backend, !golem_cs_used);
+                                golem_cs_used = true;
+                                golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
+                                    ptrs, last_id - first_id + 1,
+                                    [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
+                                        golem_cs_set((golem_ctx_t) ud, (ggml_tensor *) dst, src, dst_off, len);
+                                    }, gctx);
+                                return;
+                            }
                             golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
                                 ptrs, last_id - first_id + 1,
                                 [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
@@ -2728,10 +2858,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // and fail the compute; the graph never runs.
                             // Only a cancel aborts; storage loss fails.
                             golem_restore_ids();
-                            // Leases are released below: drain every backend that may hold an earlier split's async copy.
+                            // Leases are released below: drain all backends + copy stream (any may hold an earlier split's async copy).
                             for (int i = 0; i < sched->n_backends; i++) {
                                 ggml_backend_synchronize(sched->backends[i]);
                             }
+                            golem_drain_copy_stream(gctx);
                             if (gctx->stream_release != NULL) {
                                 golem_cb_guard cb;
                                 gctx->stream_release(gctx->payload, seq);
@@ -2858,9 +2989,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 n2->src[2] = st.ids_dev;
                             }
                         }
-                        for (size_t k4 = 0; k4 < plan.pending.size(); ++k4) {
-                            ggml_backend_tensor_set_async(split_backend, plan.slab, plan.ptrs[k4],
-                                (size_t) plan.pending[k4].first * expert_size, expert_size);
+                        if (gctx->async_h2d && !plan.pending.empty()) {
+                            // After this plane's D2H issue above: the copy
+                            // stream waits on the compute stream, so the
+                            // eviction read of a stolen slot lands first.
+                            golem_cs_begin(gctx, split_backend, !golem_cs_used);
+                            golem_cs_used = true;
+                            for (size_t k4 = 0; k4 < plan.pending.size(); ++k4) {
+                                golem_cs_set(gctx, plan.slab, plan.ptrs[k4],
+                                    (size_t) plan.pending[k4].first * expert_size, expert_size);
+                            }
+                        } else {
+                            for (size_t k4 = 0; k4 < plan.pending.size(); ++k4) {
+                                ggml_backend_tensor_set_async(split_backend, plan.slab, plan.ptrs[k4],
+                                    (size_t) plan.pending[k4].first * expert_size, expert_size);
+                            }
                         }
                         gctx->dc_stats.bytes_copied.fetch_add(plan.dc.copied * expert_size, std::memory_order_relaxed);
                         gctx->dc_stats.cache_experts_copied.fetch_add(plan.dc.copied, std::memory_order_relaxed);
@@ -2917,6 +3060,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (golem_cs_used) {
+            golem_cs_join(gctx);
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             // Prefill stream: the compute above consumed this split's slabs --
@@ -2937,6 +3084,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 for (int i = 0; i < sched->n_backends; i++) {
                     ggml_backend_synchronize(sched->backends[i]);
                 }
+                golem_drain_copy_stream(gctx);
                 if (!golem_evict_d2h.empty()) {
                     golem_evict_abandon_unfinished();
                 }
@@ -2969,6 +3117,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     for (int i = 0; i < sched->n_backends; i++) {
                         ggml_backend_synchronize(sched->backends[i]);
                     }
+                    golem_drain_copy_stream(gctx);
                     if (!golem_evict_d2h.empty()) {
                         golem_evict_abandon_unfinished();
                     }
@@ -3007,11 +3156,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        golem_drain_copy_stream(gctx);
         golem_evict_abandon_unfinished();
     }
     // Release this entry's in-flight pin (the graph_compute_async caller
-    // holds its own; the depth is per nested entry).
+    // holds its own; the depth is per nested entry). Copy-stream work never
+    // outlives the entry that queued it.
     if (golem_hooked) {
+        golem_drain_copy_stream(gctx);
         golem_in_flight_done(gctx);
     }
     return GGML_STATUS_SUCCESS;
@@ -3791,6 +3943,10 @@ void golem_ctx_free(golem_ctx_t ctx) {
                    "alive (before llama_free) — freeing device buffers after "
                    "the backend is gone is a use-after-free",
                    ctx->dc.size());
+    }
+    if (ctx->cs_backend != nullptr) {
+        GGML_ABORT("golem ctx_free with a bound copy stream: the owner must "
+                   "call golem_reset_device_cache while the backend is still alive");
     }
     if (ctx->stream_slabs[0].buf != nullptr || ctx->stream_slabs[1].buf != nullptr) {
         GGML_ABORT("golem ctx_free with live prefill-stream slabs: the owner must "

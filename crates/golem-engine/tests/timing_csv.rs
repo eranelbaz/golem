@@ -1,5 +1,8 @@
 //! §11 per-step timing CSV format tests (pure formatting; no GPU, no model).
 
+#[cfg(feature = "hip-tests")]
+mod common;
+
 use golem_engine::timing::{StepTiming, TimingRecorder};
 
 #[test]
@@ -67,4 +70,56 @@ fn compute_is_wall_minus_p3_h2d_policy_not_disk_worker() {
     r.flush(&mut out).unwrap();
     let line = std::str::from_utf8(&out).unwrap().lines().last().unwrap();
     assert!(line.contains("35.5"), "row: {line}");
+}
+
+/// HIP, pooled offload: `h2d_ms` is a measured number with async_h2d (the
+/// copy-stream event pairs) and `unmeasured` without.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn h2d_columns_measured_only_with_async_h2d() {
+    use golem_engine::config::EngineConfig;
+    use golem_engine::session::{ChatTurn, Session};
+    let rows = |async_h2d: bool| {
+        let off = common::offload::offload_config();
+        let cfg = EngineConfig {
+            ram_experts_gib: 1,
+            device_cache_experts: 4,
+            n_predict: 4,
+            async_h2d,
+            timing_csv: Some(std::env::temp_dir().join("golem-unused.csv")),
+            ..off
+        };
+        let mut s = Session::new(&cfg).unwrap();
+        s.chat_turn(
+            &[ChatTurn {
+                role: "user",
+                content: "hello",
+            }],
+            &mut |_| {},
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.write_timing(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    // columns: step,tokens,wall_ms,p3_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,...
+    let col = |csv: &str, i: usize| -> Vec<String> {
+        csv.lines()
+            .filter(|l| !l.starts_with('#') && !l.starts_with("step"))
+            .map(|l| l.split(',').nth(i).unwrap().to_owned())
+            .collect()
+    };
+    let csv_on = rows(true);
+    let on = col(&csv_on, 6);
+    assert!(!on.is_empty());
+    assert!(on.iter().all(|v| v.parse::<f64>().is_ok()), "{on:?}");
+    // The copy stream actually carried bytes (not just a zero reading).
+    let bytes: u64 = col(&csv_on, 7)
+        .iter()
+        .map(|v| v.parse::<u64>().unwrap())
+        .sum();
+    assert!(bytes > 0, "{csv_on}");
+    let off = col(&rows(false), 6);
+    assert!(!off.is_empty());
+    assert!(off.iter().all(|v| v == "unmeasured"), "{off:?}");
 }

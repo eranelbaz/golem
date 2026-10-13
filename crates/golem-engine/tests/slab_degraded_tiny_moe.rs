@@ -15,7 +15,19 @@ use xtask::tiny_moe::dims::{N_EXPERT, N_EXPERT_USED};
 
 #[test]
 fn slab_alloc_failure_degrades_and_keeps_serving() {
+    degrades_and_keeps_serving(false);
+}
+
+/// Same with pooled H2D on the dedicated copy stream (async_h2d): the
+/// failed compute drains the copy stream before the cache reset frees slabs.
+#[test]
+fn slab_alloc_failure_degrades_and_keeps_serving_async_h2d() {
+    degrades_and_keeps_serving(true);
+}
+
+fn degrades_and_keeps_serving(async_h2d: bool) {
     let mut cfg = common::offload::offload_config();
+    cfg.async_h2d = async_h2d;
     cfg.ram_experts_gib = 1;
     cfg.device_cache_experts = N_EXPERT;
     cfg.n_predict = 8;

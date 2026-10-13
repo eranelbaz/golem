@@ -682,10 +682,11 @@ impl Session {
         if config.ram_experts_gib > 0 {
             p3_glue::refuse_if_pool_session_live()?;
         }
-        // The vendored scheduler issues pooled H2D on the compute stream
-        // between the split's event wait and its compute; no copy stream
-        // exists to overlap it on.
-        if config.async_h2d {
+        // The copy stream is a HIP stream of the split backend's context; the
+        // CPU substrate has none, and without the RAM pool there is no pooled
+        // H2D to move onto it.
+        if config.async_h2d && (substrate_backend() == Backend::Cpu || config.ram_experts_gib == 0)
+        {
             return Err(EngineError::InvalidConfig(
                 "async_h2d: no dedicated H2D copy stream in this substrate".into(),
             ));
@@ -1670,8 +1671,8 @@ impl SessionInner {
             && let Some(t) = self.timing.as_mut()
         {
             // §11 step boundary: snapshot (and reset) the P3/store
-            // accumulators into this step's row. H2D and policy stay
-            // unmeasured (no fork event pair / no P2 instrumentation).
+            // accumulators into this step's row. H2D is measured only on the
+            // async_h2d copy stream; policy stays unmeasured.
             let io = p3_glue::take_step_io_stats();
             let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
             t.row(crate::timing::StepTiming {
@@ -1681,8 +1682,8 @@ impl SessionInner {
                 p3_wait_ms: ns2ms(io.p3_wait_ns),
                 disk_worker_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
                 disk_bytes: io.disk_bytes.unwrap_or(0),
-                h2d_ms: f64::NAN,
-                h2d_bytes: 0,
+                h2d_ms: io.h2d.map_or(f64::NAN, |h| h.0),
+                h2d_bytes: io.h2d.map_or(0, |h| h.1),
                 policy_ms: f64::NAN,
             });
         }

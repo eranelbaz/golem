@@ -113,8 +113,8 @@ pub struct EngineArgs {
     /// buffered + DONTNEED. Needs a manifest.
     #[arg(long)]
     pub o_direct: bool,
-    /// Pooled H2D on a dedicated copy stream (refused: the substrate has
-    /// none yet).
+    /// Pooled H2D on a dedicated HIP copy stream (needs the RAM expert
+    /// pool; refused on the CPU substrate).
     #[arg(long, hide = true)]
     pub async_h2d: bool,
     /// Share of the planner's device-expert-cache allowance a derived
@@ -133,7 +133,8 @@ pub struct EngineArgs {
     /// §11 per-step timing CSV destination: opened/truncated with a header
     /// (engine version, fork commit, resolved config), then one row per
     /// generation decode step, flushed at each turn end. H2D columns are
-    /// `unmeasured` (no fork event pair on the copy stream yet).
+    /// measured with `--async-h2d` (copy-stream event pairs), else
+    /// `unmeasured`.
     #[arg(long, value_name = "FILE")]
     pub timing_csv: Option<PathBuf>,
     /// Per-step routing-trace destination (design §2.3 step 4): a

@@ -14,6 +14,7 @@
 #define GOLEM_HOOK_CONTEXT_HPP
 
 #include "golem-hooks.h"
+#include "golem-copy-stream.h"
 #include "golem-device-cache.hpp" // golem::GolemSlabEntry + GolemLayerSlots (ODR: shared with the ctest fuzz TU)
 
 #include <algorithm>
@@ -150,6 +151,23 @@ struct golem_ctx {
     // decode-thread-only; kept here so the copy loop can flag which slabs a
     // split streamed (their events are recorded after that split's compute).
     bool stream_used_in_split[2] = {false, false};
+
+    // --- dedicated H2D copy stream (async_h2d; golem_set_async_h2d) ---
+    // Decode-thread-only. `cs`/`cs_backend`/events are bound lazily by the
+    // first split that copies on the copy stream and released by
+    // golem_reset_device_cache (after draining the stream). Ring of timed
+    // event pairs, one per copying split; read by golem_take_h2d_timing.
+    static constexpr int GOLEM_CS_RING = 256;
+    int32_t async_h2d = 0;
+    const struct golem_copy_stream_iface * cs = nullptr;
+    ggml_backend_t cs_backend = nullptr;
+    void * cs_ev_ready = nullptr; // compute stream -> copy stream (WAR, evict-before-refill)
+    void * cs_ev_done = nullptr;  // copy stream -> compute stream (RAW)
+    void * cs_t0[GOLEM_CS_RING] = {};
+    void * cs_t1[GOLEM_CS_RING] = {};
+    int32_t cs_t_n = 0;
+    bool cs_t_overflow = false;
+    uint64_t cs_bytes = 0;
 
     golem_ctx(int32_t n_layers, int32_t n_experts_)
         : orders((size_t) (n_layers > 0 ? n_layers : 1) * 3), n_experts(n_experts_) {

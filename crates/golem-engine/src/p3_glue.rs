@@ -697,6 +697,8 @@ pub(crate) struct StepIoStats {
     pub p3_wait_ns: u64,
     pub disk_ns: Option<u64>,
     pub disk_bytes: Option<u64>,
+    /// Copy-stream H2D (ms, bytes); `None` unless async_h2d measured it.
+    pub h2d: Option<(f64, u64)>,
 }
 
 fn current_states() -> Vec<Arc<HookState>> {
@@ -712,12 +714,14 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
             p3_wait_ns: 0,
             disk_ns: None,
             disk_bytes: None,
+            h2d: None,
         };
     }
     let mut out = StepIoStats {
         p3_wait_ns: 0,
         disk_ns: None,
         disk_bytes: None,
+        h2d: None,
     };
     for h in states {
         out.p3_wait_ns += h.p3_wait_ns.swap(0, Ordering::Relaxed);
@@ -725,6 +729,16 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
             let (ns, bytes) = s.take_disk_stats();
             out.disk_ns = Some(out.disk_ns.unwrap_or(0) + ns);
             out.disk_bytes = Some(out.disk_bytes.unwrap_or(0) + bytes);
+        }
+        let ctx = h.ctx_ptr.load(Ordering::SeqCst);
+        if !ctx.is_null() {
+            let (mut ms, mut bytes) = (0.0, 0);
+            // SAFETY: FFI on the live ctx between computes (the decode thread
+            // synchronized); writes only the two out-params.
+            if unsafe { raw::golem_take_h2d_timing(ctx, &mut ms, &mut bytes) } == 1 {
+                let (m0, b0) = out.h2d.unwrap_or((0.0, 0));
+                out.h2d = Some((m0 + ms, b0 + bytes));
+            }
         }
     }
     out
@@ -1586,6 +1600,12 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // self-check decode; `fit_device_cache` raises it.
     let k_start = if derived_k { n_expert_used.min(k) } else { k };
     unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k_start as i32) };
+    // SAFETY: FFI config setter on a live ctx, no compute in flight.
+    if config.async_h2d && unsafe { raw::golem_set_async_h2d(ctx.as_ptr(), 1) } != 0 {
+        return Err(EngineError::InvalidConfig(
+            "async_h2d: GGML_CUDA_GRAPH_OPT=1 owns the copy-stream index".into(),
+        ));
+    }
     // Stash the stream config C-side (slabs allocate lazily on the first
     // streamed split's backend); chunks arm/disarm via SessionHooks.
     let mut stream_cfg = None;

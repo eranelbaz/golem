@@ -13,7 +13,8 @@
 // resident device bytes; v15: golem_inject_slab_alloc_failure exists only
 // under GOLEM_TEST_SUPPORT; stream source may return
 // GOLEM_STREAM_SRC_STORAGE_LOST (compute fails); device-cache stats gain h2d
-// expert copies). Part of the vendored ggml include tree; the ABI is
+// expert copies; golem_set_async_h2d moves pooled H2D onto a dedicated copy
+// stream, golem_take_h2d_timing reads its event-timed H2D ms/bytes). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
@@ -288,6 +289,20 @@ void golem_reset_device_cache(golem_ctx_t ctx);
  * not concurrent with a compute. */
 void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
                               int32_t max_plane_stride, float routed_max);
+
+/* Dedicated H2D copy stream (ABI v15). `on != 0` issues the pooled and
+ * device-cache H2D on the split backend's copy stream, event-joined with the
+ * compute stream (WAR/evict-before-refill wait before, RAW wait after) and
+ * drained before every lease release. Returns 0, or -1 when refused
+ * (GGML_CUDA_GRAPH_OPT=1 concurrent-stream mode owns the stream indices).
+ * The backend must export "golem_copy_stream_iface" via
+ * ggml_backend_reg_get_proc_address (callers check). Config-time call. */
+int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
+
+/* Copy-stream H2D time (sum of per-split event pairs) and bytes since the
+ * last call; resets both. Returns 1 when measured, 0 when async_h2d is off
+ * or the per-step ring overflowed. Call between computes. */
+int32_t golem_take_h2d_timing(golem_ctx_t ctx, double *ms, uint64_t *bytes);
 
 /* P4 counters. Opaque here (C++ side keeps the members atomic); each member
  * is a lock-free 8-byte counter read by Rust as u64. The pointer is stable
