@@ -13,6 +13,8 @@ links = "llama-cpp"
 # forbids parallel feature variants of a substrate-linking crate in one graph.
 [features]
 default = []
+# Compiles the C test seams (golem_inject_slab_alloc_failure).
+test-support = []
 
 [dependencies]
 sha2 = { workspace = true }

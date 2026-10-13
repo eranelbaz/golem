@@ -9,7 +9,9 @@
 // touching decode residency; v11 lets the stream source abort the compute --
 // returns 1 to cancel the ubatch mid-split; v12 turns a failed device-slab
 // allocation into a failed compute instead of an abort; v13 lets ensure
-// fail a compute when the store cannot page the misses in). Part of the vendored ggml include tree; the ABI is
+// fail a compute when the store cannot page the misses in; v14 reports
+// resident device bytes; v15: golem_inject_slab_alloc_failure exists only
+// under GOLEM_TEST_SUPPORT). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
@@ -35,7 +37,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 14
+#define GOLEM_HOOKS_ABI_VERSION 15
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -254,8 +256,10 @@ int32_t golem_device_cache_experts(golem_ctx_t ctx);
  * of aborting; the engine resets the cache and lowers K. Count of such
  * failures since ctx creation (0 for a NULL ctx). */
 uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
+#ifdef GOLEM_TEST_SUPPORT
 /* Test seam: the next n slab (re)allocations fail as if out of VRAM. */
 void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
+#endif
 /* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
  * remapped-ids tensors (*slab_bytes) and prefill-stream slabs
  * (*stream_bytes). Slabs allocate lazily, so this is what is resident, not

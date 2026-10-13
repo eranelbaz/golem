@@ -39,6 +39,7 @@ jobs:
       - run: >-
           cargo clippy -p golem-engine -p golem-cli -p golem-server --all-targets
           --features golem-engine/hip-tests,golem-cli/hip-tests,golem-server/hip-tests -- -D warnings
+      - run: scripts/check-no-test-seams.sh
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest

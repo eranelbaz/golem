@@ -2331,9 +2331,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // ABI v12: a slab that no longer fits (VRAM taken
                                 // after load) fails the compute, never the process;
                                 // the engine resets the cache and lowers K.
+#ifdef GOLEM_TEST_SUPPORT
                                 const bool inject = gctx->slab_fail_inject.load(std::memory_order_relaxed) > 0 &&
                                                     gctx->slab_fail_inject.fetch_sub(1, std::memory_order_relaxed) > 0;
                                 st.buf = inject ? nullptr : ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
+#else
+                                st.buf = ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
+#endif
                                 if (st.buf == nullptr) {
                                     ggml_free(st.ctx);
                                     st.ctx = nullptr;
@@ -3907,11 +3911,13 @@ uint64_t golem_slab_alloc_failures(golem_ctx_t ctx) {
     return ctx == NULL ? 0 : ctx->slab_alloc_failures.load(std::memory_order_relaxed);
 }
 
+#ifdef GOLEM_TEST_SUPPORT
 void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n) {
     if (ctx != NULL) {
         ctx->slab_fail_inject.store(n, std::memory_order_relaxed);
     }
 }
+#endif
 
 void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t * slab_bytes, uint64_t * stream_bytes) {
     uint64_t slab = 0;

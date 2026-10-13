@@ -293,9 +293,11 @@ struct HookState {
     abort: AtomicPtr<AtomicBool>,
     /// Test seam: absolute stream plane count at which `stream_source` sets
     /// the turn's cancel flag (0 = off).
+    #[cfg(any(test, feature = "test-support"))]
     test_cancel_plane: AtomicU64,
     /// Test seam: the next ensure call marks every replica unreadable
     /// before its page-in reads, so the read itself fails.
+    #[cfg(any(test, feature = "test-support"))]
     test_fail_storage_in_read: AtomicBool,
 }
 
@@ -1627,7 +1629,9 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         stream: stream.clone(),
         stream_armed: AtomicBool::new(false),
         abort: AtomicPtr::new(std::ptr::null_mut()),
+        #[cfg(any(test, feature = "test-support"))]
         test_cancel_plane: AtomicU64::new(0),
+        #[cfg(any(test, feature = "test-support"))]
         test_fail_storage_in_read: AtomicBool::new(false),
     });
     if config.prefetch != PrefetchMode::Off {
@@ -2058,6 +2062,7 @@ pub extern "C" fn ensure_host_resident(
         // §11: a few `Instant::now()` per layer is the sanctioned hot-path cost.
         // The scratch mutex stays held across the call: the decode thread is
         // its only contender (stated invariant), so this serializes nothing.
+        #[cfg(any(test, feature = "test-support"))]
         if h.test_fail_storage_in_read.swap(false, Ordering::Relaxed) {
             h.fail_storage();
         }
@@ -2161,6 +2166,7 @@ pub extern "C" fn stream_source(
         // SAFETY: non-null only while a `StreamAbortGuard` holds the
         // `Arc<AtomicBool>` it points into (nulled in its `Drop`).
         let cancel = (!flag.is_null()).then(|| unsafe { &*flag });
+        #[cfg(any(test, feature = "test-support"))]
         if let (Some(c), Some(s)) = (cancel, &h.stream) {
             let at = h.test_cancel_plane.load(Ordering::Relaxed);
             if at != 0 && s.stats().planes + 1 >= at {
@@ -2450,6 +2456,7 @@ pub extern "C" fn routing(
 
 impl HookState {
     /// Marks every replica of every store shard unreadable (fault seam).
+    #[cfg(any(test, feature = "test-support"))]
     fn fail_storage(&self) {
         if let Some(s) = &self.store {
             for sh in s.registry().shards() {

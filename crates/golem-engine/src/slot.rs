@@ -573,6 +573,7 @@ pub(crate) fn step(
         }
         a.ffi.n_past += s.chunk;
         a.ffi.chunks += 1;
+        #[cfg(any(test, feature = "test-support"))]
         if a.ffi.chunks == session.test_cancel_after_chunks
             && let Some(c) = &s.cancel
         {

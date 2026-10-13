@@ -278,6 +278,10 @@ option(GGML_ZENDNN                          "ggml: use ZenDNN"                  
 option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
 
 # extra artifacts
+option(GGML_GOLEM_TEST_SUPPORT "ggml: compile Golem test seams" OFF)
+if (GGML_GOLEM_TEST_SUPPORT)
+    add_compile_definitions(GOLEM_TEST_SUPPORT)
+endif()
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
 option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})
 

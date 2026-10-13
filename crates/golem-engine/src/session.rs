@@ -606,6 +606,7 @@ pub(crate) struct SessionInner {
     snapshots: Option<SnapshotCache>,
     /// Test seam: the turn's cancel flag is set after this many prefill
     /// chunks decoded (0 = off).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) test_cancel_after_chunks: u32,
     /// The one `llama_batch` every step fills (capacity `llama_n_batch`),
     /// allocated at load: no per-turn or per-step batch allocation.
@@ -786,6 +787,7 @@ impl Session {
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
                     snapshots,
+                    #[cfg(any(test, feature = "test-support"))]
                     test_cancel_after_chunks: 0,
                     batch,
                     batch_cap,
@@ -831,6 +833,7 @@ impl Session {
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
                     snapshots: None,
+                    #[cfg(any(test, feature = "test-support"))]
                     test_cancel_after_chunks: 0,
                     batch,
                     batch_cap,
