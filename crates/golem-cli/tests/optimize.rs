@@ -12,7 +12,8 @@ mod profile;
 mod common;
 
 use profile::{
-    Axis, FingerprintInput, Knobs, Metrics, Profile, StopSweep, applicable, fingerprint_of, sweep,
+    Axis, FingerprintInput, Knobs, Metrics, Profile, StopSweep, applicable, fingerprint_of,
+    greedy_matches, sweep,
 };
 
 fn m(tok_s: f64) -> Metrics {
@@ -21,7 +22,7 @@ fn m(tok_s: f64) -> Metrics {
         hit_rate: 0.9,
         ttft_p50_ms: 100.0,
         ttft_p99_ms: 200.0,
-        output_sha256: [0; 32],
+        greedy: vec![vec![(1, 5.0), (2, 5.0)]],
     }
 }
 
@@ -61,7 +62,7 @@ fn gates_reject_drift_small_gain_and_ttft_regression() {
     assert!(
         r(&|k| if k.threads == 8 {
             Metrics {
-                output_sha256: [1; 32],
+                greedy: vec![vec![(1, 5.0), (3, 5.0)]],
                 ..m(20.0)
             }
         } else {
@@ -69,6 +70,21 @@ fn gates_reject_drift_small_gain_and_ttft_regression() {
         })
         .is_none(),
         "greedy drift"
+    );
+    assert!(
+        r(&|k| if k.threads == 8 {
+            Metrics {
+                greedy: vec![vec![(1, 5.0), (3, 0.1)]],
+                ..m(20.0)
+            }
+        } else {
+            Metrics {
+                greedy: vec![vec![(1, 5.0), (2, 0.15)]],
+                ..m(10.0)
+            }
+        })
+        .is_some(),
+        "near-tie flip (#113) is not drift"
     );
     assert!(
         r(&|k| if k.threads == 8 {
@@ -459,4 +475,27 @@ fn stop_optimize_kills_measuring_child() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(!alive(), "measuring child {child} survived stop");
+}
+
+/// #84/#113: a flip is accepted only where both sides were near-ties.
+#[test]
+fn greedy_matches_only_near_tie_flips() {
+    let g = |v: Vec<(i32, f32)>| Metrics {
+        greedy: vec![v],
+        ..m(1.0)
+    };
+    let base = g(vec![(1, 5.0), (2, 0.1), (4, 5.0)]);
+    assert!(greedy_matches(&base, &base));
+    assert!(greedy_matches(&g(vec![(1, 5.0), (3, 0.15)]), &base));
+    assert!(!greedy_matches(&g(vec![(1, 5.0), (3, 0.3)]), &base));
+    assert!(!greedy_matches(&g(vec![(9, 0.1)]), &g(vec![(1, 5.0)])));
+    assert!(!greedy_matches(&g(vec![(1, 5.0)]), &base), "prefix only");
+    assert!(!greedy_matches(&g(vec![]), &g(vec![])), "empty baseline");
+    let old = r#"{"tok_s":1,"hit_rate":1,"ttft_p50_ms":1,"ttft_p99_ms":1,"output_sha256":[0]}"#;
+    assert!(
+        serde_json::from_str::<Metrics>(old)
+            .unwrap()
+            .greedy
+            .is_empty()
+    );
 }

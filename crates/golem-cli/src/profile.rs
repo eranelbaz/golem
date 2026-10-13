@@ -201,7 +201,7 @@ impl Axis {
 }
 
 /// Warm steady-state measurement of one configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metrics {
     /// Median decode tokens/s.
     pub tok_s: f64,
@@ -211,8 +211,32 @@ pub struct Metrics {
     pub ttft_p50_ms: f64,
     /// Time to first token, p99.
     pub ttft_p99_ms: f64,
-    /// sha256 of the greedy outputs of the fixed prompt set.
-    pub output_sha256: [u8; 32],
+    /// Greedy `(token, top1 − top2 logit gap)` per generation step, one
+    /// row per prompt of the fixed set (§12.3 parity, gated by [`greedy_matches`]).
+    #[serde(default)]
+    pub greedy: Vec<Vec<(i32, f32)>>,
+}
+
+/// Largest top-1/top-2 logit gap at which two settings may pick different
+/// greedy tokens: the §12.3 "< 0.2" near-tie bucket. Prefill chunk shape
+/// (K / top_k tokens, #113; snapshot delta prefill, #84) reorders GPU
+/// reductions → logits shift by ≤ 0.47 on the target; measured divergences
+/// sat at gaps 0.10–0.15.
+pub const NEAR_TIE_GAP: f32 = 0.2;
+
+/// Greedy output held: per prompt, the token streams agree up to their
+/// first difference, and there both sides were near-ties (what follows a
+/// near-tie flip is unchecked). An empty baseline row never matches.
+pub fn greedy_matches(c: &Metrics, base: &Metrics) -> bool {
+    !base.greedy.is_empty()
+        && base.greedy.iter().all(|b| !b.is_empty())
+        && c.greedy.len() == base.greedy.len()
+        && c.greedy.iter().zip(&base.greedy).all(|(c, b)| {
+            match c.iter().zip(b).find(|(x, y)| x.0 != y.0) {
+                Some((x, y)) => x.1 < NEAR_TIE_GAP && y.1 < NEAR_TIE_GAP,
+                None => c.len() == b.len(),
+            }
+        })
 }
 
 /// A saved sweep result.
@@ -245,14 +269,14 @@ impl Profile {
             hit_rate: 0.0,
             ttft_p50_ms: 0.0,
             ttft_p99_ms: 0.0,
-            output_sha256: [0; 32],
+            greedy: Vec::new(),
         };
         Self {
             fingerprint: String::new(),
             measured_free_vram: 0,
             measured_free_ram: 0,
             knobs: None,
-            metrics: m,
+            metrics: m.clone(),
             baseline: m,
             candidates: Vec::new(),
         }
@@ -350,14 +374,14 @@ impl Error for StopSweep {}
 
 /// Win rule: +3% tok/s and hit rate within 0.5 pp of the paired incumbent
 /// (hit rate shifts across the first loads, so a fixed baseline drifts);
-/// TTFT and greedy output held against the baseline so small regressions
+/// TTFT and greedy output (up to near-ties) held against the baseline so small regressions
 /// cannot compound across coordinate steps.
 fn wins(c: &Metrics, incumbent: &Metrics, base: &Metrics) -> bool {
     c.tok_s >= incumbent.tok_s * 1.03
         && c.hit_rate >= incumbent.hit_rate - 0.005
         && c.ttft_p50_ms <= base.ttft_p50_ms * 1.2
         && c.ttft_p99_ms <= base.ttft_p99_ms * 1.2
-        && c.output_sha256 == base.output_sha256
+        && greedy_matches(c, base)
 }
 
 /// Bounded coordinate descent (max 2 passes) from `base` over `axes`. Each
@@ -372,7 +396,7 @@ pub fn sweep(
     measure: &mut dyn FnMut(&Knobs) -> Result<Metrics, Box<dyn Error>>,
 ) -> Result<Option<(Knobs, Metrics)>, Box<dyn Error>> {
     let baseline = measure(base)?;
-    let mut best = (*base, baseline);
+    let mut best = (*base, baseline.clone());
     let mut tried = vec![*base];
     let mut coin = rng_seed();
     let mut stopped = false;
@@ -401,8 +425,8 @@ pub fn sweep(
                     Ok((c, inc)) => {
                         // Beat both this axis's best so far and a fresh
                         // incumbent run.
-                        let bar = if best.0 == start { inc } else { best.1 };
-                        if wins(&c, &bar, &baseline) && wins(&c, &inc, &baseline) {
+                        let bar = if best.0 == start { &inc } else { &best.1 };
+                        if wins(&c, bar, &baseline) && wins(&c, &inc, &baseline) {
                             drift = axis_drift + (inc.hit_rate - c.hit_rate).max(0.0);
                             best = (cand, c);
                         }
@@ -433,7 +457,7 @@ pub fn sweep(
             None
         } else {
             eprintln!("golem optimize: winner kept unconfirmed ({why})");
-            Some(best)
+            Some(best.clone())
         }
     };
     if stopped {

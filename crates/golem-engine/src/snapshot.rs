@@ -49,31 +49,24 @@ pub struct SnapshotCache {
     keys: Vec<i32>,
     entries: Vec<Entry>,
     pending: Option<Entry>,
-    model_key: u64,
     tick: u64,
     stats: SnapshotStats,
 }
 
 impl SnapshotCache {
-    /// Empty cache over `arena`; `model_key` names the model identity +
-    /// `n_ctx` + `n_ubatch` the stored states belong to. The key arena holds
+    /// Empty cache over `arena`, owned by one session: its states come from
+    /// and return to that session's context only. The key arena holds
     /// `MAX_ENTRIES × max_tokens` tokens (the session passes `n_ctx`), allocated
     /// once. Target: 64 × 100k × 4 B = 25.6 MB at 100k ctx.
-    pub fn new(arena: PinnedArena, model_key: u64, max_tokens: usize) -> Self {
+    pub fn new(arena: PinnedArena, max_tokens: usize) -> Self {
         Self {
             arena,
             keys: vec![0; MAX_ENTRIES * max_tokens],
             entries: Vec::with_capacity(MAX_ENTRIES),
             pending: None,
-            model_key,
             tick: 0,
             stats: SnapshotStats::default(),
         }
-    }
-
-    /// Identity the stored states belong to.
-    pub fn model_key(&self) -> u64 {
-        self.model_key
     }
 
     /// Longest stored key that is a strict prefix of `tokens` (≥ 1 delta
@@ -237,7 +230,7 @@ mod tests {
 
     #[test]
     fn longest_prefix_and_lru_eviction() {
-        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 0, 256);
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 256);
         put(&mut c, &[1, 2], 4);
         put(&mut c, &[1, 2, 3], 4);
         assert!(
@@ -254,14 +247,14 @@ mod tests {
 
     #[test]
     fn uncommitted_reserve_is_invisible() {
-        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 0, 256);
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(10), 256);
         let _ = c.reserve(&[1, 2], 4); // cancelled prefill: no commit
         assert!(c.longest_prefix(&[1, 2, 3]).is_none());
     }
 
     #[test]
     fn stored_bytes_round_trip_and_invalidate_drops_entry() {
-        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(16), 0, 256);
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(16), 256);
         c.reserve(&[4, 5], 3).unwrap().copy_from_slice(&[7, 8, 9]);
         c.commit();
         assert_eq!(c.longest_prefix(&[4, 5, 6]).unwrap().1, &[7, 8, 9]);
@@ -273,7 +266,7 @@ mod tests {
 
     #[test]
     fn failed_rewrite_keeps_same_key_entry() {
-        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(16), 0, 256);
+        let mut c = SnapshotCache::new(PinnedArena::heap_for_test(16), 256);
         c.reserve(&[4, 5], 3).unwrap().copy_from_slice(&[7, 8, 9]);
         c.commit();
         let _ = c.reserve(&[4, 5], 3); // short write: never committed
