@@ -145,6 +145,7 @@ fn t8_plan_matches_hip_used_vram() {
         let (slab_res, stream_res) = s.device_cache_resident_bytes().expect("pool on");
         let copied = s.device_cache_stats().map_or(0, |d| d.bytes_copied);
         drop(s);
+        #[cfg(golem_backend_hip)]
         golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
         let actual = free_before as i64 - free_after as i64;
         // The per-term attribution, gated: stream slabs exact, cache slabs
