@@ -21,7 +21,7 @@ prod="$(archive -p golem-cli)"
 # exit 0 iff archive $1 has symbol $sym (any nm type when $2 is empty, else type $2)
 has() {
   local syms
-  syms="$(nm "$1")" || exit 1
+  syms="$(nm "$1")" || { echo "FAIL: nm $1" >&2; exit 1; }
   awk -v s="$sym" -v t="${2:-}" '$NF == s && (t == "" || $(NF-1) == t) {f=1} END {exit !f}' <<<"$syms"
 }
 

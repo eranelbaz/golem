@@ -292,7 +292,8 @@ impl StreamState {
             .filter(|&&id| id >= 0 && (id as u32) < self.n_experts)
             .map(|&id| id as u32)
             .collect();
-        // This layer's id-dependent planes, routed-only.
+        // This layer's id-dependent planes, routed-only. Errors are dropped:
+        // `source` reports them and `release_all` reclaims warmed planes.
         let _ = self
             .warm_plane(layer, ExpertKind::Up, &routed)
             .and_then(|()| self.warm_plane(layer, ExpertKind::Down, &routed))
@@ -432,6 +433,7 @@ impl StreamState {
                 }
             }
             if let Err(e) = check_read(inner.read) {
+                debug_assert!(!inner.holds.contains_key(&seq));
                 inner.holds.insert(
                     seq,
                     Hold {
@@ -487,6 +489,7 @@ impl StreamState {
         // SAFETY: the mutex critical sections above are the happens-before
         // edges for the staging bytes C is about to read.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert!(!inner.holds.contains_key(&seq));
         inner.holds.insert(
             seq,
             Hold {
@@ -541,7 +544,13 @@ impl StreamState {
                 inner.free_slots.push(p.slot);
             }
         }
-        // Nothing is in flight any more; a fatal state already aborted.
+        // Nothing is in flight any more. A fatal read is sticky: one on a
+        // warmed plane never consumed still aborts here; only StorageLost
+        // resets for the next turn.
+        if boundary_must_abort(inner.read) {
+            drop(inner);
+            p3_fatal("stream reader failed on an unconsumed plane; aborting".into());
+        }
         inner.read = ReadState::Ok;
         self.cv.notify_all();
     }
@@ -588,6 +597,11 @@ impl StreamState {
     }
 }
 
+/// Whether `release_all` must abort instead of resetting the read state.
+fn boundary_must_abort(read: ReadState) -> bool {
+    read == ReadState::Fatal
+}
+
 fn check_read(read: ReadState) -> Result<(), StreamError> {
     match read {
         ReadState::Ok => Ok(()),
@@ -614,6 +628,13 @@ mod tests {
         P3Stats, PolicySnapshot, PoolGeometry, SnapshotHandle, UnitLayout,
     };
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn boundary_aborts_only_on_fatal() {
+        assert!(boundary_must_abort(ReadState::Fatal));
+        assert!(!boundary_must_abort(ReadState::StorageLost));
+        assert!(!boundary_must_abort(ReadState::Ok));
+    }
 
     const STRIDE: u64 = 64;
     const N_EXPERTS: u32 = 4;
