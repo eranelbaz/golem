@@ -146,6 +146,7 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
         ram_experts: bytes(args.ram_experts_gib),
         snapshot_ram,
         ws: WS_MEASURED,
+        resident_experts: None,
     };
     let r = golem_plan::plan_at_frac(&m, &mach, &input, args.vram_experts_frac);
     let g = governing(&m, &r);

@@ -249,6 +249,9 @@ enum Phase {
 /// (`docs/baselines/m4.4-batching.md`) re-derives it from measured ITL p99.
 pub(crate) const STREAM_EVERY: u32 = 32;
 
+/// Initial detokenize buffer; longer pieces regrow it once.
+pub(crate) const PIECE_RESERVE: usize = 64;
+
 /// One decode slot, allocated once at `Session::new` and reused per turn.
 pub struct SlotState {
     pub(crate) seq: i32,
@@ -256,6 +259,8 @@ pub struct SlotState {
     stop: StopMatcher,
     pending: Vec<u8>,
     scratch: String,
+    /// Reused detokenize buffer (no per-step allocation).
+    piece: Vec<u8>,
     tok: i32,
     pos: usize,
     pub(crate) generated: Vec<i32>,
@@ -283,6 +288,7 @@ impl SlotState {
             stop: StopMatcher::default(),
             pending: Vec::new(),
             scratch: String::new(),
+            piece: Vec::with_capacity(PIECE_RESERVE),
             tok: 0,
             pos: 0,
             generated: Vec::with_capacity(n_predict as usize),
@@ -371,6 +377,11 @@ impl SlotState {
         self.phase = Phase::Done(f);
     }
 
+    #[cfg(test)]
+    pub(crate) fn piece_capacity(&self) -> usize {
+        self.piece.capacity()
+    }
+
     /// Ends an armed-but-failed admission with `e` (reported on next step).
     pub(crate) fn fail(&mut self, e: EngineError) {
         self.phase = Phase::Failed(e);
@@ -399,8 +410,12 @@ impl SlotState {
             self.done(FinishReason::Stop, emit);
             return false;
         }
-        let piece = session.piece(self.tok);
-        emit_valid_prefix(&mut self.pending, &mut self.scratch, &piece);
+        if let Err(e) = session.piece_into(self.tok, &mut self.piece) {
+            self.flush_text(emit);
+            self.phase = Phase::Failed(e);
+            return false;
+        }
+        emit_valid_prefix(&mut self.pending, &mut self.scratch, &self.piece);
         let hit = self.stop.push(&self.scratch, emit);
         self.scratch.clear();
         self.generated.push(self.tok);

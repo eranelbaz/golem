@@ -140,6 +140,9 @@ pub struct StreamState {
     pub planes: AtomicU64,
     /// Σ ids over successfully sourced planes.
     pub sourced_ids: AtomicU64,
+    /// Mirror of `Inner::holds.len()`, stored under the lock at every
+    /// insert/remove so `stats()` never takes it.
+    held: AtomicU64,
     /// Test seam: runs on the reader thread right before its next read.
     #[cfg(any(test, feature = "test-support"))]
     test_before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -203,6 +206,7 @@ impl StreamState {
             staged: AtomicU64::new(0),
             planes: AtomicU64::new(0),
             sourced_ids: AtomicU64::new(0),
+            held: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
             test_before_read: Mutex::new(None),
         });
@@ -446,6 +450,7 @@ impl StreamState {
                         leases: Vec::new(),
                     },
                 );
+                self.held.store(inner.holds.len() as u64, Ordering::Relaxed);
                 return Err(e);
             }
         }
@@ -502,6 +507,7 @@ impl StreamState {
                 leases,
             },
         );
+        self.held.store(inner.holds.len() as u64, Ordering::Relaxed);
         self.sourced_ids
             .fetch_add(ids.len() as u64, Ordering::Relaxed);
         Ok(())
@@ -518,6 +524,7 @@ impl StreamState {
         let done: Vec<u64> = inner.holds.range(..=seq).map(|(&s, _)| s).collect();
         for s in done {
             if let Some(h) = inner.holds.remove(&s) {
+                self.held.store(inner.holds.len() as u64, Ordering::Relaxed);
                 if h.slot != usize::MAX {
                     while inner.pending_reads[h.slot] > 0 {
                         inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
@@ -570,12 +577,7 @@ impl StreamState {
             staged: self.staged.load(Ordering::Relaxed),
             planes: self.planes.load(Ordering::Relaxed),
             sourced_ids: self.sourced_ids.load(Ordering::Relaxed),
-            held: self
-                .inner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .holds
-                .len() as u64,
+            held: self.held.load(Ordering::Relaxed),
         }
     }
 
@@ -748,6 +750,23 @@ mod tests {
         s.release(2);
         s.release_all();
         assert!(all_slots_free(&s));
+        s.stop();
+    }
+
+    #[test]
+    fn stats_held_mirrors_holds_len_issue_93() {
+        let s = state((9, 9));
+        let len = |s: &StreamState| s.inner.lock().unwrap().holds.len() as u64;
+        let mut out = [std::ptr::null(); 1];
+        for seq in 1..=3 {
+            s.source(0, 1, seq, &[seq as i32], &mut out).unwrap();
+            assert_eq!(s.stats().held, len(&s));
+        }
+        assert_eq!(s.stats().held, 3);
+        s.release(2);
+        assert_eq!((s.stats().held, len(&s)), (1, 1));
+        s.release_all();
+        assert_eq!((s.stats().held, len(&s)), (0, 0));
         s.stop();
     }
 }

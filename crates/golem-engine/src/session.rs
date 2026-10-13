@@ -1272,7 +1272,7 @@ impl AbortSet {
         self.len.store(0, Ordering::Release);
     }
 
-    fn all_cancelled(&self) -> bool {
+    pub(crate) fn all_cancelled(&self) -> bool {
         let n = self.len.load(Ordering::Acquire);
         n > 0
             && self.flags[..n].iter().all(|p| {
@@ -1680,8 +1680,10 @@ impl SessionInner {
             // whose expert-copy leases release only at the next compute.
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-            // 2 = aborted: the callback/stream source fire only on cancel.
-            return if code == 2 {
+            // 2 = aborted; a cancel only if the predicate both the abort
+            // callback and the stream source fire on still holds (the set
+            // is cleared only after this returns).
+            return if code == 2 && self.abort.all_cancelled() {
                 Ok(false)
             } else {
                 Err(EngineError::Decode(code))
@@ -1801,9 +1803,15 @@ impl SessionInner {
         unsafe { raw::llama_vocab_is_eog(self.loaded.model().vocab(), tok) }
     }
 
-    pub(crate) fn piece(&self, tok: raw::llama_token) -> Vec<u8> {
+    /// Writes `tok`'s piece into `out` (cleared first): no allocation once
+    /// `out` holds the longest piece.
+    pub(crate) fn piece_into(
+        &self,
+        tok: raw::llama_token,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
         // SAFETY: vocab is live; tok is a valid token id from the sampler.
-        unsafe { token_piece(self.loaded.model().vocab(), tok) }
+        unsafe { token_piece_into(self.loaded.model().vocab(), tok, out) }
     }
 
     fn offloaded(&self) -> bool {
@@ -2009,32 +2017,34 @@ unsafe fn tokenize_prompt(
     Ok(tokens)
 }
 
-/// Detokenizes one token to its raw piece bytes (two-pass sizing like
-/// [`tokenize_prompt`]; the `lstrip = 0, special = false` call pinned for the
-/// emitter — special tokens render as empty pieces and are skipped).
+/// Detokenizes one token into `out`'s capacity (the `lstrip = 0, special =
+/// false` call pinned for the emitter — special tokens render as empty
+/// pieces and are skipped). A too-small buffer grows to the demanded size
+/// and retries once.
 ///
 /// # Safety
 /// `vocab` must be a live llama_vocab owned by the loaded model; `token` must be
 /// a valid token id.
-unsafe fn token_piece(vocab: *const raw::llama_vocab, token: raw::llama_token) -> Vec<u8> {
-    // SAFETY: null/0 buffer only sizes; nothing is written through the null pointer.
-    let needed =
-        unsafe { raw::llama_token_to_piece(vocab, token, std::ptr::null_mut(), 0, 0, false) };
-    let n = needed.unsigned_abs() as usize;
-    if n == 0 {
-        return Vec::new();
+unsafe fn token_piece_into(
+    vocab: *const raw::llama_vocab,
+    token: raw::llama_token,
+    out: &mut Vec<u8>,
+) -> Result<(), EngineError> {
+    out.clear();
+    for _ in 0..2 {
+        let cap = i32::try_from(out.capacity()).unwrap_or(i32::MAX);
+        // SAFETY: llama writes at most `cap` bytes into out's spare capacity.
+        let n = unsafe {
+            raw::llama_token_to_piece(vocab, token, out.as_mut_ptr().cast(), cap, 0, false)
+        };
+        if n >= 0 {
+            // SAFETY: llama initialized the first n ≤ cap bytes.
+            unsafe { out.set_len(n as usize) };
+            return Ok(());
+        }
+        out.reserve_exact(n.unsigned_abs() as usize);
     }
-    let mut buf = vec![0u8; n];
-    // SAFETY: buf holds exactly the byte count the sizing call demanded.
-    let written = unsafe {
-        raw::llama_token_to_piece(vocab, token, buf.as_mut_ptr().cast(), n as i32, 0, false)
-    };
-    if written < 0 {
-        // Unreachable: same token, buffer sized from the sizing call.
-        return Vec::new();
-    }
-    buf.truncate(written as usize);
-    buf
+    Err(EngineError::Detokenize(token))
 }
 
 /// Expert copies the pool has served (demand page-ins + fast hits), cumulative.
@@ -2200,7 +2210,20 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
         ram_experts: config.ram_experts_gib << 30,
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         ws: golem_plan::WS_MEASURED,
+        resident_experts: (config.ram_experts_gib == 0).then(|| resident_expert_bytes(config, m)),
     }
+}
+
+/// Pool off: routed-expert bytes of the top `n_gpu_layers` expert layers not
+/// pinned below `cpu_moe_layers`, at the mean per-layer size. Target, all
+/// offloaded: 185.5 GB ≫ 24 GiB; all pinned: 0. Approximation: counts layers
+/// from the first expert block, ignoring the dense lead and NextN blocks.
+fn resident_expert_bytes(config: &EngineConfig, m: &golem_plan::ModelFacts) -> u64 {
+    let layers = m.expert_layers;
+    let gpu = config
+        .n_gpu_layers
+        .min(layers.saturating_sub(config.cpu_moe_layers.unwrap_or(0)));
+    m.expert_bytes_total / u64::from(layers.max(1)) * u64::from(gpu)
 }
 
 /// Load-time §10 VRAM feasibility (§6.4), same `golem_plan::plan` as
@@ -2235,10 +2258,10 @@ pub fn device_vram() -> Option<(u64, u64)> {
     None
 }
 
-/// Runs [`check_plan`] for a pooled session on a GPU build; `None` when the
-/// pool is off (the §10 tiers do not apply) or no VRAM reading exists.
+/// Runs [`check_plan`] for a pooled or offloaded session on a GPU build;
+/// `None` for a CPU-only session or when no VRAM reading exists.
 fn load_plan(config: &EngineConfig) -> Result<Option<golem_plan::PlanReport>, EngineError> {
-    if config.ram_experts_gib == 0 {
+    if config.ram_experts_gib == 0 && config.n_gpu_layers == 0 {
         return Ok(None);
     }
     let Some((free, _)) = device_vram() else {
@@ -2379,6 +2402,40 @@ mod tests {
         assert!(e.to_string().contains("device_expert_cache "), "{e}");
     }
 
+    /// Pool off, 4 layers × 1 GiB experts vs 4 GiB free: all offloaded
+    /// layers' experts alone exceed VRAM; pinning every MoE layer to the CPU
+    /// leaves only the non-expert terms.
+    #[test]
+    fn pool_off_load_check_counts_resident_experts_issue_93() {
+        let m = golem_plan::ModelFacts {
+            t_ne: 256 << 20,
+            shexp: 0,
+            n_expert: 8,
+            top_k: 2,
+            expert_layers: 4,
+            max_plane_stride: 1 << 20,
+            expert_bytes_total: 4 << 30,
+            kv_per_token: 1024,
+            rs_bytes: 0,
+            sparse_attn_layers: 4,
+            dense_below_ctx: 0,
+        };
+        let mut cfg = EngineConfig {
+            n_ctx: 4096,
+            n_gpu_layers: 99,
+            ..EngineConfig::default()
+        };
+        let e = check_plan(&cfg, &m, 4 << 30).unwrap_err();
+        assert!(
+            matches!(&e, EngineError::PlanInfeasible(r) if r.term("resident_experts") == 4 << 30),
+            "{e}"
+        );
+        cfg.cpu_moe_layers = Some(4);
+        let r = check_plan(&cfg, &m, 4 << 30).unwrap();
+        assert_eq!(r.term("resident_experts"), 0);
+        assert_eq!(r.term("ram_pool"), 0);
+    }
+
     #[test]
     fn skip_ratio_math() {
         assert_eq!(skip_ratio(0, 0), 0.0, "no traffic ⇒ 0.0, not NaN");
@@ -2469,6 +2526,65 @@ mod tests {
         let shim = s.render(&TurnRequest::new(&turns)).unwrap().prompt;
         let legacy = legacy_apply_template(c"chatml", &turns, true);
         assert_eq!(shim, legacy);
+    }
+
+    /// The pre-buffer two-pass detokenize (sizing call, exact alloc).
+    fn piece_two_pass(vocab: *const raw::llama_vocab, tok: raw::llama_token) -> Vec<u8> {
+        // SAFETY: null/0 only sizes; vocab is live.
+        let n = unsafe { raw::llama_token_to_piece(vocab, tok, std::ptr::null_mut(), 0, 0, false) }
+            .unsigned_abs() as usize;
+        let mut buf = vec![0u8; n];
+        // SAFETY: buf holds the n bytes the sizing call demanded.
+        let w = unsafe {
+            raw::llama_token_to_piece(vocab, tok, buf.as_mut_ptr().cast(), n as i32, 0, false)
+        };
+        buf.truncate(w.max(0) as usize);
+        buf
+    }
+
+    #[test]
+    fn piece_into_matches_two_pass_over_vocab_issue_93() {
+        let cfg = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let s = Session::new(&cfg).expect("tiny-moe loads");
+        let vocab = s.inner.loaded.model().vocab();
+        // SAFETY: vocab is live.
+        let n_vocab = unsafe { raw::llama_vocab_n_tokens(vocab) };
+        assert!(n_vocab > 0);
+        let mut reserved = Vec::with_capacity(crate::slot::PIECE_RESERVE);
+        for tok in 0..n_vocab {
+            let want = piece_two_pass(vocab, tok);
+            s.inner.piece_into(tok, &mut reserved).unwrap();
+            assert_eq!(reserved, want, "token {tok}");
+            let mut empty = Vec::new();
+            s.inner.piece_into(tok, &mut empty).unwrap();
+            assert_eq!(empty, want, "token {tok} via the regrow path");
+        }
+    }
+
+    #[test]
+    fn slot_piece_buffer_capacity_stable_across_decode_issue_93() {
+        let cfg = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let mut s = Session::new(&cfg).expect("tiny-moe loads");
+        let msgs = [ChatTurn {
+            role: "user",
+            content: "count to ten",
+        }];
+        let turn = |s: &mut Session, n| {
+            let out = s
+                .turn(&TurnRequest::new(&msgs).max_tokens(Some(n)), &mut |_| {})
+                .expect("turn");
+            assert!(out.completion_tokens > 1, "precondition: decode steps ran");
+        };
+        turn(&mut s, 4);
+        let warm = s.slots[0].piece_capacity();
+        turn(&mut s, 32);
+        assert_eq!(s.slots[0].piece_capacity(), warm);
     }
 
     #[test]

@@ -322,6 +322,10 @@ pub struct PlanInput {
     pub snapshot_ram: u64,
     /// Workspace model.
     pub ws: WsModel,
+    /// Pool off: routed-expert bytes llama loads as ordinary VRAM tensors
+    /// (offloaded layers not pinned to the CPU). `Some` drops the device
+    /// expert cache and RAM pool from the plan.
+    pub resident_experts: Option<u64>,
 }
 
 /// One named line of a tier's budget.
@@ -462,6 +466,16 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
             bytes: mach.rocm_overhead,
         },
     ];
+    if let Some(b) = i.resident_experts {
+        t.insert(
+            5,
+            Term {
+                name: "resident_experts",
+                bytes: b,
+            },
+        );
+        return t;
+    }
     let cache = if i.vram_experts > 0 {
         i.vram_experts
     } else {
@@ -506,10 +520,15 @@ pub fn plan(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> PlanReport {
     let ram = ram_terms(m, mach, i);
     let vram_headroom = headroom(mach.vram_total, total(&vram));
     let ram_headroom = headroom(mach.ram_free, total(&ram));
-    let min_device_expert_cache = m.min_device_expert_cache();
+    let min_device_expert_cache = if i.resident_experts.is_some() {
+        0
+    } else {
+        m.min_device_expert_cache()
+    };
     let cache_ok = |t: &[Term]| {
-        t.iter()
-            .any(|t| t.name == "device_expert_cache" && t.bytes >= min_device_expert_cache)
+        min_device_expert_cache == 0
+            || t.iter()
+                .any(|t| t.name == "device_expert_cache" && t.bytes >= min_device_expert_cache)
     };
     let fits = |t: &[Term]| total(t) <= mach.vram_total && cache_ok(t);
     // A smaller ubatch shrinks `ws`, which grows a derived cache.
@@ -574,7 +593,9 @@ fn stream_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
 /// 0.75 × 88 GiB = 66 GiB < Σ experts, + 2 GiB host + 3.69 GiB staging ring.
 #[must_use]
 pub fn ram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
-    let pool = if i.ram_experts > 0 {
+    let pool = if i.resident_experts.is_some() {
+        0
+    } else if i.ram_experts > 0 {
         i.ram_experts
     } else {
         (mach.ram_free / 4 * 3).min(m.expert_bytes_total)

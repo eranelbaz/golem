@@ -36,6 +36,9 @@ pub enum EngineError {
     /// llama_decode returned nonzero (positive: no KV slot / aborted; negative: fatal).
     #[error("llama_decode failed with code {0}")]
     Decode(i32),
+    /// llama_token_to_piece still demanded more bytes after one regrow.
+    #[error("llama_token_to_piece failed for token {0}")]
+    Detokenize(i32),
     /// Prompt does not fit the per-sequence context (`llama_n_ctx_seq`).
     #[error("prompt is {prompt} tokens; context holds {n_ctx}")]
     ContextOverflow {

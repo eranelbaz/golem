@@ -389,6 +389,12 @@ fn walk_kvs(r: &mut (impl Read + Seek), n_kv: u64) -> Result<(u64, Vec<(String, 
         }
         let val = match tag {
             TYPE_STR => KvVal::Str(read_string(r)?),
+            // Vocab-sized arrays (~151k token types on the target) are
+            // never needed; key order is unspecified, so match by prefix.
+            TYPE_ARRAY if key.starts_with("tokenizer.") => {
+                skip_value(r, tag)?;
+                continue;
+            }
             TYPE_ARRAY => match read_int_array(r)? {
                 Some(v) => KvVal::IntArr(v),
                 None => continue,
@@ -957,5 +963,40 @@ mod tests {
         assert_eq!(p("/d/one.gguf", 0, 1), Path::new("/d/one.gguf"));
         assert!(shard_path(Path::new("/d/a.gguf"), 1, 2).is_err());
         assert!(shard_path(Path::new("/d/a-x-of-2.gguf"), 1, 2).is_err());
+    }
+
+    #[test]
+    fn read_kvs_skips_tokenizer_int_arrays_any_key_order_issue_93() {
+        fn key(b: &mut Vec<u8>, k: &str) {
+            b.extend((k.len() as u64).to_le_bytes());
+            b.extend(k.as_bytes());
+        }
+        fn i32_arr(b: &mut Vec<u8>, k: &str, n: u64) {
+            key(b, k);
+            b.extend(TYPE_ARRAY.to_le_bytes());
+            b.extend(TYPE_I32.to_le_bytes());
+            b.extend(n.to_le_bytes());
+            for i in 0..n {
+                b.extend((i as i32).to_le_bytes());
+            }
+        }
+        let mut b = GGUF_MAGIC.to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend(3u64.to_le_bytes());
+        i32_arr(&mut b, "a.attention.head_count_kv", 2);
+        i32_arr(&mut b, "tokenizer.ggml.token_type", 150_000);
+        key(&mut b, "general.architecture");
+        b.extend(TYPE_STR.to_le_bytes());
+        key(&mut b, "a");
+        let kvs = read_kvs(&mut std::io::Cursor::new(b)).unwrap();
+        assert!(!kvs.iter().any(|(k, _)| k.starts_with("tokenizer.")));
+        assert_eq!(
+            kvs.iter()
+                .find(|(k, _)| k == "a.attention.head_count_kv")
+                .map(|(_, v)| v),
+            Some(&KvVal::IntArr(vec![0, 1]))
+        );
+        assert_eq!(kv_str(&kvs, "general.architecture"), Some("a"));
     }
 }

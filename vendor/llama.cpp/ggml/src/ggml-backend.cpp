@@ -2728,6 +2728,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // and fail the compute; the graph never runs.
                             // Only a cancel aborts; storage loss fails.
                             golem_restore_ids();
+                            // Leases are released below: drain every backend that may hold an earlier split's async copy.
                             for (int i = 0; i < sched->n_backends; i++) {
                                 ggml_backend_synchronize(sched->backends[i]);
                             }

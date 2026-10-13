@@ -295,6 +295,10 @@ struct HookState {
     /// the turn's cancel flag (0 = off).
     #[cfg(any(test, feature = "test-support"))]
     test_cancel_plane: AtomicU64,
+    /// Test seam: the next `stream_source` returns
+    /// `GOLEM_STREAM_SRC_CANCEL` without touching any cancel flag.
+    #[cfg(any(test, feature = "test-support"))]
+    test_spurious_cancel: AtomicBool,
     /// Test seam: the next ensure call marks every replica unreadable
     /// before its page-in reads, so the read itself fails.
     #[cfg(any(test, feature = "test-support"))]
@@ -1068,6 +1072,16 @@ impl SessionHooks {
         self.state.test_cancel_plane.store(at, Ordering::Relaxed);
     }
 
+    /// Test seam: the next `stream_source` call returns
+    /// `GOLEM_STREAM_SRC_CANCEL` with no cancel flag set.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn spurious_stream_cancel_for_test(&self) {
+        self.state
+            .test_spurious_cancel
+            .store(true, Ordering::Relaxed);
+    }
+
     /// Drops every staging slot and pool lease the stream chunks still
     /// hold (a failed decode never reaches copy_done's backstop). Call only
     /// with no compute in flight.
@@ -1649,6 +1663,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         #[cfg(any(test, feature = "test-support"))]
         test_cancel_plane: AtomicU64::new(0),
         #[cfg(any(test, feature = "test-support"))]
+        test_spurious_cancel: AtomicBool::new(false),
+        #[cfg(any(test, feature = "test-support"))]
         test_fail_storage_in_read: AtomicBool::new(false),
     });
     if config.prefetch != PrefetchMode::Off {
@@ -2190,6 +2206,10 @@ pub extern "C" fn stream_source(
             if at != 0 && s.stats().planes + 1 >= at {
                 c.store(true, Ordering::Relaxed);
             }
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if h.test_spurious_cancel.swap(false, Ordering::Relaxed) {
+            return raw::GOLEM_STREAM_SRC_CANCEL as i32;
         }
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return raw::GOLEM_STREAM_SRC_CANCEL as i32;
