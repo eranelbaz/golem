@@ -230,10 +230,10 @@ async fn serve_listener(
                 _ = shutdown => {}
                 _ = worker_dead(&drain) => {}
             }
-            // New requests 503 from here; the in-flight ones get `grace`.
+            // New requests 503 from here; in-flight and queued ones get `grace`.
             drain.set(ServeState::Draining);
             let t = tokio::time::Instant::now();
-            while drain.busy() && t.elapsed() < grace {
+            while drain.pending() && t.elapsed() < grace {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             tracing::info!("draining → cancelling");

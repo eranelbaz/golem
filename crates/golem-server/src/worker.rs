@@ -144,6 +144,9 @@ pub struct HealthState {
     last_progress: AtomicU64,
     /// Cancel flags of the jobs on the worker (one per busy slot).
     in_flight: Mutex<Vec<Arc<AtomicBool>>>,
+    /// Drain grace over: admitted and queued jobs are cancelled. Set before
+    /// the published flags are swept; Draining alone refuses only new HTTP.
+    cancelling: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     hooks: TestHooks,
 }
@@ -159,6 +162,7 @@ impl HealthState {
             epoch: Instant::now(),
             last_progress: AtomicU64::new(0),
             in_flight: Mutex::new(Vec::new()),
+            cancelling: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             hooks: TestHooks::default(),
         }
@@ -217,10 +221,11 @@ impl HealthState {
             .clone()
     }
 
-    /// Draining → new requests 503; the in-flight job is cancelled (drain
-    /// grace 0) and answered `golem_busy`.
+    /// Draining → new requests 503; in-flight and queued jobs are cancelled
+    /// and answered `golem_busy`.
     pub fn begin_drain(&self) {
         self.set(ServeState::Draining);
+        self.cancelling.store(true, Ordering::SeqCst);
         self.cancel_in_flight();
     }
 
@@ -236,6 +241,11 @@ impl HealthState {
         }
     }
 
+    /// A job is on the worker or queued for it.
+    pub fn pending(&self) -> bool {
+        self.busy() || self.queued.load(Ordering::SeqCst) > 0
+    }
+
     /// At least one job is on the worker.
     pub fn busy(&self) -> bool {
         !self
@@ -245,14 +255,14 @@ impl HealthState {
             .is_empty()
     }
 
-    /// Republishes the busy slots' flags; a job admitted while Draining is
+    /// Republishes the busy slots' flags; a job admitted once cancelling is
     /// cancelled here, so `begin_drain` never misses one. Only when the job
     /// set changed (admission or finish), never per decode step.
     fn publish_in_flight(&self, flags: impl Iterator<Item = Arc<AtomicBool>>) {
         let mut v = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
         v.clear();
         v.extend(flags);
-        if self.get() == ServeState::Draining {
+        if self.cancelling.load(Ordering::SeqCst) {
             for c in v.iter() {
                 c.store(true, Ordering::SeqCst);
             }
@@ -601,10 +611,15 @@ fn admit(
     if job.cancel.load(Ordering::SeqCst) {
         return Err(false);
     }
-    // `begin_drain` sets Draining then cancels the published flags; a job
-    // dequeued after that is answered busy here.
+    // `begin_drain` sets `cancelling` then sweeps the published flags; a
+    // job dequeued after that is answered busy here, one admitted before is
+    // swept (or cancelled by `publish_in_flight`).
+    if health.cancelling.load(Ordering::SeqCst) {
+        let _ = job.events.try_send(Event::Failed(draining()));
+        return Err(false);
+    }
     match health.get() {
-        ServeState::Draining | ServeState::Releasing => {
+        ServeState::Releasing => {
             let _ = job.events.try_send(Event::Failed(draining()));
             return Err(false);
         }
@@ -834,7 +849,9 @@ fn finish(
         snap.device_cache_skip_ratio = sch.session().device_cache_stats().map(|s| s.skip_ratio);
     }
     let event = match res {
-        Ok(o) if o.finish == FinishReason::Cancelled && health.get() == ServeState::Draining => {
+        Ok(o)
+            if o.finish == FinishReason::Cancelled && health.cancelling.load(Ordering::SeqCst) =>
+        {
             Event::Failed(draining())
         }
         // A live client that fell behind gets an error, not a truncated
@@ -1076,6 +1093,65 @@ mod tests {
             .any(|e| matches!(e, Event::Done(_) | Event::Failed(_)));
         assert!(!a_done, "slot 0 already finished when slot 1 started");
         assert!(rg.blocking_recv().is_none(), "cancelled queued job ran");
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
+    fn terminal(rx: &mut tokio::sync::mpsc::Receiver<Event>) -> Option<Event> {
+        std::iter::from_fn(|| rx.blocking_recv())
+            .find(|e| matches!(e, Event::Done(_) | Event::Failed(_)))
+    }
+
+    /// Both slots busy and B queued: during the drain grace B still runs to
+    /// `Done` once a slot frees (Draining refuses only new HTTP requests).
+    #[test]
+    fn queued_job_completes_during_drain_grace() {
+        let cfg = EngineConfig {
+            parallel: 2,
+            ..crate::test_engine_config()
+        };
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let (a, mut ra) = job("count to ten", 4);
+        let (a2, mut ra2) = job("hello", 4);
+        assert!(w.jobs.try_send(a).is_ok());
+        assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
+        assert!(w.jobs.send(a2).is_ok());
+        assert!(matches!(ra2.blocking_recv(), Some(Event::Text(_))));
+        let (b, mut rb) = job("x", 4);
+        assert!(w.jobs.try_send(b).is_ok(), "queued");
+        w.health.set(ServeState::Draining);
+        assert!(matches!(terminal(&mut ra), Some(Event::Done(_))));
+        assert!(
+            matches!(terminal(&mut rb), Some(Event::Done(_))),
+            "queued job refused during grace"
+        );
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
+    /// Grace over while B is queued: the in-flight jobs are cancelled and B
+    /// is answered with the draining error.
+    #[test]
+    fn queued_job_fails_draining_when_grace_expires() {
+        let cfg = EngineConfig {
+            parallel: 2,
+            ..crate::test_engine_config()
+        };
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let (a, mut ra) = job("count to ten", 4096);
+        let (a2, mut ra2) = job("hello", 4096);
+        assert!(w.jobs.try_send(a).is_ok());
+        assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
+        assert!(w.jobs.send(a2).is_ok());
+        assert!(matches!(ra2.blocking_recv(), Some(Event::Text(_))));
+        let (b, mut rb) = job("x", 4);
+        assert!(w.jobs.try_send(b).is_ok(), "queued");
+        w.health.set(ServeState::Draining);
+        w.health.begin_drain();
+        for rx in [&mut ra, &mut rb] {
+            match terminal(rx) {
+                Some(Event::Failed(env)) => assert_eq!(env.error.message, "server draining"),
+                other => panic!("expected draining, got {other:?}"),
+            }
+        }
         w.shutdown(|| {}, Duration::from_secs(30)).ok();
     }
 

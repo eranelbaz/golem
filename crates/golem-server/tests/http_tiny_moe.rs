@@ -118,6 +118,21 @@ fn raw_response(mut s: TcpStream) -> String {
     out
 }
 
+/// Body of a chunked `raw_response`.
+fn dechunk(resp: &str) -> String {
+    let (_, mut rest) = resp.split_once("\r\n\r\n").expect(resp);
+    let mut body = String::new();
+    while let Some((size, tail)) = rest.split_once("\r\n") {
+        let n = usize::from_str_radix(size, 16).expect(resp);
+        if n == 0 {
+            break;
+        }
+        body.push_str(&tail[..n]);
+        rest = &tail[n + 2..];
+    }
+    body
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn non_streaming_disconnect_frees_slot() {
     // 100 ms/piece: an uncancelled 4096-token job (tiny-moe EOGs after
@@ -233,7 +248,7 @@ async fn worker_death_ends_serve_with_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn streaming_worker_death_ends_with_error_frame_not_done() {
+async fn streaming_worker_death_ends_with_error_frame_then_done() {
     let app = router_with_hooks(
         golem_server::test_engine_config(),
         TestHooks::panic_after_first_token(),
@@ -248,8 +263,20 @@ async fn streaming_worker_death_ends_with_error_frame_not_done() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("golem_backend_unavailable"), "{body}");
-    assert!(!body.contains("[DONE]"), "{body}");
+    assert_error_then_done(&body, "golem_backend_unavailable");
+}
+
+/// The stream tail is exactly one error frame then one `data: [DONE]`.
+fn assert_error_then_done(body: &str, needle: &str) {
+    assert_eq!(body.matches("[DONE]").count(), 1, "{body}");
+    let head = body
+        .strip_suffix("\n\ndata: [DONE]\n\n")
+        .unwrap_or_else(|| panic!("no trailing [DONE]: {body}"));
+    let last = &head[head.rfind("data: ").expect(body)..];
+    assert!(
+        last.starts_with("data: {\"error\"") && last.contains(needle),
+        "{body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -292,7 +319,7 @@ async fn streaming_disconnect_frees_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn streaming_shutdown_ends_with_draining_error_frame() {
+async fn streaming_shutdown_ends_with_draining_error_frame_then_done() {
     let (addr, stop, task) = serve_on_port0(
         golem_server::test_engine_config(),
         TestHooks::slow_decode(100),
@@ -308,12 +335,8 @@ async fn streaming_shutdown_ends_with_draining_error_frame() {
         .unwrap()
         .unwrap();
     let resp = client.await.unwrap();
-    assert!(
-        resp.starts_with("HTTP/1.1 200")
-            && resp.contains("server draining")
-            && !resp.contains("[DONE]"),
-        "{resp}"
-    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert_error_then_done(&dechunk(&resp), "server draining");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -404,6 +427,50 @@ async fn drain_finishes_in_flight_stream_and_refuses_new_requests() {
         resp.starts_with("HTTP/1.1 200") && resp.contains("[DONE]"),
         "{resp}"
     );
+    tokio::time::timeout(Duration::from_secs(35), task)
+        .await
+        .expect("serve returns within 35 s")
+        .unwrap()
+        .unwrap();
+    assert!(t.elapsed() < Duration::from_secs(35));
+}
+
+/// `--parallel 2` drain: both in-flight streams and the queued one finish
+/// with `[DONE]` within the grace; a new request gets 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_parallel_2_finishes_queued_stream() {
+    let mut scfg = golem_server::test_support::test_server_config();
+    scfg.drain_grace = Duration::from_secs(30);
+    let (addr, stop, task) = golem_server::test_support::serve_with(
+        golem_engine::config::EngineConfig {
+            parallel: 2,
+            ..golem_server::test_engine_config()
+        },
+        TestHooks::slow_decode(50),
+        scfg,
+    )
+    .await;
+    let t = Instant::now();
+    let clients: Vec<_> = (0..3)
+        .map(|_| tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi_stream(48)))))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let late = tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi(2))))
+        .await
+        .unwrap();
+    assert!(
+        late.starts_with("HTTP/1.1 503") && late.contains("golem_busy"),
+        "{late}"
+    );
+    for c in clients {
+        let resp = c.await.unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("[DONE]") && !resp.contains("error"),
+            "{resp}"
+        );
+    }
     tokio::time::timeout(Duration::from_secs(35), task)
         .await
         .expect("serve returns within 35 s")

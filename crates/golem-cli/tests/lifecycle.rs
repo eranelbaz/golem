@@ -186,11 +186,29 @@ fn run_attaches_to_keyed_instance() {
         ])
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let unkeyed = golem(
+        &rt,
+        &[
+            "run",
+            &m,
+            "--prompt",
+            "hi",
+            "--n-predict",
+            "2",
+            "--allow-overcommit",
+        ],
+    );
     assert!(golem(&rt, &["stop", &id]).status.success());
     assert!(out.status.success(), "{err}");
     assert!(err.contains(&format!("attached to instance {id}")), "{err}");
     assert!(!out.stdout.is_empty(), "no reply: {err}");
+    let e2 = String::from_utf8_lossy(&unkeyed.stderr);
+    assert!(!unkeyed.status.success(), "{e2}");
+    assert!(
+        e2.contains(&format!("instance {id} requires an API key")) && e2.contains("GOLEM_API_KEY"),
+        "{e2}"
+    );
 }
 
 #[test]

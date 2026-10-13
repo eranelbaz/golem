@@ -1057,7 +1057,7 @@ fn attach(
     let mut history: Vec<serde_json::Value> = Vec::new();
     let turn = |history: &mut Vec<serde_json::Value>, text: String| {
         history.push(serde_json::json!({"role": "user", "content": text}));
-        let reply = stream_chat(addr, &i.model, history, n_predict, api_key)?;
+        let reply = stream_chat(addr, &i.id, &i.model, history, n_predict, api_key)?;
         history.push(serde_json::json!({"role": "assistant", "content": reply}));
         println!();
         Ok::<_, Box<dyn Error>>(())
@@ -1091,6 +1091,7 @@ fn attach(
 /// close-delimited, so SSE lines arrive intact.
 fn stream_chat(
     addr: &str,
+    id: &str,
     model: &str,
     messages: &[serde_json::Value],
     n_predict: u32,
@@ -1112,6 +1113,17 @@ fn stream_chat(
     )?;
     let mut lines = std::io::BufReader::new(s).lines();
     let status = lines.next().transpose()?.unwrap_or_default();
+    if status.contains(" 401 ") {
+        let hint = if api_key.is_some() {
+            " (the configured key was rejected)"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "instance {id} requires an API key; set GOLEM_API_KEY or api_key in golem.toml{hint}"
+        )
+        .into());
+    }
     if !status.contains(" 200 ") {
         let rest: Vec<String> = lines.map_while(Result::ok).collect();
         return Err(rest.last().cloned().unwrap_or(status).into());
@@ -1175,6 +1187,51 @@ mod tests {
             snapshot_ram_bytes: snap,
             ..EngineConfig::default()
         }
+    }
+
+    /// Serves one canned HTTP response; returns its address.
+    fn canned(resp: &'static str) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            // Drain the whole request, or the close resets the connection.
+            s.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            while std::io::Read::read(&mut s, &mut buf).is_ok_and(|n| n > 0) {}
+            let _ = s.write_all(resp.as_bytes());
+        });
+        addr
+    }
+
+    /// An error frame followed by `[DONE]` is an error, not a truncated reply.
+    #[test]
+    fn stream_chat_surfaces_error_before_done() {
+        let addr = canned(
+            "HTTP/1.0 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+             data: {\"error\":{\"code\":\"golem_busy\",\"message\":\"server draining\"}}\n\n\
+             data: [DONE]\n\n",
+        );
+        let e = stream_chat(&addr, "i1", "m", &[], 2, None).unwrap_err();
+        assert!(e.to_string().contains("server draining"), "{e}");
+    }
+
+    #[test]
+    fn stream_chat_401_names_the_key_settings() {
+        let resp = "HTTP/1.0 401 Unauthorized\r\n\r\n{\"error\":{}}";
+        let e = stream_chat(&canned(resp), "i1", "m", &[], 2, None).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "instance i1 requires an API key; set GOLEM_API_KEY or api_key in golem.toml"
+        );
+        let e = stream_chat(&canned(resp), "i1", "m", &[], 2, Some("k")).unwrap_err();
+        assert!(
+            e.to_string()
+                .ends_with("golem.toml (the configured key was rejected)"),
+            "{e}"
+        );
     }
 
     #[test]

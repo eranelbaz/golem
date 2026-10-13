@@ -127,10 +127,13 @@ async fn forward(
             }
             Some(Event::Failed(e)) => {
                 meta.health.count_error(e.error.code);
-                vec![error_frame(&e)]
+                vec![error_frame(&e), SseEvent::default().data("[DONE]")]
             }
-            // Worker died mid-stream: an error frame, never a clean `[DONE]`.
-            None => vec![error_frame(&backend_gone_envelope())],
+            // Worker died mid-stream: the error frame, then `[DONE]` (§8.3).
+            None => vec![
+                error_frame(&backend_gone_envelope()),
+                SseEvent::default().data("[DONE]"),
+            ],
         };
         for f in frames {
             if tx.send(f).await.is_err() {
