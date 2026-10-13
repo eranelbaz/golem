@@ -155,7 +155,7 @@ pub(crate) fn render(h: &HealthState) -> String {
     if let Some((cache, stream)) = m.h2d_copies {
         let _ = writeln!(
             labeled,
-            "# HELP golem_expert_h2d_copies_total routed expert planes copied host→device, by device-cache fill or streamed prefill\n# TYPE golem_expert_h2d_copies_total counter\n\
+            "# HELP golem_expert_h2d_copies_total expert planes copied host→device, by device-cache fill or streamed prefill (stream counts whole-tensor fills, which can exceed routed demand)\n# TYPE golem_expert_h2d_copies_total counter\n\
              golem_expert_h2d_copies_total{{path=\"cache\"}} {cache}\n\
              golem_expert_h2d_copies_total{{path=\"stream\"}} {stream}"
         );

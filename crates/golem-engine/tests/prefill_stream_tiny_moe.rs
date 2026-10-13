@@ -16,7 +16,6 @@ use golem_engine::config::EngineConfig;
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::stream::StreamStats;
 use std::sync::atomic::Ordering;
-use xtask::tiny_moe::dims::N_EXPERT;
 
 fn config(stream: bool, n_predict: u32) -> EngineConfig {
     EngineConfig {
@@ -78,12 +77,8 @@ fn streamed_prefill_matches_per_token_and_spares_the_pool() {
         "stream_source must fire for streamed planes"
     );
     assert!(stats.bytes > 0, "streamed bytes must be counted");
-    // C copies one range per sourced id: every pooled/staged id plus any
-    // unrouted stale id of a whole fill, at most n_expert per plane.
-    assert!(
-        dc >= stats.pool_hits + stats.staged && dc <= stats.planes * u64::from(N_EXPERT),
-        "stream copies {dc} vs {stats:?}"
-    );
+    // C copies exactly the id list it hands each successful stream_source.
+    assert_eq!(dc, stats.sourced_ids, "stream copies vs {stats:?}");
     // Pool traffic (claims, paged bytes) of a turn with one generated token
     // is the same with and without streaming: stream chunks never claim or
     // page into the pool (§7.6.4).

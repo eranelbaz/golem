@@ -41,6 +41,8 @@ pub struct StreamStats {
     pub staged: u64,
     /// stream_source calls (one per streamed plane).
     pub planes: u64,
+    /// Σ ids over successfully sourced planes (the ids C copies H2D).
+    pub sourced_ids: u64,
     /// Planes currently holding pool leases or a staging slot (sourced and
     /// not yet released).
     pub held: u64,
@@ -136,6 +138,8 @@ pub struct StreamState {
     pub staged: AtomicU64,
     /// stream_source calls (one per streamed plane).
     pub planes: AtomicU64,
+    /// Σ ids over successfully sourced planes.
+    pub sourced_ids: AtomicU64,
     /// Test seam: runs on the reader thread right before its next read.
     #[cfg(any(test, feature = "test-support"))]
     test_before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -198,6 +202,7 @@ impl StreamState {
             pool_hits: AtomicU64::new(0),
             staged: AtomicU64::new(0),
             planes: AtomicU64::new(0),
+            sourced_ids: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
             test_before_read: Mutex::new(None),
         });
@@ -497,6 +502,8 @@ impl StreamState {
                 leases,
             },
         );
+        self.sourced_ids
+            .fetch_add(ids.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -562,6 +569,7 @@ impl StreamState {
             pool_hits: self.pool_hits.load(Ordering::Relaxed),
             staged: self.staged.load(Ordering::Relaxed),
             planes: self.planes.load(Ordering::Relaxed),
+            sourced_ids: self.sourced_ids.load(Ordering::Relaxed),
             held: self
                 .inner
                 .lock()
