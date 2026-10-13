@@ -917,7 +917,8 @@ fn log_turn(run: &SlotRun, event: &Event) {
 /// emitting what each parse added. A parse is O(text), so a piece that
 /// cannot open a marker or end in parser-trimmed whitespace, arriving while
 /// the last parse ended verbatim on one section with nothing held, extends
-/// that section without one; the final parse always runs.
+/// that section without one; the final parse always runs. The skip relies
+/// on no parser marker beginning with an alphanumeric character.
 struct ToolStream {
     text: String,
     content: String,
@@ -976,7 +977,19 @@ impl ToolStream {
         self.tail = None;
         let msg = match parser.parse(&self.text, partial) {
             Ok(msg) => msg,
-            Err(_) if partial => return,
+            // With no call announced and no reasoning sent, an unparseable
+            // text ends as raw content (below), so it streams as such.
+            Err(_) if partial => {
+                if self.args.is_empty()
+                    && self.reasoning.is_empty()
+                    && let Some(add) = self.text.strip_prefix(self.content.as_str())
+                    && !add.is_empty()
+                {
+                    send(Event::Text(add.into()));
+                    self.content.push_str(add);
+                }
+                return;
+            }
             // Unparseable final text is still the model's answer: emit what
             // was not yet sent as content.
             Err(_) => {
@@ -1245,7 +1258,7 @@ mod tests {
         let mut ts = ToolStream::new();
         ts.push(&r.parser, "bad\0", true, &send);
         ts.push(&r.parser, "text", true, &send);
-        assert!(out.borrow().is_empty(), "partial failures are held");
+        assert_eq!(*out.borrow(), "bad\0text", "partial failures stream");
         ts.push(&r.parser, "", false, &send);
         assert_eq!(*out.borrow(), "bad\0text");
         assert_eq!(ts.calls, 0);
@@ -1304,8 +1317,11 @@ mod tests {
             "x <tool x> y</think>z <toolx> w",
         ];
         let mut seed = 0x9e37_79b9_u64;
-        for tools in [None, Some(GLM_TOOLS)] {
-            let r = render(GLM, tools);
+        for r in [
+            render(GLM, None),
+            render(GLM, Some(GLM_TOOLS)),
+            render(QWEN3, None),
+        ] {
             for text in transcripts {
                 let chars: Vec<(usize, char)> = text.char_indices().collect();
                 for _ in 0..40 {
@@ -1321,11 +1337,31 @@ mod tests {
                     assert_eq!(
                         stream(&r, &pieces, false).0,
                         stream(&r, &pieces, true).0,
-                        "{tools:?} {pieces:?}"
+                        "{pieces:?}"
                     );
                 }
             }
         }
+    }
+
+    /// Unusual bytes in plain Separate-mode text still stream before the
+    /// final parse.
+    #[test]
+    fn unusual_bytes_stream_before_final_parse() {
+        let r = render(GLM, None);
+        let out = std::cell::RefCell::new(String::new());
+        let send = |ev: Event| match ev {
+            Event::Text(t) => out.borrow_mut().push_str(&t),
+            other => panic!("unexpected {other:?}"),
+        };
+        let mut ts = ToolStream::new();
+        let pieces = ["a\u{0}b", " \u{7f}", " 🦀", " <", " c"];
+        for (i, p) in pieces.iter().enumerate() {
+            ts.push(&r.parser, p, true, &send);
+            assert!(!out.borrow().is_empty(), "nothing streamed after piece {i}");
+        }
+        ts.push(&r.parser, "", false, &send);
+        assert_eq!(*out.borrow(), pieces.concat());
     }
 
     #[test]
