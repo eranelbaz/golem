@@ -18,7 +18,6 @@ use golem_engine::config::EngineConfig;
 use golem_engine::session::{ChatTurn, Session};
 use golem_registry::Registry;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::profile::{self, Axis, Knobs, Metrics, Profile, StopSweep};
 use crate::run::{EngineArgs, engine_config};
@@ -199,7 +198,12 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         }
         n_measured += 1;
         longest = longest.max(t0.elapsed());
-        candidates.push((*k, r.as_ref().map(|m| m.warm).map_err(|e| e.to_string())));
+        candidates.push((
+            *k,
+            r.as_ref()
+                .map(|m| m.warm.clone())
+                .map_err(|e| e.to_string()),
+        ));
         mem0 = memory_returned(mem0)?;
         if free_vram.saturating_sub(mem0.0) > DRIFT_BUDGET {
             return Err(Box::new(StopSweep(format!(
@@ -222,9 +226,9 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         fingerprint: fp.0,
         measured_free_vram: measured_vram,
         measured_free_ram: free_ram,
-        knobs: result.map(|r| r.0),
-        metrics: result.map_or(baseline, |r| r.1),
-        baseline,
+        knobs: result.as_ref().map(|r| r.0),
+        metrics: result.as_ref().map_or(&baseline, |r| &r.1).clone(),
+        baseline: baseline.clone(),
         candidates,
     };
     // A no-winner run never replaces a saved winner for this fingerprint.
@@ -544,13 +548,12 @@ fn evict(model: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// One prompt-set pass: per-turn TTFT and decode tok/s, the outputs, and
+/// One prompt-set pass: per-turn TTFT and decode tok/s and
 /// the pool hit rate over the pass.
 struct Pass {
     ttft_ms: Vec<f64>,
     tok_s: f64,
     hit_rate: f64,
-    output: String,
 }
 
 fn pass(s: &mut Session) -> Result<Pass, Box<dyn Error>> {
@@ -566,7 +569,6 @@ fn pass(s: &mut Session) -> Result<Pass, Box<dyn Error>> {
     let (h0, m0) = counters(s);
     let mut ttft_ms = Vec::new();
     let (mut tokens, mut decode_s) = (0u64, 0f64);
-    let mut output = String::new();
     for prompt in PROMPTS {
         let t0 = Instant::now();
         let mut first: Option<Instant> = None;
@@ -575,9 +577,8 @@ fn pass(s: &mut Session) -> Result<Pass, Box<dyn Error>> {
                 role: "user",
                 content: prompt,
             }],
-            &mut |p| {
+            &mut |_| {
                 first.get_or_insert_with(Instant::now);
-                output.push_str(p);
             },
         )?;
         let end = Instant::now();
@@ -585,7 +586,6 @@ fn pass(s: &mut Session) -> Result<Pass, Box<dyn Error>> {
         ttft_ms.push((first - t0).as_secs_f64() * 1e3);
         tokens += u64::from(n.saturating_sub(1));
         decode_s += (end - first).as_secs_f64();
-        output.push('\0');
     }
     let (h1, m1) = counters(s);
     let (hits, misses) = (h1 - h0, m1 - m0);
@@ -601,7 +601,6 @@ fn pass(s: &mut Session) -> Result<Pass, Box<dyn Error>> {
         } else {
             hits as f64 / (hits + misses) as f64
         },
-        output,
     })
 }
 
@@ -615,16 +614,12 @@ fn metrics(passes: &[Pass]) -> Metrics {
     let mut tok: Vec<f64> = passes.iter().map(|p| p.tok_s).collect();
     let mut hit: Vec<f64> = passes.iter().map(|p| p.hit_rate).collect();
     let mut ttft: Vec<f64> = passes.iter().flat_map(|p| p.ttft_ms.clone()).collect();
-    let mut h = Sha256::new();
-    for p in passes {
-        h.update(p.output.as_bytes());
-    }
     Metrics {
         tok_s: percentile(&mut tok, 0.5),
         hit_rate: percentile(&mut hit, 0.5),
         ttft_p50_ms: percentile(&mut ttft, 0.5),
         ttft_p99_ms: percentile(&mut ttft, 0.99),
-        output_sha256: h.finalize().into(),
+        greedy: Vec::new(),
     }
 }
 
@@ -677,7 +672,19 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
     let passes = (0..RUNS)
         .map(|_| pass(&mut s))
         .collect::<Result<Vec<_>, _>>()?;
-    let warm = metrics(&passes);
+    let mut warm = metrics(&passes);
+    let mut steps = Vec::new();
+    for prompt in PROMPTS {
+        s.chat_turn_parity(
+            &[ChatTurn {
+                role: "user",
+                content: prompt,
+            }],
+            &mut steps,
+        )?;
+        warm.greedy
+            .push(steps.iter().map(|p| (p.token, p.top1 - p.top2)).collect());
+    }
     std::io::stdout().flush()?;
     Ok(Measured { warm, cold, load_s })
 }

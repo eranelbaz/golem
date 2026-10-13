@@ -764,7 +764,7 @@ impl Session {
         }
         let (chat, template) = probe_templates(&loaded, config)?;
 
-        let snapshots = snapshot_cache(config, &loaded)?;
+        let snapshots = snapshot_cache(config)?;
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
 
         Ok({
@@ -2218,10 +2218,7 @@ fn load_plan(config: &EngineConfig) -> Result<Option<golem_plan::PlanReport>, En
 /// Floor = `parallel × snapshot_bytes(n_ctx)`: one full-context snapshot per
 /// slot — below it long chats silently lose reuse, so smaller budgets are
 /// refused. Target: 145.56 MiB + 19,712 B × 100k ≈ 2.0 GiB at parallel 1.
-fn snapshot_cache(
-    config: &EngineConfig,
-    loaded: &LoadedModel,
-) -> Result<Option<SnapshotCache>, EngineError> {
+fn snapshot_cache(config: &EngineConfig) -> Result<Option<SnapshotCache>, EngineError> {
     if config.snapshot_ram_bytes == Some(0) {
         return Ok(None);
     }
@@ -2243,18 +2240,8 @@ fn snapshot_cache(
     };
     let len = usize::try_from(bytes)
         .map_err(|_| EngineError::InvalidConfig("snapshot_ram_bytes > usize".into()))?;
-    let model_key = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::hash::DefaultHasher::new();
-        config.model_path.hash(&mut h);
-        config.n_ctx.hash(&mut h);
-        // SAFETY: ctx is live.
-        unsafe { raw::llama_n_ubatch(loaded.ctx().as_ptr()) }.hash(&mut h);
-        h.finish()
-    };
     Ok(Some(SnapshotCache::new(
         p3_glue::PinnedArena::new(len)?,
-        model_key,
         config.n_ctx as usize,
     )))
 }
