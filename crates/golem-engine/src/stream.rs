@@ -75,6 +75,24 @@ struct Pending {
     warmed_ids: Vec<u32>,
 }
 
+/// Reader outcome since the last `release_all`; the worst failure wins.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReadState {
+    #[default]
+    Ok,
+    /// A read failed with the store already `FatalIo`: the turn fails.
+    StorageLost,
+    /// Any other read failure or a reader panic: a contract breach.
+    Fatal,
+}
+
+/// A streamed plane cannot be sourced because the store lost every replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamError {
+    /// A reader failure with the store's health already `FatalIo`.
+    StorageLost,
+}
+
 #[derive(Default)]
 struct Inner {
     free_slots: Vec<usize>,
@@ -85,7 +103,7 @@ struct Inner {
     holds: BTreeMap<u64, Hold>,
     /// Keyed (pool layer, kind code − 1).
     warm: HashMap<(u32, u8), Pending>,
-    failed: bool,
+    read: ReadState,
     stop: bool,
 }
 
@@ -96,6 +114,9 @@ struct Inner {
 pub struct StreamState {
     pool: Arc<ExpertPool>,
     source: Arc<dyn ExpertSource>,
+    /// Whether the source's health is `FatalIo` (false for sources without
+    /// a health, e.g. GGUF pread).
+    storage_lost: Box<dyn Fn() -> bool + Send + Sync>,
     arena: Arc<Arena>,
     slot_bytes: usize,
     /// Plane byte length per layer × kind (flat, from the geometry).
@@ -115,6 +136,9 @@ pub struct StreamState {
     pub staged: AtomicU64,
     /// stream_source calls (one per streamed plane).
     pub planes: AtomicU64,
+    /// Test seam: runs on the reader thread right before its next read.
+    #[cfg(any(test, feature = "test-support"))]
+    test_before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 // SAFETY: `Task.dst`/`Pending.base` point into the mlocked arena the state
@@ -134,6 +158,7 @@ impl StreamState {
     pub fn new(
         pool: Arc<ExpertPool>,
         source: Arc<dyn ExpertSource>,
+        storage_lost: Box<dyn Fn() -> bool + Send + Sync>,
         slot_bytes: usize,
     ) -> Result<Arc<Self>, String> {
         let arena = Arena::new(&[SlotClass {
@@ -154,6 +179,7 @@ impl StreamState {
             n_layers: geo.layers.len() as u32,
             pool,
             source,
+            storage_lost,
             arena: Arc::new(arena),
             slot_bytes,
             plane_lens,
@@ -163,7 +189,7 @@ impl StreamState {
                 queue: VecDeque::new(),
                 holds: BTreeMap::new(),
                 warm: HashMap::new(),
-                failed: false,
+                read: ReadState::Ok,
                 stop: false,
             }),
             cv: Condvar::new(),
@@ -172,6 +198,8 @@ impl StreamState {
             pool_hits: AtomicU64::new(0),
             staged: AtomicU64::new(0),
             planes: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            test_before_read: Mutex::new(None),
         });
         state.spawn_reader();
         Ok(state)
@@ -216,18 +244,32 @@ impl StreamState {
             // n_experts × max stride ≥ plane_len); the task is exclusively
             // owned here and C reads the bytes only after pending hits 0.
             let plane = unsafe { std::slice::from_raw_parts_mut(task.dst, task.plane_len) };
-            // A panicking source must not strand pending_reads (every
-            // waiter would hang): it counts as a failed read.
-            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.source
-                    .read_expert(task.layer, task.kind, task.expert, plane, 0)
-                    .is_ok()
-            }))
-            .unwrap_or(false);
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if !ok {
-                inner.failed = true;
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(f) = self
+                .test_before_read
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                f();
             }
+            // A panicking source must not strand pending_reads (every
+            // waiter would hang): it counts as a fatal read. The store
+            // degrades replicas inside `read_expert`, so its health is final
+            // by the time it returns.
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match self
+                    .source
+                    .read_expert(task.layer, task.kind, task.expert, plane, 0)
+                {
+                    Ok(()) => ReadState::Ok,
+                    Err(_) if (self.storage_lost)() => ReadState::StorageLost,
+                    Err(_) => ReadState::Fatal,
+                }
+            }))
+            .unwrap_or(ReadState::Fatal);
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.read = inner.read.max(read);
             inner.pending_reads[task.slot] -= 1;
             self.cv.notify_all();
         }
@@ -240,6 +282,7 @@ impl StreamState {
     /// pool copy is authoritative and `source` will lease it); no lease is
     /// taken here — the prefetcher is paused for the chunk and no demand
     /// claims run, so nothing can evict between warm and source.
+    /// A failed read stops the warm-up; the next `source` reports it.
     pub fn warm(&self, layer: u32, routed_ids: &[i32]) {
         if layer >= self.n_layers {
             return;
@@ -250,20 +293,23 @@ impl StreamState {
             .map(|&id| id as u32)
             .collect();
         // This layer's id-dependent planes, routed-only.
-        self.warm_plane(layer, ExpertKind::Up, &routed);
-        self.warm_plane(layer, ExpertKind::Down, &routed);
-        // Next layer's gate, whole.
-        if layer + 1 < self.n_layers {
-            let whole: Vec<u32> = (0..self.n_experts).collect();
-            self.warm_plane(layer + 1, ExpertKind::Gate, &whole);
-        }
+        let _ = self
+            .warm_plane(layer, ExpertKind::Up, &routed)
+            .and_then(|()| self.warm_plane(layer, ExpertKind::Down, &routed))
+            .and_then(|()| {
+                // Next layer's gate, whole.
+                if layer + 1 < self.n_layers {
+                    let whole: Vec<u32> = (0..self.n_experts).collect();
+                    self.warm_plane(layer + 1, ExpertKind::Gate, &whole)
+                } else {
+                    Ok(())
+                }
+            });
     }
 
-    fn warm_plane(&self, layer: u32, kind: ExpertKind, ids: &[u32]) {
+    fn warm_plane(&self, layer: u32, kind: ExpertKind, ids: &[u32]) -> Result<(), StreamError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.failed {
-            p3_fatal("stream reader failed; aborting rather than decoding on garbage".into());
-        }
+        check_read(inner.read)?;
         let plane_len = self.plane_lens[(layer as usize) * 3 + kind as usize] as usize;
         let mut ids = ids.to_vec();
         ids.sort_unstable();
@@ -280,11 +326,7 @@ impl StreamState {
             // C releases seq−2 before refilling a half, copy_done drops the
             // tail between chunks).
             let (slot, base) = loop {
-                if inner.failed {
-                    p3_fatal(
-                        "stream reader failed; aborting rather than decoding on garbage".into(),
-                    );
-                }
+                check_read(inner.read)?;
                 if inner.stop {
                     p3_fatal("stream warm after stop".into());
                 }
@@ -321,6 +363,7 @@ impl StreamState {
                 warmed_ids: ids,
             },
         );
+        Ok(())
     }
 
     /// The `stream_source` hook body (decode thread, once per streamed
@@ -330,6 +373,11 @@ impl StreamState {
     ///
     /// `blk` is the DENSE-LEAD-ADJUSTED pool layer (the glue subtracts the
     /// lead before calling).
+    ///
+    /// # Errors
+    /// [`StreamError::StorageLost`] when a reader failure left the plane
+    /// unfilled; a slot this plane took is held under `seq`, so C's
+    /// `stream_release(seq)` reclaims it once its reads finish.
     pub fn source(
         &self,
         blk: i32,
@@ -337,7 +385,7 @@ impl StreamState {
         seq: u64,
         ids: &[i32],
         out: &mut [*const c_void],
-    ) {
+    ) -> Result<(), StreamError> {
         let Some(kind) = kind_from_code(kind_code) else {
             p3_fatal(format!("stream_source: bad kind {kind_code}"));
         };
@@ -363,7 +411,7 @@ impl StreamState {
                     .filter(|&&id| id >= 0 && (id as u32) < self.n_experts)
                     .map(|&id| id as u32)
                     .collect();
-                self.warm_plane(layer, kind, &ids);
+                self.warm_plane(layer, kind, &ids)?;
             }
         }
         let pending = {
@@ -376,15 +424,22 @@ impl StreamState {
         // Wait for the plane's reads (the pipeline: warm enqueued them one
         // layer ahead, so this parks only when the disk is the bound — the
         // intended steady state).
-        if pending.slot != usize::MAX {
+        {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            while inner.pending_reads[pending.slot] > 0 {
-                if inner.failed {
-                    p3_fatal(
-                        "stream reader failed; aborting rather than decoding on garbage".into(),
-                    );
+            if pending.slot != usize::MAX {
+                while inner.pending_reads[pending.slot] > 0 && inner.read == ReadState::Ok {
+                    inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
                 }
-                inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+            }
+            if let Err(e) = check_read(inner.read) {
+                inner.holds.insert(
+                    seq,
+                    Hold {
+                        slot: pending.slot,
+                        leases: Vec::new(),
+                    },
+                );
+                return Err(e);
             }
         }
 
@@ -439,20 +494,24 @@ impl StreamState {
                 leases,
             },
         );
+        Ok(())
     }
 
     /// The `stream_release` hook body: releases seq and everything smaller —
     /// leases drop, staging slots recycle. C calls this after the slab's
     /// event sync, so the H2D reading these host bytes has completed; the
     /// `copy_done` backstop runs after the compute-entry drain for the same
-    /// reason.
+    /// reason. A plane held after a failed read may still have reads in
+    /// flight: its slot recycles only once they finish.
     pub fn release(&self, seq: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let done: Vec<u64> = inner.holds.range(..=seq).map(|(&s, _)| s).collect();
         for s in done {
             if let Some(h) = inner.holds.remove(&s) {
                 if h.slot != usize::MAX {
-                    debug_assert_eq!(inner.pending_reads[h.slot], 0);
+                    while inner.pending_reads[h.slot] > 0 {
+                        inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+                    }
                     inner.free_slots.push(h.slot);
                 }
                 drop(h.leases);
@@ -482,6 +541,8 @@ impl StreamState {
                 inner.free_slots.push(p.slot);
             }
         }
+        // Nothing is in flight any more; a fatal state already aborted.
+        inner.read = ReadState::Ok;
         self.cv.notify_all();
     }
 
@@ -501,6 +562,15 @@ impl StreamState {
         }
     }
 
+    /// Test seam: `f` runs on the reader thread before its next read.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn before_next_read_for_test(&self, f: Box<dyn FnOnce() + Send>) {
+        *self
+            .test_before_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
     /// Stops and joins the reader thread (session teardown; holds are empty
     /// once the hooks are unregistered and copy_done ran).
     pub fn stop(&self) {
@@ -518,11 +588,137 @@ impl StreamState {
     }
 }
 
+fn check_read(read: ReadState) -> Result<(), StreamError> {
+    match read {
+        ReadState::Ok => Ok(()),
+        ReadState::StorageLost => Err(StreamError::StorageLost),
+        ReadState::Fatal => {
+            p3_fatal("stream reader failed; aborting rather than decoding on garbage".into())
+        }
+    }
+}
+
 fn kind_from_code(code: i32) -> Option<ExpertKind> {
     match code {
         1 => Some(ExpertKind::Gate),
         2 => Some(ExpertKind::Up),
         3 => Some(ExpertKind::Down),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use golem_placement::pool::{
+        P3Stats, PolicySnapshot, PoolGeometry, SnapshotHandle, UnitLayout,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    const STRIDE: u64 = 64;
+    const N_EXPERTS: u32 = 4;
+
+    /// Fails every read of `fail` (layer, expert), marking storage lost first
+    /// like the store degrading its replicas inside `read_expert`.
+    struct FailSource {
+        fail: (u32, u32),
+        lost: Arc<AtomicBool>,
+    }
+
+    impl ExpertSource for FailSource {
+        fn read_expert(
+            &self,
+            layer: u32,
+            _kind: ExpertKind,
+            expert: u32,
+            into: &mut [u8],
+            head: usize,
+        ) -> std::io::Result<()> {
+            if (layer, expert) == self.fail {
+                self.lost.store(true, Ordering::SeqCst);
+                return Err(std::io::Error::other("replicas gone"));
+            }
+            into[head..].fill(expert as u8);
+            Ok(())
+        }
+
+        fn plane(&self, _layer: u32, _kind: ExpertKind, _expert: u32) -> Option<(u64, u64)> {
+            None
+        }
+    }
+
+    fn state(fail: (u32, u32)) -> Arc<StreamState> {
+        let lost = Arc::new(AtomicBool::new(false));
+        let source: Arc<dyn ExpertSource> = Arc::new(FailSource {
+            fail,
+            lost: lost.clone(),
+        });
+        let arena = Arena::new(&[SlotClass {
+            slot_size: 3 * STRIDE as usize,
+            slots: 4,
+        }])
+        .unwrap();
+        let pool = ExpertPool::new(
+            arena,
+            source.clone(),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            PoolGeometry {
+                layers: vec![UnitLayout::new([STRIDE; 3], [None; 3]).unwrap(); 2],
+                n_experts: N_EXPERTS,
+                expert_bytes: 0,
+            },
+            vec![0; 2],
+        );
+        let storage_lost = Box::new(move || lost.load(Ordering::SeqCst));
+        StreamState::new(
+            pool,
+            source,
+            storage_lost,
+            N_EXPERTS as usize * STRIDE as usize,
+        )
+        .unwrap()
+    }
+
+    fn all_slots_free(s: &StreamState) -> bool {
+        let inner = s.inner.lock().unwrap();
+        inner.free_slots.len() == STAGING_SLOTS as usize && inner.holds.is_empty()
+    }
+
+    #[test]
+    fn storage_loss_on_second_expert_fails_the_plane_and_release_reclaims_it() {
+        let s = state((0, 1));
+        let ids = [0, 1, 2, 3];
+        let mut out = [std::ptr::null(); 4];
+        assert_eq!(
+            s.source(0, 1, 1, &ids, &mut out),
+            Err(StreamError::StorageLost)
+        );
+        assert_eq!(s.stats().held, 1, "the failed plane's slot is held by seq");
+        s.release(1);
+        assert!(all_slots_free(&s));
+        s.release_all();
+        s.stop();
+    }
+
+    #[test]
+    fn storage_loss_seen_by_warm_first_does_not_abort() {
+        let s = state((0, 1));
+        s.warm(0, &[1]);
+        let mut out = [std::ptr::null(); 1];
+        assert_eq!(
+            s.source(0, 2, 1, &[1], &mut out),
+            Err(StreamError::StorageLost)
+        );
+        // The read-ahead now observes the failure and returns quietly.
+        s.warm(0, &[1]);
+        assert_eq!(
+            s.source(0, 3, 2, &[1], &mut out),
+            Err(StreamError::StorageLost)
+        );
+        s.release(2);
+        s.release_all();
+        assert!(all_slots_free(&s));
+        s.stop();
     }
 }

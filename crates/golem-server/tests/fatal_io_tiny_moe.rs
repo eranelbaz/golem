@@ -74,15 +74,40 @@ async fn replicas_lost_during_read_is_fatal_io_503() {
     fatal_io_503(TestHooks::fail_storage_during_read()).await;
 }
 
+/// The replicas die inside a streamed-prefill read on the stream reader
+/// thread: `stream_source` fails the compute (`llama_decode` -3) instead of
+/// aborting, and the request gets the 503.
+#[cfg(feature = "hip-tests")]
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_prefill_storage_loss_is_fatal_io_503() {
+    fatal_io_503_with(TestHooks::fail_storage_during_stream_read(), |c| {
+        golem_engine::config::EngineConfig {
+            prefill_stream: true,
+            prefill_ubatch: 64,
+            prefill_stream_min: 1,
+            n_ctx: 512,
+            ..c
+        }
+    })
+    .await;
+}
+
 async fn fatal_io_503(hooks: TestHooks) {
+    fatal_io_503_with(hooks, |c| c).await;
+}
+
+async fn fatal_io_503_with(
+    hooks: TestHooks,
+    tweak: impl FnOnce(golem_engine::config::EngineConfig) -> golem_engine::config::EngineConfig,
+) {
     let (model, manifest) = fixture();
-    let cfg = golem_engine::config::EngineConfig {
+    let cfg = tweak(golem_engine::config::EngineConfig {
         model_path: model,
         ram_experts_gib: 1,
         device_cache_experts: 4,
         manifest_path: Some(manifest),
         ..golem_server::test_engine_config()
-    };
+    });
     let app = router_with_hooks(cfg, hooks).await;
     let chat = || {
         Request::post("/v1/chat/completions")

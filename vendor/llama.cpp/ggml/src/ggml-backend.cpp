@@ -2722,10 +2722,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                 (int32_t) golem_stream_ids.size(),
                                                 golem_stream_ptrs.data());
                         }
-                        if (src_rc != 0) {
+                        if (src_rc != GOLEM_STREAM_SRC_OK) {
                             // ABI v11 abort: drain this split's issued H2D,
                             // hand back every issued seq (leases + staging),
                             // and fail the compute; the graph never runs.
+                            // Only a cancel aborts; storage loss fails.
                             golem_restore_ids();
                             for (int i = 0; i < sched->n_backends; i++) {
                                 ggml_backend_synchronize(sched->backends[i]);
@@ -2740,7 +2741,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 golem_evict_abandon_unfinished();
                             }
                             golem_in_flight_done(gctx);
-                            return GGML_STATUS_ABORTED;
+                            return src_rc == GOLEM_STREAM_SRC_CANCEL ? GGML_STATUS_ABORTED
+                                                                     : GGML_STATUS_FAILED;
                         }
                         for (size_t i6 = 0; i6 < golem_stream_ptrs.size(); ++i6) {
                             GGML_ASSERT(golem_stream_ptrs[i6] != NULL);

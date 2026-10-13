@@ -11,7 +11,8 @@
 // allocation into a failed compute instead of an abort; v13 lets ensure
 // fail a compute when the store cannot page the misses in; v14 reports
 // resident device bytes; v15: golem_inject_slab_alloc_failure exists only
-// under GOLEM_TEST_SUPPORT). Part of the vendored ggml include tree; the ABI is
+// under GOLEM_TEST_SUPPORT; stream source may return
+// GOLEM_STREAM_SRC_STORAGE_LOST (compute fails)). Part of the vendored ggml include tree; the ABI is
 // versioned — a change updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
@@ -127,10 +128,15 @@ typedef void (*golem_routing_fn)(void *payload, int32_t blk, const void *tensor,
  * the decode hot set (section 7.6.4). `seq` is C's monotonic plane counter -- the
  * matching golem_stream_release(seq) releases the leases and staging slot.
  * NULL hook -> golem_set_prefill_stream aborts (streaming unavailable).
- * Returns 0 = out_ptrs filled; 1 = abort (ABI v11, request cancelled): C
- * waits for the split's issued H2D, calls golem_stream_release(seq) for
- * every seq issued so far (this one included) and the compute returns
- * GGML_STATUS_ABORTED -- llama_decode returns 2. */
+ * Returns GOLEM_STREAM_SRC_OK = out_ptrs filled; otherwise C waits for the
+ * split's issued H2D and calls golem_stream_release(seq) for every seq
+ * issued so far (this one included): GOLEM_STREAM_SRC_CANCEL (ABI v11,
+ * request cancelled) -> GGML_STATUS_ABORTED, llama_decode returns 2;
+ * GOLEM_STREAM_SRC_STORAGE_LOST (v15) or any other value ->
+ * GGML_STATUS_FAILED, llama_decode returns -3. */
+#define GOLEM_STREAM_SRC_OK 0
+#define GOLEM_STREAM_SRC_CANCEL 1
+#define GOLEM_STREAM_SRC_STORAGE_LOST 2
 typedef int32_t (*golem_stream_source_fn)(void *payload, int32_t blk, int32_t kind,
                                        uint64_t seq, const int32_t *ids,
                                        int32_t n_ids, const void **out_ptrs);

@@ -856,6 +856,17 @@ impl SessionHooks {
             .store(true, Ordering::Relaxed);
     }
 
+    /// Test seam: the stream reader kills every replica right before its
+    /// next read.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_in_stream_read_for_test(&self) {
+        if let Some(s) = &self.state.stream {
+            let state = self.state.clone();
+            s.before_next_read_for_test(Box::new(move || state.fail_storage()));
+        }
+    }
+
     /// §6.5 prefetch and prediction counters.
     pub fn prefetch_stats(&self) -> PrefetchStats {
         let p = &self.state.pred;
@@ -1505,7 +1516,13 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // staging ring + reader thread (GPU-registered with the pool arena below).
     let stream = if stream_enabled {
         let slot_bytes = geo.n_experts as usize * max_plane_stride as usize;
-        let st = StreamState::new(pool.clone(), source.clone(), slot_bytes)
+        let health = store.clone();
+        let storage_lost = Box::new(move || {
+            health
+                .as_ref()
+                .is_some_and(|s| s.health() == golem_store::InstanceHealth::FatalIo)
+        });
+        let st = StreamState::new(pool.clone(), source.clone(), storage_lost, slot_bytes)
             .map_err(|e| EngineError::PoolInit(format!("stream staging ring: {e}")))?;
         Some(st)
     } else {
@@ -2147,8 +2164,9 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
 /// The prefill-stream byte-source hook (ABI v11, design §7.6): one call per
 /// streamed plane from the copy loop; translates the raw blk into the
 /// pool's dense-lead-adjusted layer and forwards to the stream state.
-/// Returns 1 (abort the compute) when the active turn's cancel flag is set,
-/// so a cancel lands within one plane of a streamed ubatch.
+/// Returns `GOLEM_STREAM_SRC_CANCEL` when the active turn's cancel flag is
+/// set, so a cancel lands within one plane of a streamed ubatch, and
+/// `GOLEM_STREAM_SRC_STORAGE_LOST` when the store lost the plane's bytes.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn stream_source(
     payload: *mut c_void,
@@ -2174,7 +2192,7 @@ pub extern "C" fn stream_source(
             }
         }
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return 1;
+            return raw::GOLEM_STREAM_SRC_CANCEL as i32;
         }
         let Some(s) = &h.stream else {
             p3_fatal("stream_source without stream state (streaming not enabled)".into());
@@ -2193,10 +2211,18 @@ pub extern "C" fn stream_source(
                 std::slice::from_raw_parts_mut(out_ptrs, n_ids.max(0) as usize),
             )
         };
-        s.source(blk - h.dense_lead as i32, kind, seq, ids, out);
+        if s.source(blk - h.dense_lead as i32, kind, seq, ids, out)
+            .is_err()
+        {
+            return raw::GOLEM_STREAM_SRC_STORAGE_LOST as i32;
+        }
         // Re-checked after the (possibly blocking) fill: C's abort path
         // releases this seq too, so the plane's leases never leak.
-        i32::from(cancel.is_some_and(|c| c.load(Ordering::Relaxed)))
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            raw::GOLEM_STREAM_SRC_CANCEL as i32
+        } else {
+            raw::GOLEM_STREAM_SRC_OK as i32
+        }
     })
 }
 

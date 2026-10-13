@@ -993,6 +993,16 @@ impl Session {
         }
     }
 
+    /// Test seam: the stream reader kills every replica right before its
+    /// next read, so a streamed-prefill read fails.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_in_stream_read_for_test(&self) {
+        if let Some(p) = &self.inner.p3 {
+            p.fail_storage_in_stream_read_for_test();
+        }
+    }
+
     /// Flushes the §11 per-step rows into `w` without destroying the
     /// recorder — every turn records (a `take`-style drain would leave turns
     /// 2+ empty). No-op when the timing CSV is disabled.

@@ -722,6 +722,14 @@ fn admit(
     {
         sch.session().fail_storage_in_read_for_test();
     }
+    #[cfg(any(test, feature = "test-support"))]
+    if health
+        .hooks
+        .fail_storage_in_stream_read
+        .swap(false, Ordering::SeqCst)
+    {
+        sch.session().fail_storage_in_stream_read_for_test();
+    }
     Ok(())
 }
 
@@ -1152,6 +1160,7 @@ pub struct TestHooks {
     slow_ms: u64,
     fail_storage: AtomicBool,
     fail_storage_in_read: AtomicBool,
+    fail_storage_in_stream_read: AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1188,6 +1197,15 @@ impl TestHooks {
     pub fn fail_storage_during_read() -> Self {
         Self {
             fail_storage_in_read: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// Every store replica dies inside the first job's first streamed
+    /// prefill read (the stream reader thread, not the page-in).
+    pub fn fail_storage_during_stream_read() -> Self {
+        Self {
+            fail_storage_in_stream_read: AtomicBool::new(true),
             ..Self::default()
         }
     }
