@@ -4,7 +4,7 @@
 //! the per-turn entry points (`Session::turn`, driving `slot::step`).
 #![allow(unsafe_code)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
@@ -337,9 +337,66 @@ fn init_backend(force_expert_offload: bool) {
             // SAFETY: FFI call into the vendored substrate; no invariants to uphold.
             unsafe { raw::golem_set_expert_offload_min_batch(1) };
         }
+        // SAFETY: FFI call into the vendored substrate; `llama_log` is a
+        // 'static fn that only reads `text` for the call's duration and is
+        // thread-safe (tracing + a thread-local, no borrowed state); llama.cpp
+        // may invoke it from any thread. It passes only valid ggml_log_level
+        // discriminants, so the non_exhaustive Rust enum stays defined.
+        unsafe { raw::llama_log_set(Some(llama_log), std::ptr::null_mut()) };
         // SAFETY: global one-time llama.cpp backend initialization; no invariants to uphold.
         unsafe { raw::llama_backend_init() };
     });
+}
+
+thread_local! {
+    /// Level of this thread's last non-CONT record; CONT lines inherit it.
+    static LAST_LOG_LEVEL: std::cell::Cell<raw::ggml_log_level> =
+        const { std::cell::Cell::new(raw::ggml_log_level::GGML_LOG_LEVEL_INFO) };
+}
+
+/// Routes llama.cpp/ggml logs into `tracing` so `RUST_LOG` filters them; the
+/// upstream default callback prints every level, DEBUG included, to stderr.
+/// With no subscriber installed, WARN/ERROR still reach stderr.
+///
+/// # Panics
+/// A panic inside the tracing subscriber propagates across this `extern "C"`
+/// boundary and aborts; subscriber code must not panic.
+unsafe extern "C" fn llama_log(
+    level: raw::ggml_log_level,
+    text: *const c_char,
+    _user_data: *mut c_void,
+) {
+    use raw::ggml_log_level as lvl;
+    let level = if level == lvl::GGML_LOG_LEVEL_CONT {
+        LAST_LOG_LEVEL.get()
+    } else {
+        LAST_LOG_LEVEL.set(level);
+        level
+    };
+    if text.is_null()
+        || (level == lvl::GGML_LOG_LEVEL_DEBUG
+            && !tracing::enabled!(target: "llama", tracing::Level::DEBUG))
+    {
+        return;
+    }
+    // SAFETY: llama.cpp passes a NUL-terminated buffer valid for this call.
+    let msg = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    if !tracing::dispatcher::has_been_set() {
+        if level == lvl::GGML_LOG_LEVEL_WARN || level == lvl::GGML_LOG_LEVEL_ERROR {
+            eprint!("{msg}");
+        }
+        return;
+    }
+    let msg = msg.trim_end();
+    if msg.is_empty() {
+        return;
+    }
+    match level {
+        lvl::GGML_LOG_LEVEL_DEBUG => tracing::debug!(target: "llama", "{msg}"),
+        lvl::GGML_LOG_LEVEL_WARN => tracing::warn!(target: "llama", "{msg}"),
+        lvl::GGML_LOG_LEVEL_ERROR => tracing::error!(target: "llama", "{msg}"),
+        _ => tracing::info!(target: "llama", "{msg}"),
+    }
 }
 
 /// The lightweight §4.3-item-4 probe: one decode must produce finite logits, and —
