@@ -10,7 +10,7 @@ sym=golem_inject_slab_alloc_failure
 archive() {
   local out
   out="$(cargo build --release --message-format=json "$@" |
-    jq -r 'select(.reason == "build-script-executed" and (.package_id | test("golem-llama-sys"))) | .out_dir' | tail -n1)"
+    jq -r 'select(.reason == "build-script-executed" and (.package_id | test("[/#]golem-llama-sys[#@]"))) | .out_dir' | tail -n1)"
   [[ -n "$out" ]] || { echo "no golem-llama-sys out_dir for: $*" >&2; exit 1; }
   local a=("$out"/build-*/build/ggml/src/libggml-base.a)
   [[ ${#a[@]} -eq 1 && -f "${a[0]}" ]] || { echo "libggml-base.a missing under $out" >&2; exit 1; }
@@ -19,7 +19,11 @@ archive() {
 
 prod="$(archive -p golem-cli)"
 # exit 0 iff archive $1 has symbol $sym (any nm type when $2 is empty, else type $2)
-has() { nm "$1" | awk -v s="$sym" -v t="${2:-}" '$NF == s && (t == "" || $(NF-1) == t) {f=1} END {exit !f}'; }
+has() {
+  local syms
+  syms="$(nm "$1")" || exit 1
+  awk -v s="$sym" -v t="${2:-}" '$NF == s && (t == "" || $(NF-1) == t) {f=1} END {exit !f}' <<<"$syms"
+}
 
 if has "$prod"; then
   echo "FAIL: $sym present in production archive $prod" >&2; exit 1
