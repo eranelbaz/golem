@@ -388,27 +388,35 @@ fn fake_serve(rt: &Path, id: &str, pid: u32, heartbeat_age: u64) {
 #[test]
 fn stop_kills_hung_instance_but_not_live_one() {
     let rt = common::tempdir_env();
-    let mut hung = std::process::Command::new("sleep")
-        .arg("120")
-        .spawn()
-        .unwrap();
-    let mut live = std::process::Command::new("sleep")
-        .arg("120")
-        .spawn()
-        .unwrap();
+    // Kills and reaps the `sleep` children even if an assertion panics.
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let sleep = || {
+        Reap(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let (mut hung, mut live) = (sleep(), sleep());
     let stopped = std::process::Command::new("kill")
-        .args(["-STOP", &hung.id().to_string()])
+        .args(["-STOP", &hung.0.id().to_string()])
         .status()
         .unwrap();
     assert!(stopped.success());
-    fake_serve(&rt, "hung", hung.id(), 60);
-    fake_serve(&rt, "live", live.id(), 0);
+    fake_serve(&rt, "hung", hung.0.id(), 60);
+    fake_serve(&rt, "live", live.0.id(), 0);
     let st = golem(&rt, &["stop", "live"]);
-    let live_alive = live.try_wait().unwrap().is_none();
+    let live_alive = live.0.try_wait().unwrap().is_none();
     let sh = golem(&rt, &["stop", "hung"]);
-    let hung_status = hung.try_wait().unwrap();
-    let _ = (live.kill(), hung.kill());
-    let _ = (live.wait(), hung.wait());
+    let hung_status = hung.0.try_wait().unwrap();
+    drop((live, hung));
     assert!(!st.status.success());
     assert!(live_alive, "live instance killed");
     let err = String::from_utf8_lossy(&sh.stderr);

@@ -86,7 +86,9 @@ fn h2d_columns_measured_only_with_async_h2d() {
             device_cache_experts: 4,
             n_predict: 4,
             async_h2d,
-            timing_csv: Some(std::env::temp_dir().join("golem-unused.csv")),
+            timing_csv: Some(
+                std::env::temp_dir().join(format!("golem-unused-{}.csv", std::process::id())),
+            ),
             ..off
         };
         let mut s = Session::new(&cfg).unwrap();

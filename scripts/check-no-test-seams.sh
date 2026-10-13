@@ -12,9 +12,11 @@ archive() {
   out="$(cargo build --release --message-format=json "$@" |
     jq -r 'select(.reason == "build-script-executed" and (.package_id | test("[/#]golem-llama-sys[#@]"))) | .out_dir' | tail -n1)"
   [[ -n "$out" ]] || { echo "no golem-llama-sys out_dir for: $*" >&2; exit 1; }
-  local a=("$out"/build-*/build/ggml/src/libggml-base.a)
-  [[ ${#a[@]} -eq 1 && -f "${a[0]}" ]] || { echo "libggml-base.a missing under $out" >&2; exit 1; }
-  echo "${a[0]}"
+  local backend
+  backend="$(sed -n 's/^const BACKEND: Backend = Backend::\(.*\);$/\1/p' "$out/backend_info.rs" | tr '[:upper:]' '[:lower:]')"
+  local a="$out/build-$backend/build/ggml/src/libggml-base.a"
+  [[ -n "$backend" && -f "$a" ]] || { echo "libggml-base.a missing under $out (backend '$backend')" >&2; exit 1; }
+  echo "$a"
 }
 
 prod="$(archive -p golem-cli)"

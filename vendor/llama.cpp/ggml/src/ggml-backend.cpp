@@ -156,6 +156,7 @@ static void golem_cs_free(golem_ctx_t ctx) {
     ctx->cs = nullptr;
     ctx->cs_t_n = 0;
     ctx->cs_t_overflow = false;
+    ctx->cs_bytes = 0;
 }
 
 // Orders the copy stream after everything already queued on the split

@@ -163,6 +163,11 @@ fn hung(i: &golem_registry::Instance) -> Result<bool, Box<dyn Error>> {
     if !stale(i) {
         return Ok(false);
     }
+    eprintln!(
+        "golem: {} not responding; checking heartbeat ({} s)",
+        i.id,
+        HUNG_AFTER.as_secs()
+    );
     std::thread::sleep(HUNG_AFTER);
     match Registry::open()?.find(&i.id) {
         Ok(e) => Ok(stale(&e)),

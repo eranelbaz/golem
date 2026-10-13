@@ -39,7 +39,6 @@ jobs:
       - run: >-
           cargo clippy -p golem-engine -p golem-cli -p golem-server --all-targets
           --features golem-engine/hip-tests,golem-cli/hip-tests,golem-server/hip-tests -- -D warnings
-      - run: scripts/check-no-test-seams.sh
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -59,6 +58,20 @@ jobs:
       - run: python3 -m pip install --quiet 'pytest==8.4.2' openai
       - run: python3 -m pytest tests -q
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Release builds of golem-cli (production feature unification) and the
+  # engine; own job so its two release builds stay out of `test`'s budget.
+  test-seams:
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOLEM_LLAMA_SYS_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check-no-test-seams.sh
 
   # P1 gate: upstream vendored ctest + unset-hooks byte-identity.
   # No build-substrate.sh (HIP-only, no args): CPU substrate comes from

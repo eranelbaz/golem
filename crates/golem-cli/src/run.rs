@@ -772,6 +772,14 @@ fn one_shot(
         eprintln!("error: routing trace: {e}");
     }
     println!();
+    interrupted(shutdown)
+}
+
+/// A signal cut the turn short: the reply is truncated, so exit non-zero.
+fn interrupted(shutdown: &crate::sys::Shutdown) -> Result<(), Box<dyn Error>> {
+    if shutdown.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("golem: interrupted".into());
+    }
     Ok(())
 }
 
@@ -974,6 +982,7 @@ fn repl(
         match session.turn(&req, &mut emit) {
             Ok(_) if shutdown.cancel.load(std::sync::atomic::Ordering::SeqCst) => {
                 println!();
+                eprintln!("golem: interrupted");
                 return Ok(());
             }
             Ok(_) => {
@@ -1090,7 +1099,8 @@ fn attach(
         Ok::<_, Box<dyn Error>>(())
     };
     if let Some(p) = prompt {
-        return turn(&mut history, p.to_owned());
+        turn(&mut history, p.to_owned())?;
+        return interrupted(&shutdown);
     }
     let mut lines = shutdown.stdin_lines();
     eprintln!("golem: multi-turn chat; /reset clears history, /exit quits");
