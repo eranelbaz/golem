@@ -52,6 +52,9 @@ pub struct ModelFacts {
     pub top_k: u32,
     /// Live layers carrying routed-expert planes.
     pub expert_layers: u32,
+    /// Index of the first block carrying routed-expert planes (the dense
+    /// lead length).
+    pub first_expert_block: u32,
     /// Largest per-expert plane stride (bytes of one expert in one plane).
     pub max_plane_stride: u64,
     /// Σ routed-expert plane bytes over live layers.
@@ -91,6 +94,7 @@ impl ModelFacts {
             n_expert: hp_u32(&kvs, "expert_count")?,
             top_k: hp_u32(&kvs, "expert_used_count")?,
             expert_layers: 0,
+            first_expert_block: 0,
             max_plane_stride: 0,
             expert_bytes_total: 0,
             kv_per_token: 0,
@@ -133,6 +137,7 @@ impl ModelFacts {
             }
         }
         m.expert_layers = expert_blk.iter().filter(|&&b| b).count() as u32;
+        m.first_expert_block = expert_blk.iter().position(|&b| b).unwrap_or(0) as u32;
         m.state_terms(&kvs, live.end as usize)?;
         Ok(m)
     }
@@ -631,6 +636,7 @@ mod tests {
             n_expert: 288,
             top_k: 8,
             expert_layers: 42,
+            first_expert_block: 0,
             max_plane_stride: 6_881_280,
             expert_bytes_total: 42 * 288 * 3 * 4_718_592,
             kv_per_token: 19_712,

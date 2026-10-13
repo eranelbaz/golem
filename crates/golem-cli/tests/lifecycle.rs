@@ -263,7 +263,7 @@ fn wait_for_ids(rt: &Path) -> Vec<String> {
     }
 }
 
-/// #91: `golem stop` on an in-process `run` blocked on idle stdin: the
+/// `golem stop` on an in-process `run` blocked on idle stdin: the
 /// SIGTERM handler wakes the REPL, which returns through the normal drops.
 #[test]
 fn stop_in_process_run_with_idle_stdin_exits_normally() {
@@ -383,7 +383,7 @@ fn fake_serve(rt: &Path, id: &str, pid: u32, heartbeat_age: u64) {
     .unwrap();
 }
 
-/// #91: a SIGSTOPped instance with a stale heartbeat and no socket is
+/// A SIGSTOPped instance with a stale heartbeat and no socket is
 /// killed by a plain `stop`; a fresh heartbeat with a dead socket is not.
 #[test]
 fn stop_kills_hung_instance_but_not_live_one() {

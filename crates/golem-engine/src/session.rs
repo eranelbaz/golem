@@ -2201,13 +2201,17 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
 
 /// Pool off: routed-expert bytes of the top `n_gpu_layers` expert layers not
 /// pinned below `cpu_moe_layers`, at the mean per-layer size. Target, all
-/// offloaded: 185.5 GB ≫ 24 GiB; all pinned: 0. Approximation: counts layers
-/// from the first expert block, ignoring the dense lead and NextN blocks.
+/// offloaded: 185.5 GB ≫ 24 GiB; all pinned: 0. `cpu_moe_layers` counts
+/// blocks from 0, so dense-lead blocks pin nothing; each missed layer would
+/// under-count 288 × 3 × ~5.1 MB ≈ 4.4 GB. Upper bound: assumes every
+/// offloaded block (top `n_gpu_layers`) carries experts.
 fn resident_expert_bytes(config: &EngineConfig, m: &golem_plan::ModelFacts) -> u64 {
     let layers = m.expert_layers;
-    let gpu = config
-        .n_gpu_layers
-        .min(layers.saturating_sub(config.cpu_moe_layers.unwrap_or(0)));
+    let pinned = config
+        .cpu_moe_layers
+        .unwrap_or(0)
+        .saturating_sub(m.first_expert_block);
+    let gpu = config.n_gpu_layers.min(layers.saturating_sub(pinned));
     m.expert_bytes_total / u64::from(layers.max(1)) * u64::from(gpu)
 }
 
@@ -2339,6 +2343,7 @@ mod tests {
             n_expert: 288,
             top_k: 8,
             expert_layers: 42,
+            first_expert_block: 0,
             max_plane_stride: 6_881_280,
             expert_bytes_total: 185_478_414_336,
             kv_per_token: 19_712,
@@ -2398,6 +2403,7 @@ mod tests {
             n_expert: 8,
             top_k: 2,
             expert_layers: 4,
+            first_expert_block: 0,
             max_plane_stride: 1 << 20,
             expert_bytes_total: 4 << 30,
             kv_per_token: 1024,
@@ -2419,6 +2425,24 @@ mod tests {
         let r = check_plan(&cfg, &m, 4 << 30).unwrap();
         assert_eq!(r.term("resident_experts"), 0);
         assert_eq!(r.term("ram_pool"), 0);
+    }
+
+    #[test]
+    fn resident_experts_skip_dense_lead() {
+        let m = golem_plan::ModelFacts {
+            first_expert_block: 1,
+            ..glm()
+        };
+        let cfg = EngineConfig {
+            n_gpu_layers: 99,
+            cpu_moe_layers: Some(2),
+            ..EngineConfig::default()
+        };
+        let per_layer = m.expert_bytes_total / u64::from(m.expert_layers);
+        assert_eq!(
+            resident_expert_bytes(&cfg, &m),
+            per_layer * u64::from(m.expert_layers - 1)
+        );
     }
 
     #[test]
