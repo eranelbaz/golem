@@ -405,13 +405,17 @@ fn run_child(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     let pid = child.id();
-    guard.update(|i| i.children.push(pid));
+    let entry = golem_registry::Child::of(pid);
+    if let Ok(c) = entry {
+        guard.update(|i| i.children.push(c));
+    }
     // The child checks ownership only after this byte: its pid is in the
     // entry first. Dropping stdin on error makes the child's read fail.
     let go = child.stdin.take().map(|mut s| s.write_all(b"g"));
     let out = child.wait_with_output();
-    guard.update(|i| i.children.retain(|&c| c != pid));
+    guard.update(|i| i.children.retain(|c| c.pid() != pid));
     let out = out?;
+    entry?;
     go.ok_or("child stdin missing")??;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
@@ -642,7 +646,9 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
     let entry = Registry::open()?.find(parent)?;
     if entry.kind != "optimize"
         || entry.pid != crate::sys::parent_pid()
-        || !entry.children.contains(&std::process::id())
+        || !entry
+            .children
+            .contains(&golem_registry::Child::of(std::process::id())?)
     {
         return Err(format!("entry `{parent}` does not own this measurement").into());
     }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use golem_engine::ParityStep;
+use golem_engine::TurnRequest;
 use golem_engine::atomic::write_atomic;
 use golem_engine::config::{EngineConfig, PrefetchMode, Residency, VramOrder};
 use golem_engine::gguf::read_metadata;
@@ -520,6 +521,10 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Before the entry exists: a SIGTERM from `golem stop` always returns
+    // through the normal §3.4 drops, and a second signal still kills a
+    // wedged load.
+    let shutdown = crate::sys::install_shutdown()?;
     let guard = crate::serve::register(
         &reg,
         crate::serve::new_id(),
@@ -559,11 +564,17 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         (Some(prompt), Some(dump)) => {
             one_shot_parity(&mut session, &model, prompt, dump, config.n_predict)
         }
-        (Some(prompt), None) => one_shot(&mut session, prompt, &mut timing_out, &mut trace_out),
+        (Some(prompt), None) => one_shot(
+            &mut session,
+            prompt,
+            &shutdown,
+            &mut timing_out,
+            &mut trace_out,
+        ),
         // The dump records exactly one prompt (header `prompt_tokens`), so a
         // multi-turn REPL dump would be ill-defined — refuse it up front.
         (None, Some(_)) => Err("--parity-dump requires --prompt".into()),
-        (None, None) => repl(&mut session, &mut timing_out, &mut trace_out),
+        (None, None) => repl(&mut session, &shutdown, &mut timing_out, &mut trace_out),
     };
     // §6.5 metrics for the whole run: stderr, and the timing CSV's trailer.
     if let Some(stats) = session
@@ -738,14 +749,16 @@ fn fork_commit() -> String {
 fn one_shot(
     session: &mut Session,
     prompt: &str,
+    shutdown: &crate::sys::Shutdown,
     timing_out: &mut Option<std::fs::File>,
     trace_out: &mut Option<std::fs::File>,
 ) -> Result<(), Box<dyn Error>> {
-    session.chat_turn(
-        &[ChatTurn {
+    session.turn(
+        &TurnRequest::new(&[ChatTurn {
             role: "user",
             content: prompt,
-        }],
+        }])
+        .cancel(Some(shutdown.cancel.clone())),
         &mut emit_stdout,
     )?;
     // Timing CSV is best-effort post-streaming: log, don't fail the run
@@ -918,21 +931,19 @@ fn model_identity(path: &Path) -> std::io::Result<(String, u64)> {
 /// the delta. `/reset` drops it, `/exit` ends the session.
 fn repl(
     session: &mut Session,
+    shutdown: &crate::sys::Shutdown,
     timing_out: &mut Option<std::fs::File>,
     trace_out: &mut Option<std::fs::File>,
 ) -> Result<(), Box<dyn Error>> {
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
+    let mut lines = shutdown.stdin_lines();
     // (role, content) in send order; owned because each turn borrows it all.
     let mut history: Vec<(&'static str, String)> = Vec::new();
     eprintln!("golem: multi-turn chat; /reset clears history, /exit quits");
     loop {
         eprint!("golem> ");
         let _ = std::io::stderr().flush();
-        let line = match lines.next() {
-            Some(Ok(line)) => line,
-            Some(Err(e)) => return Err(e.into()),
-            None => return Ok(()),
+        let Some(line) = lines.next_line()? else {
+            return Ok(());
         };
         match line.trim() {
             "" => continue,
@@ -957,7 +968,12 @@ fn repl(
             reply.push_str(piece);
             emit_stdout(piece);
         };
-        match session.chat_turn(&turns, &mut emit) {
+        let req = TurnRequest::new(&turns).cancel(Some(shutdown.cancel.clone()));
+        match session.turn(&req, &mut emit) {
+            Ok(_) if shutdown.cancel.load(std::sync::atomic::Ordering::SeqCst) => {
+                println!();
+                return Ok(());
+            }
             Ok(_) => {
                 history.push(("assistant", reply));
                 if let Err(e) = flush_timing(session, timing_out) {
@@ -1065,9 +1081,10 @@ fn attach(
     if let Some(p) = prompt {
         return turn(&mut history, p.to_owned());
     }
+    let shutdown = crate::sys::install_shutdown()?;
+    let mut lines = shutdown.stdin_lines();
     eprintln!("golem: multi-turn chat; /reset clears history, /exit quits");
-    for line in std::io::stdin().lock().lines() {
-        let line = line?;
+    while let Some(line) = lines.next_line()? {
         match line.trim() {
             "" => continue,
             "/exit" | "/quit" => break,

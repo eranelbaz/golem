@@ -163,7 +163,12 @@ fn envelope(e: &(dyn std::error::Error + 'static)) -> ErrorEnvelope {
     if let Some(env) = e.downcast_ref::<ErrorEnvelope>() {
         return env.clone();
     }
-    let code = if e.is::<golem_server::ServeError>() {
+    let code = if matches!(
+        e.downcast_ref::<golem_server::ServeError>(),
+        Some(golem_server::ServeError::StorageUnavailable)
+    ) {
+        ErrorCode::StorageUnavailable
+    } else if e.is::<golem_server::ServeError>() {
         ErrorCode::BackendUnavailable
     } else if matches!(
         e.downcast_ref::<golem_registry::RegistryError>(),
@@ -172,6 +177,8 @@ fn envelope(e: &(dyn std::error::Error + 'static)) -> ErrorEnvelope {
         ErrorCode::InstanceNotFound
     } else if let Some(golem_registry::RegistryError::Control(env)) = e.downcast_ref() {
         return env.clone();
+    } else if e.is::<stop::StopTimeout>() {
+        ErrorCode::StopTimeout
     } else if e.is::<run::PlanInfeasible>()
         || matches!(
             e.downcast_ref::<golem_engine::error::EngineError>(),
@@ -322,4 +329,19 @@ fn wait_ready(rd: std::fs::File, log: &std::path::Path, timeout: Duration) -> ! 
         envelope => eprintln!("{envelope}"),
     }
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_maps_stop_timeout_and_storage_unavailable() {
+        let e = stop::StopTimeout::for_test("i1");
+        assert_eq!(envelope(&e).error.code, ErrorCode::StopTimeout);
+        let e = golem_server::ServeError::StorageUnavailable;
+        assert_eq!(envelope(&e).error.code, ErrorCode::StorageUnavailable);
+        let e = golem_server::ServeError::WorkerDied("fatal");
+        assert_eq!(envelope(&e).error.code, ErrorCode::BackendUnavailable);
+    }
 }

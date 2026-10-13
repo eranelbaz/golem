@@ -519,7 +519,7 @@ One envelope everywhere (HTTP + CLI + logs):
              "detail": { /* structured, e.g. per-tier byte overruns */ } } }
 ```
 
-Codes (stable, documented): `golem_backend_unavailable`, `golem_plan_infeasible`, `golem_model_mismatch`, `golem_multimodal_unsupported`, `golem_unsupported_field`, `golem_storage_unavailable`, `golem_instance_not_found`, `golem_not_found`, `golem_busy`, `golem_invalid_request`. All 4xx/5xx carry `code`; the doc table maps codes → remediation.
+Codes (stable, documented): `golem_backend_unavailable`, `golem_plan_infeasible`, `golem_model_mismatch`, `golem_multimodal_unsupported`, `golem_unsupported_field`, `golem_storage_unavailable`, `golem_instance_not_found`, `golem_not_found`, `golem_busy`, `golem_stop_timeout` (CLI only: `golem stop` gave up waiting for the exit; retry with `--force`), `golem_invalid_request`. All 4xx/5xx carry `code`; the doc table maps codes → remediation.
 
 ### 8.5 Server posture
 
@@ -540,7 +540,7 @@ Binds `127.0.0.1` by default (port: auto-select, recorded in the registry; `--ho
 
 ### 9.2 Instance registry (D11)
 
-`$XDG_RUNTIME_DIR/golem/instances/<id>.json`: id (slug: model + port + short uuid), pid, http endpoint, model name, config hash, started-at, health cache. Liveness = PID exists **and** UDS heartbeat (< 5 s old). Stale entries are reaped by any golem client that observes them (registry is advisory state, not a database). Control (stop, status detail) goes over a per-instance UDS carrying the same JSON-RPC-ish envelope as the error model — `golem stop` works even when HTTP is wedged.
+`$XDG_RUNTIME_DIR/golem/instances/<id>.json`: id (slug: model + port + short uuid), pid, http endpoint, model name, config hash, started-at, health cache. Liveness = PID exists **and** UDS heartbeat (< 5 s old). *Amended 2026-10-13:* an entry is stale (reaped) only when its PID is gone or reused; heartbeat staleness marks a live instance **hung**, never reaped — `golem stop` escalates it to SIGKILL when the control socket is also unreachable and the heartbeat stays stale over two samples ≥ 10 s apart. Stale entries are reaped by any golem client that observes them (registry is advisory state, not a database). Control (stop, status detail) goes over a per-instance UDS carrying the same JSON-RPC-ish envelope as the error model — `golem stop` works even when HTTP is wedged.
 
 ### 9.3 Multiple instances / models
 

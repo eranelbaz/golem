@@ -228,6 +228,43 @@ fn signal_refuses_reused_pid() {
     ));
 }
 
+#[test]
+fn signal_skips_child_with_reused_pid() {
+    let mut owner = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut i = inst("x", owner.id(), now());
+    i.children = vec![golem_registry::Child::Timed {
+        pid: child.id(),
+        start_time: 1,
+    }];
+    golem_registry::signal(&i, libc::SIGKILL).unwrap();
+    owner.wait().unwrap();
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "reused child pid killed"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn bare_pid_children_still_load() {
+    let d = tempfile_dir();
+    let r = Registry::at(d.clone(), d.parent().unwrap().join("admit.lock"));
+    let mut v = serde_json::to_value(inst("old", std::process::id(), now())).unwrap();
+    v["children"] = serde_json::json!([4242]);
+    std::fs::write(d.join("old.json"), v.to_string()).unwrap();
+    let live = r.list_live().unwrap();
+    assert_eq!(live[0].children, [golem_registry::Child::Bare(4242)]);
+    golem_registry::signal(&live[0], 0).unwrap();
+}
+
 /// #81: an optimize sweep is exclusive in both directions, and
 /// `allow_overcommit` bypasses neither rule.
 #[test]

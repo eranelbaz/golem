@@ -56,11 +56,45 @@ pub struct Instance {
     /// Unix seconds of the last heartbeat.
     pub heartbeat_at: u64,
     /// Helper processes owned by this instance.
-    pub children: Vec<u32>,
+    pub children: Vec<Child>,
     /// The requested configuration, for the §9.4 [`compatible`] check
     /// beyond the `config_hash` fast path.
     #[serde(default)]
     pub config: Option<EffectiveConfig>,
+}
+
+/// A helper process; `start_time` guards against pid reuse like
+/// [`Instance::pid_start_time`]. Entries from before start times were
+/// recorded deserialise from a bare pid with `start_time: None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Child {
+    /// Current form.
+    Timed {
+        /// Process id.
+        pid: u32,
+        /// `/proc/<pid>/stat` start time (clock ticks).
+        start_time: u64,
+    },
+    /// Legacy bare pid; never signalled.
+    Bare(u32),
+}
+
+impl Child {
+    /// Records `pid` with its current start time.
+    pub fn of(pid: u32) -> Result<Self, RegistryError> {
+        Ok(Self::Timed {
+            pid,
+            start_time: pid_start_time(pid)?,
+        })
+    }
+
+    /// Process id.
+    pub fn pid(self) -> u32 {
+        match self {
+            Self::Timed { pid, .. } | Self::Bare(pid) => pid,
+        }
+    }
 }
 
 /// The requested configuration an instance was started with; its canonical
@@ -199,14 +233,25 @@ fn owner_alive(i: &Instance) -> bool {
 
 /// Sends `sig` to the instance's `children`, then its process;
 /// `InstanceNotFound` once the owner exited or its pid was reused, so a
-/// stale entry never kills a stranger. A child that already exited is
-/// skipped.
+/// stale entry never kills a stranger. A child that already exited, whose
+/// pid was reused, or that has no recorded start time is skipped.
 pub fn signal(i: &Instance, sig: libc::c_int) -> Result<(), RegistryError> {
     if !owner_alive(i) {
         return Err(RegistryError::InstanceNotFound(i.id.clone()));
     }
     for &c in &i.children {
-        match sys::signal(c, sig) {
+        let Child::Timed { pid, start_time } = c else {
+            tracing::warn!(
+                "child pid {} of {} has no start time; skipped",
+                c.pid(),
+                i.id
+            );
+            continue;
+        };
+        if pid_start_time(pid).is_ok_and(|t| t != start_time) {
+            continue;
+        }
+        match sys::signal(pid, sig) {
             Err(e) if e.raw_os_error() != Some(libc::ESRCH) => return Err(e.into()),
             _ => {}
         }

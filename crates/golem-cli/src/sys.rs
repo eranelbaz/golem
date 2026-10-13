@@ -1,10 +1,13 @@
 //! The CLI's process-control FFI for `serve --detach`: pipe, fork, setsid,
-//! stdio redirection, and the optimize child's parent-death signal.
+//! stdio redirection, the optimize child's parent-death signal, and the
+//! `run` shutdown signal handlers.
 #![allow(unsafe_code)]
 
 use std::fs::File;
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io::{self, BufRead};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// `(read, write)` ends of a close-on-exec pipe.
 pub fn pipe() -> io::Result<(File, File)> {
@@ -99,4 +102,140 @@ pub fn parent_pid() -> u32 {
 pub fn exit_now(code: i32) -> ! {
     // SAFETY: terminates the process; nothing runs afterwards.
     unsafe { libc::_exit(code) }
+}
+
+static SHUTDOWN_FD: AtomicI32 = AtomicI32::new(-1);
+static SIGNALLED: AtomicBool = AtomicBool::new(false);
+static CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+extern "C" fn on_shutdown(sig: libc::c_int) {
+    if SIGNALLED.swap(true, Ordering::SeqCst) {
+        // SAFETY: signal(2) and raise(3) are async-signal-safe; SIG_DFL
+        // makes the re-raised signal terminate the process.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+        return;
+    }
+    if let Some(c) = CANCEL.get() {
+        c.store(true, Ordering::SeqCst);
+    }
+    let fd = SHUTDOWN_FD.load(Ordering::SeqCst);
+    // SAFETY: write(2) is async-signal-safe; `fd` is the non-blocking write
+    // end leaked by `install_shutdown`, so it stays open and never blocks.
+    unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+}
+
+/// Shutdown requested by SIGINT/SIGTERM: the handler sets the turn cancel
+/// flag and makes the read end of a self-pipe readable for good. A second
+/// signal restores `SIG_DFL` and re-raises, killing a wedged process.
+pub struct Shutdown {
+    pipe: File,
+    /// Set on the first signal; pass as the turn's cancel flag.
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Installs the SIGINT/SIGTERM handlers. Call once per process.
+pub fn install_shutdown() -> io::Result<Shutdown> {
+    let (r, w) = pipe()?;
+    // SAFETY: `w` is an open fd owned by a live `File`; F_SETFL takes an int.
+    if unsafe { libc::fcntl(w.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let cancel = CANCEL.get_or_init(Arc::default).clone();
+    SHUTDOWN_FD.store(w.into_raw_fd(), Ordering::SeqCst);
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: a zeroed sigaction is a valid empty mask with no flags;
+        // `on_shutdown` touches only atomics and calls async-signal-safe
+        // functions.
+        let rc = unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_shutdown as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigaction(sig, &sa, std::ptr::null_mut())
+        };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(Shutdown { pipe: r, cancel })
+}
+
+impl Shutdown {
+    /// Line reader over stdin that returns `None` at EOF or on shutdown.
+    pub fn stdin_lines(&self) -> StdinLines<'_> {
+        StdinLines {
+            buf: Vec::new(),
+            pipe: &self.pipe,
+            eof: false,
+        }
+    }
+}
+
+/// [`BufRead::lines`] over stdin that also wakes on the shutdown pipe.
+/// Complete lines already read are served before polling again.
+pub struct StdinLines<'a> {
+    buf: Vec<u8>,
+    pipe: &'a File,
+    eof: bool,
+}
+
+impl StdinLines<'_> {
+    /// The next line without its `\n`/`\r\n`; `None` at EOF or shutdown.
+    pub fn next_line(&mut self) -> io::Result<Option<String>> {
+        loop {
+            if let Some(n) = self.buf.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = self.buf.drain(..=n).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return utf8(line).map(Some);
+            }
+            if self.eof {
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                return utf8(std::mem::take(&mut self.buf)).map(Some);
+            }
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.pipe.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: io::stdin().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: `fds` is a valid 2-element pollfd array of open fds.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } == -1 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if fds[0].revents != 0 {
+                return Ok(None);
+            }
+            if fds[1].revents != 0 {
+                // Take everything std buffered, so poll never misses data
+                // already pulled off the fd.
+                let mut s = io::stdin().lock();
+                let got = s.fill_buf()?;
+                self.eof = got.is_empty();
+                self.buf.extend_from_slice(got);
+                let n = got.len();
+                s.consume(n);
+            }
+        }
+    }
+}
+
+fn utf8(b: Vec<u8>) -> io::Result<String> {
+    String::from_utf8(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }

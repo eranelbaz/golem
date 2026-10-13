@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 
 use axum::body::Body;
-use golem_server::test_support::{TestHooks, router_with_hooks};
+use golem_server::ServeError;
+use golem_server::test_support::{TestHooks, router_with_hooks, serve_on_port0};
 use http::Request;
 use tower::ServiceExt;
 
@@ -90,6 +91,47 @@ async fn streamed_prefill_storage_loss_is_fatal_io_503() {
         }
     })
     .await;
+}
+
+/// A server left in `fatal-io` reports it from `serve` at shutdown, so the
+/// CLI exits non-zero with `golem_storage_unavailable`.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_returns_storage_unavailable_after_fatal_io() {
+    use std::io::{Read, Write};
+    let (model, manifest) = fixture();
+    let cfg = golem_engine::config::EngineConfig {
+        model_path: model,
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        manifest_path: Some(manifest),
+        ..golem_server::test_engine_config()
+    };
+    let (addr, stop, task) = serve_on_port0(cfg, TestHooks::fail_storage_after_admit()).await;
+    let resp = tokio::task::spawn_blocking(move || {
+        let body =
+            serde_json::json!({"model":"tiny-moe","messages":[{"role":"user","content":"hi"}],
+            "max_tokens":8,"temperature":0})
+            .to_string();
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        write!(
+            s,
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).unwrap();
+        r
+    })
+    .await
+    .unwrap();
+    assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+    stop.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ServeError::StorageUnavailable)
+    ));
 }
 
 async fn fatal_io_503(hooks: TestHooks) {

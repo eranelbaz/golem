@@ -447,7 +447,7 @@ fn stop_optimize_kills_measuring_child() {
                 .find_map(|e| {
                     let v: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
-                    let c = v["children"].as_array()?.first()?.as_u64()?;
+                    let c = v["children"].as_array()?.first()?["pid"].as_u64()?;
                     Some((v["id"].as_str()?.to_owned(), c))
                 })
         });

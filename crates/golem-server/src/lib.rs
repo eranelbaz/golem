@@ -67,6 +67,9 @@ pub enum ServeError {
     /// The decode worker died (panic or fatal engine error); torn down.
     #[error("decode worker died: {0}")]
     WorkerDied(&'static str),
+    /// Every replica of a shard became unreadable (`fatal-io`, §5.2).
+    #[error("storage unavailable: every replica of a shard is unreadable")]
+    StorageUnavailable,
 }
 
 /// Bound on the worker join at shutdown: one non-abortable `llama_decode`
@@ -258,6 +261,7 @@ async fn serve_listener(
     served?;
     match health.get() {
         s @ ServeState::Fatal => Err(ServeError::WorkerDied(s.as_str())),
+        ServeState::FatalIo => Err(ServeError::StorageUnavailable),
         _ => Ok(()),
     }
 }
