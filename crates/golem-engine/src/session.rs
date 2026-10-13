@@ -685,10 +685,14 @@ impl Session {
         // The copy stream is a HIP stream of the split backend's context; the
         // CPU substrate has none, and without the RAM pool there is no pooled
         // H2D to move onto it.
-        if config.async_h2d && (substrate_backend() == Backend::Cpu || config.ram_experts_gib == 0)
-        {
+        if config.async_h2d && substrate_backend() == Backend::Cpu {
             return Err(EngineError::InvalidConfig(
                 "async_h2d: no dedicated H2D copy stream in this substrate".into(),
+            ));
+        }
+        if config.async_h2d && config.ram_experts_gib == 0 {
+            return Err(EngineError::InvalidConfig(
+                "async_h2d: needs the RAM expert pool (ram_experts_gib > 0)".into(),
             ));
         }
         if config.o_direct && (config.manifest_path.is_none() || config.ram_experts_gib == 0) {
@@ -738,6 +742,15 @@ impl Session {
                 return Err(e);
             }
         };
+        // One copy stream per hook ctx: a second device backend would hit the
+        // C-side FFI abort in golem_cs_begin. Queried after the load — the
+        // registry must not be touched before `init_backend` sets the
+        // op-offload threshold.
+        if config.async_h2d && golem_llama_sys::gpu_device_count() > 1 {
+            return Err(EngineError::InvalidConfig(
+                "async_h2d: supports a single GPU device".into(),
+            ));
+        }
         // Derived K needs the resident weights, KV and compute buffer
         // (ruling R3). On error the slabs are already freed by the fit.
         if let Some(p) = p3.as_mut() {

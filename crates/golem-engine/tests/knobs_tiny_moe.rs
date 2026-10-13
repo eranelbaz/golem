@@ -136,6 +136,7 @@ fn o_direct_without_manifest_is_refused() {
 }
 
 /// CPU substrate: no copy stream exists, so `async_h2d` stays refused.
+/// (An auto-detected HIP substrate accepts it with unchanged output.)
 #[cfg(not(feature = "hip-tests"))]
 #[test]
 fn async_h2d_default_keeps_output_and_on_is_refused() {
@@ -146,8 +147,65 @@ fn async_h2d_default_keeps_output_and_on_is_refused() {
         async_h2d: true,
         ..base
     };
-    let e = greedy(&on).unwrap_err().to_string();
-    assert!(e.contains("async_h2d"), "{e}");
+    let r = greedy(&on);
+    if golem_llama_sys::substrate_backend() == golem_llama_sys::Backend::Cpu {
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("async_h2d"), "{e}");
+    } else {
+        // HIP substrate without the offload fixture: the copy stream exists
+        // but nothing is pooled onto the device, so output is unchanged.
+        let off = EngineConfig {
+            async_h2d: false,
+            ..on
+        };
+        assert_eq!(r.expect("async_h2d on HIP"), greedy(&off).unwrap());
+    }
+}
+
+/// HIP: async_h2d without the RAM expert pool has no pooled H2D to move.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn async_h2d_without_pool_is_refused() {
+    let cfg = EngineConfig {
+        async_h2d: true,
+        ram_experts_gib: 0,
+        ..pooled()
+    };
+    let e = greedy(&cfg).unwrap_err().to_string();
+    assert!(e.contains("ram_experts_gib > 0"), "{e}");
+}
+
+/// HIP: GGML_CUDA_GRAPH_OPT=1 owns the copy-stream index. The workspace
+/// denies `unsafe` (`env::set_var`), so the test re-runs itself in a child
+/// process with the variable set; nothing else sees it.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn async_h2d_with_graph_opt_is_refused() {
+    const NAME: &str = "async_h2d_with_graph_opt_is_refused";
+    if std::env::var_os("GGML_CUDA_GRAPH_OPT").is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact"])
+            .env("GGML_CUDA_GRAPH_OPT", "1")
+            .output()
+            .expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // A filter that matched nothing also exits 0: require the run.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let off = common::offload::offload_config();
+    let cfg = EngineConfig {
+        n_gpu_layers: off.n_gpu_layers,
+        cpu_moe_layers: off.cpu_moe_layers,
+        async_h2d: true,
+        ..pooled()
+    };
+    let e = greedy(&cfg).unwrap_err().to_string();
+    assert!(e.contains("GGML_CUDA_GRAPH_OPT"), "{e}");
 }
 
 /// HIP: pooled H2D on the dedicated copy stream decodes bit-identically to
@@ -230,11 +288,19 @@ fn async_h2d_on_matches_off_output() {
         assert_eq!(turn(&mut s, NEXT), reference, "turn after cancel");
         drop(s);
 
-        // Storage loss mid-stream fails the turn; a fresh session serves.
+        // Storage loss mid-stream fails the turn. The seam kills every
+        // replica, so the store stays FatalIo and the session is poisoned:
+        // slot reuse after a drain is covered by the cancel leg above; here
+        // the next turn must fail cleanly, and a fresh session serves.
         let mut s = Session::new(&streamed(true)).expect("session");
         s.fail_storage_in_stream_read_for_test();
         let mut sink = |_: &str| {};
         assert!(s.turn(&TurnRequest::new(LONG), &mut sink).is_err());
+        assert_eq!(s.p3_hooks().unwrap().pool_batch_leases(), 0);
+        assert!(matches!(
+            s.turn(&TurnRequest::new(NEXT), &mut sink),
+            Err(golem_engine::EngineError::StorageUnavailable)
+        ));
         assert_eq!(s.p3_hooks().unwrap().pool_batch_leases(), 0);
         drop(s);
         assert_eq!(

@@ -30,7 +30,10 @@ pub struct StepTiming {
     pub disk_worker_ms: f64,
     /// Expert bytes read from disk this step.
     pub disk_bytes: u64,
-    /// Host→device copy time (copy-stream event pairs; async_h2d only).
+    /// Host→device copy time (copy-stream event pairs; async_h2d only): first
+    /// copy start to last copy end on the copy stream, so it includes any
+    /// copy-stream wait on compute. Under the WAR rule (§11) GPU-side
+    /// overlap is ~0; only the host queues ahead.
     pub h2d_ms: f64,
     /// Host→device bytes (unmeasured alongside `h2d_ms`).
     pub h2d_bytes: u64,

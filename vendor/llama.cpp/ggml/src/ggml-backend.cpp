@@ -2740,8 +2740,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // expert_size is the pool's max stride, so reading
                             // past it could leave the arena mapping entirely.
                             if (gctx->async_h2d) {
-                                golem_cs_begin(gctx, split_backend, !golem_cs_used);
-                                golem_cs_used = true;
+                                // golem_cs_begin ran once for the plane (mode 1).
                                 golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
                                     ptrs, last_id - first_id + 1,
                                     [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
@@ -2916,6 +2915,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // consecutive routed experts map onto contiguous
                         // slices of the returned pointer array (plan.routed
                         // is sorted — no dependency on the mutable used_ids).
+                        // One WAR wait per plane: the runs below queue only
+                        // copy-stream work, so the stream-0 tail recorded
+                        // here covers every prior compute for all of them.
+                        if (gctx->async_h2d && !plan.routed.empty()) {
+                            golem_cs_begin(gctx, split_backend, !golem_cs_used);
+                            golem_cs_used = true;
+                        }
                         size_t i = 0;
                         while (i < plan.routed.size()) {
                             const size_t run0 = i;

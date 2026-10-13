@@ -47,6 +47,20 @@ pub fn hooks_abi_version() -> i32 {
 // guards.
 const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 15);
 
+/// Discrete GPU devices in the backend registry (each one a device backend
+/// a llama context may split across).
+pub fn gpu_device_count() -> usize {
+    // SAFETY: registry queries; indices < ggml_backend_dev_count are valid.
+    unsafe {
+        (0..raw::ggml_backend_dev_count())
+            .filter(|&i| {
+                raw::ggml_backend_dev_type(raw::ggml_backend_dev_get(i))
+                    == raw::ggml_backend_dev_type::GGML_BACKEND_DEVICE_TYPE_GPU
+            })
+            .count()
+    }
+}
+
 /// Per-model hook context (ABI v5): owns a `golem_ctx_t` from
 /// `golem_ctx_create` and frees it on drop. `golem_ctx_free` aborts while
 /// hooks are registered or scheds are attached — the C-side guard that makes

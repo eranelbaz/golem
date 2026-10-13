@@ -325,6 +325,8 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         // HIP device when the binary is HIP-linked, so compute goes through
         // the device registry instead of the CPU-only path above.
         .allowlist_function("ggml_backend_dev_by_type")
+        .allowlist_function("ggml_backend_dev_count")
+        .allowlist_function("ggml_backend_dev_get")
         .allowlist_function("ggml_backend_dev_type")
         .allowlist_function("ggml_backend_dev_name")
         .allowlist_function("ggml_backend_dev_init")
