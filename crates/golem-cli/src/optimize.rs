@@ -336,26 +336,27 @@ fn memory_returned((vram0, locked0): (u64, u64)) -> Result<(u64, u64), Box<dyn E
     }
 }
 
-/// The §10 plan with `k`'s device-cache share; `vram_experts` stays the
-/// derived allowance at 1.0.
+/// The §10 plan with `k`'s device-cache share; `vram_experts` is the
+/// (clamped) explicit K's slab, else the derived allowance at 1.0.
 fn plan_for(
     config: &EngineConfig,
     facts: &golem_plan::ModelFacts,
     mach: &golem_plan::Machine,
     k: &Knobs,
 ) -> golem_plan::PlanReport {
-    let input = golem_plan::PlanInput {
+    let mut input = golem_plan::PlanInput {
         ctx: config.n_ctx,
         parallel: config.parallel,
         prefill_ubatch: config.prefill_ubatch.min(config.n_ctx),
         prefill_stream: config.prefill_stream,
+        vram_experts: 0,
         experts: golem_plan::ExpertResidency::Pooled {
             ram_experts: config.ram_experts_gib << 30,
         },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         ws: golem_plan::WS_MEASURED,
-        ..Default::default()
     };
+    input.vram_experts = crate::serve::explicit_cache_bytes(config, facts, mach, &input);
     let frac = if k.vram_experts_frac > 0.0 {
         k.vram_experts_frac
     } else {
