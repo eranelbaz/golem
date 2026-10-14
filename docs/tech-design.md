@@ -491,7 +491,7 @@ Writing a draft model is not part of it.
 
 ### 8.2 Request field policy
 
-Strict allowlist — anything requested-but-unsupported gets an explicit typed error, per spec. Tolerated-only fields (no functional effect) are `metadata`, `user`, `request_id`.
+Strict allowlist — anything requested-but-unsupported gets an explicit typed error, per spec. Tolerated-only fields (no functional effect) are `metadata`, `user`, `request_id`, `store` (`false`/`null` only; `store: true` is rejected with `golem_unsupported_field` since completions are not stored).
 
 | Field | v1 behavior |
 |-------|-------------|

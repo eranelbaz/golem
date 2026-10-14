@@ -57,6 +57,9 @@ pub struct ChatCompletionRequest {
     /// Tolerated, no effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Tolerated, no effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
     /// Golem extension: top-k sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,

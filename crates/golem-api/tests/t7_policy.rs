@@ -25,6 +25,7 @@ fn sample(field: &str) -> serde_json::Value {
         "tool_choice" => json!("auto"),
         "metadata" => json!({"k":"v"}),
         "user" | "request_id" => json!("x"),
+        "store" => json!(false),
         "response_format" => json!({"type":"json_schema"}),
         "logit_bias" => json!({"1": 1}),
         "logprobs" => json!(true),
@@ -156,6 +157,20 @@ fn model_mismatch_n_and_multimodal() {
         validate(&r, "tiny-moe").unwrap_err().error.code,
         ErrorCode::InvalidRequest
     );
+}
+
+#[test]
+fn store_true_is_rejected_false_and_null_tolerated() {
+    let mut r = base();
+    r["store"] = json!(true);
+    let e = validate(&r, "tiny-moe").unwrap_err().error;
+    assert_eq!(e.code, ErrorCode::UnsupportedField);
+    assert!(e.message.contains("store"), "{}", e.message);
+    for ok in [json!(false), json!(null)] {
+        let mut r = base();
+        r["store"] = ok;
+        validate(&r, "tiny-moe").unwrap();
+    }
 }
 
 #[test]
