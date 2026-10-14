@@ -113,6 +113,8 @@ async fn serve_returns_storage_unavailable_after_fatal_io() {
             "max_tokens":8,"temperature":0})
             .to_string();
         let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
         write!(
             s,
             "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\

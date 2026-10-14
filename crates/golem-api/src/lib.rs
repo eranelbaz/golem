@@ -50,6 +50,23 @@ pub enum ErrorCode {
     InvalidRequest,
 }
 
+impl ErrorCode {
+    /// Every code, in declaration order (`ALL[c as usize] == c`).
+    pub const ALL: [Self; 11] = [
+        Self::BackendUnavailable,
+        Self::PlanInfeasible,
+        Self::ModelMismatch,
+        Self::MultimodalUnsupported,
+        Self::UnsupportedField,
+        Self::StorageUnavailable,
+        Self::InstanceNotFound,
+        Self::NotFound,
+        Self::Busy,
+        Self::StopTimeout,
+        Self::InvalidRequest,
+    ];
+}
+
 /// Machine-readable error payload; `message` is human-readable (tech design §8.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {

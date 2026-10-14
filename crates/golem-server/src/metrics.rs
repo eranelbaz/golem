@@ -13,23 +13,10 @@ use crate::worker::HealthState;
 /// Slots reported per snapshot (`--parallel` beyond this is truncated).
 pub(crate) const MAX_SLOTS: usize = 32;
 
-/// Every error code, in [`code_index`] order.
-const CODES: [ErrorCode; 10] = [
-    ErrorCode::BackendUnavailable,
-    ErrorCode::PlanInfeasible,
-    ErrorCode::ModelMismatch,
-    ErrorCode::MultimodalUnsupported,
-    ErrorCode::UnsupportedField,
-    ErrorCode::StorageUnavailable,
-    ErrorCode::InstanceNotFound,
-    ErrorCode::NotFound,
-    ErrorCode::Busy,
-    ErrorCode::InvalidRequest,
-];
-pub(crate) const N_CODES: usize = CODES.len();
+pub(crate) const N_CODES: usize = ErrorCode::ALL.len();
 
 pub(crate) fn code_index(c: ErrorCode) -> usize {
-    CODES.iter().position(|&x| x == c).unwrap_or(0)
+    c as usize
 }
 
 /// Worker-side counters, copied out of the `Session` at the publish cadence.
@@ -297,7 +284,7 @@ pub(crate) fn render(h: &HealthState) -> String {
         o,
         "# HELP golem_errors_total Error responses by code\n# TYPE golem_errors_total counter"
     );
-    for (i, c) in CODES.iter().enumerate() {
+    for (i, c) in ErrorCode::ALL.iter().enumerate() {
         let code = serde_json::to_value(c).ok();
         let code = code.as_ref().and_then(|v| v.as_str()).unwrap_or("unknown");
         let _ = writeln!(
@@ -322,8 +309,23 @@ mod tests {
 
     #[test]
     fn code_index_round_trips_every_code() {
-        for (i, c) in CODES.iter().enumerate() {
-            assert_eq!(code_index(*c), i);
+        for (i, &c) in ErrorCode::ALL.iter().enumerate() {
+            assert_eq!(code_index(c), i);
+            // Exhaustive: a new variant fails to compile here until `ALL`
+            // (and this list) name it.
+            match c {
+                ErrorCode::BackendUnavailable
+                | ErrorCode::PlanInfeasible
+                | ErrorCode::ModelMismatch
+                | ErrorCode::MultimodalUnsupported
+                | ErrorCode::UnsupportedField
+                | ErrorCode::StorageUnavailable
+                | ErrorCode::InstanceNotFound
+                | ErrorCode::NotFound
+                | ErrorCode::Busy
+                | ErrorCode::StopTimeout
+                | ErrorCode::InvalidRequest => {}
+            }
         }
     }
 }

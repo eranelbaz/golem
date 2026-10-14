@@ -508,7 +508,7 @@ Usage reporting: prompt/completion token counts from llama.cpp counters — cost
 
 ### 8.3 SSE shape
 
-Standard OpenAI chunk framing (`data: {chunk}\n\n`, `data: [DONE]`), deltas carrying `content` and/or `reasoning_content` (§7.3), terminal frame `usage` when `include_usage`. Backpressure: SSE streams are tokio-guarded; a dead client cancels its slot (decode loop preempts at the next iteration boundary). An error mid-stream (drain, worker death) sends the error frame, then `data: [DONE]`; a live client that cannot keep up with the event buffer gets a `golem_backend_unavailable` error frame, never a truncated `finish_reason: stop`.
+Standard OpenAI chunk framing (`data: {chunk}\n\n`, `data: [DONE]`), deltas carrying `content` and/or `reasoning_content` (§7.3), terminal frame `usage` when `include_usage`. Backpressure: SSE streams are tokio-guarded; a dead client cancels its slot (decode loop preempts at the next iteration boundary). An error mid-stream (drain, worker death) sends the error frame, then `data: [DONE]` (*Amended 2026-10-13:* previously the stream ended after the error frame with no `[DONE]`); a live client that cannot keep up with the event buffer gets a `golem_backend_unavailable` error frame, never a truncated `finish_reason: stop`.
 
 ### 8.4 Error model
 

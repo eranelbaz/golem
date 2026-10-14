@@ -112,6 +112,17 @@ fn raw_post(addr: SocketAddr, body: &serde_json::Value) -> TcpStream {
     s
 }
 
+/// Body-and-headers of a raw GET.
+fn get(addr: SocketAddr, path: &str) -> String {
+    let mut s = TcpStream::connect(addr).unwrap();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+    )
+    .unwrap();
+    raw_response(s)
+}
+
 fn raw_response(mut s: TcpStream) -> String {
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
@@ -450,11 +461,17 @@ async fn drain_parallel_2_finishes_queued_stream() {
         scfg,
     )
     .await;
-    let t = Instant::now();
     let clients: Vec<_> = (0..3)
         .map(|_| tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi_stream(48)))))
         .collect();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let t = Instant::now();
+    while !get(addr, "/metrics").contains("golem_queue_depth 1\n") {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "third request never queued"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     stop.send(()).unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let late = tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi(2))))
@@ -476,7 +493,6 @@ async fn drain_parallel_2_finishes_queued_stream() {
         .expect("serve returns within 35 s")
         .unwrap()
         .unwrap();
-    assert!(t.elapsed() < Duration::from_secs(35));
 }
 
 /// After a finished request the idle worker reports not busy, so shutdown
@@ -499,4 +515,33 @@ async fn shutdown_after_finished_request_skips_grace() {
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+/// Separate mode on the GLM template (prompt opens `<think>`): generated
+/// text streams as `reasoning_content`, and no marker leaks into `content`.
+#[tokio::test(flavor = "multi_thread")]
+async fn separate_mode_glm_streams_reasoning_without_markers() {
+    let cfg = golem_engine::config::EngineConfig {
+        chat_template: Some(
+            include_str!("../../golem-engine/tests/fixtures/glm-5.3-flash.jinja").into(),
+        ),
+        ..golem_server::test_engine_config()
+    };
+    let app = router_with_hooks(cfg, TestHooks::default()).await;
+    let r = app.oneshot(chat(hi_stream(16))).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let deltas: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|f| f.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| {
+            serde_json::from_str::<serde_json::Value>(d).unwrap()["choices"][0]["delta"].clone()
+        })
+        .collect();
+    let field = |k: &str| -> String { deltas.iter().filter_map(|d| d[k].as_str()).collect() };
+    assert!(!field("reasoning_content").is_empty(), "{body}");
+    assert!(!field("content").contains("think>"), "{body}");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
 }

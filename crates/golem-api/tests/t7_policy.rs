@@ -113,6 +113,12 @@ fn model_mismatch_n_and_multimodal() {
         ErrorCode::InvalidRequest
     );
     let mut r = base();
+    r["seed"] = json!(u32::MAX - 1);
+    assert_eq!(
+        validate(&r, "tiny-moe").unwrap().seed,
+        Some(u64::from(u32::MAX - 1))
+    );
+    let mut r = base();
     r["seed"] = json!(u32::MAX);
     assert_eq!(
         validate(&r, "tiny-moe").unwrap_err().error.code,
@@ -124,6 +130,7 @@ fn model_mismatch_n_and_multimodal() {
         ("temperature", json!(-0.1)),
         ("temperature", json!(1e39)),
         ("top_p", json!(1.5)),
+        ("top_p", json!(-0.1)),
         ("top_p", json!(1e39)),
         ("frequency_penalty", json!(-2.5)),
         ("frequency_penalty", json!(-1e39)),
