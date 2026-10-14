@@ -2207,10 +2207,15 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
             0 => 0,
             k => (u64::from(k) + 1) * per_expert,
         },
-        ram_experts: config.ram_experts_gib << 30,
+        experts: if config.ram_experts_gib == 0 {
+            golem_plan::ExpertResidency::Resident(resident_expert_bytes(config, m))
+        } else {
+            golem_plan::ExpertResidency::Pooled {
+                ram_experts: config.ram_experts_gib << 30,
+            }
+        },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         ws: golem_plan::WS_MEASURED,
-        resident_experts: (config.ram_experts_gib == 0).then(|| resident_expert_bytes(config, m)),
     }
 }
 

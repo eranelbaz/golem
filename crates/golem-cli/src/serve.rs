@@ -175,7 +175,9 @@ pub fn instance(
         parallel: config.parallel,
         prefill_ubatch: config.prefill_ubatch.min(config.n_ctx),
         prefill_stream: config.prefill_stream,
-        ram_experts: config.ram_experts_gib << 30,
+        experts: golem_plan::ExpertResidency::Pooled {
+            ram_experts: config.ram_experts_gib << 30,
+        },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         ws: golem_plan::WS_MEASURED,
         ..Default::default()

@@ -407,7 +407,9 @@ fn fit_ram(
         ctx: config.n_ctx,
         parallel: config.parallel,
         prefill_stream: config.prefill_stream,
-        ram_experts: config.ram_experts_gib * GIB,
+        experts: golem_plan::ExpertResidency::Pooled {
+            ram_experts: config.ram_experts_gib * GIB,
+        },
         ..Default::default()
     };
     let mach = golem_plan::Machine {

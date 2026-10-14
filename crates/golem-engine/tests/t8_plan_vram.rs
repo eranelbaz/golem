@@ -53,10 +53,11 @@ fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, b
         prefill_ubatch: c.prefill_ubatch.min(c.n_ctx),
         prefill_stream: true,
         vram_experts: 0,
-        ram_experts: c.ram_experts_gib << 30,
+        experts: golem_plan::ExpertResidency::Pooled {
+            ram_experts: c.ram_experts_gib << 30,
+        },
         snapshot_ram: 0,
         ws: golem_plan::WS_MEASURED,
-        resident_experts: None,
     };
     let r = golem_plan::plan(m, &mach, &i);
     // Without the cache term: the engine holds K + 1 whole slabs, and its K

@@ -307,7 +307,28 @@ pub fn device_cache_k(budget: u64, slab_bytes_per_expert: u64) -> u64 {
 /// Candidate `--prefill-ubatch` values, largest first.
 const UBATCHES: [u32; 5] = [8192, 4096, 2048, 1024, 512];
 
-/// Plan knobs; zero `ram_experts` means the §10 default pool.
+/// Where routed-expert bytes live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ExpertResidency {
+    /// RAM expert pool plus device expert cache; zero `ram_experts` means
+    /// the §10 default pool.
+    Pooled {
+        /// Host expert-pool budget.
+        ram_experts: u64,
+    },
+    /// Pool off: routed-expert bytes llama loads as ordinary VRAM tensors
+    /// (offloaded layers not pinned to the CPU); no device expert cache or
+    /// RAM pool.
+    Resident(u64),
+}
+
+impl Default for ExpertResidency {
+    fn default() -> Self {
+        Self::Pooled { ram_experts: 0 }
+    }
+}
+
+/// Plan knobs.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct PlanInput {
     /// Context length per sequence.
@@ -321,16 +342,12 @@ pub struct PlanInput {
     /// Device expert-cache budget; zero = whatever VRAM the other terms
     /// leave (the runtime's derived K).
     pub vram_experts: u64,
-    /// Host expert-pool budget.
-    pub ram_experts: u64,
+    /// Expert residency (pooled or resident).
+    pub experts: ExpertResidency,
     /// State-snapshot cache budget (§7.1).
     pub snapshot_ram: u64,
     /// Workspace model.
     pub ws: WsModel,
-    /// Pool off: routed-expert bytes llama loads as ordinary VRAM tensors
-    /// (offloaded layers not pinned to the CPU). `Some` drops the device
-    /// expert cache and RAM pool from the plan.
-    pub resident_experts: Option<u64>,
 }
 
 /// One named line of a tier's budget.
@@ -475,7 +492,7 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
         .iter()
         .position(|t| t.name == "ws")
         .map_or(t.len(), |p| p + 1);
-    if let Some(b) = i.resident_experts {
+    if let ExpertResidency::Resident(b) = i.experts {
         t.insert(
             after_ws,
             Term {
@@ -529,10 +546,9 @@ pub fn plan(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> PlanReport {
     let ram = ram_terms(m, mach, i);
     let vram_headroom = headroom(mach.vram_total, total(&vram));
     let ram_headroom = headroom(mach.ram_free, total(&ram));
-    let min_device_expert_cache = if i.resident_experts.is_some() {
-        0
-    } else {
-        m.min_device_expert_cache()
+    let min_device_expert_cache = match i.experts {
+        ExpertResidency::Resident(_) => 0,
+        ExpertResidency::Pooled { .. } => m.min_device_expert_cache(),
     };
     let cache_ok = |t: &[Term]| {
         min_device_expert_cache == 0
@@ -602,12 +618,12 @@ fn stream_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
 /// 0.75 × 88 GiB = 66 GiB < Σ experts, + 2 GiB host + 3.69 GiB staging ring.
 #[must_use]
 pub fn ram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
-    let pool = if i.resident_experts.is_some() {
-        0
-    } else if i.ram_experts > 0 {
-        i.ram_experts
-    } else {
-        (mach.ram_free / 4 * 3).min(m.expert_bytes_total)
+    let pool = match i.experts {
+        ExpertResidency::Resident(_) => 0,
+        ExpertResidency::Pooled { ram_experts: 0 } => {
+            (mach.ram_free / 4 * 3).min(m.expert_bytes_total)
+        }
+        ExpertResidency::Pooled { ram_experts } => ram_experts,
     };
     vec![
         Term {
@@ -927,7 +943,9 @@ mod tests {
             1 << 30
         );
         let set = PlanInput {
-            ram_experts: 40 << 30,
+            experts: ExpertResidency::Pooled {
+                ram_experts: 40 << 30,
+            },
             snapshot_ram: 3 << 30,
             ..Default::default()
         };
