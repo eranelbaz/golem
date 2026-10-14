@@ -8,6 +8,7 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::sys::Input;
 use golem_engine::ParityStep;
 use golem_engine::TurnRequest;
 use golem_engine::atomic::write_atomic;
@@ -774,15 +775,23 @@ fn one_shot(
         eprintln!("error: routing trace: {e}");
     }
     println!();
-    interrupted(shutdown)
+    // A signal cut the turn short: the reply is truncated, so exit non-zero.
+    Ok(shutdown.check()?)
 }
 
-/// A signal cut the turn short: the reply is truncated, so exit non-zero.
-fn interrupted(shutdown: &crate::sys::Shutdown) -> Result<(), Box<dyn Error>> {
-    if shutdown.cancel.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err("golem: interrupted".into());
+/// After a signal-cancelled REPL turn: SIGINT drops the turn and re-arms
+/// the handler so the REPL keeps going; any other signal ends the run.
+fn turn_interrupted(shutdown: &crate::sys::Shutdown) -> Result<bool, crate::sys::Interrupted> {
+    match shutdown.signal() {
+        None => Ok(false),
+        Some(libc::SIGINT) => {
+            println!();
+            eprintln!("golem: turn cancelled");
+            shutdown.rearm();
+            Ok(true)
+        }
+        Some(sig) => Err(crate::sys::Interrupted(sig)),
     }
-    Ok(())
 }
 
 /// §11: appends the turn's recorded rows to the CSV file (the recorder
@@ -954,8 +963,10 @@ fn repl(
     loop {
         eprint!("golem> ");
         let _ = std::io::stderr().flush();
-        let Some(line) = lines.next_line()? else {
-            return Ok(());
+        let line = match lines.next_line()? {
+            Input::Line(l) => l,
+            Input::Eof => return Ok(()),
+            Input::Signal(sig) => return Err(crate::sys::Interrupted(sig).into()),
         };
         match line.trim() {
             "" => continue,
@@ -981,12 +992,13 @@ fn repl(
             emit_stdout(piece);
         };
         let req = TurnRequest::new(&turns).cancel(Some(shutdown.cancel.clone()));
-        match session.turn(&req, &mut emit) {
-            Ok(_) if shutdown.cancel.load(std::sync::atomic::Ordering::SeqCst) => {
-                println!();
-                eprintln!("golem: interrupted");
-                return Ok(());
-            }
+        let res = session.turn(&req, &mut emit);
+        if turn_interrupted(shutdown)? {
+            // The partial reply never enters the history.
+            history.pop();
+            continue;
+        }
+        match res {
             Ok(_) => {
                 history.push(("assistant", reply));
                 if let Err(e) = flush_timing(session, timing_out) {
@@ -1095,21 +1107,27 @@ fn attach(
             n_predict,
             api_key,
             &shutdown.cancel,
-        )?;
+        );
+        shutdown.check()?;
+        let reply = reply?;
         history.push(serde_json::json!({"role": "assistant", "content": reply}));
         println!();
         Ok::<_, Box<dyn Error>>(())
     };
     if let Some(p) = prompt {
-        turn(&mut history, p.to_owned())?;
-        return interrupted(&shutdown);
+        return turn(&mut history, p.to_owned());
     }
     let mut lines = shutdown.stdin_lines();
     eprintln!("golem: multi-turn chat; /reset clears history, /exit quits");
-    while let Some(line) = lines.next_line()? {
+    loop {
+        let line = match lines.next_line()? {
+            Input::Line(l) => l,
+            Input::Eof => return Ok(()),
+            Input::Signal(sig) => return Err(crate::sys::Interrupted(sig).into()),
+        };
         match line.trim() {
             "" => continue,
-            "/exit" | "/quit" => break,
+            "/exit" | "/quit" => return Ok(()),
             "/reset" => {
                 history.clear();
                 eprintln!("golem: history cleared");
@@ -1117,18 +1135,20 @@ fn attach(
             _ => {
                 if let Err(e) = turn(&mut history, line) {
                     history.pop();
-                    eprintln!("error: {e}");
+                    if !turn_interrupted(&shutdown)? {
+                        eprintln!("error: {e}");
+                    }
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// One streamed chat completion; prints content deltas as they arrive and
 /// returns the full reply. HTTP/1.0 keeps the body un-chunked and
-/// close-delimited, so SSE lines arrive intact. Once `cancel` is set the
-/// connection is dropped between lines; the server cancels on disconnect.
+/// close-delimited, so SSE lines arrive intact. `cancel` is re-checked at
+/// least every [`CANCEL_POLL`]; once set the connection is dropped with an
+/// error (the server cancels on disconnect).
 fn stream_chat(
     addr: &str,
     id: &str,
@@ -1146,14 +1166,41 @@ fn stream_chat(
     .to_string();
     let auth = api_key.map_or(String::new(), |k| format!("authorization: Bearer {k}\r\n"));
     let mut s = std::net::TcpStream::connect(addr)?;
+    s.set_read_timeout(Some(CANCEL_POLL))?;
     write!(
         s,
         "POST /v1/chat/completions HTTP/1.0\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
          {auth}content-length: {}\r\n\r\n{body}",
         body.len()
     )?;
-    let mut lines = std::io::BufReader::new(s).lines();
-    let status = lines.next().transpose()?.unwrap_or_default();
+    let mut r = std::io::BufReader::new(s);
+    let mut buf = Vec::new();
+    // Next line without its terminator, `None` at EOF. `read_until` keeps
+    // the bytes read before a timeout, so a timeout never splits a line.
+    let mut next_line = || -> Result<Option<String>, Box<dyn Error>> {
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
+            match r.read_until(b'\n', &mut buf) {
+                Ok(0) if buf.is_empty() => return Ok(None),
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned();
+                    buf.clear();
+                    return Ok(Some(line));
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    let status = next_line()?.unwrap_or_default();
     if status.contains(" 401 ") {
         let hint = if api_key.is_some() {
             " (the configured key was rejected)"
@@ -1166,15 +1213,14 @@ fn stream_chat(
         .into());
     }
     if !status.contains(" 200 ") {
-        let rest: Vec<String> = lines.map_while(Result::ok).collect();
-        return Err(rest.last().cloned().unwrap_or(status).into());
+        let mut last = status;
+        while let Some(l) = next_line()? {
+            last = l;
+        }
+        return Err(last.into());
     }
     let mut reply = String::new();
-    for line in lines {
-        let line = line?;
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
+    while let Some(line) = next_line()? {
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
         };
@@ -1192,6 +1238,10 @@ fn stream_chat(
     }
     Ok(reply)
 }
+
+/// Longest an attached turn takes to notice a signal while the server is
+/// silent (e.g. prefilling).
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 fn emit_stdout(piece: &str) {
     print!("{piece}");
@@ -1263,26 +1313,27 @@ mod tests {
         assert!(e.to_string().contains("server draining"), "{e}");
     }
 
-    /// A set cancel flag drops a slow stream instead of waiting for `[DONE]`.
+    /// A cancel set while the server is silent (prefilling) is noticed
+    /// within the read timeout and is an error, never a partial reply.
     #[test]
-    fn stream_chat_returns_promptly_when_cancelled() {
+    fn stream_chat_cancel_while_server_silent_errors_promptly() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
             let (mut s, _) = l.accept().unwrap();
-            let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
-            for _ in 0..100 {
-                let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
-                if s.write_all(frame.as_bytes()).is_err() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            let _ = s.write_all(
+                b"HTTP/1.0 200 OK\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            );
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            c.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         let t = std::time::Instant::now();
-        let cancel = std::sync::atomic::AtomicBool::new(true);
-        let reply = stream_chat(&addr, "i1", "m", &[], 2, None, &cancel).unwrap();
-        assert_eq!(reply, "");
+        assert!(stream_chat(&addr, "i1", "m", &[], 2, None, &cancel).is_err());
         assert!(
             t.elapsed() < std::time::Duration::from_secs(2),
             "{:?}",

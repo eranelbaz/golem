@@ -407,17 +407,23 @@ fn run_child(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     let pid = child.id();
-    let entry = golem_registry::Child::of(pid);
-    if let Ok(c) = entry {
-        guard.update(|i| i.children.push(c));
-    }
+    // An unregistered child would hold mlocked RAM outside the entry's
+    // reservation and out of `stop`'s reach.
+    let entry = match golem_registry::Child::of(pid) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("child {pid}: cannot record start time: {e}").into());
+        }
+    };
+    guard.update(|i| i.children.push(entry));
     // The child checks ownership only after this byte: its pid is in the
     // entry first. Dropping stdin on error makes the child's read fail.
     let go = child.stdin.take().map(|mut s| s.write_all(b"g"));
     let out = child.wait_with_output();
     guard.update(|i| i.children.retain(|c| c.pid() != pid));
     let out = out?;
-    entry?;
     go.ok_or("child stdin missing")??;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
@@ -643,12 +649,12 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
     std::io::Read::read_exact(&mut std::io::stdin(), &mut go)?;
     // The parent's entry is this child's only reservation.
     let entry = Registry::open()?.find(parent)?;
-    if entry.kind != "optimize"
-        || entry.pid != crate::sys::parent_pid()
-        || !entry
-            .children
-            .contains(&golem_registry::Child::of(std::process::id())?)
-    {
+    let me = golem_registry::Child::of(std::process::id())?;
+    let listed = entry.children.iter().any(|&c| match c {
+        golem_registry::Child::Timed { .. } => c == me,
+        golem_registry::Child::Bare(pid) => pid == me.pid(),
+    });
+    if entry.kind != "optimize" || entry.pid != crate::sys::parent_pid() || !listed {
         return Err(format!("entry `{parent}` does not own this measurement").into());
     }
     let layers = crate::config::Layers::from_process()?;

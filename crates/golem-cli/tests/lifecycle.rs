@@ -294,7 +294,75 @@ fn stop_in_process_run_with_idle_stdin_exits_normally() {
         out.status.signal(),
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(out.status.code(), Some(128 + libc::SIGTERM));
     assert!(ids(&rt).is_empty());
+}
+
+/// An in-process `run` REPL waiting at its prompt, stdin held open.
+fn idle_run(rt: &Path) -> (std::process::Child, std::process::ChildStdin) {
+    use std::io::Read;
+    let mut child = common::golem_cmd(rt)
+        .args(["run", &tiny_moe(), "--new", "--allow-overcommit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let mut seen = Vec::new();
+    let mut b = [0u8; 256];
+    while !String::from_utf8_lossy(&seen).contains("golem> ") {
+        let n = err.read(&mut b).unwrap();
+        assert!(n > 0, "{}", String::from_utf8_lossy(&seen));
+        seen.extend_from_slice(&b[..n]);
+    }
+    // Keep draining so the child never blocks on a full stderr pipe.
+    std::thread::spawn(move || std::io::copy(&mut err, &mut std::io::sink()));
+    (child, stdin)
+}
+
+fn kill(sig: &[&str], pid: u32) {
+    let st = std::process::Command::new("kill")
+        .args(sig)
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
+/// Ctrl-C at the prompt exits 130 with a plain message, no error envelope.
+#[test]
+fn sigint_at_run_prompt_exits_130() {
+    let rt = common::tempdir_env();
+    let (mut child, _stdin) = idle_run(&rt);
+    kill(&["-INT"], child.id());
+    let st = child.wait().unwrap();
+    assert_eq!(st.code(), Some(128 + libc::SIGINT), "{st:?}");
+    assert!(ids(&rt).is_empty());
+}
+
+/// A second signal before the first is handled kills a `run` outright.
+/// Two kinds: two pending signals of one kind would merge.
+#[test]
+fn second_signal_kills_idle_run() {
+    use std::os::unix::process::ExitStatusExt;
+    let rt = common::tempdir_env();
+    let (mut child, _stdin) = idle_run(&rt);
+    // One `sh` so both land before the REPL wakes on the first.
+    let pid = child.id();
+    let st = std::process::Command::new("sh")
+        .args(["-c", &format!("kill -INT {pid}; kill -TERM {pid}")])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let st = child.wait().unwrap();
+    // The kernel picks which pending signal runs first; the second one,
+    // whichever it is, re-raises with SIG_DFL.
+    assert!(
+        matches!(st.signal(), Some(libc::SIGINT | libc::SIGTERM)),
+        "{st:?}"
+    );
 }
 
 /// Two lines piped at once are both answered while stdin stays open: the

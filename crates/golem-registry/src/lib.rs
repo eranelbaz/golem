@@ -76,7 +76,8 @@ pub enum Child {
         /// `/proc/<pid>/stat` start time (clock ticks).
         start_time: u64,
     },
-    /// Legacy bare pid; never signalled.
+    /// Legacy bare pid; signalled only while it is still a direct child
+    /// of the entry's owner.
     Bare(u32),
 }
 
@@ -210,9 +211,9 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Start time (clock ticks since boot, `/proc/<pid>/stat` field 22) of a
-/// live, non-zombie process.
-pub fn pid_start_time(pid: u32) -> Result<u64, RegistryError> {
+/// `/proc/<pid>/stat` field `n` (1-based, `n ≥ 4`) of a live, non-zombie
+/// process; `NotFound` once it exited.
+fn stat_field(pid: u32, n: usize) -> Result<u64, RegistryError> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     // comm may contain spaces and parens: fields resume after the last ')'.
     let bad = || io::Error::new(io::ErrorKind::InvalidData, "malformed /proc stat");
@@ -220,10 +221,31 @@ pub fn pid_start_time(pid: u32) -> Result<u64, RegistryError> {
     if f.next() == Some("Z") {
         return Err(io::Error::new(io::ErrorKind::NotFound, "zombie").into());
     }
-    // `f` now starts at field 4; start time is field 22.
-    f.nth(18)
+    // `f` now starts at field 4.
+    f.nth(n - 4)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| bad().into())
+}
+
+/// Start time (clock ticks since boot, `/proc/<pid>/stat` field 22) of a
+/// live, non-zombie process.
+pub fn pid_start_time(pid: u32) -> Result<u64, RegistryError> {
+    stat_field(pid, 22)
+}
+
+/// Parent pid (`/proc/<pid>/stat` field 4) of a live, non-zombie process.
+pub fn parent_pid(pid: u32) -> Result<u32, RegistryError> {
+    let p = stat_field(pid, 4)?;
+    u32::try_from(p).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ppid").into())
+}
+
+/// `Ok(None)` when the process has exited (missing or zombie).
+fn gone_ok<T>(r: Result<T, RegistryError>) -> Result<Option<T>, RegistryError> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(RegistryError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// The process is alive and is the one the entry was written by.
@@ -233,24 +255,28 @@ fn owner_alive(i: &Instance) -> bool {
 
 /// Sends `sig` to the instance's `children`, then its process;
 /// `InstanceNotFound` once the owner exited or its pid was reused, so a
-/// stale entry never kills a stranger. A child that already exited, whose
-/// pid was reused, or that has no recorded start time is skipped.
+/// stale entry never kills a stranger. A child that already exited or
+/// whose pid was reused is skipped; a [`Child::Bare`] is signalled only
+/// while the owner is still its parent.
 pub fn signal(i: &Instance, sig: libc::c_int) -> Result<(), RegistryError> {
     if !owner_alive(i) {
         return Err(RegistryError::InstanceNotFound(i.id.clone()));
     }
     for &c in &i.children {
-        let Child::Timed { pid, start_time } = c else {
-            tracing::warn!(
-                "child pid {} of {} has no start time; skipped",
-                c.pid(),
-                i.id
-            );
-            continue;
+        let pid = match c {
+            Child::Timed { pid, start_time } => match gone_ok(pid_start_time(pid))? {
+                Some(t) if t == start_time => pid,
+                _ => continue,
+            },
+            Child::Bare(pid) => match gone_ok(parent_pid(pid))? {
+                Some(p) if p == i.pid => pid,
+                None => continue,
+                Some(_) => {
+                    tracing::warn!("child pid {pid} of {} has another parent; skipped", i.id);
+                    continue;
+                }
+            },
         };
-        if pid_start_time(pid).is_ok_and(|t| t != start_time) {
-            continue;
-        }
         match sys::signal(pid, sig) {
             Err(e) if e.raw_os_error() != Some(libc::ESRCH) => return Err(e.into()),
             _ => {}

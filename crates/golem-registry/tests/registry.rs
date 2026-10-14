@@ -304,3 +304,52 @@ fn optimize_registration_is_exclusive() {
             .is_ok()
     );
 }
+
+/// A legacy bare child pid is signalled only while the owner is its parent:
+/// one that another process spawned survives the owner's SIGKILL.
+#[test]
+fn bare_child_of_another_parent_is_not_signalled() {
+    let mut owner = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut stranger = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut i = inst("x", owner.id(), now());
+    i.children = vec![golem_registry::Child::Bare(stranger.id())];
+    golem_registry::signal(&i, libc::SIGKILL).unwrap();
+    owner.wait().unwrap();
+    assert!(
+        stranger.try_wait().unwrap().is_none(),
+        "foreign bare pid killed"
+    );
+    stranger.kill().unwrap();
+    stranger.wait().unwrap();
+}
+
+/// A legacy bare child pid the owner spawned is signalled with it.
+#[test]
+fn bare_child_of_owner_is_signalled() {
+    use std::io::BufRead;
+    let mut owner = std::process::Command::new("sh")
+        .args(["-c", "sleep 60 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(owner.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let child: u32 = line.trim().parse().unwrap();
+    let mut i = inst("x", owner.id(), now());
+    i.children = vec![golem_registry::Child::Bare(child)];
+    golem_registry::signal(&i, libc::SIGKILL).unwrap();
+    owner.wait().unwrap();
+    let t = std::time::Instant::now();
+    while golem_registry::pid_start_time(child).is_ok() {
+        assert!(t.elapsed().as_secs() < 5, "owned bare child survived");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

@@ -36,6 +36,11 @@ struct Cli {
 enum Command {
     /// Run a local GGUF model (greedy sampling); `--parity-dump
     /// <FILE>` emits a T2 parity dump (JSONL) instead of streaming text.
+    ///
+    /// Ctrl-C during a chat reply cancels that turn and keeps the chat;
+    /// Ctrl-C at the prompt, SIGTERM, or any signal during `--prompt` exits
+    /// with 128 + signal (130 SIGINT, 143 SIGTERM). A second signal before
+    /// the first is handled kills the process.
     Run {
         /// The only sampler, on by default; the flag stays so later samplers
         /// slot in without a breaking change.
@@ -63,6 +68,10 @@ enum Command {
         args: list::ListArgs,
     },
     /// Stop a running instance by id or model name (drains first).
+    ///
+    /// `serve` drains over its control socket; `run` gets SIGTERM and up to
+    /// 60 s to tear down before SIGKILL (which may land mid-load); other
+    /// kinds get 5 s.
     Stop {
         #[command(flatten)]
         args: stop::StopArgs,
@@ -145,6 +154,12 @@ fn main() {
         Some(Command::Optimize { args }) => optimize::optimize(&args),
     };
     if let Err(e) = status {
+        // A signal is the user's choice, not a failure: no envelope, the
+        // shell convention 128 + signal (130 SIGINT, 143 SIGTERM).
+        if let Some(sys::Interrupted(sig)) = e.downcast_ref() {
+            eprintln!("{e}");
+            std::process::exit(128 + sig);
+        }
         eprintln!("{}", envelope(e.as_ref()));
         // The decode worker is leaked mid-`llama_decode`: exit now, skipping
         // pool teardown (the kernel reclaims it).
