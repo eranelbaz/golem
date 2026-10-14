@@ -966,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn read_kvs_skips_tokenizer_int_arrays_any_key_order_issue_93() {
+    fn read_kvs_skips_tokenizer_arrays_any_key_order() {
         fn key(b: &mut Vec<u8>, k: &str) {
             b.extend((k.len() as u64).to_le_bytes());
             b.extend(k.as_bytes());
@@ -983,9 +983,15 @@ mod tests {
         let mut b = GGUF_MAGIC.to_vec();
         b.extend(3u32.to_le_bytes());
         b.extend(0u64.to_le_bytes());
-        b.extend(3u64.to_le_bytes());
+        b.extend(4u64.to_le_bytes());
         i32_arr(&mut b, "a.attention.head_count_kv", 2);
         i32_arr(&mut b, "tokenizer.ggml.token_type", 150_000);
+        key(&mut b, "tokenizer.ggml.tokens");
+        b.extend(TYPE_ARRAY.to_le_bytes());
+        b.extend(TYPE_STR.to_le_bytes());
+        b.extend(2u64.to_le_bytes());
+        key(&mut b, "<s>");
+        key(&mut b, "</s>");
         key(&mut b, "general.architecture");
         b.extend(TYPE_STR.to_le_bytes());
         key(&mut b, "a");

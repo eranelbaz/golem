@@ -168,10 +168,9 @@ fn budget_k8_warm_turn_has_zero_window_counters() {
 fn cache_h2d_copies_match_routed_misses_and_bytes() {
     // K = n_expert never evicts, so after a reset every distinct routed
     // (layer, expert) is copied exactly once: 3 planes each.
-    let dir = std::env::temp_dir().join(format!("golem-h2d-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // The trace path only arms the in-memory ring; nothing is written there.
     let mut cfg = config(N_EXPERT);
-    cfg.routing_trace = Some(dir.join("trace.tsv"));
+    cfg.routing_trace = Some(std::env::temp_dir().join("golem-h2d-trace.tsv"));
     let mut session = Session::new(&cfg).expect("pooled offload session with K = n_expert");
     let _ = greedy_tokens(&mut session, PROMPTS[0]);
     // SAFETY: as in budget_k4_evicts_and_stays_on_gpu.
@@ -205,5 +204,4 @@ fn cache_h2d_copies_match_routed_misses_and_bytes() {
         routed.len() as u64 * facts.slab_bytes_per_expert()
     );
     assert_eq!(after.stream_copies, 0, "non-streamed config streamed");
-    let _ = std::fs::remove_dir_all(&dir);
 }

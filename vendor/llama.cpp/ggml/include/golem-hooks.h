@@ -1,21 +1,19 @@
-// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v10:
-// per-model hook context; v7 added the exclusive-residency eviction hook,
-// v8 batches it per (layer, compute) — one call for all of a layer's
-// evictions in one shot; v9 adds the abandoned-D2H hook — a parked eviction
-// whose plane copies were not all issued by compute end must be reported so
-// the pool cancels the claim instead of committing unwritten bytes; v10 adds
-// the prefill-stream hooks -- design section 7.6: per-plane expert streaming through
-// double-buffered device slabs, byte sources decided by the pool without
-// touching decode residency; v11 lets the stream source abort the compute --
-// returns 1 to cancel the ubatch mid-split; v12 turns a failed device-slab
-// allocation into a failed compute instead of an abort; v13 lets ensure
-// fail a compute when the store cannot page the misses in; v14 reports
-// resident device bytes; v15: golem_inject_slab_alloc_failure exists only
-// under GOLEM_TEST_SUPPORT; stream source may return
-// GOLEM_STREAM_SRC_STORAGE_LOST (compute fails); device-cache stats gain h2d
-// expert copies; golem_set_async_h2d moves pooled H2D onto a dedicated copy
-// stream, golem_take_h2d_timing reads its event-timed H2D ms/bytes). Part of
-// the vendored ggml include tree; the ABI is versioned — a change updates the Rust bindings and both sides together.
+// Golem policy-hook ABI + expert-metadata queries (Golem patch P1).
+// ABI history:
+//   v7  exclusive-residency eviction hook.
+//   v8  eviction hook batched per (layer, compute).
+//   v9  abandoned-D2H hook: a parked eviction whose plane copies were not all
+//       issued by compute end is reported so the pool cancels the claim.
+//   v10 per-model hook context; prefill-stream hooks (design section 7.6).
+//   v11 the stream source may abort the compute (returns 1).
+//   v12 a failed device-slab allocation fails the compute instead of aborting.
+//   v13 ensure may fail a compute when the store cannot page the misses in.
+//   v14 resident device bytes query.
+//   v15 GOLEM_STREAM_SRC_STORAGE_LOST; device-cache stats gain H2D expert
+//       copies; dedicated H2D copy stream (golem_set_async_h2d,
+//       golem_take_h2d_timing).
+// Part of the vendored ggml include tree; the ABI is versioned -- a change
+// updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
 #ifndef GOLEM_HOOKS_H
@@ -265,7 +263,8 @@ int32_t golem_device_cache_experts(golem_ctx_t ctx);
  * failures since ctx creation (0 for a NULL ctx). */
 uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
 #ifdef GOLEM_TEST_SUPPORT
-/* Test seam: the next n slab (re)allocations fail as if out of VRAM. */
+/* Test seam (ABI v15: declared only under GOLEM_TEST_SUPPORT): the next n
+ * slab (re)allocations fail as if out of VRAM. */
 void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
 #endif
 /* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
@@ -296,9 +295,11 @@ void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
  * drained before every lease release. Returns 0, or -1 when refused
  * (GGML_CUDA_GRAPH_OPT=1 concurrent-stream mode owns the stream indices).
  * The backend must export "golem_copy_stream_iface" via
- * ggml_backend_reg_get_proc_address (callers check). Config-time call.
- * One device backend per ctx: a compute on a second device backend is a
- * documented FFI abort (the engine refuses multi-GPU async_h2d up front). */
+ * ggml_backend_reg_get_proc_address; a compute on a backend without it is a
+ * documented FFI abort (the engine refuses async_h2d on a non-HIP substrate).
+ * Config-time call. One device backend per ctx: a compute on a second device
+ * backend is a documented FFI abort (the engine refuses multi-GPU async_h2d
+ * up front). */
 int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
 
 /* Copy-stream H2D time (sum of per-split event pairs) and bytes since the

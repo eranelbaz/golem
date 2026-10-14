@@ -35,7 +35,8 @@ pub struct StepTiming {
     /// copy-stream wait on compute. Under the WAR rule (§11) GPU-side
     /// overlap is ~0; only the host queues ahead.
     pub h2d_ms: f64,
-    /// Host→device bytes (unmeasured alongside `h2d_ms`).
+    /// Host→device bytes, MMQ padding tails included (unmeasured alongside
+    /// `h2d_ms`).
     pub h2d_bytes: u64,
     /// P2 policy order-building time (unmeasured today).
     pub policy_ms: f64,

@@ -140,7 +140,7 @@ fn cancel_inside_streamed_ubatch_aborts_within_one_plane() {
 /// failure, never a silent `Cancelled`.
 #[cfg(feature = "hip-tests")]
 #[test]
-fn spurious_stream_cancel_is_decode_error_issue_93() {
+fn spurious_stream_cancel_is_decode_error_and_next_turn_succeeds() {
     let mut s = Session::new(&streamed()).expect("session");
     s.p3_hooks().unwrap().spurious_stream_cancel_for_test();
     let err = s
@@ -153,6 +153,8 @@ fn spurious_stream_cancel_is_decode_error_issue_93() {
         matches!(err, golem_engine::EngineError::Decode(2)),
         "got {err:?}"
     );
+    s.turn(&TurnRequest::new(LONG), &mut |_| {})
+        .expect("the turn after a spurious cancel succeeds");
 }
 
 /// Real-target leg (GOLEM_HW=1, `GOLEM_HW_MODEL` = first UD-Q4_K_XL shard):

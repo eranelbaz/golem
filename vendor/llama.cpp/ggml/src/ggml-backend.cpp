@@ -162,8 +162,9 @@ static void golem_cs_free(golem_ctx_t ctx) {
 // Orders the copy stream after everything already queued on the split
 // backend's compute stream (prior computes reading the destination, O10
 // eviction D2H of the slots about to be refilled). Called before each
-// plane's copy-stream H2D batch; `first` opens the split's timing pair.
-static void golem_cs_begin(golem_ctx_t ctx, ggml_backend_t be, bool first) {
+// plane's copy-stream H2D batch; `first` opens the split's timing pair;
+// `wait` is false when nothing was queued on compute since the last wait.
+static void golem_cs_begin(golem_ctx_t ctx, ggml_backend_t be, bool first, bool wait) {
     if (ctx->cs_backend == nullptr) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
         ctx->cs = (const golem_copy_stream_iface *) ggml_backend_reg_get_proc_address(reg, "golem_copy_stream_iface");
@@ -179,8 +180,10 @@ static void golem_cs_begin(golem_ctx_t ctx, ggml_backend_t be, bool first) {
         }
     }
     GGML_ASSERT(ctx->cs_backend == be && "golem async_h2d: one device backend per ctx");
-    ctx->cs->record_compute(be, ctx->cs_ev_ready);
-    ctx->cs->copy_wait(be, ctx->cs_ev_ready);
+    if (wait) {
+        ctx->cs->record_compute(be, ctx->cs_ev_ready);
+        ctx->cs->copy_wait(be, ctx->cs_ev_ready);
+    }
     if (first) {
         if (ctx->cs_t_n < golem_ctx::GOLEM_CS_RING) {
             ctx->cs->record_copy(be, ctx->cs_t0[ctx->cs_t_n]);
@@ -2154,6 +2157,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // async_h2d: did this split queue pooled H2D on the copy stream
         // (joined into the compute stream before the split's graph).
         bool golem_cs_used = false;
+        // Copy stream already ordered after every compute-stream op queued
+        // so far in this split (cleared by eviction D2H).
+        bool golem_cs_fenced = false;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2916,12 +2922,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // consecutive routed experts map onto contiguous
                         // slices of the returned pointer array (plan.routed
                         // is sorted — no dependency on the mutable used_ids).
-                        // One WAR wait per plane: the runs below queue only
-                        // copy-stream work, so the stream-0 tail recorded
-                        // here covers every prior compute for all of them.
                         if (gctx->async_h2d && !plan.routed.empty()) {
-                            golem_cs_begin(gctx, split_backend, !golem_cs_used);
+                            golem_cs_begin(gctx, split_backend, !golem_cs_used, !golem_cs_fenced);
                             golem_cs_used = true;
+                            golem_cs_fenced = true;
                         }
                         size_t i = 0;
                         while (i < plan.routed.size()) {
@@ -2963,6 +2967,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             e.dst[kind_d], (size_t) e.slot * st.expert_size,
                                             st.expert_size);
                                         e.done |= bit;
+                                        golem_cs_fenced = false;
                                     }
                                     if (e.done != 7u) {
                                         golem_evict_d2h[w++] = e;
@@ -3000,8 +3005,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // After this plane's D2H issue above: the copy
                             // stream waits on the compute stream, so the
                             // eviction read of a stolen slot lands first.
-                            golem_cs_begin(gctx, split_backend, !golem_cs_used);
+                            golem_cs_begin(gctx, split_backend, !golem_cs_used, !golem_cs_fenced);
                             golem_cs_used = true;
+                            golem_cs_fenced = true;
                             for (size_t k4 = 0; k4 < plan.pending.size(); ++k4) {
                                 golem_cs_set(gctx, plan.slab, plan.ptrs[k4],
                                     (size_t) plan.pending[k4].first * expert_size, expert_size);

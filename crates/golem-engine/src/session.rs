@@ -253,7 +253,15 @@ pub(crate) fn load_with_hooks(
     };
 
     let loaded = LoadedModel { ctx, model, arch };
-    decode_self_check(loaded.ctx(), loaded.model().vocab())?;
+    if let Err(e) = decode_self_check(loaded.ctx(), loaded.model().vocab()) {
+        if let Some(ctx) = attach {
+            // SAFETY: the self-check decode is synchronized; the backend
+            // is alive until `loaded` drops, so the slabs and copy stream
+            // it bound are freed before `golem_ctx_free` asserts on them.
+            unsafe { raw::golem_reset_device_cache(ctx) };
+        }
+        return Err(e);
+    }
     Ok(loaded)
 }
 
@@ -721,6 +729,18 @@ impl Session {
             }
             None => tracing::warn!("no manifest: start-time model verification (R-8) skipped"),
         }
+        // One copy stream per hook ctx: a second device backend would hit the
+        // C-side FFI abort in golem_cs_begin, and the load's self-check decode
+        // already binds the copy stream. `init_backend` first: the registry
+        // must not be touched before it sets the op-offload threshold.
+        if config.async_h2d {
+            init_backend(forces_expert_offload(config));
+            if golem_llama_sys::gpu_device_count() > 1 {
+                return Err(EngineError::InvalidConfig(
+                    "async_h2d: supports a single GPU device".into(),
+                ));
+            }
+        }
         // P3 (§3.4): build the RAM expert pool + create the per-model ctx
         // BEFORE the model loads — the ctx must attach to the llama_model
         // before `llama_init_from_model` so its first `sched_reserve` sees
@@ -742,23 +762,25 @@ impl Session {
                 return Err(e);
             }
         };
-        // One copy stream per hook ctx: a second device backend would hit the
-        // C-side FFI abort in golem_cs_begin. Queried after the load — the
-        // registry must not be touched before `init_backend` sets the
-        // op-offload threshold.
-        if config.async_h2d && golem_llama_sys::gpu_device_count() > 1 {
-            return Err(EngineError::InvalidConfig(
-                "async_h2d: supports a single GPU device".into(),
-            ));
-        }
         // Derived K needs the resident weights, KV and compute buffer
-        // (ruling R3). On error the slabs are already freed by the fit.
-        if let Some(p) = p3.as_mut() {
-            p.fit_device_cache()?;
-        }
-        let chat = probe_templates(&loaded, config)?;
-
-        let snapshots = snapshot_cache(config)?;
+        // (ruling R3).
+        let rest = p3
+            .as_mut()
+            .map_or(Ok(()), |p| p.fit_device_cache())
+            .and_then(|()| Ok((probe_templates(&loaded, config)?, snapshot_cache(config)?)));
+        let (chat, snapshots) = match rest {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(p) = p3.as_mut() {
+                    // SAFETY: decode is idle and the backend lives until
+                    // `loaded` drops: free what the self-check bound before
+                    // `golem_ctx_free` asserts on it.
+                    unsafe { raw::golem_reset_device_cache(p.ctx_ptr()) };
+                    p.device_cache_reset();
+                }
+                return Err(e);
+            }
+        };
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
 
         Ok({
@@ -930,14 +952,23 @@ impl Session {
         // order bytes_copied, bytes_skipped, evictions, cache_experts_copied,
         // stream_experts_copied (pinned by static_assert/offsetof there).
         let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 5]>() };
-        let load = |i: usize| counters[i].load(std::sync::atomic::Ordering::Relaxed);
-        Some(DeviceCacheStats::new(
-            load(0),
-            load(1),
-            load(2),
-            load(3),
-            load(4),
-        ))
+        let [
+            bytes_copied,
+            bytes_skipped,
+            evictions,
+            cache_copies,
+            stream_copies,
+        ] = counters
+            .each_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        Some(DeviceCacheStats {
+            bytes_copied,
+            bytes_skipped,
+            evictions,
+            cache_copies,
+            stream_copies,
+            skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
+        })
     }
 
     /// Expert `MUL_MAT_ID` nodes the scheduler placed on a CPU backend
@@ -1680,13 +1711,16 @@ impl SessionInner {
         // The lease-release contract: synchronize before the next compute.
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-        if n_gen > 0
-            && let Some(t) = self.timing.as_mut()
-        {
+        if let Some(t) = self.timing.as_mut() {
             // §11 step boundary: snapshot (and reset) the P3/store
-            // accumulators into this step's row. H2D is measured only on the
-            // async_h2d copy stream; policy stays unmeasured.
+            // accumulators into this step's row; a prefill-only decode's
+            // are discarded, not charged to the next generation row. H2D is
+            // measured only on the async_h2d copy stream; policy stays
+            // unmeasured.
             let io = p3_glue::take_step_io_stats();
+            if n_gen == 0 {
+                return Ok(true);
+            }
             let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
             t.row(crate::timing::StepTiming {
                 step,
@@ -2140,25 +2174,6 @@ pub struct DeviceCacheStats {
     pub skip_ratio: f64,
 }
 
-impl DeviceCacheStats {
-    fn new(
-        bytes_copied: u64,
-        bytes_skipped: u64,
-        evictions: u64,
-        cache_copies: u64,
-        stream_copies: u64,
-    ) -> Self {
-        Self {
-            bytes_copied,
-            bytes_skipped,
-            evictions,
-            cache_copies,
-            stream_copies,
-            skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
-        }
-    }
-}
-
 /// `skipped / (skipped + copied)`; 0.0 when there is no traffic at all.
 fn skip_ratio(bytes_copied: u64, bytes_skipped: u64) -> f64 {
     let total = bytes_copied.saturating_add(bytes_skipped);
@@ -2396,7 +2411,7 @@ mod tests {
     /// layers' experts alone exceed VRAM; pinning every MoE layer to the CPU
     /// leaves only the non-expert terms.
     #[test]
-    fn pool_off_load_check_counts_resident_experts_issue_93() {
+    fn pool_off_load_check_counts_resident_experts() {
         let m = golem_plan::ModelFacts {
             t_ne: 256 << 20,
             shexp: 0,
@@ -2451,12 +2466,6 @@ mod tests {
         assert_eq!(skip_ratio(3, 0), 0.0, "all copied ⇒ 0.0");
         assert_eq!(skip_ratio(0, 5), 1.0, "all skipped ⇒ 1.0");
         assert_eq!(skip_ratio(1, 3), 0.75);
-        let stats = DeviceCacheStats::new(1, 3, 7, 2, 4);
-        assert_eq!(stats.bytes_copied, 1);
-        assert_eq!(stats.bytes_skipped, 3);
-        assert_eq!(stats.evictions, 7);
-        assert_eq!((stats.cache_copies, stats.stream_copies), (2, 4));
-        assert_eq!(stats.skip_ratio, 0.75);
     }
 
     #[test]
@@ -2552,7 +2561,7 @@ mod tests {
     }
 
     #[test]
-    fn piece_into_matches_two_pass_over_vocab_issue_93() {
+    fn piece_into_matches_two_pass_over_vocab() {
         let cfg = EngineConfig {
             model_path: xtask::tiny_moe::cached_fixture(),
             ..EngineConfig::default()
@@ -2574,7 +2583,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_piece_buffer_capacity_stable_across_decode_issue_93() {
+    fn slot_piece_buffer_capacity_stable_across_decode() {
         let cfg = EngineConfig {
             model_path: xtask::tiny_moe::cached_fixture(),
             ..EngineConfig::default()

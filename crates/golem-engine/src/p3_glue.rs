@@ -693,6 +693,7 @@ pub(crate) fn advance_decode_step() {
 
 /// Per-step I/O timing snapshot (§11): P3 wait is always measured once the
 /// hooks exist; disk time/bytes only when the store-backed source is live.
+#[derive(Default)]
 pub(crate) struct StepIoStats {
     pub p3_wait_ns: u64,
     pub disk_ns: Option<u64>,
@@ -708,22 +709,8 @@ fn current_states() -> Vec<Arc<HookState>> {
 /// Takes (swap-to-zero) the timing accumulators at a decode step boundary.
 /// No-op while hooks are unregistered: unmeasured fields come back `None`.
 pub(crate) fn take_step_io_stats() -> StepIoStats {
-    let states = current_states();
-    if states.is_empty() {
-        return StepIoStats {
-            p3_wait_ns: 0,
-            disk_ns: None,
-            disk_bytes: None,
-            h2d: None,
-        };
-    }
-    let mut out = StepIoStats {
-        p3_wait_ns: 0,
-        disk_ns: None,
-        disk_bytes: None,
-        h2d: None,
-    };
-    for h in states {
+    let mut out = StepIoStats::default();
+    for h in current_states() {
         out.p3_wait_ns += h.p3_wait_ns.swap(0, Ordering::Relaxed);
         if let Some(s) = &h.store {
             let (ns, bytes) = s.take_disk_stats();
@@ -734,7 +721,8 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
         if !ctx.is_null() {
             let (mut ms, mut bytes) = (0.0, 0);
             // SAFETY: FFI on the live ctx between computes (the decode thread
-            // synchronized); writes only the two out-params.
+            // synchronized); the cs_* fields are decode-thread-only and it
+            // writes only the two out-params.
             if unsafe { raw::golem_take_h2d_timing(ctx, &mut ms, &mut bytes) } == 1 {
                 let (m0, b0) = out.h2d.unwrap_or((0.0, 0));
                 out.h2d = Some((m0 + ms, b0 + bytes));

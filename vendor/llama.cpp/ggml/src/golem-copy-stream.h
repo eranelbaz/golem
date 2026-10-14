@@ -1,8 +1,9 @@
 // Golem dedicated H2D copy stream (async_h2d, design option A). ggml-base
 // cannot call into a device backend, so the device backend exports this table
 // through ggml_backend_reg_get_proc_address(reg, "golem_copy_stream_iface");
-// NULL there means the backend has no copy stream and the scheduler keeps
-// every H2D on the compute stream. Events are opaque device events created by
+// NULL there means the backend has no copy stream: an async_h2d compute on it
+// is a documented FFI abort (the engine refuses async_h2d on a non-HIP
+// substrate). Events are opaque device events created by
 // event_new; `timing != 0` creates one usable with elapsed_ms.
 #ifndef GOLEM_COPY_STREAM_H
 #define GOLEM_COPY_STREAM_H

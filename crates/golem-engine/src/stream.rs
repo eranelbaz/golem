@@ -139,7 +139,7 @@ pub struct StreamState {
     /// stream_source calls (one per streamed plane).
     pub planes: AtomicU64,
     /// Σ ids over successfully sourced planes.
-    pub sourced_ids: AtomicU64,
+    sourced_ids: AtomicU64,
     /// Mirror of `Inner::holds.len()`, stored under the lock at every
     /// insert/remove so `stats()` never takes it.
     held: AtomicU64,
@@ -317,6 +317,7 @@ impl StreamState {
             });
     }
 
+    /// Errors only before a staging slot is popped: nothing to give back.
     fn warm_plane(&self, layer: u32, kind: ExpertKind, ids: &[u32]) -> Result<(), StreamError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         check_read(inner.read)?;
@@ -437,6 +438,8 @@ impl StreamState {
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if pending.slot != usize::MAX {
+                // `read` is store-global on purpose: any plane's loss ends
+                // this wait, not just this slot's reads.
                 while inner.pending_reads[pending.slot] > 0 && inner.read == ReadState::Ok {
                     inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
                 }
@@ -561,7 +564,7 @@ impl StreamState {
         // Nothing is in flight any more. A fatal read is sticky: one on a
         // warmed plane never consumed still aborts here; only StorageLost
         // resets for the next turn.
-        if boundary_must_abort(inner.read) {
+        if inner.read == ReadState::Fatal {
             drop(inner);
             p3_fatal("stream reader failed on an unconsumed plane; aborting".into());
         }
@@ -607,11 +610,6 @@ impl StreamState {
     }
 }
 
-/// Whether `release_all` must abort instead of resetting the read state.
-fn boundary_must_abort(read: ReadState) -> bool {
-    read == ReadState::Fatal
-}
-
 fn check_read(read: ReadState) -> Result<(), StreamError> {
     match read {
         ReadState::Ok => Ok(()),
@@ -638,13 +636,6 @@ mod tests {
         P3Stats, PolicySnapshot, PoolGeometry, SnapshotHandle, UnitLayout,
     };
     use std::sync::atomic::AtomicBool;
-
-    #[test]
-    fn boundary_aborts_only_on_fatal() {
-        assert!(boundary_must_abort(ReadState::Fatal));
-        assert!(!boundary_must_abort(ReadState::StorageLost));
-        assert!(!boundary_must_abort(ReadState::Ok));
-    }
 
     const STRIDE: u64 = 64;
     const N_EXPERTS: u32 = 4;
@@ -754,7 +745,23 @@ mod tests {
     }
 
     #[test]
-    fn stats_held_mirrors_holds_len_issue_93() {
+    fn storage_loss_resets_at_the_boundary_for_the_next_turn() {
+        let s = state((0, 1));
+        let mut out = [std::ptr::null(); 1];
+        assert_eq!(
+            s.source(0, 1, 1, &[1], &mut out),
+            Err(StreamError::StorageLost)
+        );
+        s.release_all();
+        s.warm(0, &[2]);
+        assert_eq!(s.source(0, 1, 2, &[2], &mut out), Ok(()));
+        s.release_all();
+        assert!(all_slots_free(&s));
+        s.stop();
+    }
+
+    #[test]
+    fn stats_held_mirrors_holds_len() {
         let s = state((9, 9));
         let len = |s: &StreamState| s.inner.lock().unwrap().holds.len() as u64;
         let mut out = [std::ptr::null(); 1];

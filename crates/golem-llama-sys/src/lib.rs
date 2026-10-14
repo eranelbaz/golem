@@ -47,15 +47,18 @@ pub fn hooks_abi_version() -> i32 {
 // guards.
 const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 15);
 
-/// Discrete GPU devices in the backend registry (each one a device backend
-/// a llama context may split across).
+/// GPU devices (discrete or integrated) in the backend registry (each one a
+/// device backend a llama context may split across).
 pub fn gpu_device_count() -> usize {
+    use raw::ggml_backend_dev_type::{GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU};
     // SAFETY: registry queries; indices < ggml_backend_dev_count are valid.
     unsafe {
         (0..raw::ggml_backend_dev_count())
             .filter(|&i| {
-                raw::ggml_backend_dev_type(raw::ggml_backend_dev_get(i))
-                    == raw::ggml_backend_dev_type::GGML_BACKEND_DEVICE_TYPE_GPU
+                matches!(
+                    raw::ggml_backend_dev_type(raw::ggml_backend_dev_get(i)),
+                    GGML_BACKEND_DEVICE_TYPE_GPU | GGML_BACKEND_DEVICE_TYPE_IGPU
+                )
             })
             .count()
     }

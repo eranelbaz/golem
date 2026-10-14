@@ -5690,20 +5690,28 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 // Golem async_h2d copy stream (golem-copy-stream.h): the last stream index
 // of the backend's device; the scheduler refuses it while concurrent-stream
 // forking (which uses indices >= 1) is enabled.
-static cudaStream_t golem_cs_stream(ggml_backend_t backend) {
+// Every wrapper makes the backend's device current first: the scheduler may
+// call in from a thread whose current device is another one.
+static ggml_backend_cuda_context * golem_cs_ctx(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    return cuda_ctx;
+}
+
+static cudaStream_t golem_cs_stream(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = golem_cs_ctx(backend);
     return cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_MAX_STREAMS - 1);
 }
 
 static void golem_cs_set_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_cuda_context * cuda_ctx = golem_cs_ctx(backend);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, golem_cs_stream(backend)));
 }
 
 static void * golem_cs_event_new(ggml_backend_t backend, int timing) {
-    ggml_cuda_set_device(((ggml_backend_cuda_context *) backend->context)->device);
+    golem_cs_ctx(backend);
     cudaEvent_t ev;
     CUDA_CHECK(cudaEventCreateWithFlags(&ev, timing ? cudaEventDefault : cudaEventDisableTiming));
     return (void *) ev;
@@ -5716,7 +5724,7 @@ static void golem_cs_event_free(void * event) {
 }
 
 static void golem_cs_record_compute(ggml_backend_t backend, void * event) {
-    CUDA_CHECK(cudaEventRecord((cudaEvent_t) event, ((ggml_backend_cuda_context *) backend->context)->stream()));
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) event, golem_cs_ctx(backend)->stream()));
 }
 
 static void golem_cs_record_copy(ggml_backend_t backend, void * event) {
@@ -5728,7 +5736,7 @@ static void golem_cs_copy_wait(ggml_backend_t backend, void * event) {
 }
 
 static void golem_cs_compute_wait(ggml_backend_t backend, void * event) {
-    CUDA_CHECK(cudaStreamWaitEvent(((ggml_backend_cuda_context *) backend->context)->stream(), (cudaEvent_t) event, 0));
+    CUDA_CHECK(cudaStreamWaitEvent(golem_cs_ctx(backend)->stream(), (cudaEvent_t) event, 0));
 }
 
 static void golem_cs_sync(ggml_backend_t backend) {

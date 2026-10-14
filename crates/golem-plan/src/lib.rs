@@ -471,9 +471,13 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
             bytes: mach.rocm_overhead,
         },
     ];
+    let after_ws = t
+        .iter()
+        .position(|t| t.name == "ws")
+        .map_or(t.len(), |p| p + 1);
     if let Some(b) = i.resident_experts {
         t.insert(
-            5,
+            after_ws,
             Term {
                 name: "resident_experts",
                 bytes: b,
@@ -487,7 +491,7 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
         mach.vram_total.saturating_sub(total(&t))
     };
     t.insert(
-        5,
+        after_ws,
         Term {
             name: "device_expert_cache",
             bytes: cache,
