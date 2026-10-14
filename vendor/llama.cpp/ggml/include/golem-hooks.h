@@ -1,16 +1,19 @@
-// Golem policy-hook ABI + expert-metadata queries (Golem patch P1, ABI v10:
-// per-model hook context; v7 added the exclusive-residency eviction hook,
-// v8 batches it per (layer, compute) — one call for all of a layer's
-// evictions in one shot; v9 adds the abandoned-D2H hook — a parked eviction
-// whose plane copies were not all issued by compute end must be reported so
-// the pool cancels the claim instead of committing unwritten bytes; v10 adds
-// the prefill-stream hooks -- design section 7.6: per-plane expert streaming through
-// double-buffered device slabs, byte sources decided by the pool without
-// touching decode residency; v11 lets the stream source abort the compute --
-// returns 1 to cancel the ubatch mid-split; v12 turns a failed device-slab
-// allocation into a failed compute instead of an abort; v13 lets ensure
-// fail a compute when the store cannot page the misses in). Part of the vendored ggml include tree; the ABI is
-// versioned — a change updates the Rust bindings and both sides together.
+// Golem policy-hook ABI + expert-metadata queries (Golem patch P1).
+// ABI history:
+//   v7  exclusive-residency eviction hook.
+//   v8  eviction hook batched per (layer, compute).
+//   v9  abandoned-D2H hook: a parked eviction whose plane copies were not all
+//       issued by compute end is reported so the pool cancels the claim.
+//   v10 per-model hook context; prefill-stream hooks (design section 7.6).
+//   v11 the stream source may abort the compute (returns 1).
+//   v12 a failed device-slab allocation fails the compute instead of aborting.
+//   v13 ensure may fail a compute when the store cannot page the misses in.
+//   v14 resident device bytes query.
+//   v15 GOLEM_STREAM_SRC_STORAGE_LOST; device-cache stats gain H2D expert
+//       copies; dedicated H2D copy stream (golem_set_async_h2d,
+//       golem_take_h2d_timing).
+// Part of the vendored ggml include tree; the ABI is versioned -- a change
+// updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
 // to llama_model / scheds); only process-global capability flags remain here.
 #ifndef GOLEM_HOOKS_H
@@ -35,7 +38,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 14
+#define GOLEM_HOOKS_ABI_VERSION 15
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -125,10 +128,15 @@ typedef void (*golem_routing_fn)(void *payload, int32_t blk, const void *tensor,
  * the decode hot set (section 7.6.4). `seq` is C's monotonic plane counter -- the
  * matching golem_stream_release(seq) releases the leases and staging slot.
  * NULL hook -> golem_set_prefill_stream aborts (streaming unavailable).
- * Returns 0 = out_ptrs filled; 1 = abort (ABI v11, request cancelled): C
- * waits for the split's issued H2D, calls golem_stream_release(seq) for
- * every seq issued so far (this one included) and the compute returns
- * GGML_STATUS_ABORTED -- llama_decode returns 2. */
+ * Returns GOLEM_STREAM_SRC_OK = out_ptrs filled; otherwise C waits for the
+ * split's issued H2D and calls golem_stream_release(seq) for every seq
+ * issued so far (this one included): GOLEM_STREAM_SRC_CANCEL (ABI v11,
+ * request cancelled) -> GGML_STATUS_ABORTED, llama_decode returns 2;
+ * GOLEM_STREAM_SRC_STORAGE_LOST (v15) or any other value ->
+ * GGML_STATUS_FAILED, llama_decode returns -3. */
+#define GOLEM_STREAM_SRC_OK 0
+#define GOLEM_STREAM_SRC_CANCEL 1
+#define GOLEM_STREAM_SRC_STORAGE_LOST 2
 typedef int32_t (*golem_stream_source_fn)(void *payload, int32_t blk, int32_t kind,
                                        uint64_t seq, const int32_t *ids,
                                        int32_t n_ids, const void **out_ptrs);
@@ -254,8 +262,11 @@ int32_t golem_device_cache_experts(golem_ctx_t ctx);
  * of aborting; the engine resets the cache and lowers K. Count of such
  * failures since ctx creation (0 for a NULL ctx). */
 uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
-/* Test seam: the next n slab (re)allocations fail as if out of VRAM. */
+#ifdef GOLEM_TEST_SUPPORT
+/* Test seam (ABI v15: declared only under GOLEM_TEST_SUPPORT): the next n
+ * slab (re)allocations fail as if out of VRAM. */
 void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
+#endif
 /* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
  * remapped-ids tensors (*slab_bytes) and prefill-stream slabs
  * (*stream_bytes). Slabs allocate lazily, so this is what is resident, not
@@ -277,6 +288,24 @@ void golem_reset_device_cache(golem_ctx_t ctx);
  * not concurrent with a compute. */
 void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
                               int32_t max_plane_stride, float routed_max);
+
+/* Dedicated H2D copy stream (ABI v15). `on != 0` issues the pooled and
+ * device-cache H2D on the split backend's copy stream, event-joined with the
+ * compute stream (WAR/evict-before-refill wait before, RAW wait after) and
+ * drained before every lease release. Returns 0, or -1 when refused
+ * (GGML_CUDA_GRAPH_OPT=1 concurrent-stream mode owns the stream indices).
+ * The backend must export "golem_copy_stream_iface" via
+ * ggml_backend_reg_get_proc_address; a compute on a backend without it is a
+ * documented FFI abort (the engine refuses async_h2d on a non-HIP substrate).
+ * Config-time call. One device backend per ctx: a compute on a second device
+ * backend is a documented FFI abort (the engine refuses multi-GPU async_h2d
+ * up front). */
+int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
+
+/* Copy-stream H2D time (sum of per-split event pairs) and bytes since the
+ * last call; resets both. Returns 1 when measured, 0 when async_h2d is off
+ * or the per-step ring overflowed. Call between computes. */
+int32_t golem_take_h2d_timing(golem_ctx_t ctx, double *ms, uint64_t *bytes);
 
 /* P4 counters. Opaque here (C++ side keeps the members atomic); each member
  * is a lock-free 8-byte counter read by Rust as u64. The pointer is stable

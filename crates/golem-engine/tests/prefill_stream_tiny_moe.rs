@@ -8,6 +8,7 @@
 //! host-to-device expert copy to stream.
 
 #![cfg(feature = "hip-tests")]
+#![allow(unsafe_code)] // FFI counter read, same gate as budget_tiny_moe
 
 mod common;
 
@@ -36,6 +37,20 @@ const TURNS: [ChatTurn<'static>; 1] = [ChatTurn {
     content: "counting one two three four five six seven eight nine ten",
 }];
 
+/// `stream_experts_copied` straight from the ctx block: this config is not
+/// `offloaded()`, so `Session::device_cache_stats` reports `None`.
+fn stream_copies(session: &Session) -> u64 {
+    // SAFETY: FFI getter with the session's live ctx; ctx-owned block.
+    let block = unsafe {
+        golem_llama_sys::raw::golem_get_device_cache_stats(session.p3_ctx_ptr().expect("pooled"))
+    };
+    assert!(!block.is_null());
+    // SAFETY: layout documented on `Session::device_cache_stats`: 5
+    // contiguous AtomicU64, stream_experts_copied last.
+    let c = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 5]>() };
+    c[4].load(Ordering::Relaxed)
+}
+
 #[test]
 fn streamed_prefill_matches_per_token_and_spares_the_pool() {
     let run = |stream: bool| {
@@ -45,10 +60,12 @@ fn streamed_prefill_matches_per_token_and_spares_the_pool() {
             .chat_turn(&TURNS, &mut |piece| out.push_str(piece))
             .expect("turn");
         let stats = session.p3_hooks().expect("pooled session").stream_stats();
-        (n, out, stats)
+        let dc = stream_copies(&session);
+        (n, out, stats, dc)
     };
-    let (n_stream, out_stream, stats) = run(true);
-    let (n_token, out_token, _) = run(false);
+    let (n_stream, out_stream, stats, dc) = run(true);
+    let (n_token, out_token, _, dc_token) = run(false);
+    assert_eq!(dc_token, 0, "per-token path streamed");
 
     assert_eq!(n_stream, n_token, "same generation length");
     assert_eq!(out_stream, out_token, "greedy output must match");
@@ -60,6 +77,8 @@ fn streamed_prefill_matches_per_token_and_spares_the_pool() {
         "stream_source must fire for streamed planes"
     );
     assert!(stats.bytes > 0, "streamed bytes must be counted");
+    // C copies exactly the id list it hands each successful stream_source.
+    assert_eq!(dc, stats.sourced_ids, "stream copies vs {stats:?}");
     // Pool traffic (claims, paged bytes) of a turn with one generated token
     // is the same with and without streaming: stream chunks never claim or
     // page into the pool (§7.6.4).

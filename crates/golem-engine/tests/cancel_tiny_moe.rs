@@ -136,6 +136,27 @@ fn cancel_inside_streamed_ubatch_aborts_within_one_plane() {
     });
 }
 
+/// A `GOLEM_STREAM_SRC_CANCEL` with no cancel flag set is a decode
+/// failure, never a silent `Cancelled`.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn spurious_stream_cancel_is_decode_error_and_next_turn_succeeds() {
+    let mut s = Session::new(&streamed()).expect("session");
+    s.p3_hooks().unwrap().spurious_stream_cancel_for_test();
+    let err = s
+        .turn(
+            &TurnRequest::new(LONG).cancel(Some(Arc::new(AtomicBool::new(false)))),
+            &mut |_| {},
+        )
+        .expect_err("spurious abort must fail the turn");
+    assert!(
+        matches!(err, golem_engine::EngineError::Decode(2)),
+        "got {err:?}"
+    );
+    s.turn(&TurnRequest::new(LONG), &mut |_| {})
+        .expect("the turn after a spurious cancel succeeds");
+}
+
 /// Real-target leg (GOLEM_HW=1, `GOLEM_HW_MODEL` = first UD-Q4_K_XL shard):
 /// cancel inside a streamed 2048-token prefill ubatch. Budget: one plane
 /// ≈ 13.4 s / (42 × 3) ≈ 0.11 s cold, so cancel → return must be ≲ one

@@ -22,7 +22,7 @@ sysinfo.workspace = true
 
 [features]
 hip-tests = []
-test-support = []
+test-support = ["golem-llama-sys/test-support"]
 
 [dev-dependencies]
 # Integration tests call the `*_for_test` seams.

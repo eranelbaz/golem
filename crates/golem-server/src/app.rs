@@ -50,7 +50,10 @@ pub(crate) fn status_of(code: ErrorCode) -> StatusCode {
         | ErrorCode::MultimodalUnsupported => StatusCode::BAD_REQUEST,
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
         ErrorCode::Busy | ErrorCode::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::BackendUnavailable
+        | ErrorCode::PlanInfeasible
+        | ErrorCode::InstanceNotFound
+        | ErrorCode::StopTimeout => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -211,17 +214,17 @@ async fn chat_inner(
     };
     let deadline = Instant::now() + ACCEPT_RETRY;
     // Counted before the send: the worker's dequeue may run first.
-    st.health.queued.fetch_add(1, Ordering::Relaxed);
+    st.health.queued.fetch_add(1, Ordering::SeqCst);
     loop {
         match st.jobs.try_send(job) {
             Ok(()) => break,
             Err(TrySendError::Disconnected(_)) => {
-                st.health.queued.fetch_sub(1, Ordering::Relaxed);
+                st.health.queued.fetch_sub(1, Ordering::SeqCst);
                 return Err(backend_gone());
             }
             Err(TrySendError::Full(j)) => {
                 if Instant::now() >= deadline {
-                    st.health.queued.fetch_sub(1, Ordering::Relaxed);
+                    st.health.queued.fetch_sub(1, Ordering::SeqCst);
                     return Err(api_err(ErrorCode::Busy, "all slots busy"));
                 }
                 job = j;

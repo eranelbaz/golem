@@ -52,6 +52,9 @@ pub struct ModelFacts {
     pub top_k: u32,
     /// Live layers carrying routed-expert planes.
     pub expert_layers: u32,
+    /// Index of the first block carrying routed-expert planes (the dense
+    /// lead length).
+    pub first_expert_block: u32,
     /// Largest per-expert plane stride (bytes of one expert in one plane).
     pub max_plane_stride: u64,
     /// Σ routed-expert plane bytes over live layers.
@@ -91,6 +94,7 @@ impl ModelFacts {
             n_expert: hp_u32(&kvs, "expert_count")?,
             top_k: hp_u32(&kvs, "expert_used_count")?,
             expert_layers: 0,
+            first_expert_block: 0,
             max_plane_stride: 0,
             expert_bytes_total: 0,
             kv_per_token: 0,
@@ -133,6 +137,7 @@ impl ModelFacts {
             }
         }
         m.expert_layers = expert_blk.iter().filter(|&&b| b).count() as u32;
+        m.first_expert_block = expert_blk.iter().position(|&b| b).unwrap_or(0) as u32;
         m.state_terms(&kvs, live.end as usize)?;
         Ok(m)
     }
@@ -302,7 +307,28 @@ pub fn device_cache_k(budget: u64, slab_bytes_per_expert: u64) -> u64 {
 /// Candidate `--prefill-ubatch` values, largest first.
 const UBATCHES: [u32; 5] = [8192, 4096, 2048, 1024, 512];
 
-/// Plan knobs; zero `ram_experts` means the §10 default pool.
+/// Where routed-expert bytes live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ExpertResidency {
+    /// RAM expert pool plus device expert cache; zero `ram_experts` means
+    /// the §10 default pool.
+    Pooled {
+        /// Host expert-pool budget.
+        ram_experts: u64,
+    },
+    /// Pool off: routed-expert bytes llama loads as ordinary VRAM tensors
+    /// (offloaded layers not pinned to the CPU); no device expert cache or
+    /// RAM pool.
+    Resident(u64),
+}
+
+impl Default for ExpertResidency {
+    fn default() -> Self {
+        Self::Pooled { ram_experts: 0 }
+    }
+}
+
+/// Plan knobs.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct PlanInput {
     /// Context length per sequence.
@@ -316,8 +342,8 @@ pub struct PlanInput {
     /// Device expert-cache budget; zero = whatever VRAM the other terms
     /// leave (the runtime's derived K).
     pub vram_experts: u64,
-    /// Host expert-pool budget.
-    pub ram_experts: u64,
+    /// Expert residency (pooled or resident).
+    pub experts: ExpertResidency,
     /// State-snapshot cache budget (§7.1).
     pub snapshot_ram: u64,
     /// Workspace model.
@@ -462,13 +488,27 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
             bytes: mach.rocm_overhead,
         },
     ];
+    let after_ws = t
+        .iter()
+        .position(|t| t.name == "ws")
+        .map_or(t.len(), |p| p + 1);
+    if let ExpertResidency::Resident(b) = i.experts {
+        t.insert(
+            after_ws,
+            Term {
+                name: "resident_experts",
+                bytes: b,
+            },
+        );
+        return t;
+    }
     let cache = if i.vram_experts > 0 {
         i.vram_experts
     } else {
         mach.vram_total.saturating_sub(total(&t))
     };
     t.insert(
-        5,
+        after_ws,
         Term {
             name: "device_expert_cache",
             bytes: cache,
@@ -506,10 +546,14 @@ pub fn plan(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> PlanReport {
     let ram = ram_terms(m, mach, i);
     let vram_headroom = headroom(mach.vram_total, total(&vram));
     let ram_headroom = headroom(mach.ram_free, total(&ram));
-    let min_device_expert_cache = m.min_device_expert_cache();
+    let min_device_expert_cache = match i.experts {
+        ExpertResidency::Resident(_) => 0,
+        ExpertResidency::Pooled { .. } => m.min_device_expert_cache(),
+    };
     let cache_ok = |t: &[Term]| {
-        t.iter()
-            .any(|t| t.name == "device_expert_cache" && t.bytes >= min_device_expert_cache)
+        min_device_expert_cache == 0
+            || t.iter()
+                .any(|t| t.name == "device_expert_cache" && t.bytes >= min_device_expert_cache)
     };
     let fits = |t: &[Term]| total(t) <= mach.vram_total && cache_ok(t);
     // A smaller ubatch shrinks `ws`, which grows a derived cache.
@@ -574,10 +618,12 @@ fn stream_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
 /// 0.75 × 88 GiB = 66 GiB < Σ experts, + 2 GiB host + 3.69 GiB staging ring.
 #[must_use]
 pub fn ram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
-    let pool = if i.ram_experts > 0 {
-        i.ram_experts
-    } else {
-        (mach.ram_free / 4 * 3).min(m.expert_bytes_total)
+    let pool = match i.experts {
+        ExpertResidency::Resident(_) => 0,
+        ExpertResidency::Pooled { ram_experts: 0 } => {
+            (mach.ram_free / 4 * 3).min(m.expert_bytes_total)
+        }
+        ExpertResidency::Pooled { ram_experts } => ram_experts,
     };
     vec![
         Term {
@@ -610,6 +656,7 @@ mod tests {
             n_expert: 288,
             top_k: 8,
             expert_layers: 42,
+            first_expert_block: 0,
             max_plane_stride: 6_881_280,
             expert_bytes_total: 42 * 288 * 3 * 4_718_592,
             kv_per_token: 19_712,
@@ -896,7 +943,9 @@ mod tests {
             1 << 30
         );
         let set = PlanInput {
-            ram_experts: 40 << 30,
+            experts: ExpertResidency::Pooled {
+                ram_experts: 40 << 30,
+            },
             snapshot_ram: 3 << 30,
             ..Default::default()
         };

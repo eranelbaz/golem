@@ -186,11 +186,29 @@ fn run_attaches_to_keyed_instance() {
         ])
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let unkeyed = golem(
+        &rt,
+        &[
+            "run",
+            &m,
+            "--prompt",
+            "hi",
+            "--n-predict",
+            "2",
+            "--allow-overcommit",
+        ],
+    );
     assert!(golem(&rt, &["stop", &id]).status.success());
     assert!(out.status.success(), "{err}");
     assert!(err.contains(&format!("attached to instance {id}")), "{err}");
     assert!(!out.stdout.is_empty(), "no reply: {err}");
+    let e2 = String::from_utf8_lossy(&unkeyed.stderr);
+    assert!(!unkeyed.status.success(), "{e2}");
+    assert!(
+        e2.contains(&format!("instance {id} requires an API key")) && e2.contains("GOLEM_API_KEY"),
+        "{e2}"
+    );
 }
 
 #[test]
@@ -231,4 +249,250 @@ fn detach_load_timeout_kills_grandchild() {
         "pid {pid} survived"
     );
     assert!(ids(&rt).is_empty());
+}
+
+fn wait_for_ids(rt: &Path) -> Vec<String> {
+    let t = std::time::Instant::now();
+    loop {
+        let v = ids(rt);
+        if !v.is_empty() {
+            return v;
+        }
+        assert!(t.elapsed().as_secs() < 60, "no registry entry within 60 s");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// `golem stop` on an in-process `run` blocked on idle stdin: the
+/// SIGTERM handler wakes the REPL, which returns through the normal drops.
+#[test]
+fn stop_in_process_run_with_idle_stdin_exits_normally() {
+    use std::os::unix::process::ExitStatusExt;
+    let rt = common::tempdir_env();
+    let mut child = common::golem_cmd(&rt)
+        .args(["run", &tiny_moe(), "--new", "--allow-overcommit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take();
+    let id = wait_for_ids(&rt).remove(0);
+    let st = golem(&rt, &["stop", &id]);
+    if !st.status.success() {
+        let _ = child.kill();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    assert!(
+        out.status.signal().is_none(),
+        "killed by signal {:?}: {}",
+        out.status.signal(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(128 + libc::SIGTERM));
+    assert!(ids(&rt).is_empty());
+}
+
+/// An in-process `run` REPL waiting at its prompt, stdin held open.
+fn idle_run(rt: &Path) -> (std::process::Child, std::process::ChildStdin) {
+    use std::io::Read;
+    let mut child = common::golem_cmd(rt)
+        .args(["run", &tiny_moe(), "--new", "--allow-overcommit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let mut seen = Vec::new();
+    let mut b = [0u8; 256];
+    while !String::from_utf8_lossy(&seen).contains("golem> ") {
+        let n = err.read(&mut b).unwrap();
+        assert!(n > 0, "{}", String::from_utf8_lossy(&seen));
+        seen.extend_from_slice(&b[..n]);
+    }
+    // Keep draining so the child never blocks on a full stderr pipe.
+    std::thread::spawn(move || std::io::copy(&mut err, &mut std::io::sink()));
+    (child, stdin)
+}
+
+fn kill(sig: &[&str], pid: u32) {
+    let st = std::process::Command::new("kill")
+        .args(sig)
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
+/// Ctrl-C at the prompt exits 130 with a plain message, no error envelope.
+#[test]
+fn sigint_at_run_prompt_exits_130() {
+    let rt = common::tempdir_env();
+    let (mut child, _stdin) = idle_run(&rt);
+    kill(&["-INT"], child.id());
+    let st = child.wait().unwrap();
+    assert_eq!(st.code(), Some(128 + libc::SIGINT), "{st:?}");
+    assert!(ids(&rt).is_empty());
+}
+
+/// A second signal before the first is handled kills a `run` outright.
+/// Two kinds: two pending signals of one kind would merge.
+#[test]
+fn second_signal_kills_idle_run() {
+    use std::os::unix::process::ExitStatusExt;
+    let rt = common::tempdir_env();
+    let (mut child, _stdin) = idle_run(&rt);
+    // Stopped, the child cannot handle the first before the second is
+    // pending: both run on SIGCONT, ahead of any REPL code.
+    let pid = child.id();
+    let st = std::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!("kill -STOP {pid}; kill -INT {pid}; kill -TERM {pid}; kill -CONT {pid}"),
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let st = child.wait().unwrap();
+    // The kernel picks which pending signal runs first; the second one,
+    // whichever it is, re-raises with SIG_DFL.
+    assert!(
+        matches!(st.signal(), Some(libc::SIGINT | libc::SIGTERM)),
+        "{st:?}"
+    );
+}
+
+/// Two lines piped at once are both answered while stdin stays open: the
+/// reader serves buffered complete lines before polling stdin again.
+#[test]
+fn run_repl_answers_two_lines_piped_at_once() {
+    let rt = common::tempdir_env();
+    let mut child = common::golem_cmd(&rt)
+        .args([
+            "run",
+            &tiny_moe(),
+            "--new",
+            "--n-predict",
+            "2",
+            "--allow-overcommit",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"hi\nhello\n").unwrap();
+    // The prompt is printed before each read: the third one means the
+    // second turn finished, whatever the replies contain.
+    let mut stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = std::io::Read::read(&mut stderr, &mut buf) {
+            let _ = tx.send(buf[..n].to_vec());
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut err = Vec::new();
+    let prompts = |e: &[u8]| String::from_utf8_lossy(e).matches("golem> ").count();
+    while prompts(&err) < 3 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => err.extend(chunk),
+            Err(_) => break,
+        }
+    }
+    drop(stdin);
+    let answered = prompts(&err) >= 3;
+    if !answered {
+        let _ = child.kill();
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        answered,
+        "second piped line not answered: {}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(status.success());
+}
+
+/// A registered `serve` entry for `pid` with no control socket.
+fn fake_serve(rt: &Path, id: &str, pid: u32, heartbeat_age: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let i = golem_registry::Instance {
+        id: id.into(),
+        pid,
+        pid_start_time: golem_registry::pid_start_time(pid).unwrap(),
+        kind: "serve".into(),
+        endpoint: String::new(),
+        model: "m".into(),
+        config_hash: "h".into(),
+        started_at: now,
+        planned_vram: 0,
+        planned_ram: 0,
+        health: "healthy".into(),
+        heartbeat_at: now - heartbeat_age,
+        children: vec![],
+        config: None,
+    };
+    let d = rt.join("run/golem/instances");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join(format!("{id}.json")),
+        serde_json::to_vec(&i).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A SIGSTOPped instance with a stale heartbeat and no socket is
+/// killed by a plain `stop`; a fresh heartbeat with a dead socket is not.
+#[test]
+fn stop_kills_hung_instance_but_not_live_one() {
+    let rt = common::tempdir_env();
+    // Kills and reaps the `sleep` children even if an assertion panics.
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let sleep = || {
+        Reap(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let (mut hung, mut live) = (sleep(), sleep());
+    let stopped = std::process::Command::new("kill")
+        .args(["-STOP", &hung.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(stopped.success());
+    fake_serve(&rt, "hung", hung.0.id(), 60);
+    fake_serve(&rt, "live", live.0.id(), 0);
+    let st = golem(&rt, &["stop", "live"]);
+    let live_alive = live.0.try_wait().unwrap().is_none();
+    let sh = golem(&rt, &["stop", "hung"]);
+    let hung_status = hung.0.try_wait().unwrap();
+    drop((live, hung));
+    assert!(!st.status.success());
+    assert!(live_alive, "live instance killed");
+    let err = String::from_utf8_lossy(&sh.stderr);
+    assert!(sh.status.success(), "{err}");
+    assert!(err.contains("golem: hung is hung; killing"), "{err}");
+    assert!(hung_status.is_some(), "hung instance survived");
 }

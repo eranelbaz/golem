@@ -14,8 +14,8 @@
 use std::io::{self, Write};
 
 /// One generation step's timing. `f64::NAN` marks an unmeasured component
-/// (`h2d_*`: the fork exposes no event pair on the copy stream until the
-/// M3.8 ABI bump; `policy_ms`: P2 order-building is not instrumented).
+/// (`h2d_*`: measured only on the async_h2d copy stream; `policy_ms`: P2
+/// order-building is not instrumented).
 pub struct StepTiming {
     /// 0-based generation step within the turn.
     pub step: u64,
@@ -30,9 +30,13 @@ pub struct StepTiming {
     pub disk_worker_ms: f64,
     /// Expert bytes read from disk this step.
     pub disk_bytes: u64,
-    /// Host→device copy time (unmeasured until the fork event pair exists).
+    /// Host→device copy time (copy-stream event pairs; async_h2d only): first
+    /// copy start to last copy end on the copy stream, so it includes any
+    /// copy-stream wait on compute. Under the WAR rule (§11) GPU-side
+    /// overlap is ~0; only the host queues ahead.
     pub h2d_ms: f64,
-    /// Host→device bytes (unmeasured alongside `h2d_ms`).
+    /// Host→device bytes, MMQ padding tails included (unmeasured alongside
+    /// `h2d_ms`).
     pub h2d_bytes: u64,
     /// P2 policy order-building time (unmeasured today).
     pub policy_ms: f64,

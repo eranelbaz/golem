@@ -50,8 +50,17 @@ fn hook_abi_types_generated() {
     // constant the bindings came from matches the compiled substrate.
     // ABI v9 adds the abandoned-D2H hook (parked evictions whose plane
     // copies were not all issued must be reported, not committed).
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 14);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 14);
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 15);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 15);
+    // v15: stream source return codes.
+    assert_eq!(
+        (
+            raw::GOLEM_STREAM_SRC_OK,
+            raw::GOLEM_STREAM_SRC_CANCEL,
+            raw::GOLEM_STREAM_SRC_STORAGE_LOST
+        ),
+        (0, 1, 2)
+    );
     let fns: &[(&str, *const ())] = &[
         ("golem_set_predict", raw::golem_set_predict as *const ()),
         (

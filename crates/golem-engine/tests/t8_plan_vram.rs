@@ -53,7 +53,9 @@ fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, b
         prefill_ubatch: c.prefill_ubatch.min(c.n_ctx),
         prefill_stream: true,
         vram_experts: 0,
-        ram_experts: c.ram_experts_gib << 30,
+        experts: golem_plan::ExpertResidency::Pooled {
+            ram_experts: c.ram_experts_gib << 30,
+        },
         snapshot_ram: 0,
         ws: golem_plan::WS_MEASURED,
     };
@@ -145,6 +147,7 @@ fn t8_plan_matches_hip_used_vram() {
         let (slab_res, stream_res) = s.device_cache_resident_bytes().expect("pool on");
         let copied = s.device_cache_stats().map_or(0, |d| d.bytes_copied);
         drop(s);
+        #[cfg(golem_backend_hip)]
         golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
         let actual = free_before as i64 - free_after as i64;
         // The per-term attribution, gated: stream slabs exact, cache slabs

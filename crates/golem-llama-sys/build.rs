@@ -220,6 +220,9 @@ fn build_substrate(repo_root: &Path, backend: &str, out_dir: &Path, pin_skipped:
         }
         other => unreachable!("detect_backend only yields cpu|hip, got {other:?}"),
     }
+    if env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some() {
+        cfg.define("GGML_GOLEM_TEST_SUPPORT", "ON");
+    }
     if pin_skipped {
         println!("cargo:warning={SKIP_GATE_ENV}=1 build: post-build pin re-check suppressed");
     }
@@ -289,6 +292,7 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         )
         .clang_arg(format!("-I{}", vendor.join("include").display()))
         .clang_arg(format!("-I{}", vendor.join("ggml/include").display()))
+        .clang_args(env::var_os("CARGO_FEATURE_TEST_SUPPORT").map(|_| "-DGOLEM_TEST_SUPPORT"))
         .allowlist_function("llama_.*")
         .allowlist_function("golem_.*")
         // GPU-offload plumbing: the `-ncmoe`-equivalent buft
@@ -321,6 +325,8 @@ fn generate_bindings(repo_root: &Path, out_dir: &Path) {
         // HIP device when the binary is HIP-linked, so compute goes through
         // the device registry instead of the CPU-only path above.
         .allowlist_function("ggml_backend_dev_by_type")
+        .allowlist_function("ggml_backend_dev_count")
+        .allowlist_function("ggml_backend_dev_get")
         .allowlist_function("ggml_backend_dev_type")
         .allowlist_function("ggml_backend_dev_name")
         .allowlist_function("ggml_backend_dev_init")

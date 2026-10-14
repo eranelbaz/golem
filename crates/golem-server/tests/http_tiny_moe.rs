@@ -112,10 +112,36 @@ fn raw_post(addr: SocketAddr, body: &serde_json::Value) -> TcpStream {
     s
 }
 
+/// Body-and-headers of a raw GET.
+fn get(addr: SocketAddr, path: &str) -> String {
+    let mut s = TcpStream::connect(addr).unwrap();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+    )
+    .unwrap();
+    raw_response(s)
+}
+
 fn raw_response(mut s: TcpStream) -> String {
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
     out
+}
+
+/// Body of a chunked `raw_response`.
+fn dechunk(resp: &str) -> String {
+    let (_, mut rest) = resp.split_once("\r\n\r\n").expect(resp);
+    let mut body = String::new();
+    while let Some((size, tail)) = rest.split_once("\r\n") {
+        let n = usize::from_str_radix(size, 16).expect(resp);
+        if n == 0 {
+            break;
+        }
+        body.push_str(&tail[..n]);
+        rest = &tail[n + 2..];
+    }
+    body
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -233,7 +259,7 @@ async fn worker_death_ends_serve_with_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn streaming_worker_death_ends_with_error_frame_not_done() {
+async fn streaming_worker_death_ends_with_error_frame_then_done() {
     let app = router_with_hooks(
         golem_server::test_engine_config(),
         TestHooks::panic_after_first_token(),
@@ -248,8 +274,20 @@ async fn streaming_worker_death_ends_with_error_frame_not_done() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("golem_backend_unavailable"), "{body}");
-    assert!(!body.contains("[DONE]"), "{body}");
+    assert_error_then_done(&body, "golem_backend_unavailable");
+}
+
+/// The stream tail is exactly one error frame then one `data: [DONE]`.
+fn assert_error_then_done(body: &str, needle: &str) {
+    assert_eq!(body.matches("[DONE]").count(), 1, "{body}");
+    let head = body
+        .strip_suffix("\n\ndata: [DONE]\n\n")
+        .unwrap_or_else(|| panic!("no trailing [DONE]: {body}"));
+    let last = &head[head.rfind("data: ").expect(body)..];
+    assert!(
+        last.starts_with("data: {\"error\"") && last.contains(needle),
+        "{body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -292,7 +330,7 @@ async fn streaming_disconnect_frees_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn streaming_shutdown_ends_with_draining_error_frame() {
+async fn streaming_shutdown_ends_with_draining_error_frame_then_done() {
     let (addr, stop, task) = serve_on_port0(
         golem_server::test_engine_config(),
         TestHooks::slow_decode(100),
@@ -308,12 +346,8 @@ async fn streaming_shutdown_ends_with_draining_error_frame() {
         .unwrap()
         .unwrap();
     let resp = client.await.unwrap();
-    assert!(
-        resp.starts_with("HTTP/1.1 200")
-            && resp.contains("server draining")
-            && !resp.contains("[DONE]"),
-        "{resp}"
-    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert_error_then_done(&dechunk(&resp), "server draining");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -342,8 +376,17 @@ async fn metrics_parse_as_prometheus_text() {
     // on HIP builds the series is emitted and must be 0; on CPU it is omitted (on_cpu is nonzero there)
     #[cfg(golem_backend_hip)]
     assert!(body.contains("golem_expert_mul_mat_id_off_gpu_total 0"));
+    #[cfg(golem_backend_hip)]
+    assert!(
+        body.contains("golem_expert_mul_mat_id_total{device=\"cpu\"} 0"),
+        "{body}"
+    );
     #[cfg(not(golem_backend_hip))]
     assert!(!body.contains("golem_expert_mul_mat_id_off_gpu_total"));
+    #[cfg(not(golem_backend_hip))]
+    assert!(!body.contains("golem_expert_mul_mat_id_total"));
+    // Non-pooled: no device cache, so no fake-zero copy series.
+    assert!(!body.contains("golem_expert_h2d_copies_total"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -403,6 +446,55 @@ async fn drain_finishes_in_flight_stream_and_refuses_new_requests() {
     assert!(t.elapsed() < Duration::from_secs(35));
 }
 
+/// `--parallel 2` drain: both in-flight streams and the queued one finish
+/// with `[DONE]` within the grace; a new request gets 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_parallel_2_finishes_queued_stream() {
+    let mut scfg = golem_server::test_support::test_server_config();
+    scfg.drain_grace = Duration::from_secs(30);
+    let (addr, stop, task) = golem_server::test_support::serve_with(
+        golem_engine::config::EngineConfig {
+            parallel: 2,
+            ..golem_server::test_engine_config()
+        },
+        TestHooks::slow_decode(50),
+        scfg,
+    )
+    .await;
+    let clients: Vec<_> = (0..3)
+        .map(|_| tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi_stream(48)))))
+        .collect();
+    let t = Instant::now();
+    while !get(addr, "/metrics").contains("golem_queue_depth 1\n") {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "third request never queued"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let late = tokio::task::spawn_blocking(move || raw_response(raw_post(addr, &hi(2))))
+        .await
+        .unwrap();
+    assert!(
+        late.starts_with("HTTP/1.1 503") && late.contains("golem_busy"),
+        "{late}"
+    );
+    for c in clients {
+        let resp = c.await.unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("[DONE]") && !resp.contains("error"),
+            "{resp}"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(35), task)
+        .await
+        .expect("serve returns within 35 s")
+        .unwrap()
+        .unwrap();
+}
+
 /// After a finished request the idle worker reports not busy, so shutdown
 /// does not sit out the whole drain grace.
 #[tokio::test(flavor = "multi_thread")]
@@ -423,4 +515,33 @@ async fn shutdown_after_finished_request_skips_grace() {
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+/// Separate mode on the GLM template (prompt opens `<think>`): generated
+/// text streams as `reasoning_content`, and no marker leaks into `content`.
+#[tokio::test(flavor = "multi_thread")]
+async fn separate_mode_glm_streams_reasoning_without_markers() {
+    let cfg = golem_engine::config::EngineConfig {
+        chat_template: Some(
+            include_str!("../../golem-engine/tests/fixtures/glm-5.3-flash.jinja").into(),
+        ),
+        ..golem_server::test_engine_config()
+    };
+    let app = router_with_hooks(cfg, TestHooks::default()).await;
+    let r = app.oneshot(chat(hi_stream(16))).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let deltas: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|f| f.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| {
+            serde_json::from_str::<serde_json::Value>(d).unwrap()["choices"][0]["delta"].clone()
+        })
+        .collect();
+    let field = |k: &str| -> String { deltas.iter().filter_map(|d| d[k].as_str()).collect() };
+    assert!(!field("reasoning_content").is_empty(), "{body}");
+    assert!(!field("content").contains("think>"), "{body}");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
 }

@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 
 use axum::body::Body;
-use golem_server::test_support::{TestHooks, router_with_hooks};
+use golem_server::ServeError;
+use golem_server::test_support::{TestHooks, router_with_hooks, serve_on_port0};
 use http::Request;
 use tower::ServiceExt;
 
@@ -74,7 +75,29 @@ async fn replicas_lost_during_read_is_fatal_io_503() {
     fatal_io_503(TestHooks::fail_storage_during_read()).await;
 }
 
-async fn fatal_io_503(hooks: TestHooks) {
+/// The replicas die inside a streamed-prefill read on the stream reader
+/// thread: `stream_source` fails the compute (`llama_decode` -3) instead of
+/// aborting, and the request gets the 503.
+#[cfg(feature = "hip-tests")]
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_prefill_storage_loss_is_fatal_io_503() {
+    fatal_io_503_with(TestHooks::fail_storage_during_stream_read(), |c| {
+        golem_engine::config::EngineConfig {
+            prefill_stream: true,
+            prefill_ubatch: 64,
+            prefill_stream_min: 1,
+            n_ctx: 512,
+            ..c
+        }
+    })
+    .await;
+}
+
+/// A server left in `fatal-io` reports it from `serve` at shutdown, so the
+/// CLI exits non-zero with `golem_storage_unavailable`.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_returns_storage_unavailable_after_fatal_io() {
+    use std::io::{Read, Write};
     let (model, manifest) = fixture();
     let cfg = golem_engine::config::EngineConfig {
         model_path: model,
@@ -83,6 +106,52 @@ async fn fatal_io_503(hooks: TestHooks) {
         manifest_path: Some(manifest),
         ..golem_server::test_engine_config()
     };
+    let (addr, stop, task) = serve_on_port0(cfg, TestHooks::fail_storage_after_admit()).await;
+    let resp = tokio::task::spawn_blocking(move || {
+        let body =
+            serde_json::json!({"model":"tiny-moe","messages":[{"role":"user","content":"hi"}],
+            "max_tokens":8,"temperature":0})
+            .to_string();
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        write!(
+            s,
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).unwrap();
+        r
+    })
+    .await
+    .unwrap();
+    assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+    stop.send(()).unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ServeError::StorageUnavailable)
+    ));
+}
+
+async fn fatal_io_503(hooks: TestHooks) {
+    fatal_io_503_with(hooks, |c| c).await;
+}
+
+async fn fatal_io_503_with(
+    hooks: TestHooks,
+    tweak: impl FnOnce(golem_engine::config::EngineConfig) -> golem_engine::config::EngineConfig,
+) {
+    let (model, manifest) = fixture();
+    let cfg = tweak(golem_engine::config::EngineConfig {
+        model_path: model,
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        manifest_path: Some(manifest),
+        ..golem_server::test_engine_config()
+    });
     let app = router_with_hooks(cfg, hooks).await;
     let chat = || {
         Request::post("/v1/chat/completions")
@@ -111,4 +180,63 @@ async fn fatal_io_503(hooks: TestHooks) {
         .await
         .unwrap();
     assert_eq!(body_json(r).await["state"], "fatal-io");
+}
+
+/// Pooled offloaded session: after one chat turn the H2D copy series is
+/// exported and the cache path moved (HIP only; CPU never copies H2D).
+#[cfg(golem_backend_hip)]
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_export_expert_h2d_copies() {
+    let (model, manifest) = fixture();
+    let cfg = golem_engine::config::EngineConfig {
+        model_path: model,
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        manifest_path: Some(manifest),
+        n_gpu_layers: 99,
+        cpu_moe_layers: Some(99),
+        ..golem_server::test_engine_config()
+    };
+    let app = router_with_hooks(cfg, TestHooks::default()).await;
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model":"tiny-moe","messages":[{"role":"user","content":"hi"}],
+                        "max_tokens":8,"temperature":0})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = app
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = String::from_utf8(
+        axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let cache: u64 = body
+        .lines()
+        .find_map(|l| l.strip_prefix("golem_expert_h2d_copies_total{path=\"cache\"} "))
+        .unwrap_or_else(|| panic!("{body}"))
+        .parse()
+        .unwrap();
+    assert!(cache > 0, "{body}");
+    assert!(
+        body.contains("golem_expert_h2d_copies_total{path=\"stream\"} "),
+        "{body}"
+    );
+    assert!(
+        body.contains("golem_expert_mul_mat_id_total{device=\"cpu\"} 0"),
+        "{body}"
+    );
 }

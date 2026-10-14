@@ -42,9 +42,29 @@ pub enum ErrorCode {
     /// Instance is draining or overloaded; retry semantics attached.
     #[serde(rename = "golem_busy")]
     Busy,
+    /// `golem stop` gave up waiting for the instance to exit.
+    #[serde(rename = "golem_stop_timeout")]
+    StopTimeout,
     /// Malformed request that does not fit a more specific code.
     #[serde(rename = "golem_invalid_request")]
     InvalidRequest,
+}
+
+impl ErrorCode {
+    /// Every code, in declaration order (`ALL[c as usize] == c`).
+    pub const ALL: [Self; 11] = [
+        Self::BackendUnavailable,
+        Self::PlanInfeasible,
+        Self::ModelMismatch,
+        Self::MultimodalUnsupported,
+        Self::UnsupportedField,
+        Self::StorageUnavailable,
+        Self::InstanceNotFound,
+        Self::NotFound,
+        Self::Busy,
+        Self::StopTimeout,
+        Self::InvalidRequest,
+    ];
 }
 
 /// Machine-readable error payload; `message` is human-readable (tech design §8.4).
@@ -118,6 +138,7 @@ mod tests {
             (ErrorCode::InstanceNotFound, "golem_instance_not_found"),
             (ErrorCode::NotFound, "golem_not_found"),
             (ErrorCode::Busy, "golem_busy"),
+            (ErrorCode::StopTimeout, "golem_stop_timeout"),
             (ErrorCode::InvalidRequest, "golem_invalid_request"),
         ];
         for (code, wire) in cases {

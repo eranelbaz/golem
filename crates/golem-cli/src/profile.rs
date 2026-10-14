@@ -175,6 +175,8 @@ pub enum Axis {
     IoDepth(Vec<u32>),
     /// [`Knobs::vram_experts_frac`].
     VramExpertsFrac(Vec<f32>),
+    /// [`Knobs::async_h2d`].
+    AsyncH2d(Vec<bool>),
 }
 
 impl Axis {
@@ -196,6 +198,7 @@ impl Axis {
             Axis::IoThreads(v) => each(v, |k, x| k.io_threads = x, base),
             Axis::IoDepth(v) => each(v, |k, x| k.io_depth = x, base),
             Axis::VramExpertsFrac(v) => each(v, |k, x| k.vram_experts_frac = x, base),
+            Axis::AsyncH2d(v) => each(v, |k, x| k.async_h2d = x, base),
         }
     }
 }

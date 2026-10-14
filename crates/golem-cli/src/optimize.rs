@@ -50,8 +50,8 @@ pub struct OptimizeArgs {
     #[arg(long, default_value_t = 120)]
     pub max_minutes: u64,
     /// Override the swept axes: `knob=v1,v2;knob=...` over threads,
-    /// numa_interleave, o_direct, io_threads, io_depth, vram_experts_frac
-    /// (`async_h2d` is refused).
+    /// numa_interleave, o_direct, io_threads, io_depth, vram_experts_frac,
+    /// async_h2d.
     #[arg(long)]
     pub axes: Option<String>,
     /// Internal: measure one knob set (JSON) and print its metrics.
@@ -349,7 +349,9 @@ fn plan_for(
         parallel: config.parallel,
         prefill_ubatch: config.prefill_ubatch.min(config.n_ctx),
         prefill_stream: config.prefill_stream,
-        ram_experts: config.ram_experts_gib << 30,
+        experts: golem_plan::ExpertResidency::Pooled {
+            ram_experts: config.ram_experts_gib << 30,
+        },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         ws: golem_plan::WS_MEASURED,
         ..Default::default()
@@ -405,12 +407,22 @@ fn run_child(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     let pid = child.id();
-    guard.update(|i| i.children.push(pid));
+    // An unregistered child would hold mlocked RAM outside the entry's
+    // reservation and out of `stop`'s reach.
+    let entry = match golem_registry::Child::of(pid) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("child {pid}: cannot record start time: {e}").into());
+        }
+    };
+    guard.update(|i| i.children.push(entry));
     // The child checks ownership only after this byte: its pid is in the
     // entry first. Dropping stdin on error makes the child's read fail.
     let go = child.stdin.take().map(|mut s| s.write_all(b"g"));
     let out = child.wait_with_output();
-    guard.update(|i| i.children.retain(|&c| c != pid));
+    guard.update(|i| i.children.retain(|c| c.pid() != pid));
     let out = out?;
     go.ok_or("child stdin missing")??;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -450,11 +462,7 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
                 "o_direct" => Axis::ODirect(vals(v)?),
                 "io_threads" => Axis::IoThreads(vals(v)?),
                 "io_depth" => Axis::IoDepth(vals(v)?),
-                "async_h2d" => {
-                    return Err("async_h2d is not sweepable: the engine refuses it at load \
-                                (no dedicated copy stream)"
-                        .into());
-                }
+                "async_h2d" => Axis::AsyncH2d(vals(v)?),
                 "vram_experts_frac" => Axis::VramExpertsFrac(vals(v)?),
                 other => return Err(format!("unknown knob {other:?}").into()),
             })
@@ -463,8 +471,8 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
 }
 
 /// The swept axes for this machine. NUMA only with > 1 node, `O_DIRECT`
-/// and I/O only with a store-backed pool; `async_h2d` is absent (the
-/// substrate refuses it). Target: 16 physical cores → threads {8, 12, 16}.
+/// and I/O only with a store-backed pool; `async_h2d` is opt-in via
+/// `--axes` (no measured win yet). Target: 16 physical cores → threads {8, 12, 16}.
 fn default_axes(config: &EngineConfig) -> Vec<Axis> {
     let phys = sysinfo::System::new().physical_core_count().unwrap_or(2) as u32;
     let mut threads = vec![(phys / 2).max(1), (phys * 3 / 4).max(1), phys.max(1)];
@@ -515,6 +523,7 @@ fn fold_defaults(axes: &mut [Axis], config: &EngineConfig) {
             Axis::IoThreads(v) => fold(v, |x| Some(x) == config.io_threads, 0),
             Axis::IoDepth(v) => fold(v, |x| x == config.io_depth.max(1), 0),
             Axis::VramExpertsFrac(v) => fold(v, |x| x == config.vram_experts_frac, 0.0),
+            Axis::AsyncH2d(v) => fold(v, |x| x == config.async_h2d, false),
         }
     }
 }
@@ -640,10 +649,12 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
     std::io::Read::read_exact(&mut std::io::stdin(), &mut go)?;
     // The parent's entry is this child's only reservation.
     let entry = Registry::open()?.find(parent)?;
-    if entry.kind != "optimize"
-        || entry.pid != crate::sys::parent_pid()
-        || !entry.children.contains(&std::process::id())
-    {
+    let me = golem_registry::Child::of(std::process::id())?;
+    let listed = entry.children.iter().any(|&c| match c {
+        golem_registry::Child::Timed { .. } => c == me,
+        golem_registry::Child::Bare(pid) => pid == me.pid(),
+    });
+    if entry.kind != "optimize" || entry.pid != crate::sys::parent_pid() || !listed {
         return Err(format!("entry `{parent}` does not own this measurement").into());
     }
     let layers = crate::config::Layers::from_process()?;

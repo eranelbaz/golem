@@ -293,9 +293,15 @@ struct HookState {
     abort: AtomicPtr<AtomicBool>,
     /// Test seam: absolute stream plane count at which `stream_source` sets
     /// the turn's cancel flag (0 = off).
+    #[cfg(any(test, feature = "test-support"))]
     test_cancel_plane: AtomicU64,
+    /// Test seam: the next `stream_source` returns
+    /// `GOLEM_STREAM_SRC_CANCEL` without touching any cancel flag.
+    #[cfg(any(test, feature = "test-support"))]
+    test_spurious_cancel: AtomicBool,
     /// Test seam: the next ensure call marks every replica unreadable
     /// before its page-in reads, so the read itself fails.
+    #[cfg(any(test, feature = "test-support"))]
     test_fail_storage_in_read: AtomicBool,
 }
 
@@ -687,10 +693,13 @@ pub(crate) fn advance_decode_step() {
 
 /// Per-step I/O timing snapshot (§11): P3 wait is always measured once the
 /// hooks exist; disk time/bytes only when the store-backed source is live.
+#[derive(Default)]
 pub(crate) struct StepIoStats {
     pub p3_wait_ns: u64,
     pub disk_ns: Option<u64>,
     pub disk_bytes: Option<u64>,
+    /// Copy-stream H2D (ms, bytes); `None` unless async_h2d measured it.
+    pub h2d: Option<(f64, u64)>,
 }
 
 fn current_states() -> Vec<Arc<HookState>> {
@@ -700,25 +709,24 @@ fn current_states() -> Vec<Arc<HookState>> {
 /// Takes (swap-to-zero) the timing accumulators at a decode step boundary.
 /// No-op while hooks are unregistered: unmeasured fields come back `None`.
 pub(crate) fn take_step_io_stats() -> StepIoStats {
-    let states = current_states();
-    if states.is_empty() {
-        return StepIoStats {
-            p3_wait_ns: 0,
-            disk_ns: None,
-            disk_bytes: None,
-        };
-    }
-    let mut out = StepIoStats {
-        p3_wait_ns: 0,
-        disk_ns: None,
-        disk_bytes: None,
-    };
-    for h in states {
+    let mut out = StepIoStats::default();
+    for h in current_states() {
         out.p3_wait_ns += h.p3_wait_ns.swap(0, Ordering::Relaxed);
         if let Some(s) = &h.store {
             let (ns, bytes) = s.take_disk_stats();
             out.disk_ns = Some(out.disk_ns.unwrap_or(0) + ns);
             out.disk_bytes = Some(out.disk_bytes.unwrap_or(0) + bytes);
+        }
+        let ctx = h.ctx_ptr.load(Ordering::SeqCst);
+        if !ctx.is_null() {
+            let (mut ms, mut bytes) = (0.0, 0);
+            // SAFETY: FFI on the live ctx between computes (the decode thread
+            // synchronized); the cs_* fields are decode-thread-only and it
+            // writes only the two out-params.
+            if unsafe { raw::golem_take_h2d_timing(ctx, &mut ms, &mut bytes) } == 1 {
+                let (m0, b0) = out.h2d.unwrap_or((0.0, 0));
+                out.h2d = Some((m0 + ms, b0 + bytes));
+            }
         }
     }
     out
@@ -852,6 +860,17 @@ impl SessionHooks {
         self.state
             .test_fail_storage_in_read
             .store(true, Ordering::Relaxed);
+    }
+
+    /// Test seam: the stream reader kills every replica right before its
+    /// next read.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_in_stream_read_for_test(&self) {
+        if let Some(s) = &self.state.stream {
+            let state = self.state.clone();
+            s.before_next_read_for_test(Box::new(move || state.fail_storage()));
+        }
     }
 
     /// §6.5 prefetch and prediction counters.
@@ -1053,6 +1072,16 @@ impl SessionHooks {
         let base = self.stream_stats().map_or(0, |s| s.planes);
         let at = if n == 0 { 0 } else { base + n };
         self.state.test_cancel_plane.store(at, Ordering::Relaxed);
+    }
+
+    /// Test seam: the next `stream_source` call returns
+    /// `GOLEM_STREAM_SRC_CANCEL` with no cancel flag set.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn spurious_stream_cancel_for_test(&self) {
+        self.state
+            .test_spurious_cancel
+            .store(true, Ordering::Relaxed);
     }
 
     /// Drops every staging slot and pool lease the stream chunks still
@@ -1503,7 +1532,13 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // staging ring + reader thread (GPU-registered with the pool arena below).
     let stream = if stream_enabled {
         let slot_bytes = geo.n_experts as usize * max_plane_stride as usize;
-        let st = StreamState::new(pool.clone(), source.clone(), slot_bytes)
+        let health = store.clone();
+        let storage_lost = Box::new(move || {
+            health
+                .as_ref()
+                .is_some_and(|s| s.health() == golem_store::InstanceHealth::FatalIo)
+        });
+        let st = StreamState::new(pool.clone(), source.clone(), storage_lost, slot_bytes)
             .map_err(|e| EngineError::PoolInit(format!("stream staging ring: {e}")))?;
         Some(st)
     } else {
@@ -1553,6 +1588,12 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // self-check decode; `fit_device_cache` raises it.
     let k_start = if derived_k { n_expert_used.min(k) } else { k };
     unsafe { raw::golem_set_device_cache_experts(ctx.as_ptr(), k_start as i32) };
+    // SAFETY: FFI config setter on a live ctx, no compute in flight.
+    if config.async_h2d && unsafe { raw::golem_set_async_h2d(ctx.as_ptr(), 1) } != 0 {
+        return Err(EngineError::InvalidConfig(
+            "async_h2d: GGML_CUDA_GRAPH_OPT=1 owns the copy-stream index".into(),
+        ));
+    }
     // Stash the stream config C-side (slabs allocate lazily on the first
     // streamed split's backend); chunks arm/disarm via SessionHooks.
     let mut stream_cfg = None;
@@ -1627,7 +1668,11 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         stream: stream.clone(),
         stream_armed: AtomicBool::new(false),
         abort: AtomicPtr::new(std::ptr::null_mut()),
+        #[cfg(any(test, feature = "test-support"))]
         test_cancel_plane: AtomicU64::new(0),
+        #[cfg(any(test, feature = "test-support"))]
+        test_spurious_cancel: AtomicBool::new(false),
+        #[cfg(any(test, feature = "test-support"))]
         test_fail_storage_in_read: AtomicBool::new(false),
     });
     if config.prefetch != PrefetchMode::Off {
@@ -2058,6 +2103,7 @@ pub extern "C" fn ensure_host_resident(
         // §11: a few `Instant::now()` per layer is the sanctioned hot-path cost.
         // The scratch mutex stays held across the call: the decode thread is
         // its only contender (stated invariant), so this serializes nothing.
+        #[cfg(any(test, feature = "test-support"))]
         if h.test_fail_storage_in_read.swap(false, Ordering::Relaxed) {
             h.fail_storage();
         }
@@ -2142,8 +2188,9 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
 /// The prefill-stream byte-source hook (ABI v11, design §7.6): one call per
 /// streamed plane from the copy loop; translates the raw blk into the
 /// pool's dense-lead-adjusted layer and forwards to the stream state.
-/// Returns 1 (abort the compute) when the active turn's cancel flag is set,
-/// so a cancel lands within one plane of a streamed ubatch.
+/// Returns `GOLEM_STREAM_SRC_CANCEL` when the active turn's cancel flag is
+/// set, so a cancel lands within one plane of a streamed ubatch, and
+/// `GOLEM_STREAM_SRC_STORAGE_LOST` when the store lost the plane's bytes.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn stream_source(
     payload: *mut c_void,
@@ -2161,14 +2208,19 @@ pub extern "C" fn stream_source(
         // SAFETY: non-null only while a `StreamAbortGuard` holds the
         // `Arc<AtomicBool>` it points into (nulled in its `Drop`).
         let cancel = (!flag.is_null()).then(|| unsafe { &*flag });
+        #[cfg(any(test, feature = "test-support"))]
         if let (Some(c), Some(s)) = (cancel, &h.stream) {
             let at = h.test_cancel_plane.load(Ordering::Relaxed);
             if at != 0 && s.stats().planes + 1 >= at {
                 c.store(true, Ordering::Relaxed);
             }
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if h.test_spurious_cancel.swap(false, Ordering::Relaxed) {
+            return raw::GOLEM_STREAM_SRC_CANCEL as i32;
+        }
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return 1;
+            return raw::GOLEM_STREAM_SRC_CANCEL as i32;
         }
         let Some(s) = &h.stream else {
             p3_fatal("stream_source without stream state (streaming not enabled)".into());
@@ -2187,10 +2239,18 @@ pub extern "C" fn stream_source(
                 std::slice::from_raw_parts_mut(out_ptrs, n_ids.max(0) as usize),
             )
         };
-        s.source(blk - h.dense_lead as i32, kind, seq, ids, out);
+        if s.source(blk - h.dense_lead as i32, kind, seq, ids, out)
+            .is_err()
+        {
+            return raw::GOLEM_STREAM_SRC_STORAGE_LOST as i32;
+        }
         // Re-checked after the (possibly blocking) fill: C's abort path
         // releases this seq too, so the plane's leases never leak.
-        i32::from(cancel.is_some_and(|c| c.load(Ordering::Relaxed)))
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            raw::GOLEM_STREAM_SRC_CANCEL as i32
+        } else {
+            raw::GOLEM_STREAM_SRC_OK as i32
+        }
     })
 }
 
@@ -2450,6 +2510,7 @@ pub extern "C" fn routing(
 
 impl HookState {
     /// Marks every replica of every store shard unreadable (fault seam).
+    #[cfg(any(test, feature = "test-support"))]
     fn fail_storage(&self) {
         if let Some(s) = &self.store {
             for sh in s.registry().shards() {

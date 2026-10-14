@@ -143,7 +143,9 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
         prefill_ubatch: args.prefill_ubatch.min(args.ctx),
         prefill_stream: true,
         vram_experts: bytes(args.vram_experts_gib),
-        ram_experts: bytes(args.ram_experts_gib),
+        experts: golem_plan::ExpertResidency::Pooled {
+            ram_experts: bytes(args.ram_experts_gib),
+        },
         snapshot_ram,
         ws: WS_MEASURED,
     };

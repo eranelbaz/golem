@@ -43,9 +43,26 @@ pub fn hooks_abi_version() -> i32 {
 
 // The RAII surface below is written against ABI v5 (per-model `golem_ctx`,
 // handle-returning register, batched ensure, triple-buffered order push).
-// A header drift past v14 must fail this build, not silently re-shape the
+// A header drift past v15 must fail this build, not silently re-shape the
 // guards.
-const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 14);
+const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 15);
+
+/// GPU devices (discrete or integrated) in the backend registry (each one a
+/// device backend a llama context may split across).
+pub fn gpu_device_count() -> usize {
+    use raw::ggml_backend_dev_type::{GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU};
+    // SAFETY: registry queries; indices < ggml_backend_dev_count are valid.
+    unsafe {
+        (0..raw::ggml_backend_dev_count())
+            .filter(|&i| {
+                matches!(
+                    raw::ggml_backend_dev_type(raw::ggml_backend_dev_get(i)),
+                    GGML_BACKEND_DEVICE_TYPE_GPU | GGML_BACKEND_DEVICE_TYPE_IGPU
+                )
+            })
+            .count()
+    }
+}
 
 /// Per-model hook context (ABI v5): owns a `golem_ctx_t` from
 /// `golem_ctx_create` and frees it on drop. `golem_ctx_free` aborts while

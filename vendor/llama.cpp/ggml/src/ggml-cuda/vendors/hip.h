@@ -66,6 +66,8 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
+#define cudaEventDefault hipEventDefault
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaFree hipFree
 #define cudaFreeHost hipHostFree
 #define cudaGetDevice hipGetDevice

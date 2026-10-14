@@ -72,7 +72,7 @@ impl Scheduler {
         self.rendered.get(id)?.as_ref().map(|r| &r.parser)
     }
 
-    /// The owned session (render, stats, reasoning splitter).
+    /// The owned session (render, stats, storage health).
     pub fn session(&mut self) -> &mut Session {
         &mut self.session
     }

@@ -32,20 +32,6 @@ impl Model {
         self.ptr
     }
 
-    /// Embedded chat template, `None` when the model ships none.
-    pub(crate) fn chat_template(&self) -> Option<String> {
-        // SAFETY: self.ptr is a live llama_model from llama_model_load_from_file;
-        // null name selects the default template (vendor/llama.cpp/include/llama.h).
-        let p = unsafe { raw::llama_model_chat_template(self.ptr, std::ptr::null()) };
-        if p.is_null() {
-            None
-        } else {
-            // SAFETY: llama.cpp returns a pointer to a NUL-terminated buffer
-            // owned by the model, valid for the model's lifetime.
-            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-        }
-    }
-
     /// Vocabulary handle for tokenization and logits sizing; lifetime tied to the model.
     pub(crate) fn vocab(&self) -> *const raw::llama_vocab {
         // SAFETY: self.ptr is a live llama_model; the vocab outlives the model.
@@ -267,7 +253,15 @@ pub(crate) fn load_with_hooks(
     };
 
     let loaded = LoadedModel { ctx, model, arch };
-    decode_self_check(loaded.ctx(), loaded.model().vocab())?;
+    if let Err(e) = decode_self_check(loaded.ctx(), loaded.model().vocab()) {
+        if let Some(ctx) = attach {
+            // SAFETY: the self-check decode is synchronized; the backend
+            // is alive until `loaded` drops, so the slabs and copy stream
+            // it bound are freed before `golem_ctx_free` asserts on them.
+            unsafe { raw::golem_reset_device_cache(ctx) };
+        }
+        return Err(e);
+    }
     Ok(loaded)
 }
 
@@ -517,11 +511,11 @@ pub struct ChatTurn<'a> {
 }
 
 /// Builds the session's chat templates and validates them with a 1-message
-/// probe render; also returns the default template source.
+/// probe render.
 fn probe_templates(
     loaded: &LoadedModel,
     config: &EngineConfig,
-) -> Result<(ChatTemplates, String), EngineError> {
+) -> Result<ChatTemplates, EngineError> {
     let over = config.chat_template.as_deref();
     let chat = ChatTemplates::from_model(loaded.model().as_ptr(), over)?;
     let probe = chat.render(
@@ -534,12 +528,7 @@ fn probe_templates(
     if probe.prompt.is_empty() {
         return Err(EngineError::TemplateUnavailable);
     }
-    let src = over.map(str::to_owned);
-    Ok((
-        chat,
-        src.or_else(|| loaded.model().chat_template())
-            .unwrap_or_default(),
-    ))
+    Ok(chat)
 }
 
 /// Renders `req`'s transcript (raw JSON, else its `ChatTurn`s) and tools.
@@ -584,8 +573,6 @@ pub(crate) struct SessionInner {
     loaded: LoadedModel,
     config: EngineConfig,
     chat: ChatTemplates,
-    /// Default template source (reasoning-marker detection).
-    template: String,
     last_prompt_tokens: Vec<raw::llama_token>,
     /// P3 pool state when the RAM expert pool is enabled (nonzero
     /// `ram_experts_gib`); `None` keeps flagless runs pristine (hooks unset,
@@ -606,6 +593,7 @@ pub(crate) struct SessionInner {
     snapshots: Option<SnapshotCache>,
     /// Test seam: the turn's cancel flag is set after this many prefill
     /// chunks decoded (0 = off).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) test_cancel_after_chunks: u32,
     /// The one `llama_batch` every step fills (capacity `llama_n_batch`),
     /// allocated at load: no per-turn or per-step batch allocation.
@@ -702,12 +690,17 @@ impl Session {
         if config.ram_experts_gib > 0 {
             p3_glue::refuse_if_pool_session_live()?;
         }
-        // The vendored scheduler issues pooled H2D on the compute stream
-        // between the split's event wait and its compute; no copy stream
-        // exists to overlap it on.
-        if config.async_h2d {
+        // The copy stream is a HIP stream of the split backend's context; the
+        // CPU substrate has none, and without the RAM pool there is no pooled
+        // H2D to move onto it.
+        if config.async_h2d && substrate_backend() == Backend::Cpu {
             return Err(EngineError::InvalidConfig(
                 "async_h2d: no dedicated H2D copy stream in this substrate".into(),
+            ));
+        }
+        if config.async_h2d && config.ram_experts_gib == 0 {
+            return Err(EngineError::InvalidConfig(
+                "async_h2d: needs the RAM expert pool (ram_experts_gib > 0)".into(),
             ));
         }
         if config.o_direct && (config.manifest_path.is_none() || config.ram_experts_gib == 0) {
@@ -736,6 +729,18 @@ impl Session {
             }
             None => tracing::warn!("no manifest: start-time model verification (R-8) skipped"),
         }
+        // One copy stream per hook ctx: a second device backend would hit the
+        // C-side FFI abort in golem_cs_begin, and the load's self-check decode
+        // already binds the copy stream. `init_backend` first: the registry
+        // must not be touched before it sets the op-offload threshold.
+        if config.async_h2d {
+            init_backend(forces_expert_offload(config));
+            if golem_llama_sys::gpu_device_count() > 1 {
+                return Err(EngineError::InvalidConfig(
+                    "async_h2d: supports a single GPU device".into(),
+                ));
+            }
+        }
         // P3 (§3.4): build the RAM expert pool + create the per-model ctx
         // BEFORE the model loads — the ctx must attach to the llama_model
         // before `llama_init_from_model` so its first `sched_reserve` sees
@@ -758,13 +763,24 @@ impl Session {
             }
         };
         // Derived K needs the resident weights, KV and compute buffer
-        // (ruling R3). On error the slabs are already freed by the fit.
-        if let Some(p) = p3.as_mut() {
-            p.fit_device_cache()?;
-        }
-        let (chat, template) = probe_templates(&loaded, config)?;
-
-        let snapshots = snapshot_cache(config)?;
+        // (ruling R3).
+        let rest = p3
+            .as_mut()
+            .map_or(Ok(()), |p| p.fit_device_cache())
+            .and_then(|()| Ok((probe_templates(&loaded, config)?, snapshot_cache(config)?)));
+        let (chat, snapshots) = match rest {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(p) = p3.as_mut() {
+                    // SAFETY: decode is idle and the backend lives until
+                    // `loaded` drops: free what the self-check bound before
+                    // `golem_ctx_free` asserts on it.
+                    unsafe { raw::golem_reset_device_cache(p.ctx_ptr()) };
+                    p.device_cache_reset();
+                }
+                return Err(e);
+            }
+        };
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
 
         Ok({
@@ -777,7 +793,6 @@ impl Session {
                     loaded,
                     config: config.clone(),
                     chat,
-                    template,
                     last_prompt_tokens: Vec::new(),
                     p3,
                     timing: config
@@ -786,6 +801,7 @@ impl Session {
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
                     snapshots,
+                    #[cfg(any(test, feature = "test-support"))]
                     test_cancel_after_chunks: 0,
                     batch,
                     batch_cap,
@@ -810,7 +826,7 @@ impl Session {
     ) -> Result<Self, EngineError> {
         let _guard = construction_lock();
         let loaded = load_with_hooks(config, Some(ctx))?;
-        let (chat, template) = probe_templates(&loaded, config)?;
+        let chat = probe_templates(&loaded, config)?;
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
         Ok({
             p3_glue::session_opened();
@@ -822,7 +838,6 @@ impl Session {
                     loaded,
                     config: config.clone(),
                     chat,
-                    template,
                     last_prompt_tokens: Vec::new(),
                     p3: None,
                     timing: config
@@ -831,6 +846,7 @@ impl Session {
                         .map(|_| crate::timing::TimingRecorder::new(config.n_predict as usize + 1)),
                     pool_verified: false,
                     snapshots: None,
+                    #[cfg(any(test, feature = "test-support"))]
                     test_cancel_after_chunks: 0,
                     batch,
                     batch_cap,
@@ -932,11 +948,27 @@ impl Session {
             "golem_get_device_cache_stats returned null"
         );
         // SAFETY: layout contract from the C++ definition (bindgen renders
-        // the struct opaque): 3 contiguous lock-free u64 counters in member
-        // order bytes_copied, bytes_skipped, evictions.
-        let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 3]>() };
-        let load = |i: usize| counters[i].load(std::sync::atomic::Ordering::Relaxed);
-        Some(DeviceCacheStats::new(load(0), load(1), load(2)))
+        // the struct opaque): 5 contiguous lock-free u64 counters in member
+        // order bytes_copied, bytes_skipped, evictions, cache_experts_copied,
+        // stream_experts_copied (pinned by static_assert/offsetof there).
+        let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 5]>() };
+        let [
+            bytes_copied,
+            bytes_skipped,
+            evictions,
+            cache_copies,
+            stream_copies,
+        ] = counters
+            .each_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        Some(DeviceCacheStats {
+            bytes_copied,
+            bytes_skipped,
+            evictions,
+            cache_copies,
+            stream_copies,
+            skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
+        })
     }
 
     /// Expert `MUL_MAT_ID` nodes the scheduler placed on a CPU backend
@@ -944,6 +976,12 @@ impl Session {
     /// like [`expert_placement`].
     pub fn expert_mul_mat_id_off_gpu(&self) -> u64 {
         expert_placement().on_cpu
+    }
+
+    /// Expert `MUL_MAT_ID` nodes the scheduler placed on a GPU backend
+    /// (process-cumulative, process-global like [`expert_placement`]).
+    pub fn expert_mul_mat_id_on_gpu(&self) -> u64 {
+        expert_placement().on_gpu
     }
 
     /// Locked RAM: expert pool (mlocked + GPU-registered) plus the
@@ -987,6 +1025,16 @@ impl Session {
     pub fn fail_storage_in_read_for_test(&self) {
         if let Some(p) = &self.inner.p3 {
             p.fail_storage_in_read_for_test();
+        }
+    }
+
+    /// Test seam: the stream reader kills every replica right before its
+    /// next read, so a streamed-prefill read fails.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_storage_in_stream_read_for_test(&self) {
+        if let Some(p) = &self.inner.p3 {
+            p.fail_storage_in_stream_read_for_test();
         }
     }
 
@@ -1072,12 +1120,6 @@ impl Session {
     /// parsing the generated text.
     pub fn render(&self, req: &TurnRequest<'_>) -> Result<Rendered, EngineError> {
         render(&self.inner.chat, req)
-    }
-
-    /// Reasoning-marker splitter for the session's chat template (§8.1
-    /// `reasoning_content`); `None` when the template has no markers.
-    pub fn reasoning_splitter(&self) -> Option<crate::reasoning::ReasoningSplitter> {
-        crate::reasoning::ReasoningSplitter::from_template(&self.inner.template)
     }
 
     /// Test seam: every later turn sets its own cancel flag right after
@@ -1246,7 +1288,7 @@ impl AbortSet {
         self.len.store(0, Ordering::Release);
     }
 
-    fn all_cancelled(&self) -> bool {
+    pub(crate) fn all_cancelled(&self) -> bool {
         let n = self.len.load(Ordering::Acquire);
         n > 0
             && self.flags[..n].iter().all(|p| {
@@ -1654,8 +1696,10 @@ impl SessionInner {
             // whose expert-copy leases release only at the next compute.
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-            // 2 = aborted: the callback/stream source fire only on cancel.
-            return if code == 2 {
+            // 2 = aborted; a cancel only if the predicate both the abort
+            // callback and the stream source fire on still holds (the set
+            // is cleared only after this returns).
+            return if code == 2 && self.abort.all_cancelled() {
                 Ok(false)
             } else {
                 Err(EngineError::Decode(code))
@@ -1667,13 +1711,16 @@ impl SessionInner {
         // The lease-release contract: synchronize before the next compute.
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-        if n_gen > 0
-            && let Some(t) = self.timing.as_mut()
-        {
+        if let Some(t) = self.timing.as_mut() {
             // §11 step boundary: snapshot (and reset) the P3/store
-            // accumulators into this step's row. H2D and policy stay
-            // unmeasured (no fork event pair / no P2 instrumentation).
+            // accumulators into this step's row; a prefill-only decode's
+            // are discarded, not charged to the next generation row. H2D is
+            // measured only on the async_h2d copy stream; policy stays
+            // unmeasured.
             let io = p3_glue::take_step_io_stats();
+            if n_gen == 0 {
+                return Ok(true);
+            }
             let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
             t.row(crate::timing::StepTiming {
                 step,
@@ -1682,8 +1729,8 @@ impl SessionInner {
                 p3_wait_ms: ns2ms(io.p3_wait_ns),
                 disk_worker_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
                 disk_bytes: io.disk_bytes.unwrap_or(0),
-                h2d_ms: f64::NAN,
-                h2d_bytes: 0,
+                h2d_ms: io.h2d.map_or(f64::NAN, |h| h.0),
+                h2d_bytes: io.h2d.map_or(0, |h| h.1),
                 policy_ms: f64::NAN,
             });
         }
@@ -1775,9 +1822,15 @@ impl SessionInner {
         unsafe { raw::llama_vocab_is_eog(self.loaded.model().vocab(), tok) }
     }
 
-    pub(crate) fn piece(&self, tok: raw::llama_token) -> Vec<u8> {
+    /// Writes `tok`'s piece into `out` (cleared first): no allocation once
+    /// `out` holds the longest piece.
+    pub(crate) fn piece_into(
+        &self,
+        tok: raw::llama_token,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
         // SAFETY: vocab is live; tok is a valid token id from the sampler.
-        unsafe { token_piece(self.loaded.model().vocab(), tok) }
+        unsafe { token_piece_into(self.loaded.model().vocab(), tok, out) }
     }
 
     fn offloaded(&self) -> bool {
@@ -1983,32 +2036,34 @@ unsafe fn tokenize_prompt(
     Ok(tokens)
 }
 
-/// Detokenizes one token to its raw piece bytes (two-pass sizing like
-/// [`tokenize_prompt`]; the `lstrip = 0, special = false` call pinned for the
-/// emitter — special tokens render as empty pieces and are skipped).
+/// Detokenizes one token into `out`'s capacity (the `lstrip = 0, special =
+/// false` call pinned for the emitter — special tokens render as empty
+/// pieces and are skipped). A too-small buffer grows to the demanded size
+/// and retries once.
 ///
 /// # Safety
 /// `vocab` must be a live llama_vocab owned by the loaded model; `token` must be
 /// a valid token id.
-unsafe fn token_piece(vocab: *const raw::llama_vocab, token: raw::llama_token) -> Vec<u8> {
-    // SAFETY: null/0 buffer only sizes; nothing is written through the null pointer.
-    let needed =
-        unsafe { raw::llama_token_to_piece(vocab, token, std::ptr::null_mut(), 0, 0, false) };
-    let n = needed.unsigned_abs() as usize;
-    if n == 0 {
-        return Vec::new();
+unsafe fn token_piece_into(
+    vocab: *const raw::llama_vocab,
+    token: raw::llama_token,
+    out: &mut Vec<u8>,
+) -> Result<(), EngineError> {
+    out.clear();
+    for _ in 0..2 {
+        let cap = i32::try_from(out.capacity()).unwrap_or(i32::MAX);
+        // SAFETY: llama writes at most `cap` bytes into out's spare capacity.
+        let n = unsafe {
+            raw::llama_token_to_piece(vocab, token, out.as_mut_ptr().cast(), cap, 0, false)
+        };
+        if n >= 0 {
+            // SAFETY: llama initialized the first n ≤ cap bytes.
+            unsafe { out.set_len(n as usize) };
+            return Ok(());
+        }
+        out.reserve_exact(n.unsigned_abs() as usize);
     }
-    let mut buf = vec![0u8; n];
-    // SAFETY: buf holds exactly the byte count the sizing call demanded.
-    let written = unsafe {
-        raw::llama_token_to_piece(vocab, token, buf.as_mut_ptr().cast(), n as i32, 0, false)
-    };
-    if written < 0 {
-        // Unreachable: same token, buffer sized from the sizing call.
-        return Vec::new();
-    }
-    buf.truncate(written as usize);
-    buf
+    Err(EngineError::Detokenize(token))
 }
 
 /// Expert copies the pool has served (demand page-ins + fast hits), cumulative.
@@ -2111,19 +2166,12 @@ pub struct DeviceCacheStats {
     pub bytes_skipped: u64,
     /// Cached experts evicted under the soft budget.
     pub evictions: u64,
+    /// Expert planes copied host→device into the device cache.
+    pub cache_copies: u64,
+    /// Expert planes copied host→device by streamed prefill.
+    pub stream_copies: u64,
     /// `bytes_skipped / (bytes_skipped + bytes_copied)`; 0.0 with no traffic.
     pub skip_ratio: f64,
-}
-
-impl DeviceCacheStats {
-    fn new(bytes_copied: u64, bytes_skipped: u64, evictions: u64) -> Self {
-        Self {
-            bytes_copied,
-            bytes_skipped,
-            evictions,
-            skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
-        }
-    }
 }
 
 /// `skipped / (skipped + copied)`; 0.0 when there is no traffic at all.
@@ -2159,10 +2207,32 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
             0 => 0,
             k => (u64::from(k) + 1) * per_expert,
         },
-        ram_experts: config.ram_experts_gib << 30,
+        experts: if config.ram_experts_gib == 0 {
+            golem_plan::ExpertResidency::Resident(resident_expert_bytes(config, m))
+        } else {
+            golem_plan::ExpertResidency::Pooled {
+                ram_experts: config.ram_experts_gib << 30,
+            }
+        },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         ws: golem_plan::WS_MEASURED,
     }
+}
+
+/// Pool off: routed-expert bytes of the top `n_gpu_layers` expert layers not
+/// pinned below `cpu_moe_layers`, at the mean per-layer size. Target, all
+/// offloaded: 185.5 GB ≫ 24 GiB; all pinned: 0. `cpu_moe_layers` counts
+/// blocks from 0, so dense-lead blocks pin nothing; each missed layer would
+/// under-count 288 × 3 × ~5.1 MB ≈ 4.4 GB. Upper bound: assumes every
+/// offloaded block (top `n_gpu_layers`) carries experts.
+fn resident_expert_bytes(config: &EngineConfig, m: &golem_plan::ModelFacts) -> u64 {
+    let layers = m.expert_layers;
+    let pinned = config
+        .cpu_moe_layers
+        .unwrap_or(0)
+        .saturating_sub(m.first_expert_block);
+    let gpu = config.n_gpu_layers.min(layers.saturating_sub(pinned));
+    m.expert_bytes_total / u64::from(layers.max(1)) * u64::from(gpu)
 }
 
 /// Load-time §10 VRAM feasibility (§6.4), same `golem_plan::plan` as
@@ -2197,10 +2267,10 @@ pub fn device_vram() -> Option<(u64, u64)> {
     None
 }
 
-/// Runs [`check_plan`] for a pooled session on a GPU build; `None` when the
-/// pool is off (the §10 tiers do not apply) or no VRAM reading exists.
+/// Runs [`check_plan`] for a pooled or offloaded session on a GPU build;
+/// `None` for a CPU-only session or when no VRAM reading exists.
 fn load_plan(config: &EngineConfig) -> Result<Option<golem_plan::PlanReport>, EngineError> {
-    if config.ram_experts_gib == 0 {
+    if config.ram_experts_gib == 0 && config.n_gpu_layers == 0 {
         return Ok(None);
     }
     let Some((free, _)) = device_vram() else {
@@ -2293,6 +2363,7 @@ mod tests {
             n_expert: 288,
             top_k: 8,
             expert_layers: 42,
+            first_expert_block: 0,
             max_plane_stride: 6_881_280,
             expert_bytes_total: 185_478_414_336,
             kv_per_token: 19_712,
@@ -2341,17 +2412,65 @@ mod tests {
         assert!(e.to_string().contains("device_expert_cache "), "{e}");
     }
 
+    /// Pool off, 4 layers × 1 GiB experts vs 4 GiB free: all offloaded
+    /// layers' experts alone exceed VRAM; pinning every MoE layer to the CPU
+    /// leaves only the non-expert terms.
+    #[test]
+    fn pool_off_load_check_counts_resident_experts() {
+        let m = golem_plan::ModelFacts {
+            t_ne: 256 << 20,
+            shexp: 0,
+            n_expert: 8,
+            top_k: 2,
+            expert_layers: 4,
+            first_expert_block: 0,
+            max_plane_stride: 1 << 20,
+            expert_bytes_total: 4 << 30,
+            kv_per_token: 1024,
+            rs_bytes: 0,
+            sparse_attn_layers: 4,
+            dense_below_ctx: 0,
+        };
+        let mut cfg = EngineConfig {
+            n_ctx: 4096,
+            n_gpu_layers: 99,
+            ..EngineConfig::default()
+        };
+        let e = check_plan(&cfg, &m, 4 << 30).unwrap_err();
+        assert!(
+            matches!(&e, EngineError::PlanInfeasible(r) if r.term("resident_experts") == 4 << 30),
+            "{e}"
+        );
+        cfg.cpu_moe_layers = Some(4);
+        let r = check_plan(&cfg, &m, 4 << 30).unwrap();
+        assert_eq!(r.term("resident_experts"), 0);
+        assert_eq!(r.term("ram_pool"), 0);
+    }
+
+    #[test]
+    fn resident_experts_skip_dense_lead() {
+        let m = golem_plan::ModelFacts {
+            first_expert_block: 1,
+            ..glm()
+        };
+        let cfg = EngineConfig {
+            n_gpu_layers: 99,
+            cpu_moe_layers: Some(2),
+            ..EngineConfig::default()
+        };
+        let per_layer = m.expert_bytes_total / u64::from(m.expert_layers);
+        assert_eq!(
+            resident_expert_bytes(&cfg, &m),
+            per_layer * u64::from(m.expert_layers - 1)
+        );
+    }
+
     #[test]
     fn skip_ratio_math() {
         assert_eq!(skip_ratio(0, 0), 0.0, "no traffic ⇒ 0.0, not NaN");
         assert_eq!(skip_ratio(3, 0), 0.0, "all copied ⇒ 0.0");
         assert_eq!(skip_ratio(0, 5), 1.0, "all skipped ⇒ 1.0");
         assert_eq!(skip_ratio(1, 3), 0.75);
-        let stats = DeviceCacheStats::new(1, 3, 7);
-        assert_eq!(stats.bytes_copied, 1);
-        assert_eq!(stats.bytes_skipped, 3);
-        assert_eq!(stats.evictions, 7);
-        assert_eq!(stats.skip_ratio, 0.75);
     }
 
     #[test]
@@ -2430,6 +2549,65 @@ mod tests {
         let shim = s.render(&TurnRequest::new(&turns)).unwrap().prompt;
         let legacy = legacy_apply_template(c"chatml", &turns, true);
         assert_eq!(shim, legacy);
+    }
+
+    /// The pre-buffer two-pass detokenize (sizing call, exact alloc).
+    fn piece_two_pass(vocab: *const raw::llama_vocab, tok: raw::llama_token) -> Vec<u8> {
+        // SAFETY: null/0 only sizes; vocab is live.
+        let n = unsafe { raw::llama_token_to_piece(vocab, tok, std::ptr::null_mut(), 0, 0, false) }
+            .unsigned_abs() as usize;
+        let mut buf = vec![0u8; n];
+        // SAFETY: buf holds the n bytes the sizing call demanded.
+        let w = unsafe {
+            raw::llama_token_to_piece(vocab, tok, buf.as_mut_ptr().cast(), n as i32, 0, false)
+        };
+        buf.truncate(w.max(0) as usize);
+        buf
+    }
+
+    #[test]
+    fn piece_into_matches_two_pass_over_vocab() {
+        let cfg = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let s = Session::new(&cfg).expect("tiny-moe loads");
+        let vocab = s.inner.loaded.model().vocab();
+        // SAFETY: vocab is live.
+        let n_vocab = unsafe { raw::llama_vocab_n_tokens(vocab) };
+        assert!(n_vocab > 0);
+        let mut reserved = Vec::with_capacity(crate::slot::PIECE_RESERVE);
+        for tok in 0..n_vocab {
+            let want = piece_two_pass(vocab, tok);
+            s.inner.piece_into(tok, &mut reserved).unwrap();
+            assert_eq!(reserved, want, "token {tok}");
+            let mut empty = Vec::new();
+            s.inner.piece_into(tok, &mut empty).unwrap();
+            assert_eq!(empty, want, "token {tok} via the regrow path");
+        }
+    }
+
+    #[test]
+    fn slot_piece_buffer_capacity_stable_across_decode() {
+        let cfg = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ..EngineConfig::default()
+        };
+        let mut s = Session::new(&cfg).expect("tiny-moe loads");
+        let msgs = [ChatTurn {
+            role: "user",
+            content: "count to ten",
+        }];
+        let turn = |s: &mut Session, n| {
+            let out = s
+                .turn(&TurnRequest::new(&msgs).max_tokens(Some(n)), &mut |_| {})
+                .expect("turn");
+            assert!(out.completion_tokens > 1, "precondition: decode steps ran");
+        };
+        turn(&mut s, 4);
+        let warm = s.slots[0].piece_capacity();
+        turn(&mut s, 32);
+        assert_eq!(s.slots[0].piece_capacity(), warm);
     }
 
     #[test]

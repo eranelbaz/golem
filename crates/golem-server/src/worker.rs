@@ -12,8 +12,8 @@ use golem_api::chat::{FunctionCall, Stop, ToolCall};
 use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent};
 use golem_engine::config::EngineConfig;
 use golem_engine::{
-    ChatTurn, EngineError, FinishReason, OutputParser, Piece, ReasoningSplitter, SamplingParams,
-    Scheduler, Session, SlotEvent, SlotJob, TurnOutcome,
+    ChatTurn, EngineError, FinishReason, OutputParser, SamplingParams, Scheduler, Session,
+    SlotEvent, SlotJob, TurnOutcome,
 };
 use golem_llama_sys::raw::LLAMA_DEFAULT_SEED;
 
@@ -39,7 +39,7 @@ pub struct Job {
 /// `--reasoning`: where text between the template's reasoning markers goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReasoningMode {
-    /// Markers and reasoning stay in `content` (splitter bypassed).
+    /// Markers and reasoning stay in `content` (parser bypassed).
     Inline,
     /// Reasoning goes to `reasoning_content`; markers are dropped.
     #[default]
@@ -144,6 +144,9 @@ pub struct HealthState {
     last_progress: AtomicU64,
     /// Cancel flags of the jobs on the worker (one per busy slot).
     in_flight: Mutex<Vec<Arc<AtomicBool>>>,
+    /// Drain grace over: admitted and queued jobs are cancelled. Set before
+    /// the published flags are swept; Draining alone refuses only new HTTP.
+    cancelling: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     hooks: TestHooks,
 }
@@ -159,6 +162,7 @@ impl HealthState {
             epoch: Instant::now(),
             last_progress: AtomicU64::new(0),
             in_flight: Mutex::new(Vec::new()),
+            cancelling: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             hooks: TestHooks::default(),
         }
@@ -217,10 +221,11 @@ impl HealthState {
             .clone()
     }
 
-    /// Draining → new requests 503; the in-flight job is cancelled (drain
-    /// grace 0) and answered `golem_busy`.
+    /// Draining → new requests 503; in-flight and queued jobs are cancelled
+    /// and answered `golem_busy`.
     pub fn begin_drain(&self) {
         self.set(ServeState::Draining);
+        self.cancelling.store(true, Ordering::SeqCst);
         self.cancel_in_flight();
     }
 
@@ -236,6 +241,11 @@ impl HealthState {
         }
     }
 
+    /// A job is on the worker or queued for it.
+    pub fn pending(&self) -> bool {
+        self.busy() || self.queued.load(Ordering::SeqCst) > 0
+    }
+
     /// At least one job is on the worker.
     pub fn busy(&self) -> bool {
         !self
@@ -245,14 +255,14 @@ impl HealthState {
             .is_empty()
     }
 
-    /// Republishes the busy slots' flags; a job admitted while Draining is
+    /// Republishes the busy slots' flags; a job admitted once cancelling is
     /// cancelled here, so `begin_drain` never misses one. Only when the job
     /// set changed (admission or finish), never per decode step.
     fn publish_in_flight(&self, flags: impl Iterator<Item = Arc<AtomicBool>>) {
         let mut v = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
         v.clear();
         v.extend(flags);
-        if self.get() == ServeState::Draining {
+        if self.cancelling.load(Ordering::SeqCst) {
             for c in v.iter() {
                 c.store(true, Ordering::SeqCst);
             }
@@ -362,8 +372,8 @@ struct SlotRun {
     job: Job,
     /// Reserved before any text so the terminal event is never dropped.
     permit: tokio::sync::mpsc::OwnedPermit<Event>,
-    splitter: Option<ReasoningSplitter>,
-    tools: Option<ToolStream>,
+    /// Parses the text when the slot keeps its render's parser.
+    output: Option<OutputStream>,
     /// Cancelled because the event channel was full (client too slow),
     /// not because the client left.
     slow_client: std::cell::Cell<bool>,
@@ -390,26 +400,11 @@ impl SlotRun {
     }
 
     fn piece(&mut self, parser: Option<&OutputParser>, t: &str) {
-        let (job, splitter, tools, slow) = (
-            &self.job,
-            &mut self.splitter,
-            &mut self.tools,
-            &self.slow_client,
-        );
+        let (job, output, slow) = (&self.job, &mut self.output, &self.slow_client);
         let send = |ev: Event| try_deliver(job, slow, ev);
-        if let (Some(ts), Some(p)) = (tools.as_mut(), parser) {
-            ts.push(p, t, true, &send);
-            return;
-        }
-        let mut send_piece = |p: Piece| {
-            send(match p {
-                Piece::Content(t) => Event::Text(t.into()),
-                Piece::Reasoning(t) => Event::Reasoning(t.into()),
-            })
-        };
-        match splitter {
-            Some(s) => s.push(t, &mut send_piece),
-            None => send_piece(Piece::Content(t)),
+        match (output.as_mut(), parser) {
+            (Some(ts), Some(p)) => ts.push(p, t, true, &send),
+            _ => send(Event::Text(t.into())),
         }
     }
 }
@@ -434,6 +429,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
         }
         // Block only when every slot is free; else poll between steps.
         let idle = runs.iter().all(Option::is_none);
+        let mut taken = 0;
         while sch.free_slots() > 0 {
             let job = if idle && runs.iter().all(Option::is_none) {
                 match rx.recv() {
@@ -452,22 +448,36 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
                     }
                 }
             };
-            health.queued.fetch_sub(1, Ordering::Relaxed);
             match admit(sch, &mut runs, job, health) {
                 Ok(()) => {
                     changed = true;
+                    taken += 1;
                     health.mark_progress();
                 }
                 Err(true) => {
                     fail_all(&mut runs, health);
+                    health.queued.fetch_sub(taken + 1, Ordering::SeqCst);
+                    // Still-buffered jobs would hold `pending()` up for the
+                    // whole drain grace.
+                    while let Ok(job) = rx.try_recv() {
+                        health.queued.fetch_sub(1, Ordering::SeqCst);
+                        let _ = job
+                            .events
+                            .try_send(Event::Failed(crate::app::backend_gone_envelope()));
+                    }
                     return;
                 }
-                Err(false) => {}
+                Err(false) => {
+                    health.queued.fetch_sub(1, Ordering::SeqCst);
+                }
             }
         }
         if std::mem::take(&mut changed) {
             health.publish_in_flight(runs.iter().flatten().map(|r| r.job.cancel.clone()));
         }
+        // After the publish, so `pending()` never sees an admitted job as
+        // neither queued nor busy (the drain grace would end early).
+        health.queued.fetch_sub(taken, Ordering::SeqCst);
         if runs.iter().all(Option::is_none) {
             continue;
         }
@@ -554,7 +564,7 @@ fn storage_lost(sch: &mut Scheduler, runs: &mut [Option<SlotRun>], health: &Heal
 /// until the handlers disconnect.
 fn refuse_all(rx: &Receiver<Job>, health: &HealthState) {
     while let Ok(job) = rx.recv() {
-        health.queued.fetch_sub(1, Ordering::Relaxed);
+        health.queued.fetch_sub(1, Ordering::SeqCst);
         let _ = job.events.try_send(Event::Failed(storage_unavailable()));
     }
 }
@@ -601,10 +611,15 @@ fn admit(
     if job.cancel.load(Ordering::SeqCst) {
         return Err(false);
     }
-    // `begin_drain` sets Draining then cancels the published flags; a job
-    // dequeued after that is answered busy here.
+    // `begin_drain` sets `cancelling` then sweeps the published flags; a
+    // job dequeued after that is answered busy here, one admitted before is
+    // swept (or cancelled by `publish_in_flight`).
+    if health.cancelling.load(Ordering::SeqCst) {
+        let _ = job.events.try_send(Event::Failed(draining()));
+        return Err(false);
+    }
     match health.get() {
-        ServeState::Draining | ServeState::Releasing => {
+        ServeState::Releasing => {
             let _ = job.events.try_send(Event::Failed(draining()));
             return Err(false);
         }
@@ -643,12 +658,14 @@ fn admit(
         Some(Stop::One(s)) => vec![s.clone()],
         Some(Stop::Many(v)) => v.clone(),
     };
+    // `policy::validate` bounds `seed` below `u32::MAX`: lossless.
+    let seed = req.seed.map_or(LLAMA_DEFAULT_SEED, |s| s as u32);
     // OpenAI defaults, not `SamplingParams::default()` (greedy).
     let sampling = SamplingParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.unwrap_or(0),
-        seed: req.seed.map_or(LLAMA_DEFAULT_SEED, |s| s as u32),
+        seed,
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
     };
@@ -685,18 +702,15 @@ fn admit(
             return Err(false);
         }
     };
-    let splitter = match job.reasoning {
-        ReasoningMode::Separate if !tool_mode => sch.session().reasoning_splitter(),
-        _ => None,
-    };
+    let parsed = tool_mode || job.reasoning == ReasoningMode::Separate;
     let slot_job = SlotJob {
         tokens,
         sampling,
         max_tokens: req.max_tokens,
         stop,
         cancel: job.cancel.clone(),
-        // Only tool-mode renders carry a grammar the sampler must apply.
-        rendered: tool_mode.then_some(rendered),
+        // Kept for its parser; only tool-mode renders carry a grammar.
+        rendered: parsed.then_some(rendered),
     };
     let Ok(id) = sch.admit(slot_job) else {
         unreachable!("admit runs only while a slot is free");
@@ -704,8 +718,7 @@ fn admit(
     runs[id] = Some(SlotRun {
         job,
         permit,
-        splitter,
-        tools: tool_mode.then(ToolStream::new),
+        output: parsed.then(|| OutputStream::new(!tool_mode)),
         slow_client: std::cell::Cell::new(false),
         admitted: Instant::now(),
         first_piece: None,
@@ -721,6 +734,14 @@ fn admit(
         .swap(false, Ordering::SeqCst)
     {
         sch.session().fail_storage_in_read_for_test();
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    if health
+        .hooks
+        .fail_storage_in_stream_read
+        .swap(false, Ordering::SeqCst)
+    {
+        sch.session().fail_storage_in_stream_read_for_test();
     }
     Ok(())
 }
@@ -792,21 +813,12 @@ fn finish(
 ) {
     let SlotRun {
         job,
-        splitter,
-        tools,
+        output,
         slow_client,
         ..
     } = &mut run;
     let send = |ev: Event| try_deliver(job, slow_client, ev);
-    if let Some(s) = splitter {
-        s.finish(&mut |p: Piece| {
-            send(match p {
-                Piece::Content(t) => Event::Text(t.into()),
-                Piece::Reasoning(t) => Event::Reasoning(t.into()),
-            })
-        });
-    }
-    let called = match (tools.as_mut(), sch.parser(id)) {
+    let called = match (output.as_mut(), sch.parser(id)) {
         (Some(ts), Some(p)) => {
             ts.push(p, "", false, &send);
             ts.calls > 0
@@ -826,7 +838,9 @@ fn finish(
         snap.device_cache_skip_ratio = sch.session().device_cache_stats().map(|s| s.skip_ratio);
     }
     let event = match res {
-        Ok(o) if o.finish == FinishReason::Cancelled && health.get() == ServeState::Draining => {
+        Ok(o)
+            if o.finish == FinishReason::Cancelled && health.cancelling.load(Ordering::SeqCst) =>
+        {
             Event::Failed(draining())
         }
         // A live client that fell behind gets an error, not a truncated
@@ -904,47 +918,132 @@ fn log_turn(run: &SlotRun, event: &Event) {
     }
 }
 
+/// Section of the output a parse ended on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Content,
+    Reasoning,
+}
+
 /// Turns the growing generated text into OpenAI deltas by re-parsing it with
 /// the request's chat-layer parser (`partial` until the turn ends) and
-/// emitting what each parse added. Re-parsing is O(text) per piece — one
-/// parse per token at ≤ ~10 tok/s on the target, off the per-expert path.
-struct ToolStream {
+/// emitting what each parse added. A parse is O(text), so a piece that
+/// cannot open a marker or end in parser-trimmed whitespace, arriving while
+/// the last parse ended verbatim on one section with nothing held, extends
+/// that section without one; the final parse always runs. The skip relies
+/// on no marker beginning with an alphanumeric character or space, which
+/// holds for every vendored parser without tools (firefunction-v2's tool
+/// marker ` functools[` breaks it), so tool-mode streams always parse.
+struct OutputStream {
     text: String,
     content: String,
     reasoning: String,
     /// Per announced call: arguments sent so far.
     args: Vec<String>,
     calls: usize,
+    /// Section whose text ends `text` verbatim.
+    tail: Option<Section>,
+    /// The fast path may run (no tools rendered).
+    skip: bool,
+    /// The fast path ran this turn.
+    fast: bool,
+    /// Text length and `(content, reasoning)` of the last successful parse.
+    parsed: (usize, String, String),
+    /// Every successful parse so far put all of `text` in content; `None`
+    /// before the first parse.
+    raw: Option<bool>,
+    #[cfg(test)]
+    parses: usize,
+    #[cfg(test)]
+    always_parse: bool,
 }
 
-impl ToolStream {
-    fn new() -> Self {
+impl OutputStream {
+    fn new(skip: bool) -> Self {
         Self {
+            skip,
             text: String::new(),
             content: String::new(),
             reasoning: String::new(),
             args: Vec::new(),
             calls: 0,
+            tail: None,
+            fast: false,
+            parsed: (0, String::new(), String::new()),
+            raw: None,
+            #[cfg(test)]
+            parses: 0,
+            #[cfg(test)]
+            always_parse: false,
         }
     }
 
     fn push(&mut self, parser: &OutputParser, piece: &str, partial: bool, send: &dyn Fn(Event)) {
         self.text.push_str(piece);
+        let plain = self.skip
+            && !piece.ends_with(' ')
+            && !piece.is_empty()
+            && piece.chars().all(|c| c == ' ' || c.is_alphanumeric());
+        #[cfg(test)]
+        let plain = plain && !self.always_parse;
+        if let Some(s) = self.tail.filter(|_| partial && plain) {
+            self.fast = true;
+            let (n, content, reasoning) = &mut self.parsed;
+            let (seen, last, ev): (_, _, fn(String) -> Event) = match s {
+                Section::Reasoning => (&mut self.reasoning, reasoning, Event::Reasoning),
+                Section::Content => (&mut self.content, content, Event::Text),
+            };
+            seen.push_str(piece);
+            last.push_str(piece);
+            *n = self.text.len();
+            send(ev(piece.into()));
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.parses += 1;
+        }
+        self.tail = None;
         let msg = match parser.parse(&self.text, partial) {
             Ok(msg) => msg,
-            Err(_) if partial => return,
-            // Unparseable final text is still the model's answer: emit what
-            // was not yet sent as content.
-            Err(_) => serde_json::json!({ "content": self.text }),
+            // Unparseable partial text streams as content only while it
+            // cannot become reasoning or a call: every parse so far (or,
+            // before any, one plain character) landed wholly in content.
+            Err(_) if partial => {
+                let raw = *self.raw.get_or_insert_with(|| {
+                    parser.parse("x", true).is_ok_and(|m| m["content"] == "x")
+                });
+                if raw
+                    && self.args.is_empty()
+                    && let Some(add) = self.text.strip_prefix(self.content.as_str())
+                    && !add.is_empty()
+                {
+                    send(Event::Text(add.into()));
+                    self.content.push_str(add);
+                }
+                return;
+            }
+            // Unparseable final text is still the model's answer: what the
+            // last good parse classified keeps its section, the rest is
+            // content.
+            Err(_) => {
+                self.fast = false;
+                let (n, content, reasoning) = &self.parsed;
+                serde_json::json!({
+                    "content": format!("{content}{}", &self.text[*n..]),
+                    "reasoning_content": reasoning,
+                })
+            }
         };
         let field = |k: &str| msg[k].as_str().unwrap_or_default().to_owned();
+        let (content, reasoning) = (field("content"), field("reasoning_content"));
         for (seen, now, ev) in [
             (
                 &mut self.reasoning,
-                field("reasoning_content"),
+                reasoning.clone(),
                 Event::Reasoning as fn(String) -> Event,
             ),
-            (&mut self.content, field("content"), Event::Text),
+            (&mut self.content, content.clone(), Event::Text),
         ] {
             // A partial parse can only grow; anything else is a re-parse we
             // cannot retract, so it is held until the text settles. The final
@@ -995,6 +1094,26 @@ impl ToolStream {
                 }));
                 *seen = args.into();
             }
+        }
+        let diverged =
+            !partial && self.fast && (self.content != content || self.reasoning != reasoning);
+        if diverged {
+            tracing::error!("final parse diverged from the incrementally streamed text");
+        }
+        debug_assert!(!diverged, "final parse diverged from the streamed text");
+        let held = self.content != content || self.reasoning != reasoning;
+        if partial && !held && calls.is_empty() {
+            let ends = |s: &str| !s.is_empty() && self.text.ends_with(s);
+            self.tail = match (ends(&content), ends(&reasoning)) {
+                (true, false) => Some(Section::Content),
+                (false, true) if content.is_empty() => Some(Section::Reasoning),
+                _ => None,
+            };
+        }
+        if partial {
+            let all_content = reasoning.is_empty() && calls.is_empty() && content == self.text;
+            self.raw = Some(self.raw.unwrap_or(true) && all_content);
+            self.parsed = (self.text.len(), content, reasoning);
         }
     }
 }
@@ -1071,6 +1190,77 @@ mod tests {
         w.shutdown(|| {}, Duration::from_secs(30)).ok();
     }
 
+    /// Enqueues as the HTTP handler does (counted before the send).
+    fn enqueue(w: &WorkerHandle, j: Job) {
+        w.health.queued.fetch_add(1, Ordering::SeqCst);
+        assert!(w.jobs.send(j).is_ok());
+    }
+
+    fn terminal(rx: &mut tokio::sync::mpsc::Receiver<Event>) -> Option<Event> {
+        std::iter::from_fn(|| rx.blocking_recv())
+            .find(|e| matches!(e, Event::Done(_) | Event::Failed(_)))
+    }
+
+    /// Both slots busy and B queued: during the drain grace B still runs to
+    /// `Done` once a slot frees (Draining refuses only new HTTP requests).
+    #[test]
+    fn queued_job_completes_during_drain_grace() {
+        let cfg = EngineConfig {
+            parallel: 2,
+            ..crate::test_engine_config()
+        };
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let (a, mut ra) = job("count to ten", 4);
+        let (a2, mut ra2) = job("hello", 4);
+        enqueue(&w, a);
+        assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
+        enqueue(&w, a2);
+        assert!(matches!(ra2.blocking_recv(), Some(Event::Text(_))));
+        let (b, mut rb) = job("x", 4);
+        enqueue(&w, b);
+        assert_eq!(w.health.queued.load(Ordering::SeqCst), 1);
+        assert!(w.health.pending());
+
+        w.health.set(ServeState::Draining);
+        assert!(matches!(terminal(&mut ra), Some(Event::Done(_))));
+        assert!(
+            matches!(terminal(&mut rb), Some(Event::Done(_))),
+            "queued job refused during grace"
+        );
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
+    /// Grace over while B is queued: the in-flight jobs are cancelled and B
+    /// is answered with the draining error.
+    #[test]
+    fn queued_job_fails_draining_when_grace_expires() {
+        let cfg = EngineConfig {
+            parallel: 2,
+            ..crate::test_engine_config()
+        };
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let (a, mut ra) = job("count to ten", 4096);
+        let (a2, mut ra2) = job("hello", 4096);
+        enqueue(&w, a);
+        assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
+        enqueue(&w, a2);
+        assert!(matches!(ra2.blocking_recv(), Some(Event::Text(_))));
+        let (b, mut rb) = job("x", 4);
+        enqueue(&w, b);
+        assert_eq!(w.health.queued.load(Ordering::SeqCst), 1);
+        assert!(w.health.pending());
+
+        w.health.set(ServeState::Draining);
+        w.health.begin_drain();
+        for rx in [&mut ra, &mut rb] {
+            match terminal(rx) {
+                Some(Event::Failed(env)) => assert_eq!(env.error.message, "server draining"),
+                other => panic!("expected draining, got {other:?}"),
+            }
+        }
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
     /// A reader that never drains fills the channel: the job ends with
     /// `Failed(BackendUnavailable)` through the reserved permit, not `Done`.
     #[test]
@@ -1092,6 +1282,54 @@ mod tests {
         w.shutdown(|| {}, Duration::from_secs(30)).ok();
     }
 
+    /// A worker that dies at admit answers the jobs still buffered behind
+    /// it and leaves nothing pending.
+    #[test]
+    fn worker_death_at_admit_fails_buffered_jobs() {
+        let cfg = EngineConfig {
+            parallel: 3,
+            ..crate::test_engine_config()
+        };
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let mut running = Vec::new();
+        for p in ["a", "b", "c"] {
+            let (j, mut rx) = job(p, 4096);
+            let cancel = j.cancel.clone();
+            enqueue(&w, j);
+            assert!(matches!(rx.blocking_recv(), Some(Event::Text(_))));
+            running.push((cancel, rx));
+        }
+        // Every slot busy: both land in the channel buffer.
+        let (d, _rd) = job("d", 4);
+        let (e, mut re) = job("e", 4);
+        enqueue(&w, d);
+        enqueue(&w, e);
+        w.health
+            .hooks
+            .panic
+            .store(INJECT_AT_START, Ordering::SeqCst);
+        running[0].0.store(true, Ordering::SeqCst);
+        match terminal(&mut re) {
+            Some(Event::Failed(env)) => assert_eq!(env.error.code, ErrorCode::BackendUnavailable),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!w.health.pending());
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
+    #[test]
+    fn pending_while_queued_or_busy() {
+        let h = HealthState::new();
+        assert!(!h.pending());
+        h.queued.store(1, Ordering::SeqCst);
+        assert!(h.pending(), "queued");
+        h.queued.store(0, Ordering::SeqCst);
+        h.publish_in_flight(std::iter::once(Arc::new(AtomicBool::new(false))));
+        assert!(h.pending(), "busy");
+        h.publish_in_flight(std::iter::empty());
+        assert!(!h.pending());
+    }
+
     #[test]
     fn stalled_only_with_an_active_job_past_the_bound() {
         let h = HealthState::new();
@@ -1107,7 +1345,7 @@ mod tests {
     /// generated text as content instead of finishing empty.
     #[test]
     fn final_parse_failure_falls_back_to_raw_content() {
-        let t = golem_engine::ChatTemplates::from_source(GLM).unwrap();
+        let t = golem_engine::ChatTemplates::from_source(QWEN3).unwrap();
         let r = t
             .render(
                 r#"[{"role":"user","content":"hi"}]"#,
@@ -1122,13 +1360,225 @@ mod tests {
             Event::Text(t) => out.borrow_mut().push_str(&t),
             other => panic!("unexpected {other:?}"),
         };
-        let mut ts = ToolStream::new();
+        let mut ts = OutputStream::new(true);
         ts.push(&r.parser, "bad\0", true, &send);
         ts.push(&r.parser, "text", true, &send);
-        assert!(out.borrow().is_empty(), "partial failures are held");
+        assert_eq!(*out.borrow(), "bad\0text", "partial failures stream");
         ts.push(&r.parser, "", false, &send);
         assert_eq!(*out.borrow(), "bad\0text");
         assert_eq!(ts.calls, 0);
+    }
+
+    const QWEN3: &str =
+        include_str!("../../../vendor/llama.cpp/models/templates/Qwen-Qwen3-0.6B.jinja");
+    const GLM_TOOLS: &str = r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#;
+
+    fn render(src: &str, tools: Option<&str>) -> golem_engine::Rendered {
+        golem_engine::ChatTemplates::from_source(src)
+            .unwrap()
+            .render(
+                r#"[{"role":"user","content":"hi"}]"#,
+                tools,
+                None,
+                false,
+                None,
+            )
+            .unwrap()
+    }
+
+    /// Streams `pieces` then the final parse; returns the events (call ids
+    /// masked) and the number of parses.
+    fn stream(r: &golem_engine::Rendered, pieces: &[&str], always: bool) -> (Vec<String>, usize) {
+        let out = std::cell::RefCell::new(Vec::new());
+        let send = |ev: Event| {
+            let ev = match ev {
+                Event::ToolCall(mut c) => {
+                    c.id = c.id.map(|_| "ID".into());
+                    Event::ToolCall(c)
+                }
+                ev => ev,
+            };
+            out.borrow_mut().push(format!("{ev:?}"));
+        };
+        let mut ts = OutputStream::new(true);
+        ts.always_parse = always;
+        for p in pieces {
+            ts.push(&r.parser, p, true, &send);
+        }
+        ts.push(&r.parser, "", false, &send);
+        (out.into_inner(), ts.parses)
+    }
+
+    /// Random splits stream exactly the events of a parse per piece.
+    #[test]
+    fn incremental_stream_matches_reparse_oracle() {
+        let transcripts = [
+            "plain text with 42 words",
+            "think about it</think>the answer is 7",
+            "r \n</think>\n\n answer \n",
+            "plan</think>calling<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+            "é 日本語 ü</think>ß 中文 ok",
+            "a <</think>b <",
+            "x <tool x> y</think>z <toolx> w",
+        ];
+        let mut seed = 0x9e37_79b9_u64;
+        for r in [
+            render(GLM, None),
+            render(GLM, Some(GLM_TOOLS)),
+            render(QWEN3, None),
+        ] {
+            for text in transcripts {
+                let chars: Vec<(usize, char)> = text.char_indices().collect();
+                for _ in 0..40 {
+                    let mut pieces = Vec::new();
+                    let mut i = 0;
+                    while i < chars.len() {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        let n = 1 + (seed >> 33) as usize % 4;
+                        let end = chars.get(i + n).map_or(text.len(), |c| c.0);
+                        pieces.push(&text[chars[i].0..end]);
+                        i += n;
+                    }
+                    assert_eq!(
+                        stream(&r, &pieces, false).0,
+                        stream(&r, &pieces, true).0,
+                        "{pieces:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Unusual bytes in plain Separate-mode text still stream before the
+    /// final parse.
+    #[test]
+    fn unusual_bytes_stream_before_final_parse() {
+        let r = render(QWEN3, None);
+        let out = std::cell::RefCell::new(String::new());
+        let send = |ev: Event| match ev {
+            Event::Text(t) => out.borrow_mut().push_str(&t),
+            other => panic!("unexpected {other:?}"),
+        };
+        let mut ts = OutputStream::new(true);
+        let pieces = ["a\u{0}b", " \u{7f}", " 🦀", " <", " c"];
+        for (i, p) in pieces.iter().enumerate() {
+            ts.push(&r.parser, p, true, &send);
+            assert!(!out.borrow().is_empty(), "nothing streamed after piece {i}");
+        }
+        ts.push(&r.parser, "", false, &send);
+        assert_eq!(*out.borrow(), pieces.concat());
+    }
+
+    /// Pieces streamed by the fast path keep their section when a later
+    /// piece makes the final parse fail.
+    #[test]
+    fn final_parse_failure_keeps_fast_path_sections() {
+        let r = render(GLM, None);
+        let (events, _) = stream(&r, &["plan", " it", "\0"], false);
+        assert_eq!(
+            events,
+            [
+                r#"Reasoning("plan")"#,
+                r#"Reasoning(" it")"#,
+                r#"Text("\0")"#
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_pieces_skip_most_parses() {
+        let pieces = vec![" w"; 1000];
+        for r in [render(GLM, None), render(QWEN3, None)] {
+            let (events, parses) = stream(&r, &pieces, false);
+            assert_eq!(events, stream(&r, &pieces, true).0);
+            assert!(parses < 10, "{parses} parses");
+        }
+    }
+
+    /// The fast path's invariant over every vendored tool-free parser: word
+    /// pieces it skips the parse for stream exactly what a parse per piece
+    /// would (a marker opening with an alphanumeric or space breaks this).
+    #[test]
+    fn fast_path_matches_reparse_for_every_vendored_parser() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendor/llama.cpp/models/templates"
+        );
+        let text = "Thought x Action y functools z Answer q think tool call 42";
+        let pieces: Vec<String> = text.split(' ').map(|w| format!(" {w}")).collect();
+        let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        let mut checked = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let src = std::fs::read_to_string(e.unwrap().path()).unwrap();
+            let Ok(t) = golem_engine::ChatTemplates::from_source(&src) else {
+                continue;
+            };
+            let msgs = r#"[{"role":"user","content":"hi"}]"#;
+            let Ok(r) = t.render(msgs, None, None, false, None) else {
+                continue;
+            };
+            assert_eq!(stream(&r, &pieces, false).0, stream(&r, &pieces, true).0);
+            checked += 1;
+        }
+        assert!(checked > 40, "{checked} parsers");
+    }
+
+    /// A failed partial parse never streams text a later parse could
+    /// reclassify: GLM opens `<think>` in the prompt, so leading text is
+    /// reasoning and nothing goes out as content before the final parse.
+    #[test]
+    fn failed_partial_parse_cannot_leak_reasoning_as_content() {
+        let r = render(GLM, None);
+        let out = std::cell::RefCell::new(Vec::new());
+        let send = |ev: Event| out.borrow_mut().push(format!("{ev:?}"));
+        let mut ts = OutputStream::new(true);
+        for p in ["r\0", "</think>", "a"] {
+            ts.push(&r.parser, p, true, &send);
+        }
+        assert!(out.borrow().is_empty(), "{:?}", out.borrow());
+        ts.push(&r.parser, "", false, &send);
+        assert_eq!(*out.borrow(), [r#"Text("r\0</think>a")"#]);
+        let (events, _) = stream(&r, &["r</think>", "a\0"], false);
+        assert_eq!(events, [r#"Reasoning("r")"#, r#"Text("a\0")"#]);
+    }
+
+    fn split(r: &golem_engine::Rendered, pieces: &[&str]) -> (String, String) {
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for ev in stream(r, pieces, false).0 {
+            if let Some(t) = ev.strip_prefix("Reasoning(") {
+                reasoning.push_str(&serde_json::from_str::<String>(&t[..t.len() - 1]).unwrap());
+            } else if let Some(t) = ev.strip_prefix("Text(") {
+                content.push_str(&serde_json::from_str::<String>(&t[..t.len() - 1]).unwrap());
+            }
+        }
+        (reasoning, content)
+    }
+
+    #[test]
+    fn splits_across_token_boundaries() {
+        let r = render(QWEN3, None);
+        for cut in 1..12 {
+            let text = "<think>plan it</think>answer";
+            let pieces: Vec<&str> = text
+                .as_bytes()
+                .chunks(cut)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect();
+            let (r, c) = split(&r, &pieces);
+            assert_eq!((r.as_str(), c.as_str()), ("plan it", "answer"), "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn false_marker_prefix_and_multibyte_tail_are_content() {
+        let r = render(QWEN3, None);
+        assert_eq!(
+            split(&r, &["a<th", "ing ", "é<", "x"]),
+            (String::new(), "a<thing é<x".into())
+        );
+        // Unclosed reasoning flushes as reasoning; state resets per turn.
+        assert_eq!(split(&r, &["<think>half"]), ("half".into(), String::new()));
+        assert_eq!(split(&r, &["plain"]), (String::new(), "plain".into()));
     }
 
     #[test]
@@ -1152,6 +1602,7 @@ pub struct TestHooks {
     slow_ms: u64,
     fail_storage: AtomicBool,
     fail_storage_in_read: AtomicBool,
+    fail_storage_in_stream_read: AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1188,6 +1639,15 @@ impl TestHooks {
     pub fn fail_storage_during_read() -> Self {
         Self {
             fail_storage_in_read: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// Every store replica dies inside the first job's first streamed
+    /// prefill read (the stream reader thread, not the page-in).
+    pub fn fail_storage_during_stream_read() -> Self {
+        Self {
+            fail_storage_in_stream_read: AtomicBool::new(true),
             ..Self::default()
         }
     }
