@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::sys::Input;
+use golem_engine::FinishReason;
 use golem_engine::ParityStep;
 use golem_engine::TurnRequest;
 use golem_engine::atomic::write_atomic;
@@ -758,7 +759,7 @@ fn one_shot(
     timing_out: &mut Option<std::fs::File>,
     trace_out: &mut Option<std::fs::File>,
 ) -> Result<(), Box<dyn Error>> {
-    session.turn(
+    let out = session.turn(
         &TurnRequest::new(&[ChatTurn {
             role: "user",
             content: prompt,
@@ -776,7 +777,10 @@ fn one_shot(
     }
     println!();
     // A signal cut the turn short: the reply is truncated, so exit non-zero.
-    Ok(shutdown.check()?)
+    if out.finish == FinishReason::Cancelled {
+        shutdown.check()?;
+    }
+    Ok(())
 }
 
 /// After a signal-cancelled REPL turn: SIGINT drops the turn and re-arms
@@ -993,7 +997,10 @@ fn repl(
         };
         let req = TurnRequest::new(&turns).cancel(Some(shutdown.cancel.clone()));
         let res = session.turn(&req, &mut emit);
-        if turn_interrupted(shutdown)? {
+        // A completed turn is kept; a signal that landed after it is seen
+        // at the next prompt.
+        let cut = !matches!(res, Ok(o) if o.finish != FinishReason::Cancelled);
+        if cut && turn_interrupted(shutdown)? {
             // The partial reply never enters the history.
             history.pop();
             continue;
@@ -1099,7 +1106,7 @@ fn attach(
     let mut history: Vec<serde_json::Value> = Vec::new();
     let turn = |history: &mut Vec<serde_json::Value>, text: String| {
         history.push(serde_json::json!({"role": "user", "content": text}));
-        let reply = stream_chat(
+        let reply = match stream_chat(
             addr,
             &i.id,
             &i.model,
@@ -1107,9 +1114,13 @@ fn attach(
             n_predict,
             api_key,
             &shutdown.cancel,
-        );
-        shutdown.check()?;
-        let reply = reply?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                shutdown.check()?;
+                return Err(e);
+            }
+        };
         history.push(serde_json::json!({"role": "assistant", "content": reply}));
         println!();
         Ok::<_, Box<dyn Error>>(())
@@ -1324,7 +1335,9 @@ mod tests {
             let _ = s.write_all(
                 b"HTTP/1.0 200 OK\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
             );
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            // Hold the connection open until the client hangs up.
+            let mut b = [0u8; 1024];
+            while s.read(&mut b).is_ok_and(|n| n > 0) {}
         });
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = cancel.clone();

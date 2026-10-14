@@ -23,6 +23,42 @@ fn inst(id: &str, pid: u32, hb: u64) -> Instance {
     }
 }
 
+/// Kills and reaps a test-spawned process even when an assert fails first.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for Reaped {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// SIGKILLs a grandchild on drop while `(pid, start time)` still names it.
+struct KillPid(u32, u64);
+
+impl Drop for KillPid {
+    fn drop(&mut self) {
+        if golem_registry::pid_start_time(self.0).is_ok_and(|t| t == self.1) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &self.0.to_string()])
+                .status();
+        }
+    }
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -230,14 +266,18 @@ fn signal_refuses_reused_pid() {
 
 #[test]
 fn signal_skips_child_with_reused_pid() {
-    let mut owner = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
+    let mut owner = Reaped(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
+    let mut child = Reaped(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
     let mut i = inst("x", owner.id(), now());
     i.children = vec![golem_registry::Child::Timed {
         pid: child.id(),
@@ -309,14 +349,18 @@ fn optimize_registration_is_exclusive() {
 /// one that another process spawned survives the owner's SIGKILL.
 #[test]
 fn bare_child_of_another_parent_is_not_signalled() {
-    let mut owner = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
-    let mut stranger = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
+    let mut owner = Reaped(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
+    let mut stranger = Reaped(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
     let mut i = inst("x", owner.id(), now());
     i.children = vec![golem_registry::Child::Bare(stranger.id())];
     golem_registry::signal(&i, libc::SIGKILL).unwrap();
@@ -333,16 +377,19 @@ fn bare_child_of_another_parent_is_not_signalled() {
 #[test]
 fn bare_child_of_owner_is_signalled() {
     use std::io::BufRead;
-    let mut owner = std::process::Command::new("sh")
-        .args(["-c", "sleep 60 & echo $!; wait"])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut owner = Reaped(
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let mut line = String::new();
     std::io::BufReader::new(owner.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
     let child: u32 = line.trim().parse().unwrap();
+    let _child = KillPid(child, golem_registry::pid_start_time(child).unwrap());
     let mut i = inst("x", owner.id(), now());
     i.children = vec![golem_registry::Child::Bare(child)];
     golem_registry::signal(&i, libc::SIGKILL).unwrap();

@@ -202,11 +202,13 @@ impl Shutdown {
     /// Forgets the signal after a cancelled turn, so the next one is again
     /// a first signal.
     pub fn rearm(&self) {
+        // Re-enable first: a signal racing the clear below is at worst
+        // forgotten (pressed again), never taken as a second one.
+        SIGNALLED.store(false, Ordering::SeqCst);
         self.cancel.store(false, Ordering::SeqCst);
         SIGNAL.store(0, Ordering::SeqCst);
         let mut b = [0u8; 16];
         while (&self.pipe).read(&mut b).is_ok_and(|n| n > 0) {}
-        SIGNALLED.store(false, Ordering::SeqCst);
     }
 
     /// Line reader over stdin that also wakes on a signal.

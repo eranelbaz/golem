@@ -349,10 +349,14 @@ fn second_signal_kills_idle_run() {
     use std::os::unix::process::ExitStatusExt;
     let rt = common::tempdir_env();
     let (mut child, _stdin) = idle_run(&rt);
-    // One `sh` so both land before the REPL wakes on the first.
+    // Stopped, the child cannot handle the first before the second is
+    // pending: both run on SIGCONT, ahead of any REPL code.
     let pid = child.id();
     let st = std::process::Command::new("sh")
-        .args(["-c", &format!("kill -INT {pid}; kill -TERM {pid}")])
+        .args([
+            "-c",
+            &format!("kill -STOP {pid}; kill -INT {pid}; kill -TERM {pid}; kill -CONT {pid}"),
+        ])
         .status()
         .unwrap();
     assert!(st.success());

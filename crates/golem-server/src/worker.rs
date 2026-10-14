@@ -457,6 +457,14 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
                 Err(true) => {
                     fail_all(&mut runs, health);
                     health.queued.fetch_sub(taken + 1, Ordering::SeqCst);
+                    // Still-buffered jobs would hold `pending()` up for the
+                    // whole drain grace.
+                    while let Ok(job) = rx.try_recv() {
+                        let _ = job
+                            .events
+                            .try_send(Event::Failed(crate::app::backend_gone_envelope()));
+                        health.queued.fetch_sub(1, Ordering::SeqCst);
+                    }
                     return;
                 }
                 Err(false) => {
@@ -980,11 +988,14 @@ impl OutputStream {
         let plain = plain && !self.always_parse;
         if let Some(s) = self.tail.filter(|_| partial && plain) {
             self.fast = true;
-            let (seen, ev): (_, fn(String) -> Event) = match s {
-                Section::Reasoning => (&mut self.reasoning, Event::Reasoning),
-                Section::Content => (&mut self.content, Event::Text),
+            let (n, content, reasoning) = &mut self.parsed;
+            let (seen, last, ev): (_, _, fn(String) -> Event) = match s {
+                Section::Reasoning => (&mut self.reasoning, reasoning, Event::Reasoning),
+                Section::Content => (&mut self.content, content, Event::Text),
             };
             seen.push_str(piece);
+            last.push_str(piece);
+            *n = self.text.len();
             send(ev(piece.into()));
             return;
         }
@@ -1271,6 +1282,41 @@ mod tests {
         w.shutdown(|| {}, Duration::from_secs(30)).ok();
     }
 
+    /// A worker that dies at admit answers the jobs still buffered behind
+    /// it and leaves nothing pending.
+    #[test]
+    fn worker_death_at_admit_fails_buffered_jobs() {
+        let cfg = EngineConfig {
+            parallel: 3,
+            ..crate::test_engine_config()
+        };
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let mut running = Vec::new();
+        for p in ["a", "b", "c"] {
+            let (j, mut rx) = job(p, 4096);
+            let cancel = j.cancel.clone();
+            enqueue(&w, j);
+            assert!(matches!(rx.blocking_recv(), Some(Event::Text(_))));
+            running.push((cancel, rx));
+        }
+        // Every slot busy: both land in the channel buffer.
+        let (d, _rd) = job("d", 4);
+        let (e, mut re) = job("e", 4);
+        enqueue(&w, d);
+        enqueue(&w, e);
+        w.health
+            .hooks
+            .panic
+            .store(INJECT_AT_START, Ordering::SeqCst);
+        running[0].0.store(true, Ordering::SeqCst);
+        match terminal(&mut re) {
+            Some(Event::Failed(env)) => assert_eq!(env.error.code, ErrorCode::BackendUnavailable),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!w.health.pending());
+        w.shutdown(|| {}, Duration::from_secs(30)).ok();
+    }
+
     #[test]
     fn pending_while_queued_or_busy() {
         let h = HealthState::new();
@@ -1421,6 +1467,22 @@ mod tests {
         }
         ts.push(&r.parser, "", false, &send);
         assert_eq!(*out.borrow(), pieces.concat());
+    }
+
+    /// Pieces streamed by the fast path keep their section when a later
+    /// piece makes the final parse fail.
+    #[test]
+    fn final_parse_failure_keeps_fast_path_sections() {
+        let r = render(GLM, None);
+        let (events, _) = stream(&r, &["plan", " it", "\0"], false);
+        assert_eq!(
+            events,
+            [
+                r#"Reasoning("plan")"#,
+                r#"Reasoning(" it")"#,
+                r#"Text("\0")"#
+            ]
+        );
     }
 
     #[test]
