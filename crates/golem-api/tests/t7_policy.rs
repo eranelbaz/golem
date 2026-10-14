@@ -166,23 +166,32 @@ fn max_completion_tokens_aliases_max_tokens() {
 }
 
 #[test]
-fn reasoning_effort_maps_onto_template_levels() {
-    let with = |e: &str| {
+fn reasoning_effort_keeps_low_high_else_max() {
+    let with = |e: serde_json::Value| {
         let mut r = base();
-        r["reasoning_effort"] = json!(e);
-        validate(&r, "tiny-moe")
+        r["reasoning_effort"] = e;
+        validate(&r, "tiny-moe").unwrap().reasoning_effort
     };
+    assert_eq!(with(json!("low")).as_deref(), Some("low"));
+    assert_eq!(with(json!("high")).as_deref(), Some("high"));
+    for e in [
+        json!("max"),
+        json!("medium"),
+        json!("minimal"),
+        json!("none"),
+        json!(""),
+        json!("LOW"),
+        json!(" low"),
+        json!("low\0"),
+        json!(null),
+        json!(5),
+        json!(true),
+        json!({"level": "low"}),
+    ] {
+        assert_eq!(with(e.clone()), None, "{e}");
+    }
     assert_eq!(
-        with("medium").unwrap().reasoning_effort.as_deref(),
-        Some("high")
-    );
-    assert_eq!(
-        with("minimal").unwrap().reasoning_effort.as_deref(),
-        Some("low")
-    );
-    assert_eq!(with("max").unwrap().reasoning_effort, None);
-    assert_eq!(
-        with("huge").unwrap_err().error.code,
-        ErrorCode::InvalidRequest
+        validate(&base(), "tiny-moe").unwrap().reasoning_effort,
+        None
     );
 }
