@@ -1,0 +1,9 @@
+message_start {"message":{"content":[],"id":"ID","model":"tiny-moe","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"input_tokens":0,"output_tokens":0}},"type":"message_start"}
+content_block_start {"content_block":{"signature":"","thinking":"","type":"thinking"},"index":0,"type":"content_block_start"}
+content_block_delta {"delta":{"thinking":"plan","type":"thinking_delta"},"index":0,"type":"content_block_delta"}
+content_block_stop {"index":0,"type":"content_block_stop"}
+content_block_start {"content_block":{"text":"","type":"text"},"index":1,"type":"content_block_start"}
+content_block_delta {"delta":{"text":"answer","type":"text_delta"},"index":1,"type":"content_block_delta"}
+content_block_stop {"index":1,"type":"content_block_stop"}
+message_delta {"delta":{"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"input_tokens":3,"output_tokens":2}}
+message_stop {"type":"message_stop"}

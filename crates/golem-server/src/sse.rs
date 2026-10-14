@@ -57,27 +57,45 @@ pub(crate) fn response(
     rx: Receiver<Event>,
     guard: CancelOnDrop,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let (tx, frames) = channel(EVENT_CAPACITY);
-    tokio::spawn(forward(meta, rx, tx, guard));
-    Sse::new(tokio_stream::StreamExt::map(
-        ReceiverStream::new(frames),
-        Ok,
-    ))
-    .keep_alive(KeepAlive::default())
-}
-
-async fn forward(
-    meta: ChunkMeta,
-    mut rx: Receiver<Event>,
-    tx: Sender<SseEvent>,
-    _guard: CancelOnDrop,
-) {
     let role = Delta {
         role: Some("assistant".into()),
         ..Delta::default()
     };
-    if tx.send(meta.delta(role, None)).await.is_err() {
-        return;
+    let first = vec![meta.delta(role, None)];
+    stream(first, rx, guard, KeepAlive::default(), move |ev| {
+        openai_frames(&meta, ev)
+    })
+}
+
+/// Shared SSE plumbing: `first` frames, then `map` per worker event until a
+/// terminal one (`Done`, `Failed` or a closed channel).
+pub(crate) fn stream(
+    first: Vec<SseEvent>,
+    rx: Receiver<Event>,
+    guard: CancelOnDrop,
+    keep_alive: KeepAlive,
+    map: impl FnMut(Option<Event>) -> Vec<SseEvent> + Send + 'static,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, frames) = channel(EVENT_CAPACITY);
+    tokio::spawn(forward(first, rx, tx, guard, map));
+    Sse::new(tokio_stream::StreamExt::map(
+        ReceiverStream::new(frames),
+        Ok,
+    ))
+    .keep_alive(keep_alive)
+}
+
+async fn forward(
+    first: Vec<SseEvent>,
+    mut rx: Receiver<Event>,
+    tx: Sender<SseEvent>,
+    _guard: CancelOnDrop,
+    mut map: impl FnMut(Option<Event>) -> Vec<SseEvent>,
+) {
+    for f in first {
+        if tx.send(f).await.is_err() {
+            return;
+        }
     }
     loop {
         let ev = tokio::select! {
@@ -88,54 +106,7 @@ async fn forward(
             ev,
             Some(Event::Text(_) | Event::Reasoning(_) | Event::ToolCall(_))
         );
-        let frames = match ev {
-            Some(Event::Text(t)) => vec![meta.delta(
-                Delta {
-                    content: Some(t),
-                    ..Delta::default()
-                },
-                None,
-            )],
-            Some(Event::Reasoning(t)) => vec![meta.delta(
-                Delta {
-                    reasoning_content: Some(t),
-                    ..Delta::default()
-                },
-                None,
-            )],
-            Some(Event::ToolCall(c)) => vec![meta.delta(
-                Delta {
-                    tool_calls: Some(vec![c]),
-                    ..Delta::default()
-                },
-                None,
-            )],
-            Some(Event::Done(o)) => {
-                let mut v = vec![meta.delta(Delta::default(), Some(finish_reason(o.finish)))];
-                if meta.include_usage {
-                    v.push(meta.chunk(
-                        Vec::new(),
-                        Some(Usage {
-                            prompt_tokens: o.prompt_tokens,
-                            completion_tokens: o.completion_tokens,
-                            total_tokens: o.prompt_tokens + o.completion_tokens,
-                        }),
-                    ));
-                }
-                v.push(SseEvent::default().data("[DONE]"));
-                v
-            }
-            Some(Event::Failed(e)) => {
-                meta.health.count_error(e.error.code);
-                vec![error_frame(&e), SseEvent::default().data("[DONE]")]
-            }
-            // Worker died mid-stream: the error frame, then `[DONE]` (§8.3).
-            None => vec![
-                error_frame(&backend_gone_envelope()),
-                SseEvent::default().data("[DONE]"),
-            ],
-        };
-        for f in frames {
+        for f in map(ev) {
             if tx.send(f).await.is_err() {
                 return;
             }
@@ -143,6 +114,56 @@ async fn forward(
         if terminal {
             return;
         }
+    }
+}
+
+fn openai_frames(meta: &ChunkMeta, ev: Option<Event>) -> Vec<SseEvent> {
+    match ev {
+        Some(Event::Text(t)) => vec![meta.delta(
+            Delta {
+                content: Some(t),
+                ..Delta::default()
+            },
+            None,
+        )],
+        Some(Event::Reasoning(t)) => vec![meta.delta(
+            Delta {
+                reasoning_content: Some(t),
+                ..Delta::default()
+            },
+            None,
+        )],
+        Some(Event::ToolCall(c)) => vec![meta.delta(
+            Delta {
+                tool_calls: Some(vec![c]),
+                ..Delta::default()
+            },
+            None,
+        )],
+        Some(Event::Done(o)) => {
+            let mut v = vec![meta.delta(Delta::default(), Some(finish_reason(o.finish)))];
+            if meta.include_usage {
+                v.push(meta.chunk(
+                    Vec::new(),
+                    Some(Usage {
+                        prompt_tokens: o.prompt_tokens,
+                        completion_tokens: o.completion_tokens,
+                        total_tokens: o.prompt_tokens + o.completion_tokens,
+                    }),
+                ));
+            }
+            v.push(SseEvent::default().data("[DONE]"));
+            v
+        }
+        Some(Event::Failed(e)) => {
+            meta.health.count_error(e.error.code);
+            vec![error_frame(&e), SseEvent::default().data("[DONE]")]
+        }
+        // Worker died mid-stream: the error frame, then `[DONE]` (§8.3).
+        None => vec![
+            error_frame(&backend_gone_envelope()),
+            SseEvent::default().data("[DONE]"),
+        ],
     }
 }
 

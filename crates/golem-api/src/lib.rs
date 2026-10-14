@@ -1,6 +1,7 @@
 //! HTTP API contract: OpenAI-compatible types, the Golem error envelope, and
 //! the request field policy (tech design §8).
 
+pub mod anthropic;
 pub mod chat;
 pub mod policy;
 

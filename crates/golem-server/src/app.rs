@@ -40,7 +40,7 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(250);
 const ACCEPT_STEP: Duration = Duration::from_millis(10);
 
 /// Error response: status plus §8.4 envelope.
-struct ApiError(StatusCode, ErrorEnvelope);
+pub(crate) struct ApiError(pub StatusCode, pub ErrorEnvelope);
 
 pub(crate) fn status_of(code: ErrorCode) -> StatusCode {
     match code {
@@ -75,7 +75,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn api_err(code: ErrorCode, msg: impl Into<String>) -> ApiError {
+pub(crate) fn api_err(code: ErrorCode, msg: impl Into<String>) -> ApiError {
     ErrorEnvelope::new(code, msg).into()
 }
 
@@ -109,12 +109,13 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// `/v1/chat/completions`, `/v1/models`, `/metrics` and unknown `/v1/*`
+/// `/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/metrics` and unknown `/v1/*`
 /// (behind the API key when set; no route probing without it), `/health`
 /// (always open); everything else 404.
 pub fn router(state: AppState) -> Router {
     let keyed = Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(crate::anthropic::messages))
         .route("/v1/models", get(models))
         .route("/v1/{*rest}", any(not_found))
         .route("/metrics", get(metrics))
@@ -131,7 +132,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -146,23 +147,37 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0 && a.len() == b.len()
 }
 
-/// `--api-key`: a missing or wrong `Authorization: Bearer` is a 401
-/// `golem_invalid_request` (built here, not through the 400 code map).
+/// Anthropic routes answer errors in the Anthropic envelope (§8.6).
+fn is_anthropic(path: &str) -> bool {
+    path == "/v1/messages" || path.starts_with("/v1/messages/")
+}
+
+/// `--api-key`: `Authorization: Bearer` or `x-api-key` (Anthropic clients;
+/// Claude Code sends both) must match, else a 401 `golem_invalid_request`
+/// (built here, not through the 400 code map).
 async fn authorize(State(st): State<AppState>, req: Request, next: Next) -> Response {
     if let Some(key) = &st.cfg.api_key {
-        let got = req
-            .headers()
+        let h = req.headers();
+        let bearer = h
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !ct_eq(got.as_bytes(), key.as_bytes()) {
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let x_api_key = h.get("x-api-key").and_then(|v| v.to_str().ok());
+        let ok = [bearer, x_api_key]
+            .into_iter()
+            .flatten()
+            .fold(false, |ok, got| ok | ct_eq(got.as_bytes(), key.as_bytes()));
+        if !ok {
             st.health.count_error(ErrorCode::InvalidRequest);
-            return ApiError(
+            let e = ApiError(
                 StatusCode::UNAUTHORIZED,
                 ErrorEnvelope::new(ErrorCode::InvalidRequest, "missing or wrong API key"),
-            )
-            .into_response();
+            );
+            return if is_anthropic(req.uri().path()) {
+                crate::anthropic::AnthropicError(e).into_response()
+            } else {
+                e.into_response()
+            };
         }
     }
     next.run(req).await
@@ -188,50 +203,10 @@ async fn chat_inner(
 ) -> Result<Response, ApiError> {
     let Json(raw) = body.map_err(|e| api_err(ErrorCode::InvalidRequest, e.body_text()))?;
     let req = golem_api::policy::validate(&raw, &st.cfg.model_name)?;
-    match st.health.get() {
-        ServeState::Draining | ServeState::Releasing => {
-            return Err(api_err(ErrorCode::Busy, "server draining"));
-        }
-        ServeState::FatalIo => {
-            return Err(api_err(
-                ErrorCode::StorageUnavailable,
-                "every replica of a model shard is unreadable",
-            ));
-        }
-        ServeState::Fatal => return Err(backend_gone()),
-        _ => {}
-    }
     let stream = req.stream == Some(true);
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let guard = CancelOnDrop(cancel.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
-    let mut job = Job {
-        req,
-        cancel,
-        events: tx,
-        reasoning: st.cfg.reasoning,
-    };
-    let deadline = Instant::now() + ACCEPT_RETRY;
-    // Counted before the send: the worker's dequeue may run first.
-    st.health.queued.fetch_add(1, Ordering::SeqCst);
-    loop {
-        match st.jobs.try_send(job) {
-            Ok(()) => break,
-            Err(TrySendError::Disconnected(_)) => {
-                st.health.queued.fetch_sub(1, Ordering::SeqCst);
-                return Err(backend_gone());
-            }
-            Err(TrySendError::Full(j)) => {
-                if Instant::now() >= deadline {
-                    st.health.queued.fetch_sub(1, Ordering::SeqCst);
-                    return Err(api_err(ErrorCode::Busy, "all slots busy"));
-                }
-                job = j;
-                tokio::time::sleep(ACCEPT_STEP).await;
-            }
-        }
-    }
+    let reasoning = st.cfg.reasoning;
+    let (mut rx, guard) = submit(&st, req, reasoning).await?;
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     if stream {
         let meta = crate::sse::ChunkMeta {
@@ -244,19 +219,12 @@ async fn chat_inner(
         return Ok(crate::sse::response(meta, rx, guard).into_response());
     }
     let _guard = guard;
-    let (mut text, mut reasoning) = (String::new(), String::new());
-    let mut calls: Vec<ToolCall> = Vec::new();
-    let outcome = loop {
-        match rx.recv().await {
-            Some(Event::Text(t)) => text.push_str(&t),
-            Some(Event::Reasoning(t)) => reasoning.push_str(&t),
-            Some(Event::ToolCall(d)) => merge_tool_call(&mut calls, d),
-            Some(Event::Done(o)) => break o,
-            Some(Event::Failed(e)) => return Err(e.into()),
-            // Worker died mid-job: never a 200 with truncated content.
-            None => return Err(backend_gone()),
-        }
-    };
+    let Collected {
+        text,
+        reasoning,
+        calls,
+        outcome,
+    } = collect(&mut rx).await?;
     let finish_reason = finish_reason(outcome.finish);
     Ok(Json(ChatCompletionResponse {
         id,
@@ -283,6 +251,93 @@ async fn chat_inner(
         },
     })
     .into_response())
+}
+
+/// Hands a validated request to the worker: refuses by instance state,
+/// retries a full queue for [`ACCEPT_RETRY`], then 503 `golem_busy`. The
+/// guard cancels the job when the caller drops it.
+pub(crate) async fn submit(
+    st: &AppState,
+    req: golem_api::ChatCompletionRequest,
+    reasoning: crate::ReasoningMode,
+) -> Result<(tokio::sync::mpsc::Receiver<Event>, CancelOnDrop), ApiError> {
+    match st.health.get() {
+        ServeState::Draining | ServeState::Releasing => {
+            return Err(api_err(ErrorCode::Busy, "server draining"));
+        }
+        ServeState::FatalIo => {
+            return Err(api_err(
+                ErrorCode::StorageUnavailable,
+                "every replica of a model shard is unreadable",
+            ));
+        }
+        ServeState::Fatal => return Err(backend_gone()),
+        _ => {}
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let guard = CancelOnDrop(cancel.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
+    let mut job = Job {
+        req,
+        cancel,
+        events: tx,
+        reasoning,
+    };
+    let deadline = Instant::now() + ACCEPT_RETRY;
+    // Counted before the send: the worker's dequeue may run first.
+    st.health.queued.fetch_add(1, Ordering::SeqCst);
+    loop {
+        match st.jobs.try_send(job) {
+            Ok(()) => break,
+            Err(TrySendError::Disconnected(_)) => {
+                st.health.queued.fetch_sub(1, Ordering::SeqCst);
+                return Err(backend_gone());
+            }
+            Err(TrySendError::Full(j)) => {
+                if Instant::now() >= deadline {
+                    st.health.queued.fetch_sub(1, Ordering::SeqCst);
+                    return Err(api_err(ErrorCode::Busy, "all slots busy"));
+                }
+                job = j;
+                tokio::time::sleep(ACCEPT_STEP).await;
+            }
+        }
+    }
+    Ok((rx, guard))
+}
+
+/// A finished non-streaming turn.
+pub(crate) struct Collected {
+    pub text: String,
+    pub reasoning: String,
+    pub calls: Vec<ToolCall>,
+    pub outcome: golem_engine::TurnOutcome,
+}
+
+/// Drains one job's events into the full turn.
+pub(crate) async fn collect(
+    rx: &mut tokio::sync::mpsc::Receiver<Event>,
+) -> Result<Collected, ApiError> {
+    let (mut text, mut reasoning) = (String::new(), String::new());
+    let mut calls: Vec<ToolCall> = Vec::new();
+    loop {
+        match rx.recv().await {
+            Some(Event::Text(t)) => text.push_str(&t),
+            Some(Event::Reasoning(t)) => reasoning.push_str(&t),
+            Some(Event::ToolCall(d)) => merge_tool_call(&mut calls, d),
+            Some(Event::Done(outcome)) => {
+                return Ok(Collected {
+                    text,
+                    reasoning,
+                    calls,
+                    outcome,
+                });
+            }
+            Some(Event::Failed(e)) => return Err(e.into()),
+            // Worker died mid-job: never a 200 with truncated content.
+            None => return Err(backend_gone()),
+        }
+    }
 }
 
 /// Folds one streamed tool-call delta into the full calls (`index` selects
@@ -350,13 +405,18 @@ async fn metrics(State(st): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn not_found(State(st): State<AppState>) -> ApiError {
+async fn not_found(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
     st.health.count_error(ErrorCode::NotFound);
-    api_err(ErrorCode::NotFound, "no such route")
+    let e = api_err(ErrorCode::NotFound, "no such route");
+    if is_anthropic(uri.path()) {
+        crate::anthropic::AnthropicError(e).into_response()
+    } else {
+        e.into_response()
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ReasoningMode;
     use axum::body::Body;
@@ -365,6 +425,19 @@ mod tests {
 
     /// Router over a scripted worker: every job gets `events`, then Done.
     fn scripted(events: Vec<Event>) -> Router {
+        scripted_with(
+            events,
+            TurnOutcome {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                finish: EngineFinish::Stop,
+                stop_sequence: None,
+            },
+        )
+    }
+
+    /// [`scripted`] ending in `outcome`.
+    pub(crate) fn scripted_with(events: Vec<Event>, outcome: TurnOutcome) -> Router {
         let (jobs, rx) = std::sync::mpsc::sync_channel::<Job>(0);
         std::thread::spawn(move || {
             if let Ok(job) = rx.recv() {
@@ -372,13 +445,7 @@ mod tests {
                 for e in events {
                     job.events.blocking_send(e).unwrap();
                 }
-                job.events
-                    .blocking_send(Event::Done(TurnOutcome {
-                        prompt_tokens: 3,
-                        completion_tokens: 2,
-                        finish: EngineFinish::Stop,
-                    }))
-                    .unwrap();
+                job.events.blocking_send(Event::Done(outcome)).unwrap();
             }
         });
         let mut cfg = crate::test_support::test_server_config();

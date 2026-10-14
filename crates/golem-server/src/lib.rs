@@ -1,5 +1,6 @@
 //! Instance process: HTTP server, slot scheduler, decode loop (tech design sections 2 and 7).
 
+mod anthropic;
 mod app;
 mod metrics;
 mod sse;

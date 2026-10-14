@@ -1,0 +1,6 @@
+message_start {"message":{"content":[],"id":"ID","model":"tiny-moe","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"input_tokens":0,"output_tokens":0}},"type":"message_start"}
+content_block_start {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
+content_block_delta {"delta":{"text":"a","type":"text_delta"},"index":0,"type":"content_block_delta"}
+content_block_stop {"index":0,"type":"content_block_stop"}
+message_delta {"delta":{"stop_reason":"stop_sequence","stop_sequence":"Z"},"type":"message_delta","usage":{"input_tokens":3,"output_tokens":2}}
+message_stop {"type":"message_stop"}

@@ -72,6 +72,17 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
 }
 
+impl ChatCompletionRequest {
+    /// `stop` as a list; indices match `TurnOutcome::stop_sequence`.
+    pub fn stop_list(&self) -> Vec<String> {
+        match &self.stop {
+            None => Vec::new(),
+            Some(Stop::One(s)) => vec![s.clone()],
+            Some(Stop::Many(v)) => v.clone(),
+        }
+    }
+}
+
 /// GLM-5.3-Flash model card: only `low`/`high` are explicit; absent or any
 /// other value is `max`, the template default, so nothing is sent.
 fn glm_effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {

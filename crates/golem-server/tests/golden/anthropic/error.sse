@@ -1,0 +1,2 @@
+message_start {"message":{"content":[],"id":"ID","model":"tiny-moe","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"input_tokens":0,"output_tokens":0}},"type":"message_start"}
+error {"error":{"message":"golem_busy: server draining","type":"overloaded_error"},"type":"error"}
