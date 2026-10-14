@@ -1,0 +1,4 @@
+message_start {"message":{"content":[],"id":"ID","model":"tiny-moe","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"input_tokens":0,"output_tokens":0}},"type":"message_start"}
+content_block_start {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
+content_block_delta {"delta":{"text":"par","type":"text_delta"},"index":0,"type":"content_block_delta"}
+error {"error":{"message":"golem_backend_unavailable: decode worker is not running","type":"api_error"},"type":"error"}

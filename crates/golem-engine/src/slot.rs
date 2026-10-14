@@ -169,13 +169,16 @@ pub struct TurnOutcome {
     pub completion_tokens: u32,
     /// Why the turn ended.
     pub finish: FinishReason,
+    /// Index into the request's `stop` of the string that ended the turn.
+    pub stop_sequence: Option<u32>,
 }
 
 /// Holds back up to `max_stop_len - 1` bytes so a stop string split across
 /// pieces is still caught; the tail buffer is reused across turns.
 #[derive(Default)]
 pub(crate) struct StopMatcher {
-    stops: Vec<String>,
+    /// Non-empty stops with their index in the request's list.
+    stops: Vec<(u32, String)>,
     max_len: usize,
     held: String,
 }
@@ -183,28 +186,38 @@ pub(crate) struct StopMatcher {
 impl StopMatcher {
     fn reset(&mut self, stops: &[String]) {
         self.stops.clear();
-        self.stops
-            .extend(stops.iter().filter(|s| !s.is_empty()).cloned());
-        self.max_len = self.stops.iter().map(String::len).max().unwrap_or(0);
+        self.stops.extend(
+            (0u32..)
+                .zip(stops)
+                .filter(|(_, s)| !s.is_empty())
+                .map(|(i, s)| (i, s.clone())),
+        );
+        self.max_len = self.stops.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
         self.held.clear();
     }
 
-    /// Emits text that can no longer start a stop; `true` once a stop matched
-    /// (text before it emitted, the stop and anything after dropped).
-    fn push(&mut self, s: &str, emit: &mut dyn FnMut(&str)) -> bool {
+    /// Emits text that can no longer start a stop; the matched stop's
+    /// request index once one matched (earliest position, then lowest
+    /// index; text before it emitted, the stop and anything after dropped).
+    fn push(&mut self, s: &str, emit: &mut dyn FnMut(&str)) -> Option<u32> {
         if self.stops.is_empty() {
             if !s.is_empty() {
                 emit(s);
             }
-            return false;
+            return None;
         }
         self.held.push_str(s);
-        if let Some(i) = self.stops.iter().filter_map(|st| self.held.find(st)).min() {
-            if i > 0 {
-                emit(&self.held[..i]);
+        if let Some((at, idx)) = self
+            .stops
+            .iter()
+            .filter_map(|(idx, st)| self.held.find(st.as_str()).map(|at| (at, *idx)))
+            .min()
+        {
+            if at > 0 {
+                emit(&self.held[..at]);
             }
             self.held.clear();
-            return true;
+            return Some(idx);
         }
         let keep = self.max_len - 1;
         if self.held.len() > keep {
@@ -214,7 +227,7 @@ impl StopMatcher {
                 self.held.drain(..cut);
             }
         }
-        false
+        None
     }
 
     fn flush(&mut self, emit: &mut dyn FnMut(&str)) {
@@ -266,6 +279,8 @@ pub struct SlotState {
     pub(crate) generated: Vec<i32>,
     limit: u32,
     pub(crate) prompt_tokens: u32,
+    /// The stop string that ended this turn.
+    stop_hit: Option<u32>,
     cancel: Option<Arc<AtomicBool>>,
     /// Greedy without penalties: a failed batch can be replayed exactly. A
     /// grammar does not matter: greedy + grammar is deterministic too.
@@ -294,6 +309,7 @@ impl SlotState {
             generated: Vec::with_capacity(n_predict as usize),
             limit: 0,
             prompt_tokens: 0,
+            stop_hit: None,
             cancel: None,
             replayable: true,
             failures: 0,
@@ -325,6 +341,7 @@ impl SlotState {
         self.generated.reserve(limit as usize);
         self.limit = limit;
         self.prompt_tokens = prompt_tokens;
+        self.stop_hit = None;
         self.cancel = cancel;
         self.replayable = sampling.temperature <= 0.0
             && sampling.frequency_penalty == 0.0
@@ -352,11 +369,19 @@ impl SlotState {
     /// Takes a finished slot's result and frees it.
     pub(crate) fn take_result(&mut self) -> Option<Result<TurnOutcome, EngineError>> {
         let r = match std::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::Done(finish) => Ok(TurnOutcome {
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens: self.generated.len() as u32,
-                finish,
-            }),
+            Phase::Done(finish) => {
+                // A stop completed by the turn-end flush cut the text: Stop.
+                let finish = match (finish, self.stop_hit) {
+                    (FinishReason::Length, Some(_)) => FinishReason::Stop,
+                    _ => finish,
+                };
+                Ok(TurnOutcome {
+                    prompt_tokens: self.prompt_tokens,
+                    completion_tokens: self.generated.len() as u32,
+                    finish,
+                    stop_sequence: self.stop_hit.filter(|_| finish == FinishReason::Stop),
+                })
+            }
             Phase::Failed(e) => Err(e),
             p => {
                 self.phase = p;
@@ -398,9 +423,10 @@ impl SlotState {
         flush_utf8_tail(&mut self.pending, &mut self.scratch);
         let hit = self.stop.push(&self.scratch, emit);
         self.scratch.clear();
-        if !hit {
+        if hit.is_none() {
             self.stop.flush(emit);
         }
+        self.stop_hit = self.stop_hit.or(hit);
     }
 
     /// Emits the sampled-but-undecoded token and runs the finish checks;
@@ -419,7 +445,8 @@ impl SlotState {
         let hit = self.stop.push(&self.scratch, emit);
         self.scratch.clear();
         self.generated.push(self.tok);
-        if hit {
+        if hit.is_some() {
+            self.stop_hit = hit;
             self.pending.clear();
             self.phase = Phase::Done(FinishReason::Stop);
             return false;
@@ -673,22 +700,53 @@ fn recover_slot(
 mod tests {
     use super::*;
 
-    fn feed(stops: &[&str], pieces: &[&str]) -> (String, bool) {
+    fn feed_idx(stops: &[&str], pieces: &[&str]) -> (String, Option<u32>) {
         let stops: Vec<String> = stops.iter().map(|s| s.to_string()).collect();
         let mut m = StopMatcher::default();
         m.reset(&stops);
         let mut out = String::new();
-        let mut hit = false;
+        let mut hit = None;
         for p in pieces {
-            if m.push(p, &mut |s| out.push_str(s)) {
-                hit = true;
+            hit = m.push(p, &mut |s| out.push_str(s));
+            if hit.is_some() {
                 break;
             }
         }
-        if !hit {
+        if hit.is_none() {
             m.flush(&mut |s| out.push_str(s));
         }
         (out, hit)
+    }
+
+    fn feed(stops: &[&str], pieces: &[&str]) -> (String, bool) {
+        let (out, hit) = feed_idx(stops, pieces);
+        (out, hit.is_some())
+    }
+
+    #[test]
+    fn stop_completed_by_turn_end_flush_is_reported() {
+        let mut s = SlotState::new(0, 4);
+        s.stop.reset(&["xy".into()]);
+        s.phase = Phase::Done(FinishReason::Length);
+        let mut out = String::new();
+        s.stop.push("ax", &mut |t| out.push_str(t));
+        s.scratch.push('y');
+        s.flush_text(&mut |t| out.push_str(t));
+        let o = s.take_result().unwrap().unwrap();
+        assert_eq!(
+            (out.as_str(), o.finish, o.stop_sequence),
+            ("a", FinishReason::Stop, Some(0))
+        );
+    }
+
+    #[test]
+    fn stop_hit_reports_request_index_earliest_then_lowest() {
+        assert_eq!(
+            feed_idx(&["", "zz", "c"], &["ab", "cd"]),
+            ("ab".into(), Some(2))
+        );
+        assert_eq!(feed_idx(&["cd", "c"], &["abcd"]), ("ab".into(), Some(0)));
+        assert_eq!(feed_idx(&["d", "bc"], &["abcd"]), ("a".into(), Some(1)));
     }
 
     #[test]

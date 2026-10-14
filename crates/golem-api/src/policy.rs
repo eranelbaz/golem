@@ -59,11 +59,12 @@ fn err(code: ErrorCode, msg: String) -> ErrorEnvelope {
     ErrorEnvelope::new(code, msg)
 }
 
-/// Validates a raw JSON body against §8.2 and returns the typed request.
-pub fn validate(
+/// Checks every key of `raw` against `table`: unknown or `Unsupported` keys
+/// are a typed `golem_unsupported_field` naming the field.
+pub fn check_fields(
     raw: &serde_json::Value,
-    instance_model: &str,
-) -> Result<ChatCompletionRequest, ErrorEnvelope> {
+    table: &[(&str, FieldRule)],
+) -> Result<(), ErrorEnvelope> {
     let obj = raw.as_object().ok_or_else(|| {
         err(
             ErrorCode::InvalidRequest,
@@ -71,7 +72,7 @@ pub fn validate(
         )
     })?;
     for key in obj.keys() {
-        match FIELD_POLICY.iter().find(|(f, _)| f == key) {
+        match table.iter().find(|(f, _)| f == key) {
             None => {
                 return Err(err(
                     ErrorCode::UnsupportedField,
@@ -87,6 +88,15 @@ pub fn validate(
             Some(_) => {}
         }
     }
+    Ok(())
+}
+
+/// Validates a raw JSON body against §8.2 and returns the typed request.
+pub fn validate(
+    raw: &serde_json::Value,
+    instance_model: &str,
+) -> Result<ChatCompletionRequest, ErrorEnvelope> {
+    check_fields(raw, FIELD_POLICY)?;
     let mut req: ChatCompletionRequest = serde_json::from_value(raw.clone())
         .map_err(|e| err(ErrorCode::InvalidRequest, e.to_string()))?;
     if req.store == Some(true) {

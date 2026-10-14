@@ -484,6 +484,7 @@ Writing a draft model is not part of it.
 | Endpoint | Status | Notes |
 |----------|--------|-------|
 | `POST /v1/chat/completions` | v1 | streaming (`stream: true`, SSE) and non-streaming |
+| `POST /v1/messages` | v1 | Anthropic Messages API, streaming and non-streaming (§8.6, #106) |
 | `GET /v1/models` | v1 | the instance's single model |
 | `GET /health` | v1 | Golem extension: `state`, `tiers{vram_fill,ram_fill}`, `degraded`, `model`, `turns`, `device_cache_skip_ratio` (§11) |
 | `GET /metrics` | v1 | Prometheus-format (§11) |
@@ -524,6 +525,38 @@ Codes (stable, documented): `golem_backend_unavailable`, `golem_plan_infeasible`
 ### 8.5 Server posture
 
 Binds `127.0.0.1` by default (port: auto-select, recorded in the registry; `--host/--port` to override). Optional bearer token (`--api-key`). No TLS in v1 (loopback tool; document the reverse-proxy path). `golem serve` runs in the foreground by default — logs to stderr; *amended 2026-10-10:* Ctrl-C cancels in-flight requests at once (a second Ctrl-C exits without teardown), SIGTERM and `golem stop` keep the 30 s drain grace (`golem stop --now` cancels at once) — with `--detach` (double-fork, logs to `$GOLEM_DATA_DIR/logs/<instance>.log`, PID in registry) for the background habit.
+
+### 8.6 Anthropic Messages API
+
+*Added 2026-10-14 (#106).* `POST /v1/messages` serves Anthropic-protocol clients (Claude Code, the Anthropic SDKs) on the same port and key. There is one decode path: `golem_api::anthropic::to_chat` translates the body into the §8.2 chat request. That request then runs through the same `policy::validate`, worker, chat template and tool parser, and the result is translated back.
+
+- **Fields.** A strict allowlist, separate from §8.2's:
+  - Supported: `model`, `messages`, `system`, `max_tokens` (required), `stop_sequences`, `temperature`, `top_p`, `top_k`, `stream`, `tools`, `tool_choice`, `thinking`, and `output_config.effort` (→ `reasoning_effort`).
+  - Tolerated with no effect: `metadata`, `context_management`, `safeguards`. Claude Code sends all three.
+  - Anything else is 400 `golem_unsupported_field`. That includes server tools, `redacted_thinking` and other `output_config` keys.
+  - Every block accepts `cache_control` and `citations`, with no effect.
+- **Messages.**
+  - `system` (a string or text blocks) becomes the system message.
+  - User `tool_result` blocks become `tool` messages (`tool_call_id` = `tool_use_id`), followed by the remaining text as one user message.
+  - Assistant blocks: `text` becomes `content`, `thinking` becomes `reasoning_content`, and `tool_use` becomes `tool_calls`.
+  - `image`/`document` are 400 `golem_multimodal_unsupported`.
+- **Tool choice.** `auto`/`any`/`tool`/`none` map to `auto`/`required`/named/`none`.
+- **Thinking.** Reasoning is always split into `thinking` blocks (`signature: ""`), whatever `--reasoning` is set to.
+  - `enabled` and `adaptive` keep the template default. `budget_tokens` and `display` have no effect.
+  - `disabled` is 400 until the template's no-think form is verified.
+- **Response.** Blocks come in the order `thinking`, `text`, `tool_use` (`input` is the parsed arguments; unparseable arguments are a 500, never `{}`).
+  - `stop_reason` is `end_turn`, `max_tokens`, `tool_use`, or `stop_sequence`, which echoes the matched string via `TurnOutcome::stop_sequence`.
+  - `usage` carries `input_tokens`/`output_tokens`.
+- **Streaming.** Named events: `message_start` (sent before prefill), then `content_block_start`/`_delta` (`text_delta`, `thinking_delta`, `input_json_delta`)/`_stop`, then `message_delta` (stop reason, usage) and `message_stop`.
+  - A `ping` event (not an SSE comment) goes out every 10 s while idle, because a cold agent prefill runs for minutes.
+  - Errors mid-stream are an `error` event.
+  - A disconnect cancels the slot, as on `/v1/chat/completions`.
+- **Errors and auth.**
+  - Error envelope: `{"type":"error","error":{"type","message":"<golem code>: …"}}` with the §8.4 status. `type` is one of `invalid_request_error`, `authentication_error`, `not_found_error`, `overloaded_error`, `api_error`.
+  - Auth accepts `x-api-key` or `Authorization: Bearer`. A 401 or 404 under `/v1/messages` uses this envelope.
+  - `anthropic-version` and `anthropic-beta` are ignored.
+- **Model.** Strict, as in §8.2. Claude Code sets it with `ANTHROPIC_MODEL`.
+- **Cost.** A captured Claude Code request (2026-10-14) is 66 KB of JSON: ≈ 47.5k chars of tool schemas plus ≈ 5.8k of system prompt. At ≈ 3.5–4 chars/token that is ≈ 13–15k tokens. At the measured 5.6 tok/s cold streamed prefill (m3.6) that is ≈ 14 000 / 5.6 ≈ 42 min for a cold first turn. Later turns depend on §7.1 prefix snapshots. Turn-1/turn-2 TTFT on the target is still to be measured.
 
 ---
 

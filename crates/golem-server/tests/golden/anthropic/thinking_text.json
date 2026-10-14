@@ -1,0 +1,1 @@
+{"content":[{"signature":"","thinking":"plan","type":"thinking"},{"text":"answer","type":"text"}],"id":"ID","model":"tiny-moe","role":"assistant","stop_reason":"end_turn","stop_sequence":null,"type":"message","usage":{"input_tokens":3,"output_tokens":2}}

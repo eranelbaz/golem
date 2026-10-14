@@ -1,0 +1,1 @@
+{"content":[{"signature":"","thinking":"call f","type":"thinking"},{"id":"call_1","input":{"x":1},"name":"f","type":"tool_use"}],"id":"ID","model":"tiny-moe","role":"assistant","stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"input_tokens":3,"output_tokens":2}}

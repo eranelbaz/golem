@@ -31,6 +31,26 @@ exits; `--detach` runs in the background (`golem list`, `golem stop <id>`). `gol
 --ctx <ctx> --max-minutes <n>` sweeps scheduling knobs on this machine and
 saves a winner that `serve`/`run` apply automatically (flags still win).
 
+Anthropic clients (Claude Code, the Anthropic SDKs) use `POST /v1/messages` on
+the same port and key (`x-api-key` or `Authorization: Bearer`). The model name
+is strict: send the instance's `--model-name`.
+
+```sh
+M_NAME=<--model-name>
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=<--api-key or any> \
+ANTHROPIC_MODEL=$M_NAME ANTHROPIC_SMALL_FAST_MODEL=$M_NAME \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=$M_NAME ANTHROPIC_DEFAULT_SONNET_MODEL=$M_NAME \
+ANTHROPIC_DEFAULT_OPUS_MODEL=$M_NAME claude
+```
+
+Claude Code's background calls (titles, summaries) use the small/fast and
+per-tier models; unset, they name a `claude-*` model and get
+`golem_model_mismatch`.
+
+Claude Code's first request carries ≈ 53 KB of system prompt and tool schemas
+(≈ 13–15k tokens, measured 2026-10-14), so `--ctx` must exceed that plus the
+conversation, and a cold first turn is a long prefill (design §8.6).
+
 ## Repository layout
 
 ```

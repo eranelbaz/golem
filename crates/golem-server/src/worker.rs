@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use golem_api::chat::{FunctionCall, Stop, ToolCall};
+use golem_api::chat::{FunctionCall, ToolCall};
 use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent};
 use golem_engine::config::EngineConfig;
 use golem_engine::{
@@ -47,7 +47,7 @@ pub enum ReasoningMode {
 }
 
 /// Worker → handler stream for one job.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Event {
     /// Generated answer text piece.
     Text(String),
@@ -653,11 +653,7 @@ fn admit(
             content: t,
         })
         .collect();
-    let stop: Vec<String> = match &req.stop {
-        None => Vec::new(),
-        Some(Stop::One(s)) => vec![s.clone()],
-        Some(Stop::Many(v)) => v.clone(),
-    };
+    let stop = req.stop_list();
     // `policy::validate` bounds `seed` below `u32::MAX`: lossless.
     let seed = req.seed.map_or(LLAMA_DEFAULT_SEED, |s| s as u32);
     // OpenAI defaults, not `SamplingParams::default()` (greedy).
@@ -828,6 +824,7 @@ fn finish(
     let res = res.map(|o| match o.finish {
         FinishReason::Stop if called => TurnOutcome {
             finish: FinishReason::ToolCalls,
+            stop_sequence: None,
             ..o
         },
         _ => o,
