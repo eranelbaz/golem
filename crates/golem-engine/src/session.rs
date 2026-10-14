@@ -746,6 +746,18 @@ impl Session {
         // before `llama_init_from_model` so its first `sched_reserve` sees
         // the hooks (cpy shrink). If the load fails, the guards drop cleanly.
         let report = load_plan(config)?;
+        let clamped;
+        let config = match report.as_ref().and_then(|(_, k)| *k) {
+            Some(k) => {
+                clamped = EngineConfig {
+                    device_cache_experts: k,
+                    ..config.clone()
+                };
+                &clamped
+            }
+            None => config,
+        };
+        let report = report.map(|(r, _)| r);
         let mut p3 = if config.ram_experts_gib > 0 {
             let mut p = p3_glue::enable(config)?;
             if let Some(r) = &report {
@@ -2197,16 +2209,12 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
     } else {
         config.batch_tokens
     };
-    let per_expert = m.slab_bytes_per_expert();
     golem_plan::PlanInput {
         ctx: config.n_ctx,
         parallel: config.parallel,
         prefill_ubatch: ubatch.min(config.n_ctx),
         prefill_stream: config.prefill_stream,
-        vram_experts: match config.device_cache_experts {
-            0 => 0,
-            k => (u64::from(k) + 1) * per_expert,
-        },
+        vram_experts: m.device_cache_bytes(u64::from(config.device_cache_experts)),
         experts: if config.ram_experts_gib == 0 {
             golem_plan::ExpertResidency::Resident(resident_expert_bytes(config, m))
         } else {
@@ -2238,21 +2246,49 @@ fn resident_expert_bytes(config: &EngineConfig, m: &golem_plan::ModelFacts) -> u
 /// Load-time §10 VRAM feasibility (§6.4), same `golem_plan::plan` as
 /// `golem plan`, against the VRAM free before the load. RAM admission is
 /// the CLI's `fit_ram` over the same `ram_terms`, so RAM is not re-judged
-/// here. Err = `PlanInfeasible` with the failing inequality.
+/// here. An explicit K whose slab overruns what the other terms leave is
+/// clamped to the largest K the plan fits (WARN), returned as `Some(k)`;
+/// an explicit K is not refit after load, so a short estimate falls back to
+/// `shrink_after_slab_failure`. Below top-k there is no
+/// usable K: `InvalidConfig` naming the max. Otherwise Err = `PlanInfeasible`
+/// with the failing inequality.
 fn check_plan(
     config: &EngineConfig,
     m: &golem_plan::ModelFacts,
     vram_free: u64,
-) -> Result<golem_plan::PlanReport, EngineError> {
+) -> Result<(golem_plan::PlanReport, Option<u32>), EngineError> {
     let mach = golem_plan::Machine {
         vram_total: vram_free,
         ram_total: u64::MAX,
         ram_free: u64::MAX,
         rocm_overhead: golem_plan::ROCM_OVERHEAD,
     };
-    let r = golem_plan::plan_at_frac(m, &mach, &plan_input(config, m), config.vram_experts_frac);
+    let mut input = plan_input(config, m);
+    let mut clamped = None;
+    let k = u64::from(config.device_cache_experts);
+    if matches!(input.experts, golem_plan::ExpertResidency::Pooled { .. }) {
+        let max = golem_plan::clamp_device_cache_k(m, &mach, &input, k).map_err(|max| {
+            EngineError::InvalidConfig(format!(
+                "device_cache_experts {k}: at most {max} fit in {:.1} GiB free VRAM \
+                 (below expert_used_count {}); lower --ctx or --parallel",
+                vram_free as f64 / f64::from(1u32 << 30),
+                m.top_k
+            ))
+        })?;
+        if max < k {
+            tracing::warn!(
+                requested = k,
+                clamped = max,
+                "device_cache_experts exceeds free VRAM; clamped"
+            );
+            input.vram_experts = m.device_cache_bytes(max);
+            // max < k ≤ u32::MAX.
+            clamped = Some(max as u32);
+        }
+    }
+    let r = golem_plan::plan_at_frac(m, &mach, &input, config.vram_experts_frac);
     if r.feasible {
-        Ok(r)
+        Ok((r, clamped))
     } else {
         Err(EngineError::PlanInfeasible(Box::new(r)))
     }
@@ -2269,7 +2305,9 @@ pub fn device_vram() -> Option<(u64, u64)> {
 
 /// Runs [`check_plan`] for a pooled or offloaded session on a GPU build;
 /// `None` for a CPU-only session or when no VRAM reading exists.
-fn load_plan(config: &EngineConfig) -> Result<Option<golem_plan::PlanReport>, EngineError> {
+fn load_plan(
+    config: &EngineConfig,
+) -> Result<Option<(golem_plan::PlanReport, Option<u32>)>, EngineError> {
     if config.ram_experts_gib == 0 && config.n_gpu_layers == 0 {
         return Ok(None);
     }
@@ -2376,9 +2414,9 @@ mod tests {
     /// Target, 24 GiB free: 100k ctx + streamed 512 ubatch (fitted ws 0.79
     /// GiB) + explicit K = 8 (9 × 644 MB = 5.4 GiB) is 8.35 + 1.84 + 0.14 +
     /// 0.79 + 5.4 + 3.69 + 2.64 ≈ 22.9 GiB → fits; K = 12 (7.8 GiB) →
-    /// 25.3 GiB, refused.
+    /// 25.3 GiB, clamped to the ≈ 6.55 GiB left: ⌊6.55 / 0.6⌋ − 1 = 9.
     #[test]
-    fn load_check_refuses_an_overcommitted_k() {
+    fn load_check_clamps_an_overcommitted_k() {
         let mut cfg = EngineConfig {
             n_ctx: 100_000,
             ram_experts_gib: 57,
@@ -2389,19 +2427,17 @@ mod tests {
             device_cache_experts: 8,
             ..EngineConfig::default()
         };
-        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap().0;
         assert_eq!(r.term("device_expert_cache"), 9 * 644_022_272);
         assert_eq!(r.term("stream_slabs"), 3_963_617_280);
         cfg.device_cache_experts = 12;
-        let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
-        assert!(
-            matches!(&e, EngineError::PlanInfeasible(r) if !r.feasible),
-            "{e}"
-        );
-        assert!(e.to_string().contains("> 24.0 GiB"), "{e}");
+        let (r, k) = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        assert_eq!(k, Some(9));
+        assert_eq!(r.term("device_expert_cache"), 10 * 644_022_272);
+        assert!(r.vram_headroom >= 0);
         // Derived K: the cache term is whatever the other terms leave.
         cfg.device_cache_experts = 0;
-        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap().0;
         assert_eq!(r.vram_headroom, 0);
         // ctx 100k at ubatch 512: fitted ws 0.79 GiB; 24 GiB − (8.35 t_ne +
         // 1.84 kv + 0.14 rs + 0.79 ws + 3.69 slabs + 2.64 ROCm) ≈ 6.55 GiB.
@@ -2410,6 +2446,38 @@ mod tests {
         cfg.vram_experts_frac = 0.5;
         let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
         assert!(e.to_string().contains("device_expert_cache "), "{e}");
+    }
+
+    /// Issue #102, real target: `--device-cache-experts 512` at ctx 262,144
+    /// on 23.9 GiB free priced 513 × 644 MB ≈ 307 GiB + 4.8 GiB KV. Now the
+    /// other terms are 8.35 t_ne + 4.81 kv + 0.14 rs + 1.57 ws + 2.64 ROCm =
+    /// 18,803,322,759 B (17.5 GiB), leaving 6.4 GiB → ⌊6.86 / 0.644⌋ − 1 =
+    /// K = 9. The top-k boundary: others + 9 slots fits K = 8 exactly; one
+    /// byte less leaves K = 7 < 8, refused naming the max. At 12 GiB free
+    /// less than one slab slot (644 MB) is left: max 0. Never the raw
+    /// 328.5 GiB inequality.
+    #[test]
+    fn explicit_k_512_clamps_or_names_the_max() {
+        let cfg = EngineConfig {
+            n_ctx: 262_144,
+            ram_experts_gib: 57,
+            device_cache_experts: 512,
+            ..EngineConfig::default()
+        };
+        let (r, k) = check_plan(&cfg, &glm(), (239 << 30) / 10).unwrap();
+        assert_eq!(k, Some(9));
+        assert_eq!(r.term("device_expert_cache"), 10 * 644_022_272);
+        let at_top_k = 18_803_322_759 + 9 * 644_022_272;
+        assert_eq!(check_plan(&cfg, &glm(), at_top_k).unwrap().1, Some(8));
+        let e = check_plan(&cfg, &glm(), at_top_k - 1).unwrap_err();
+        assert!(e.to_string().contains("at most 7 fit"), "{e}");
+        let e = check_plan(&cfg, &glm(), 12 << 30).unwrap_err();
+        let msg = e.to_string();
+        assert!(matches!(e, EngineError::InvalidConfig(_)), "{msg}");
+        assert!(
+            msg.contains("device_cache_experts 512: at most 0 fit"),
+            "{msg}"
+        );
     }
 
     /// Pool off, 4 layers × 1 GiB experts vs 4 GiB free: all offloaded
@@ -2442,7 +2510,7 @@ mod tests {
             "{e}"
         );
         cfg.cpu_moe_layers = Some(4);
-        let r = check_plan(&cfg, &m, 4 << 30).unwrap();
+        let r = check_plan(&cfg, &m, 4 << 30).unwrap().0;
         assert_eq!(r.term("resident_experts"), 0);
         assert_eq!(r.term("ram_pool"), 0);
     }

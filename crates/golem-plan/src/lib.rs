@@ -154,7 +154,19 @@ impl ModelFacts {
     /// `top_k`. Target: 9 × 644 MB = 5.80 GB.
     #[must_use]
     pub fn min_device_expert_cache(&self) -> u64 {
-        (u64::from(self.top_k) + 1).saturating_mul(self.slab_bytes_per_expert())
+        self.device_cache_bytes(u64::from(self.top_k))
+    }
+
+    /// `device_expert_cache` bytes of an explicit per-layer K: `(K + 1)`
+    /// slots (one prefetch headroom); 0 for K = 0 (derived). Target, K = 8:
+    /// 9 × 644,022,272 B = 5.4 GiB.
+    #[must_use]
+    pub fn device_cache_bytes(&self, k: u64) -> u64 {
+        if k == 0 {
+            0
+        } else {
+            (k + 1).saturating_mul(self.slab_bytes_per_expert())
+        }
     }
 
     /// KV per token and recurrent-state bytes, mirroring the vendored
@@ -302,6 +314,47 @@ pub const ROCM_OVERHEAD: u64 = 2_834_678_415;
 #[must_use]
 pub fn device_cache_k(budget: u64, slab_bytes_per_expert: u64) -> u64 {
     (budget / slab_bytes_per_expert.max(1)).saturating_sub(1)
+}
+
+/// Largest explicit K whose slab fits what the other VRAM terms leave on
+/// `mach`: [`device_cache_k`] of the derived `device_expert_cache`. Target,
+/// 23.9 GiB free at ctx 262k: K = 8 (9 × 644 MB = 5.4 GiB), against an
+/// explicit K = 512 pricing 513 × 644 MB ≈ 307 GiB.
+#[must_use]
+pub fn max_device_cache_k(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> u64 {
+    let derived = PlanInput {
+        vram_experts: 0,
+        ..*i
+    };
+    let cache = vram_terms(m, mach, &derived)
+        .iter()
+        .find(|t| t.name == "device_expert_cache")
+        .map_or(0, |t| t.bytes);
+    device_cache_k(cache, m.slab_bytes_per_expert())
+}
+
+/// The K an explicit `k` runs at on `mach`: `k` when it fits, else the
+/// largest K that does ([`max_device_cache_k`]); `Err(max)` when even
+/// that is below `top_k` (a routed set larger than K aborts mid-decode).
+/// `k = 0` (derived) → `Ok(0)`.
+///
+/// # Errors
+/// `Err(max)` when `max < top_k`.
+pub fn clamp_device_cache_k(
+    m: &ModelFacts,
+    mach: &Machine,
+    i: &PlanInput,
+    k: u64,
+) -> Result<u64, u64> {
+    if k == 0 {
+        return Ok(0);
+    }
+    let max = max_device_cache_k(m, mach, i);
+    match k {
+        k if k <= max => Ok(k),
+        _ if max >= u64::from(m.top_k) => Ok(max),
+        _ => Err(max),
+    }
 }
 
 /// Candidate `--prefill-ubatch` values, largest first.
@@ -784,6 +837,58 @@ mod tests {
         );
         assert!(!set.feasible);
         assert!(set.vram_headroom < 0);
+    }
+
+    /// Issue #102 admission: a K = 8 instance at ctx 4096 prices 9 × 644 MB
+    /// = 5.4 GiB of cache, not the whole card: t_ne 8.35, kv 0.08, rs 0.14,
+    /// ws 0.34, cache 5.4, ROCm 2.64 ≈ 16.9 GiB. Derived (unset K) takes all
+    /// 24 GiB. The max K is exactly the largest feasible one.
+    #[test]
+    fn explicit_k_prices_its_slab_not_the_card() {
+        let m = ModelFacts {
+            t_ne: 8_966_188_280,
+            expert_bytes_total: 185_478_414_336,
+            ..glm()
+        };
+        let i = PlanInput {
+            ctx: 4096,
+            parallel: 1,
+            ws: WS_MEASURED,
+            ..Default::default()
+        };
+        assert_eq!(total(&vram_terms(&m, &box24(), &i)), 24 << 30);
+        let k8 = PlanInput {
+            vram_experts: m.device_cache_bytes(8),
+            ..i
+        };
+        let t = vram_terms(&m, &box24(), &k8);
+        assert_eq!(get(&t, "device_expert_cache"), 9 * 644_022_272);
+        assert!(total(&t) < 17 << 30, "{}", total(&t));
+        assert_eq!(m.device_cache_bytes(0), 0);
+        let max = max_device_cache_k(&m, &box24(), &k8);
+        assert_eq!(max, max_device_cache_k(&m, &box24(), &i));
+        assert!(
+            plan(
+                &m,
+                &box24(),
+                &PlanInput {
+                    vram_experts: m.device_cache_bytes(max),
+                    ..i
+                }
+            )
+            .feasible
+        );
+        assert!(
+            !plan(
+                &m,
+                &box24(),
+                &PlanInput {
+                    vram_experts: m.device_cache_bytes(max + 1),
+                    ..i
+                }
+            )
+            .feasible
+        );
     }
 
     /// Target at ctx 32768, streamed, parallel 4: 8.97 t_ne + 2.58 kv +

@@ -6,7 +6,7 @@ use crate::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, chat::MessageConten
 pub enum FieldRule {
     /// Functional and honoured.
     Supported,
-    /// Accepted, no functional effect (§8.2: metadata, user, request_id).
+    /// Accepted, no functional effect (§8.2: metadata, user, request_id, `store: false`).
     Tolerated,
     /// Rejected with `golem_unsupported_field`; payload is the reason.
     Unsupported(&'static str),
@@ -35,6 +35,7 @@ pub const FIELD_POLICY: &[(&str, FieldRule)] = &[
     ("metadata", FieldRule::Tolerated),
     ("user", FieldRule::Tolerated),
     ("request_id", FieldRule::Tolerated),
+    ("store", FieldRule::Tolerated),
     ("top_k", FieldRule::Extension),
     (
         "response_format",
@@ -88,6 +89,12 @@ pub fn validate(
     }
     let mut req: ChatCompletionRequest = serde_json::from_value(raw.clone())
         .map_err(|e| err(ErrorCode::InvalidRequest, e.to_string()))?;
+    if req.store == Some(true) {
+        return Err(err(
+            ErrorCode::UnsupportedField,
+            "field `store` is not supported: completions are not stored".into(),
+        ));
+    }
     if req.model != instance_model {
         return Err(err(
             ErrorCode::ModelMismatch,

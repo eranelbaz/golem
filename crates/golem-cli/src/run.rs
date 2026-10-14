@@ -540,21 +540,14 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
         &eff,
         args.allow_overcommit,
     )?;
-    // §11 CSV lifecycle: truncate + header here, rows appended per turn end.
-    let mut timing_out = match &config.timing_csv {
-        Some(path) => {
-            let mut f = std::fs::File::create(path)?;
-            TimingRecorder::header(
-                &mut f,
-                env!("CARGO_PKG_VERSION"),
-                &fork_commit(),
-                &resolved_config_line(&config),
-            )?;
-            f.flush()?;
-            Some(f)
-        }
-        None => None,
-    };
+    // §11 CSV lifecycle: truncate before the load (fail fast), header once
+    // the session reports its starting K, rows appended per turn end. A
+    // failed load leaves the CSV empty.
+    let mut timing_out = config
+        .timing_csv
+        .as_ref()
+        .map(std::fs::File::create)
+        .transpose()?;
     // Routing trace (§2.3 step 4): same turn-end flush lifecycle as the CSV.
     let mut trace_out = match &config.routing_trace {
         Some(path) => Some(std::fs::File::create(path)?),
@@ -564,6 +557,20 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     guard.update(|i| i.health = "healthy".into());
     if let Some(k) = session.device_cache_experts() {
         eprintln!("golem: device cache {k} expert slots per layer");
+    }
+    if let Some(f) = timing_out.as_mut() {
+        TimingRecorder::header(
+            f,
+            env!("CARGO_PKG_VERSION"),
+            &fork_commit(),
+            &resolved_config_line(&EngineConfig {
+                device_cache_experts: session
+                    .device_cache_experts()
+                    .unwrap_or(config.device_cache_experts),
+                ..config.clone()
+            }),
+        )?;
+        f.flush()?;
     }
 
     let result = match (&args.prompt, &args.parity_dump) {

@@ -170,18 +170,19 @@ pub fn instance(
 ) -> Result<Instance, Box<dyn Error>> {
     let mach = *mach;
     let facts = config.model_facts.ok_or("model facts unresolved")?;
-    let input = golem_plan::PlanInput {
+    let mut input = golem_plan::PlanInput {
         ctx: config.n_ctx,
         parallel: config.parallel,
         prefill_ubatch: config.prefill_ubatch.min(config.n_ctx),
         prefill_stream: config.prefill_stream,
+        vram_experts: 0,
         experts: golem_plan::ExpertResidency::Pooled {
             ram_experts: config.ram_experts_gib << 30,
         },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         ws: golem_plan::WS_MEASURED,
-        ..Default::default()
     };
+    input.vram_experts = explicit_cache_bytes(config, &facts, &mach, &input);
     let planned_vram = if config.n_gpu_layers > 0 && substrate_backend() == Backend::Hip {
         golem_plan::total(&golem_plan::vram_terms(&facts, &mach, &input))
     } else {
@@ -213,6 +214,23 @@ pub fn instance(
         children: Vec::new(),
         config: Some(eff.clone()),
     })
+}
+
+/// `vram_experts` for the K the engine will run, by the engine's own
+/// [`golem_plan::clamp_device_cache_k`]; 0 (derived) when unset. Admission
+/// plans against the whole card (`mach`), the engine against free VRAM, so
+/// the engine's K is never larger. A K the engine will refuse (max below
+/// top-k) prices the top-k floor, never the derived whole card.
+pub fn explicit_cache_bytes(
+    config: &EngineConfig,
+    facts: &golem_plan::ModelFacts,
+    mach: &golem_plan::Machine,
+    input: &golem_plan::PlanInput,
+) -> u64 {
+    let k = u64::from(config.device_cache_experts);
+    let k =
+        golem_plan::clamp_device_cache_k(facts, mach, input, k).unwrap_or(u64::from(facts.top_k));
+    facts.device_cache_bytes(k)
 }
 
 /// Fresh instance id.
@@ -354,6 +372,69 @@ pub fn log_path(id: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// Real target, 24 GiB, ctx 4096: unset K → 0 (derived); K = 8 → 9 ×
+    /// 644,022,272 B; K = 512 → clamped to the plan's max, never 513 slots.
+    #[test]
+    fn explicit_cache_bytes_clamps_to_what_fits() {
+        let facts = golem_plan::ModelFacts {
+            t_ne: 8_966_188_280,
+            shexp: 1_123_024_896,
+            n_expert: 288,
+            top_k: 8,
+            expert_layers: 42,
+            first_expert_block: 0,
+            max_plane_stride: 6_881_280,
+            expert_bytes_total: 185_478_414_336,
+            kv_per_token: 19_712,
+            rs_bytes: 152_633_344,
+            sparse_attn_layers: 11,
+            dense_below_ctx: 2_052,
+        };
+        let mach = golem_plan::Machine {
+            vram_total: 24 << 30,
+            ram_total: 93 << 30,
+            ram_free: 88 << 30,
+            rocm_overhead: golem_plan::ROCM_OVERHEAD,
+        };
+        let input = golem_plan::PlanInput {
+            ctx: 4096,
+            parallel: 1,
+            ws: golem_plan::WS_MEASURED,
+            ..Default::default()
+        };
+        let bytes = |k| {
+            let config = golem_engine::config::EngineConfig {
+                device_cache_experts: k,
+                ..Default::default()
+            };
+            super::explicit_cache_bytes(&config, &facts, &mach, &input)
+        };
+        assert_eq!(bytes(0), 0);
+        assert_eq!(bytes(8), 9 * 644_022_272);
+        let max = golem_plan::max_device_cache_k(&facts, &mach, &input);
+        assert!(max < 511);
+        assert_eq!(bytes(512), (max + 1) * 644_022_272);
+        let fits = golem_plan::PlanInput {
+            vram_experts: bytes(512),
+            ..input
+        };
+        assert!(golem_plan::plan(&facts, &mach, &fits).feasible);
+        // ctx 1M: KV alone (19.7 GB) leaves max < top_k → top-k floor.
+        let long = golem_plan::PlanInput {
+            ctx: 1 << 20,
+            ..input
+        };
+        assert!(golem_plan::max_device_cache_k(&facts, &mach, &long) < 8);
+        let config = golem_engine::config::EngineConfig {
+            device_cache_experts: 512,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::explicit_cache_bytes(&config, &facts, &mach, &long),
+            9 * 644_022_272
+        );
+    }
+
     #[test]
     fn parallel_above_one_needs_the_override() {
         assert!(super::check_parallel(1, false).is_ok());
