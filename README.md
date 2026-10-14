@@ -25,8 +25,8 @@ scripts/build.sh run serve "$M" --port 8080 --ctx 32768 --n-predict 4096 --prefi
 ```
 
 Any OpenAI client then talks to `http://127.0.0.1:8080/v1` (`/v1/chat/completions`
-with streaming, tools and `reasoning_effort`; `/v1/models`; `/health`;
-`/metrics`). Ctrl-C cancels in-flight work and exits; `--detach` runs in the
+with streaming, tools and `reasoning_effort` — `low`/`high`, anything else is
+`max`; `/v1/models`; `/health`; `/metrics`). Ctrl-C cancels in-flight work and exits; `--detach` runs in the
 background (`golem list`, `golem stop <id>`). `golem optimize --model "$M"
 --ctx <ctx> --max-minutes <n>` sweeps scheduling knobs on this machine and
 saves a winner that `serve`/`run` apply automatically (flags still win).

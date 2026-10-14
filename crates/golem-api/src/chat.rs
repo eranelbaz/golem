@@ -60,9 +60,22 @@ pub struct ChatCompletionRequest {
     /// Golem extension: top-k sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
-    /// Passed to the chat template as `reasoning_effort`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `low`/`high`, passed to the chat template as `reasoning_effort`.
+    #[serde(
+        default,
+        deserialize_with = "glm_effort",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_effort: Option<String>,
+}
+
+/// GLM-5.3-Flash model card: only `low`/`high` are explicit; absent or any
+/// other value is `max`, the template default, so nothing is sent.
+fn glm_effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?
+        .as_str()
+        .filter(|e| matches!(*e, "low" | "high"))
+        .map(str::to_owned))
 }
 
 /// `stop` is a string or a list of strings.

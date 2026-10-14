@@ -308,6 +308,8 @@ mod tests {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let p = |e| t.render(&user(), None, None, false, e).unwrap().prompt;
         assert!(p(None).contains("Reasoning Effort: Max"), "{}", p(None));
+        assert!(p(Some("max")).contains("Reasoning Effort: Max"));
+        assert!(p(Some("medium")).contains("Reasoning Effort: Max"));
         assert!(p(Some("low")).contains("Reasoning Effort: Low"));
         assert!(p(Some("high")).contains("Reasoning Effort: High"));
     }
