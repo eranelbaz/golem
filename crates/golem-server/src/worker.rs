@@ -460,10 +460,10 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
                     // Still-buffered jobs would hold `pending()` up for the
                     // whole drain grace.
                     while let Ok(job) = rx.try_recv() {
+                        health.queued.fetch_sub(1, Ordering::SeqCst);
                         let _ = job
                             .events
                             .try_send(Event::Failed(crate::app::backend_gone_envelope()));
-                        health.queued.fetch_sub(1, Ordering::SeqCst);
                     }
                     return;
                 }
@@ -564,8 +564,8 @@ fn storage_lost(sch: &mut Scheduler, runs: &mut [Option<SlotRun>], health: &Heal
 /// until the handlers disconnect.
 fn refuse_all(rx: &Receiver<Job>, health: &HealthState) {
     while let Ok(job) = rx.recv() {
-        let _ = job.events.try_send(Event::Failed(storage_unavailable()));
         health.queued.fetch_sub(1, Ordering::SeqCst);
+        let _ = job.events.try_send(Event::Failed(storage_unavailable()));
     }
 }
 
