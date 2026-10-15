@@ -333,23 +333,8 @@ impl StreamState {
         let (slot, base) = if staged_ids.is_empty() {
             (usize::MAX, std::ptr::null_mut())
         } else {
-            // Wait for a free staging slot (bounded by the release protocol:
-            // C releases seq−2 before refilling a half, copy_done drops the
-            // tail between chunks).
-            let (slot, base) = loop {
-                check_read(inner.read)?;
-                if inner.stop {
-                    p3_fatal("stream warm after stop".into());
-                }
-                if let Some(&s) = inner.free_slots.last() {
-                    inner.free_slots.pop();
-                    debug_assert_eq!(inner.pending_reads[s], 0);
-                    // SAFETY: s < STAGING_SLOTS, arena alive.
-                    // Slots are indexed 0..STAGING_SLOTS in the arena.
-                    break (s, self.arena.slot_base(s as u32));
-                }
-                inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
-            };
+            let (guard, slot, base) = self.take_slot(inner)?;
+            inner = guard;
             inner.pending_reads[slot] = staged_ids.len();
             for &id in &staged_ids {
                 // SAFETY: id × plane_len stays inside the slot.
@@ -375,6 +360,28 @@ impl StreamState {
             },
         );
         Ok(())
+    }
+
+    /// Waits for a free staging slot (bounded by the release protocol: C
+    /// releases seq−2 before refilling a half, copy_done drops the tail
+    /// between chunks).
+    fn take_slot<'a>(
+        &self,
+        mut inner: std::sync::MutexGuard<'a, Inner>,
+    ) -> Result<(std::sync::MutexGuard<'a, Inner>, usize, *mut u8), StreamError> {
+        loop {
+            check_read(inner.read)?;
+            if inner.stop {
+                p3_fatal("stream slot after stop".into());
+            }
+            if let Some(s) = inner.free_slots.pop() {
+                debug_assert_eq!(inner.pending_reads[s], 0);
+                // Slots are indexed 0..STAGING_SLOTS in the arena.
+                let base = self.arena.slot_base(s as u32);
+                return Ok((inner, s, base));
+            }
+            inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     /// The `stream_source` hook body (decode thread, once per streamed
@@ -425,13 +432,14 @@ impl StreamState {
                 self.warm_plane(layer, kind, &ids)?;
             }
         }
-        let pending = {
+        let mut pending = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner
                 .warm
                 .remove(&(layer, kind as u8))
                 .expect("warm plane inserted above")
         };
+
         // Wait for the plane's reads (the pipeline: warm enqueued them one
         // layer ahead, so this parks only when the disk is the bound — the
         // intended steady state).
@@ -482,18 +490,21 @@ impl StreamState {
                 self.bytes.fetch_add(plane_len as u64, Ordering::Relaxed);
                 // SAFETY: id × plane_len inside the slot (slot_bytes bound).
                 out[i] = unsafe { pending.base.add(id as usize * plane_len) } as *const c_void;
-            } else if pending.slot != usize::MAX && pending.warmed_ids.binary_search(&id).is_err() {
+            } else if pending.warmed_ids.binary_search(&id).is_err() {
+                // A whole fill over a routed-only warm with no misses has no
+                // slot yet: take one with no reads for the stale pointers.
+                if pending.slot == usize::MAX {
+                    let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    let (_inner, slot, base) = self.take_slot(inner)?;
+                    pending.slot = slot;
+                    pending.base = base;
+                }
                 // SAFETY: as above; the bytes are stale (never staged this
                 // plane) but finite, and the id is unrouted.
                 out[i] = unsafe { pending.base.add(id as usize * plane_len) } as *const c_void;
             } else {
-                // Warm had no slot (everything resident) but this id is no
-                // longer resident: read it inline (never expected under the
-                // pause protocol; correctness over speed).
-                // SAFETY: slot-bounds argument does not apply — this is the
-                // pool slot leased below? No: read into a stack buffer is
-                // impossible (C keeps the pointer). Lease the resident slot
-                // is the only option; if residency is truly gone, fatal.
+                // A warmed id lost residency after warm (the pause protocol
+                // forbids it): fatal, never stale.
                 p3_fatal(format!(
                     "stream_source: expert {id} of layer {layer} neither resident nor staged"
                 ));
@@ -774,6 +785,25 @@ mod tests {
         assert_eq!((s.stats().held, len(&s)), (1, 1));
         s.release_all();
         assert_eq!((s.stats().held, len(&s)), (0, 0));
+        s.stop();
+    }
+
+    #[test]
+    fn whole_fill_over_all_resident_routed_warm_takes_a_slot() {
+        let s = state((9, 9));
+        s.pool.ensure_unit(true, 0, 0).unwrap();
+        s.warm(0, &[0]);
+        let mut out = [std::ptr::null(); N_EXPERTS as usize];
+        s.source(0, 2, 1, &[0, 1, 2, 3], &mut out).unwrap();
+        let (lo, len) = s.arena_ptr_range();
+        let arena = lo as usize..lo as usize + len;
+        assert!(out[1..].iter().all(|&p| arena.contains(&(p as usize))));
+        assert_eq!((s.stats().pool_hits, s.stats().staged), (1, 0));
+        assert_eq!(s.stats().held, 1);
+        s.release(1);
+        assert_eq!(s.stats().held, 0);
+        s.release_all();
+        assert!(all_slots_free(&s));
         s.stop();
     }
 }
