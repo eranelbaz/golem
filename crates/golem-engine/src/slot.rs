@@ -503,6 +503,14 @@ pub(crate) fn step(
         .filter(|s| matches!(s.phase, Phase::Decode(_)))
         .count();
     let may_stream = n_dec == 0 || session.decode_since_stream >= STREAM_EVERY;
+    // #135: stream-sized cache while any prefill still has a streamed chunk
+    // ahead, decode-sized once none does; before chunk selection, since the
+    // switch may drop streaming.
+    let stream_pending = slots.iter().any(|s| match &s.phase {
+        Phase::Prefill(a) => session.next_chunk(&a.ffi, 0).1,
+        _ => false,
+    });
+    session.set_vram_mode(stream_pending);
     let streams = |i: usize| match &slots[i].phase {
         Phase::Prefill(a) => Some(session.next_chunk(&a.ffi, 0).1),
         _ => None,
