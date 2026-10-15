@@ -886,6 +886,13 @@ impl Session {
         self.inner.p3.as_ref()
     }
 
+    /// Test seam: mutable hooks (between turns only).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn p3_hooks_mut(&mut self) -> Option<&mut crate::p3_glue::SessionHooks> {
+        self.inner.p3.as_mut()
+    }
+
     /// The session's per-model hook context pointer (ABI v5), for test seams
     /// that address per-ctx substrate state (the P4 budget setter/reset).
     /// `None` when the pool is off.
@@ -1426,7 +1433,7 @@ impl SessionInner {
         let chunk_cap = prefill_chunk_cap(
             self.config.batch_tokens as usize,
             n_ctx_seq as usize,
-            self.p3.as_ref().map(|p| (p.device_cache_experts, p.top_k)),
+            self.p3.as_ref().map(|p| (p.prefill_k(), p.top_k)),
         );
         if chunk_cap == 0 {
             // n_ctx <= 1 cannot fit even one prompt token — llama_decode would
@@ -1590,11 +1597,20 @@ impl SessionInner {
     /// budget `chunk_cap` (= K / top_k tokens) too.
     pub(crate) fn next_chunk(&self, ffi: &TurnFfi, n_gen: usize) -> (usize, bool) {
         let remaining = ffi.prompt.len() - ffi.n_past;
-        if ffi.streaming && remaining >= self.config.prefill_stream_min as usize {
+        let p3 = self.p3.as_ref();
+        if ffi.streaming
+            && p3.is_some_and(|p| p.stream_enabled())
+            && remaining >= self.config.prefill_stream_min as usize
+        {
             return (remaining.min(ffi.n_ubatch), true);
         }
-        let room = ffi
-            .chunk_cap
+        // Live K: a mid-turn degrade or mode switch must not leave a chunk
+        // routing more experts than the slab holds.
+        let cap = p3.map_or(ffi.chunk_cap, |p| {
+            ffi.chunk_cap
+                .min((p.prefill_k() / p.top_k.max(1)).max(1) as usize)
+        });
+        let room = cap
             .saturating_sub(n_gen)
             .min(ffi.n_ubatch - n_gen.min(ffi.n_ubatch));
         (remaining.min(room), false)
@@ -1774,6 +1790,13 @@ impl SessionInner {
             .as_ref()
             .and_then(|p| p.storage_health())
             .is_some_and(|h| h == golem_store::InstanceHealth::FatalIo)
+    }
+
+    /// Sizes the device cache for streamed prefill or decode (#135).
+    pub(crate) fn set_vram_mode(&mut self, stream: bool) {
+        if let Some(p) = self.p3.as_mut() {
+            p.set_vram_mode(stream);
+        }
     }
 
     /// Slab-failure recovery (§2.4): a `Decode(-2)` shrinks the device

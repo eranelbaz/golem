@@ -814,6 +814,16 @@ pub struct SessionHooks {
     /// The C-side stream config stashed at enable (n_experts, max stride,
     /// routed_max): re-passed on every arm/disarm (the setter takes all).
     stream_cfg: Option<(i32, i32, f32)>,
+    /// K while stream slabs may be live, and K for decode with them freed
+    /// (#135); equal unless the derived fit found room for more.
+    k_stream: u32,
+    k_decode: u32,
+    /// Whether the device cache is sized for streamed prefill (`k_stream`).
+    vram_stream: bool,
+    /// Both stream slabs' bytes (0 without streaming).
+    stream_slab_vram: u64,
+    /// Device bytes of one K slot across the model (§3.4).
+    slab_bytes_per_expert: u64,
 }
 
 impl SessionHooks {
@@ -946,7 +956,24 @@ impl SessionHooks {
                 .map(|k| k.min(fit.k_bound))
         };
         let k = match k_of(free.saturating_sub(fit.stream_slab_vram)) {
-            Ok(k) => k,
+            Ok(k) => {
+                // Decode runs with the stream slabs freed: the §10 cap
+                // already netted them out, so it gives them back too.
+                // Exclusive residency keeps one K: a reset drops VRAM-only
+                // units to disk (§6.3 O10).
+                self.k_decode = if self.stream.is_some() && !self.state.exclusive {
+                    k_from_free_vram(
+                        free,
+                        fit.plan_cap.saturating_add(fit.stream_slab_vram),
+                        fit.slab_bytes_per_expert,
+                        self.top_k,
+                    )
+                    .map_or(k, |d| d.min(fit.k_bound).max(k))
+                } else {
+                    k
+                };
+                k
+            }
             Err(e) if self.stream.is_some() => {
                 tracing::warn!(
                     stream_slab_vram = fit.stream_slab_vram,
@@ -958,14 +985,119 @@ impl SessionHooks {
                 );
                 self.stream = None;
                 self.stream_cfg = None;
-                k_of(free)?
+                let k = k_of(free)?;
+                self.k_decode = k;
+                k
             }
             Err(e) => return Err(e),
         };
         // SAFETY: FFI setter on the live ctx between computes.
         unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
         self.device_cache_experts = k;
+        self.k_stream = k;
+        self.vram_stream = true;
+        tracing::info!(
+            k_stream = k,
+            k_decode = self.k_decode,
+            "device cache fitted"
+        );
         Ok(())
+    }
+
+    /// Sizes the device cache for streamed prefill (`k_stream`, stream slabs
+    /// may allocate) or decode (`k_decode`, stream slabs freed). A K change
+    /// reallocates every C slab entry anyway (`st.K != K`), so the switch is
+    /// a full reset: it frees the stream slabs and the old-K slabs before
+    /// the new ones allocate, so peak VRAM never holds both sizes. Entering
+    /// stream mode re-checks free VRAM against the slabs, whose allocation
+    /// aborts on failure; when they no longer fit, streaming is dropped for
+    /// the session. Call between computes only.
+    pub(crate) fn set_vram_mode(&mut self, stream: bool) {
+        if stream == self.vram_stream {
+            return;
+        }
+        self.vram_stream = stream;
+        let k = vram_mode_k(stream, self.k_stream, self.k_decode);
+        if k == self.device_cache_experts {
+            return;
+        }
+        let ctx = self.ctx_ptr();
+        if let Some(p) = &self.prefetch {
+            p.pause();
+        }
+        // SAFETY: FFI on the live ctx between computes (every decode
+        // synchronizes before returning; no slab in flight).
+        unsafe { raw::golem_reset_device_cache(ctx) };
+        self.device_cache_reset();
+        if stream {
+            match self.refit_stream_k() {
+                Some(k) => self.k_stream = self.k_stream.min(k),
+                None => {
+                    tracing::warn!(
+                        stream_slab_vram = self.stream_slab_vram,
+                        "prefill-stream disabled: free VRAM no longer fits the stream \
+                         slabs beside a K ≥ top-k cache; continuing without streaming"
+                    );
+                    self.stream = None;
+                    self.stream_cfg = None;
+                    self.k_stream = self.k_decode;
+                }
+            }
+        }
+        let k = vram_mode_k(stream, self.k_stream, self.k_decode);
+        // SAFETY: FFI setter on the live ctx between computes.
+        unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
+        tracing::debug!(
+            from = self.device_cache_experts,
+            to = k,
+            stream,
+            "device cache resized"
+        );
+        self.device_cache_experts = k;
+        if let Some(p) = &self.prefetch {
+            p.resume();
+        }
+    }
+
+    /// K the free VRAM (after a reset) supports beside both stream slabs,
+    /// whose allocation aborts on failure while a K slab's fails soft;
+    /// `None` below top-k. Without a VRAM query the startup fit stands.
+    fn refit_stream_k(&self) -> Option<u32> {
+        #[cfg(golem_backend_hip)]
+        if let Some((free, _)) = golem_llama_sys::pinned::free_device_mem() {
+            return k_from_free_vram(
+                (free as u64).saturating_sub(self.stream_slab_vram),
+                u64::MAX,
+                self.slab_bytes_per_expert,
+                self.top_k,
+            )
+            .ok();
+        }
+        Some(self.k_stream)
+    }
+
+    /// Largest K a prefill chunk may run under (`chunk_cap` = K / top-k):
+    /// a routed-only chunk can run in either mode.
+    pub(crate) fn prefill_k(&self) -> u32 {
+        self.k_stream.min(self.k_decode)
+    }
+
+    /// Test seam, between turns only: overrides both Ks (an explicit-K
+    /// session never splits them) and puts the cache in stream mode at
+    /// `k_stream`.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_set_ks(&mut self, k_stream: u32, k_decode: u32) {
+        self.k_stream = k_stream;
+        self.k_decode = k_decode;
+        self.vram_stream = true;
+        let ctx = self.ctx_ptr();
+        // SAFETY: FFI on the live ctx between computes.
+        unsafe { raw::golem_reset_device_cache(ctx) };
+        self.device_cache_reset();
+        // SAFETY: FFI setter on the live ctx between computes.
+        unsafe { raw::golem_set_device_cache_experts(ctx, k_stream as i32) };
+        self.device_cache_experts = k_stream;
     }
 
     /// Caps the pending derived-K fit at the §10 plan's `device_expert_cache`
@@ -1010,6 +1142,8 @@ impl SessionHooks {
              cache reset and shrunk, serving degraded"
         );
         self.device_cache_experts = k;
+        self.k_stream = self.k_stream.min(k);
+        self.k_decode = self.k_decode.min(k);
         Ok(Some(k))
     }
 
@@ -1749,7 +1883,17 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         top_k: n_expert_used,
         stream: stream.clone(),
         stream_cfg,
+        k_stream: k_start,
+        k_decode: k_start,
+        vram_stream: true,
+        stream_slab_vram,
+        slab_bytes_per_expert: slab,
     })
+}
+
+/// The device-cache K of a VRAM mode (#135).
+fn vram_mode_k(stream: bool, k_stream: u32, k_decode: u32) -> u32 {
+    if stream { k_stream } else { k_decode }
 }
 
 /// Per-layer device-slab expert count for this pool, and whether it is
@@ -2835,6 +2979,27 @@ mod tests {
         assert_eq!(
             k_from_free_vram(2 * 6_657_000_000, 6 << 30, geo_bytes, 8).unwrap(),
             9
+        );
+    }
+
+    #[test]
+    fn decode_k_reclaims_the_stream_slabs_under_a_binding_plan_cap() {
+        // IQ3_XXS: slabs 2,566,914,048 B, slot ≈ 381 MB; the §10 cap already
+        // netted the slabs out and binds before free VRAM.
+        let (slab, stream) = (381_000_000u64, 2_566_914_048u64);
+        let (free, cap) = (12_000_000_000u64, 4_000_000_000u64);
+        let k_stream = k_from_free_vram(free - stream, cap, slab, 8).unwrap();
+        let k_decode = k_from_free_vram(free, cap + stream, slab, 8).unwrap();
+        // ⌊4.0 GB / 381 MB⌋ − 1 = 9; ⌊6.567 GB / 381 MB⌋ − 1 = 16.
+        assert_eq!((k_stream, k_decode), (9, 16));
+        assert_eq!(vram_mode_k(true, k_stream, k_decode), 9);
+        assert_eq!(vram_mode_k(false, k_stream, k_decode), 16);
+        // UD-Q4_K_XL target: slabs 3,963,617,280 B / 644,022,272 B per slot
+        // → 6 more decode slots per layer.
+        let k = |free, cap| k_from_free_vram(free, cap, 644_022_272, 8).unwrap();
+        assert_eq!(
+            k(20 << 30, 8 << 30) + 6,
+            k(20 << 30, (8 << 30) + 3_963_617_280)
         );
     }
 

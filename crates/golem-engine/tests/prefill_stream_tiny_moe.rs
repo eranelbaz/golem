@@ -116,3 +116,60 @@ fn streamed_prefill_matches_per_token_and_spares_the_pool() {
     );
     assert_eq!(out, out_token, "gated output must match");
 }
+
+/// #135: after a streamed prefill, decode runs at `k_decode` with the
+/// stream slabs freed; the next turn re-shrinks to `k_stream` and streams
+/// again. Greedy output matches the per-token path on both turns.
+#[test]
+fn decode_reclaims_the_stream_slabs_and_the_next_turn_streams_again() {
+    let resident = |session: &Session| {
+        let (mut slab, mut stream) = (0u64, 0u64);
+        // SAFETY: FFI getter on the session's live ctx between turns; the
+        // out pointers are valid locals.
+        unsafe {
+            golem_llama_sys::raw::golem_device_cache_resident_bytes(
+                session.p3_ctx_ptr().expect("pooled"),
+                &mut slab,
+                &mut stream,
+            )
+        };
+        (slab, stream)
+    };
+    let mut token = Session::new(&config(false, 8)).expect("session");
+    let mut out_token = String::new();
+    token
+        .chat_turn(&TURNS, &mut |p| out_token.push_str(p))
+        .expect("turn");
+    drop(token);
+
+    // Snapshots off: turn 2 must re-prefill (and stream), not restore.
+    let mut session = Session::new(&EngineConfig {
+        snapshot_ram_bytes: Some(0),
+        ..config(true, 8)
+    })
+    .expect("session");
+    // tiny-moe top_k 2: stream K 2, decode K 4.
+    session.p3_hooks_mut().expect("pooled").test_set_ks(2, 4);
+    for turn in 0..2 {
+        let planes_before = session
+            .p3_hooks()
+            .and_then(|p| p.stream_stats())
+            .expect("stream stats")
+            .planes;
+        let mut out = String::new();
+        session
+            .chat_turn(&TURNS, &mut |p| out.push_str(p))
+            .expect("turn");
+        let planes = session
+            .p3_hooks()
+            .and_then(|p| p.stream_stats())
+            .expect("stream stats")
+            .planes;
+        assert!(planes > planes_before, "turn {turn} did not stream");
+        assert_eq!(session.device_cache_experts(), Some(4), "turn {turn} K");
+        let (slab, stream) = resident(&session);
+        assert_eq!(stream, 0, "turn {turn}: stream slabs live during decode");
+        assert!(slab > 0, "turn {turn}: decode slabs missing");
+        assert_eq!(out, out_token, "turn {turn} output");
+    }
+}
