@@ -25,8 +25,12 @@
 //!
 //! `--whole` bypasses the queue: one 4 KiB-aligned `O_DIRECT` `pread` per
 //! plane on replica `--replica <i>` (default 0). With `max_sectors_kb = 128`
-//! a 5.9 MB read is ≈45 device requests in flight, a 2 MiB chunk 16 (§5.4). Errors return `Err` from `run`; `main` exits
-//! nonzero on error (the one documented exit path in this binary).
+//! a 5.9 MB read is ≈45 device requests in flight (§5.4).
+//! `--piece <bytes>` (a multiple of 4096) splits each plane into back-to-back
+//! reads of that size on the same drive (e.g. 2097152 for the old 2 MiB cap).
+//!
+//! Errors return `Err` from `run`; `main` exits nonzero on error (the one
+//! documented exit path in this binary).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +52,7 @@ struct Args {
     sequential: bool,
     whole: bool,
     replica: usize,
+    piece: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
     let mut sequential = false;
     let mut whole = false;
     let mut replica = 0usize;
+    let mut piece = 0usize;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -74,6 +80,13 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or("--replica needs a value")?
                     .parse()
                     .map_err(|_| "--replica must be a usize")?;
+            }
+            "--piece" => {
+                piece = it
+                    .next()
+                    .ok_or("--piece needs a value")?
+                    .parse()
+                    .map_err(|_| "--piece must be a usize")?;
             }
             "--io-threads" => {
                 io_threads = it
@@ -108,10 +121,13 @@ fn parse_args() -> Result<Args, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>] [--sequential] [--whole [--replica <i>]] [--io-threads <usize>]"
+                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>] [--sequential] [--whole [--replica <i>] [--piece <bytes>]] [--io-threads <usize>]"
                 ));
             }
         }
+    }
+    if piece != 0 && !whole {
+        return Err("--piece needs --whole".into());
     }
     Ok(Args {
         manifest: PathBuf::from(manifest.ok_or("--manifest <path> is required")?),
@@ -122,6 +138,7 @@ fn parse_args() -> Result<Args, String> {
         sequential,
         whole,
         replica,
+        piece,
     })
 }
 
@@ -278,6 +295,11 @@ fn run_whole(
 ) -> Result<(), golem_store::StoreError> {
     use std::os::unix::fs::FileExt;
     let align = golem_store::sys::DIRECT_ALIGN;
+    if !args.piece.is_multiple_of(align as usize) {
+        return Err(golem_store::StoreError::Invalid {
+            msg: format!("--piece {} is not a multiple of {align}", args.piece),
+        });
+    }
     let files = manifest
         .shards
         .iter()
@@ -315,11 +337,21 @@ fn run_whole(
         let offset = read_offset(args, manifest.shards[s].bytes, i, shard_count);
         let start = offset - offset % align;
         let len = ((offset + args.plane_bytes as u64).div_ceil(align) * align - start) as usize;
-        let got = files[s].read_at(&mut buf[..len], start).map_err(|e| {
-            golem_store::StoreError::Invalid {
-                msg: format!("shard {s} pread @{start}+{len}: {e}"),
+        let piece = if args.piece == 0 { len } else { args.piece };
+        let mut got = 0;
+        for at in (0..len).step_by(piece) {
+            let end = (at + piece).min(len);
+            let pos = start + at as u64;
+            let n = files[s].read_at(&mut buf[at..end], pos).map_err(|e| {
+                golem_store::StoreError::Invalid {
+                    msg: format!("shard {s} pread @{pos}+{}: {e}", end - at),
+                }
+            })?;
+            got += n;
+            if n < end - at {
+                break;
             }
-        })?;
+        }
         // The aligned tail may pass EOF; the logical plane must not.
         if (start + got as u64) < offset + args.plane_bytes as u64 {
             return Err(golem_store::StoreError::Invalid {
@@ -331,8 +363,14 @@ fn run_whole(
     let wall = t0.elapsed();
     let total = args.n as u64 * args.plane_bytes as u64;
     println!(
-        "reads: {} × {} B (logical), whole-plane O_DIRECT",
-        args.n, args.plane_bytes
+        "reads: {} × {} B (logical), O_DIRECT, piece {}",
+        args.n,
+        args.plane_bytes,
+        if args.piece == 0 {
+            "whole".to_owned()
+        } else {
+            args.piece.to_string()
+        }
     );
     let secs = wall.as_secs_f64();
     println!(

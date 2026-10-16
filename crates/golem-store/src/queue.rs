@@ -1417,7 +1417,7 @@ mod tests {
         // drive), 2 chunks. Each worker prefers its home drive, so the chunks
         // land on different replicas — a lowest-eligible pick would serve
         // both chunks from replica 0 (no striping, §5.2).
-        let bytes = crate::stripe::CHUNK + 8192; // 2 chunks: 2 MiB + 8 KiB
+        let bytes = crate::stripe::CHUNK + 8192; // 2 chunks: CHUNK + 8 KiB
         let root = std::env::temp_dir().join("golem-store-queue-stripe");
         let mut replicas = Vec::with_capacity(2);
         for r in 0..2 {
