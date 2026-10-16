@@ -12,7 +12,7 @@ run_upstream=0
 if [ "${1:-}" = "--upstream-tests" ]; then run_upstream=1; shift; fi
 bin=$1; model=$2   # model = positional model arg, passed through unchanged
 base_dir=$(cd "$(dirname "$0")" && pwd)
-base="$base_dir/../docs/baselines/p1-unset-baseline/dump.jsonl"
+base="$base_dir/../tests/fixtures/t4-p1-unset.jsonl"
 out=$(mktemp)
 cleanup() { rm -rf "$out" "${build:-}"; }; trap cleanup EXIT
 if [ "$run_upstream" = 1 ]; then
@@ -46,7 +46,7 @@ fi
 if python3 "$base_dir/t4_gate_cmp.py" "$base" "$out"; then
   echo "t4-gate: PASS (unset-hooks dump matches pristine baseline: tokens exact, logits within tolerance)"
 else
-  echo "t4-gate: FAIL (dump diverged from docs/baselines/p1-unset-baseline)" >&2
+  echo "t4-gate: FAIL (dump diverged from tests/fixtures/t4-p1-unset.jsonl)" >&2
   diff "$base" "$out" | head -20 >&2 || true
   exit 1
 fi

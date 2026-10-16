@@ -18,28 +18,24 @@ Road-tested on one machine; smaller configs work, larger ones just add headroom:
 | RAM | 93 GiB DDR5 |
 | Storage | Samsung 990 PRO 4TB NVMe SSD (expert streaming is SSD-bound) |
 
-Any OpenAI-compatible client talks to `http://127.0.0.1:8080/v1`; Anthropic
-clients (Claude Code, the SDKs) use the same port via `POST /v1/messages`.
+Any OpenAI-compatible client talks to `http://127.0.0.1:8080/v1`.
+
+Anthropic clients (Claude Code, the SDKs) use the same port via `POST /v1/messages`.
 
 ## Benchmarks
 
-Measured on the target machine, GLM-5.3-Flash UD-Q4_K_XL, greedy, release HIP
-build (see [`docs/baselines/`](docs/baselines/) for methodology):
+Measured on the target machine — GLM-5.3-Flash UD-Q4_K_XL, ctx 262144, greedy,
+release HIP build:
 
-| Metric | Value |
-|---|---|
-| Decode, cold (page cache evicted) | **2.42 tok/s** |
-| Decode, warm RAM cache | **2.12 tok/s** |
-| Prefill TTFT p50 | 11.1 s cold / 13.4 s warm |
-| RAM→GPU cache hit rate (warm) | 69.9 % |
+| GPU | RAM | Storage | Quant | Context | Prefill (cold/warm) | token/s (cold/warm) |
+|---|---|---|---|---|---|---|
+| AMD RX 7900 XTX | 93 GiB DDR5 | Samsung 990 PRO 4TB NVMe | UD-Q4_K_XL | 262144 | 11.1 s / 13.4 s | 2.42 / 2.12 |
 
-Measured 2026-10-10, ctx 262144, pool 62 GiB, greedy, release HIP build,
-desktop GPU sharing; methodology and the RAM arithmetic (72.7 GiB planned) in
-[`docs/baselines/m4.9-optimize.md`](docs/baselines/m4.9-optimize.md).
+Run [`benchmarks/bench.sh`](benchmarks/bench.sh) on your machine and add a
+row to [`BENCHMARKS.md`](BENCHMARKS.md).
 
 Community results from other machines live in
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) — run
-[`benchmarks/bench.sh`](benchmarks/bench.sh) and add your numbers.
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Quick start
 
@@ -86,9 +82,9 @@ vendor/        vendored llama.cpp fork (squashed import + Golem hook patches)
 crates/        Rust workspace (golem-cli, -server, -engine, -llama-sys, -gguf,
                -placement, -store, -plan, -api, -registry) + xtask
 scripts/       substrate build + hardware test scripts
-benchmarks/    community benchmark script + RESULTS.md
-docs/          tech-design.md (design doc, referenced across the codebase),
-               baselines/ (measured numbers), procedures/
+benchmarks/    community benchmark runner (bench.sh)
+docs/          tech-design.md (design doc, referenced across the codebase), procedures/
+BENCHMARKS.md  community benchmark table + methodology
 ```
 
 ## Provenance
