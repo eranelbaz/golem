@@ -340,8 +340,8 @@ pub(crate) async fn collect(
     }
 }
 
-/// Folds one streamed tool-call delta into the full calls (`index` selects
-/// the call; `arguments` pieces append).
+/// Folds one streamed tool call into the full calls (`index` selects the
+/// call; `arguments` pieces append).
 fn merge_tool_call(calls: &mut Vec<ToolCall>, d: ToolCall) {
     let i = d.index.unwrap_or(0) as usize;
     if i >= calls.len() {
