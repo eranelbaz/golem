@@ -281,7 +281,7 @@ pub fn repo_text(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
-pub const CANONICAL_CS_CORE: &str = "find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum";
+pub const CANONICAL_CS_CORE: &str = "find . -path ./.git -prune -o -path ./build -prune -o -name __pycache__ -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum";
 
 pub fn cs_recipe_line<'a>(text: &'a str, source: &str) -> &'a str {
     text.lines()

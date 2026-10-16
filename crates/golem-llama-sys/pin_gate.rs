@@ -182,6 +182,9 @@ fn walk(
         let child_rel = join_rel(rel, &name);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if name == *"__pycache__" {
+                continue;
+            }
             walk(&entry.path(), &child_rel, false, out)?;
         } else if file_type.is_file() {
             out.push(child_rel);
@@ -300,6 +303,17 @@ ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             let _g = Guard(tree.parent().unwrap().to_path_buf());
             let digest = content_hash(&tree).unwrap();
             fs::write(&pin, format!("content_sha256 = {digest}\n")).unwrap();
+            assert!(verify_pin(&tree, &pin).is_ok());
+        }
+
+        #[test]
+        fn pycache_is_ignored() {
+            let (tree, pin) = setup("pycache");
+            let _g = Guard(tree.parent().unwrap().to_path_buf());
+            let digest = content_hash(&tree).unwrap();
+            fs::write(&pin, format!("content_sha256 = {digest}\n")).unwrap();
+            fs::create_dir_all(tree.join("a/__pycache__")).unwrap();
+            fs::write(tree.join("a/__pycache__/x.pyc"), b"junk").unwrap();
             assert!(verify_pin(&tree, &pin).is_ok());
         }
 

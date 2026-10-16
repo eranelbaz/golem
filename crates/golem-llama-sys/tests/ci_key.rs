@@ -53,7 +53,7 @@ fn vendor_pin_workflow_recipe_matches_build_substrate() {
 
 #[test]
 fn vendor_pin_recipe_extraction_is_exact() {
-    let line = "          cs() { cd \"$1\" && find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'; }";
+    let line = "          cs() { cd \"$1\" && find . -path ./.git -prune -o -path ./build -prune -o -name __pycache__ -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'; }";
     assert_eq!(
         core_recipe(cs_recipe_line(line, "inline fixture")),
         CANONICAL_CS_CORE,

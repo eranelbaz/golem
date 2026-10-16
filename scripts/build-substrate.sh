@@ -9,10 +9,11 @@ BUILD_DIR="$VENDOR/build"
 TARGET=gfx1100
 
 # --- pin integrity: never build a drifted tree (canonical recipe, mirrored in crates/golem-llama-sys/tests/common/mod.rs::CANONICAL_CS_CORE) ---
+# __pycache__ dirs (interpreter byproducts) are pruned at any depth.
 # The build-output dir is pruned: the canonical hash covers source, not artifacts, so
 # re-runs after a (re)build still match VENDOR_SHA. Pruning changes nothing on a pristine tree.
 # xargs -r: empty input → empty stream (never sha256sum reading stdin as "-").
-cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'; }
+cs() { cd "$1" && find . -path ./.git -prune -o -path ./build -prune -o -name __pycache__ -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'; }
 want=$(sed -n 's/^content_sha256 *= *//p' vendor/VENDOR_SHA)
 [ -n "$want" ] || { echo "FATAL: content_sha256 key missing/empty in vendor/VENDOR_SHA"; exit 1; }
 got=$(cs "$VENDOR")
