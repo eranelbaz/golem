@@ -104,23 +104,28 @@ struct TraceRing {
 
 /// Routing-trace ring capacities for one turn: one record per (prefill
 /// chunk or decode step, layer), `top_k` ids per token per layer; a turn's
-/// tokens are bounded by `n_ctx + n_predict`. GLM at ctx 4096 + 512, batch
-/// 512: 21.8k records, 1.5M ids ≈ 6 MiB; at ctx 131072: 33k records, 44M
-/// ids ≈ 177 MB (opt-in `--routing-trace` only). With prediction on, each
-/// decode step adds `lookahead` records of `top_k + margin` ids per layer:
-/// 512 steps × 42 layers × 12 ids ≈ 21.5k records, 258k ids ≈ 1 MB more.
+/// tokens are bounded by `n_ctx + n_predict`. Pooled prefill chunks are
+/// `max(1, K / top_k)` tokens (K = 19, top-k 8 → 2), so chunks are bounded
+/// by tokens, not by `batch`. GLM at ctx 4096 + 512: 193.5k records × 32 B
+/// ≈ 6.2 MB + 1.55M ids × 4 B ≈ 6.2 MB; at ctx 131072: 5.5M records ≈ 177 MB
+/// + 44M ids ≈ 177 MB (opt-in `--routing-trace` only). With prediction on,
+/// each decode step adds `lookahead` records of `top_k + margin` ids per
+/// layer: 512 steps × 42 layers × 12 ids ≈ 21.5k records, 258k ids ≈ 1 MB.
 fn trace_caps(
     n_ctx: u32,
     n_predict: u32,
-    batch: u32,
     n_layers: u32,
     top_k: u32,
     pred: (u32, u32),
 ) -> (usize, usize) {
-    let (ctx, steps, layers) = (n_ctx as usize, n_predict as usize, n_layers as usize);
+    let (tokens, steps, layers) = (
+        n_ctx as usize + n_predict as usize,
+        n_predict as usize,
+        n_layers as usize,
+    );
     let (lookahead, pred_ids) = (pred.0 as usize, pred.1 as usize);
-    let recs = (ctx.div_ceil(batch.max(1) as usize) + steps * (1 + lookahead)) * layers;
-    let ids = ((ctx + steps) * top_k as usize + steps * lookahead * pred_ids) * layers;
+    let recs = (tokens + steps * lookahead) * layers;
+    let ids = (tokens * top_k as usize + steps * lookahead * pred_ids) * layers;
     (recs, ids)
 }
 
@@ -1794,7 +1799,6 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         let (rec_cap, id_cap) = trace_caps(
             config.n_ctx,
             config.n_predict,
-            config.batch_tokens,
             n_layers,
             n_expert_used,
             pred,
@@ -2865,13 +2869,13 @@ mod tests {
 
     #[test]
     fn trace_caps_cover_every_layer_of_every_token() {
-        // GLM: 1024-token ctx in 512-token chunks + 32 decode steps × 42 layers.
-        let (recs, ids) = trace_caps(1024, 32, 512, 42, 8, (0, 0));
-        assert_eq!(recs, (2 + 32) * 42);
+        // GLM: 1024-token ctx in 1-token chunks + 32 decode steps × 42 layers.
+        let (recs, ids) = trace_caps(1024, 32, 42, 8, (0, 0));
+        assert_eq!(recs, 1056 * 42);
         assert_eq!(ids, 1056 * 42 * 8);
         // Lookahead 1 at top 12 adds one 12-id record per decode step per layer.
-        let (recs, ids) = trace_caps(1024, 32, 512, 42, 8, (1, 12));
-        assert_eq!(recs, (2 + 2 * 32) * 42);
+        let (recs, ids) = trace_caps(1024, 32, 42, 8, (1, 12));
+        assert_eq!(recs, (1056 + 32) * 42);
         assert_eq!(ids, (1056 * 8 + 32 * 12) * 42);
     }
 

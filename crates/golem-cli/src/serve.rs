@@ -2,18 +2,21 @@
 //! loaded model.
 
 use std::error::Error;
+use std::fs::File;
+use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use golem_engine::config::EngineConfig;
 use golem_engine::gguf::read_metadata;
+use golem_engine::timing::TimingRecorder;
 use golem_llama_sys::{Backend, substrate_backend};
 use golem_registry::{EffectiveConfig, Guard, Instance, Registry};
-use golem_server::{ReasoningMode, ServeError, ServerConfig, spawn_worker};
+use golem_server::{ReasoningMode, ServeError, ServerConfig, TurnSinks, check_sinks, spawn_worker};
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::run::{EngineArgs, engine_config};
+use crate::run::{EngineArgs, engine_config, fork_commit, resolved_config_line};
 
 /// Arguments of the `serve` subcommand.
 #[derive(clap::Args)]
@@ -282,6 +285,20 @@ pub fn serve(
             sys.available_memory()
         },
     )?;
+    check_sinks(
+        config.parallel,
+        config.timing_csv.is_some() || config.routing_trace.is_some(),
+    )?;
+    // Same lifecycle as `run`: truncated before the load (an unwritable
+    // path refuses to start), rows appended at each turn end.
+    let sinks = TurnSinks {
+        timing: config.timing_csv.as_ref().map(File::create).transpose()?,
+        trace: config
+            .routing_trace
+            .as_ref()
+            .map(File::create)
+            .transpose()?,
+    };
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;
     let model_name = match l.model_name {
         Some(n) => n,
@@ -316,7 +333,22 @@ pub fn serve(
             signal(SignalKind::interrupt())?,
         )
     };
-    let worker = spawn_worker(config)?;
+    let mut timing = sinks.timing.as_ref().map(File::try_clone).transpose()?;
+    let worker = spawn_worker(config.clone(), sinks)?;
+    if let Some(f) = timing.as_mut() {
+        TimingRecorder::header(
+            f,
+            env!("CARGO_PKG_VERSION"),
+            &fork_commit(),
+            &resolved_config_line(&EngineConfig {
+                device_cache_experts: worker
+                    .device_cache_experts
+                    .unwrap_or(config.device_cache_experts),
+                ..config
+            }),
+        )?;
+        f.flush()?;
+    }
     let health = worker.health.clone();
     let cfg = ServerConfig {
         host: l.host,

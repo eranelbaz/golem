@@ -281,6 +281,8 @@ pub struct WorkerHandle {
     pub jobs: SyncSender<Job>,
     /// Shared health.
     pub health: Arc<HealthState>,
+    /// The session's device expert-cache K after load (timing CSV header).
+    pub device_cache_experts: Option<u32>,
     join: std::thread::JoinHandle<()>,
 }
 
@@ -308,10 +310,20 @@ impl WorkerHandle {
     }
 }
 
+/// Per-turn record files (`--timing-csv`, `--routing-trace`), opened by the
+/// caller; the worker appends each finished turn's rows (§11, §2.3 step 4).
+#[derive(Debug, Default)]
+pub struct TurnSinks {
+    /// §11 timing CSV; the caller writes its header.
+    pub timing: Option<std::fs::File>,
+    /// Routing trace; its header is written at load.
+    pub trace: Option<std::fs::File>,
+}
+
 /// Loads `cfg` on a new thread (the `Session` never leaves it) and returns
 /// once the model is loaded, or the load error.
-pub fn spawn_worker(cfg: EngineConfig) -> Result<WorkerHandle, EngineError> {
-    spawn(cfg, HealthState::new())
+pub fn spawn_worker(cfg: EngineConfig, sinks: TurnSinks) -> Result<WorkerHandle, EngineError> {
+    spawn(cfg, HealthState::new(), sinks)
 }
 
 /// [`spawn_worker`] with fault injection scoped to this worker.
@@ -319,6 +331,7 @@ pub fn spawn_worker(cfg: EngineConfig) -> Result<WorkerHandle, EngineError> {
 pub fn spawn_worker_with_hooks(
     cfg: EngineConfig,
     hooks: TestHooks,
+    sinks: TurnSinks,
 ) -> Result<WorkerHandle, EngineError> {
     spawn(
         cfg,
@@ -326,21 +339,63 @@ pub fn spawn_worker_with_hooks(
             hooks,
             ..HealthState::new()
         },
+        sinks,
     )
 }
 
-fn spawn(cfg: EngineConfig, health: HealthState) -> Result<WorkerHandle, EngineError> {
+/// Refuses per-turn recording with `parallel > 1`: both recorders are one
+/// per session and every slot's turn start resets them, so concurrent slots
+/// would truncate each other's rows; the trace has no sequence column.
+pub fn check_sinks(parallel: u32, recording: bool) -> Result<(), EngineError> {
+    if parallel > 1 && recording {
+        return Err(EngineError::InvalidConfig(format!(
+            "timing_csv/routing_trace record one sequence; refused with parallel {parallel}"
+        )));
+    }
+    Ok(())
+}
+
+fn spawn(
+    cfg: EngineConfig,
+    health: HealthState,
+    mut sinks: TurnSinks,
+) -> Result<WorkerHandle, EngineError> {
+    check_sinks(
+        cfg.parallel,
+        sinks.timing.is_some() || sinks.trace.is_some(),
+    )?;
+    // The session arms its recorders from `cfg`; a file without a recorder
+    // stays empty, a recorder without a file drops every row.
+    if cfg.timing_csv.is_some() != sinks.timing.is_some()
+        || cfg.routing_trace.is_some() != sinks.trace.is_some()
+    {
+        return Err(EngineError::InvalidConfig(
+            "turn sinks must match timing_csv/routing_trace".into(),
+        ));
+    }
     let health = Arc::new(health);
     // parallel − 1 queued jobs: with every slot busy the handler's
     // `try_send` fills this, then 503s — never more queued than can start
     // once one slot frees (parallel 1 keeps the rendezvous).
     let (jobs, rx) = sync_channel::<Job>(cfg.parallel.saturating_sub(1) as usize);
-    let (loaded_tx, loaded_rx) = sync_channel::<Result<(), EngineError>>(0);
+    let (loaded_tx, loaded_rx) = sync_channel::<Result<Option<u32>, EngineError>>(0);
     let h = health.clone();
     let join = std::thread::Builder::new()
         .name("golem-decode".into())
         .spawn(move || {
-            let mut sch = match Session::new(&cfg).and_then(Scheduler::new) {
+            let loaded = Session::new(&cfg)
+                .and_then(Scheduler::new)
+                .and_then(|mut s| {
+                    // The header hashes the model file: paid at load, not by
+                    // the first request.
+                    if let Some(f) = sinks.trace.as_mut() {
+                        // Not the load self-check decode's records.
+                        s.session().discard_turn_records();
+                        s.session().write_routing_trace(f)?;
+                    }
+                    Ok(s)
+                });
+            let mut sch = match loaded {
                 Ok(s) => s,
                 Err(e) => {
                     h.set(ServeState::Fatal);
@@ -349,11 +404,16 @@ fn spawn(cfg: EngineConfig, health: HealthState) -> Result<WorkerHandle, EngineE
                 }
             };
             h.set(ServeState::Healthy);
-            let _ = loaded_tx.send(Ok(()));
-            run(&mut sch, &rx, &h);
+            let _ = loaded_tx.send(Ok(sch.session().device_cache_experts()));
+            run(&mut sch, &rx, &h, &mut sinks);
         })?;
     match loaded_rx.recv() {
-        Ok(Ok(())) => Ok(WorkerHandle { jobs, health, join }),
+        Ok(Ok(device_cache_experts)) => Ok(WorkerHandle {
+            jobs,
+            health,
+            device_cache_experts,
+            join,
+        }),
         Ok(Err(e)) => {
             let _ = join.join();
             Err(e)
@@ -412,7 +472,7 @@ impl SlotRun {
 /// The decode loop: admits jobs into free slots (never dequeuing one it
 /// cannot admit), steps every active slot through one batched decode, and
 /// answers each finished slot on its own event stream.
-fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
+fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mut TurnSinks) {
     let n = sch.free_slots();
     let mut runs: Vec<Option<SlotRun>> = (0..n).map(|_| None).collect();
     // Per-step event buffers, reused: no allocation per step.
@@ -493,6 +553,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState) {
                 &mut ended,
                 health,
                 &mut slot_tokens,
+                sinks,
             )
         }));
         health.mark_progress();
@@ -732,6 +793,10 @@ fn admit(
         sch.session().fail_storage_in_read_for_test();
     }
     #[cfg(any(test, feature = "test-support"))]
+    if let n @ 1.. = health.hooks.fail_gen_step.swap(0, Ordering::SeqCst) {
+        sch.session().fail_generation_step_for_test(n);
+    }
+    #[cfg(any(test, feature = "test-support"))]
     if health
         .hooks
         .fail_storage_in_stream_read
@@ -751,6 +816,7 @@ fn step(
     ended: &mut Vec<(usize, Result<TurnOutcome, EngineError>)>,
     health: &HealthState,
     slot_tokens: &mut [u64],
+    sinks: &mut TurnSinks,
 ) -> Result<bool, EngineError> {
     pieces.clear();
     ended.clear();
@@ -791,12 +857,38 @@ fn step(
     let finished = !ended.is_empty();
     for (i, res) in ended.drain(..) {
         let Some(run) = runs[i].take() else { continue };
+        flush_turn(sch, sinks, res.is_ok());
         finish(sch, run, i, res, health);
     }
     if finished {
         publish_metrics(sch, health, slot_tokens);
     }
     Ok(finished)
+}
+
+/// Turn-end record flush, best-effort like `run`'s: a write error is logged,
+/// never fails the request. A failed turn's rows are dropped; a cancelled
+/// turn's partial rows are kept (the routing ran).
+fn flush_turn(sch: &mut Scheduler, sinks: &mut TurnSinks, ok: bool) {
+    use std::io::{BufWriter, Write};
+    let s = sch.session();
+    if !ok {
+        s.discard_turn_records();
+        return;
+    }
+    // One write(2) per turn, not per row (~21k trace rows per 511-step turn).
+    if let Some(f) = sinks.timing.as_mut() {
+        let mut w = BufWriter::new(f);
+        if let Err(e) = s.write_timing(&mut w).and_then(|()| w.flush()) {
+            tracing::warn!("timing csv: {e}");
+        }
+    }
+    if let Some(f) = sinks.trace.as_mut() {
+        let mut w = BufWriter::new(f);
+        if let Err(e) = s.write_routing_trace(&mut w).and_then(|()| w.flush()) {
+            tracing::warn!("routing trace: {e}");
+        }
+    }
 }
 
 /// Final flushes and the slot's one terminal event.
@@ -1158,7 +1250,8 @@ mod tests {
             parallel: 2,
             ..crate::test_engine_config()
         };
-        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20), TurnSinks::default())
+            .expect("worker");
         let (a, mut ra) = job("count to ten", 64);
         assert!(w.jobs.try_send(a).is_ok(), "slot 0");
         assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
@@ -1197,7 +1290,8 @@ mod tests {
             parallel: 2,
             ..crate::test_engine_config()
         };
-        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20), TurnSinks::default())
+            .expect("worker");
         let (a, mut ra) = job("count to ten", 4);
         let (a2, mut ra2) = job("hello", 4);
         enqueue(&w, a);
@@ -1226,7 +1320,8 @@ mod tests {
             parallel: 2,
             ..crate::test_engine_config()
         };
-        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20), TurnSinks::default())
+            .expect("worker");
         let (a, mut ra) = job("count to ten", 4096);
         let (a2, mut ra2) = job("hello", 4096);
         enqueue(&w, a);
@@ -1253,7 +1348,7 @@ mod tests {
     /// `Failed(BackendUnavailable)` through the reserved permit, not `Done`.
     #[test]
     fn slow_client_gets_failed_not_done() {
-        let w = spawn_worker(crate::test_engine_config()).expect("worker");
+        let w = spawn_worker(crate::test_engine_config(), TurnSinks::default()).expect("worker");
         let (mut j, _) = job("count to ten", 64);
         // Capacity 1: the reserved terminal permit takes the only slot, so
         // the first text piece finds the channel full.
@@ -1278,7 +1373,8 @@ mod tests {
             parallel: 3,
             ..crate::test_engine_config()
         };
-        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20)).expect("worker");
+        let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20), TurnSinks::default())
+            .expect("worker");
         let mut running = Vec::new();
         for p in ["a", "b", "c"] {
             let (j, mut rx) = job(p, 4096);
@@ -1644,6 +1740,7 @@ pub struct TestHooks {
     fail_storage: AtomicBool,
     fail_storage_in_read: AtomicBool,
     fail_storage_in_stream_read: AtomicBool,
+    fail_gen_step: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1689,6 +1786,14 @@ impl TestHooks {
     pub fn fail_storage_during_stream_read() -> Self {
         Self {
             fail_storage_in_stream_read: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// The first job's `n`-th generation batch fails (`Decode(1)`).
+    pub fn fail_generation_step(n: u32) -> Self {
+        Self {
+            fail_gen_step: std::sync::atomic::AtomicU32::new(n),
             ..Self::default()
         }
     }

@@ -1079,6 +1079,18 @@ impl Session {
         }
     }
 
+    /// Drops the buffered timing rows and routing-trace records of a turn
+    /// that failed, keeping the trace header state (a sink flush would
+    /// swallow the header).
+    pub fn discard_turn_records(&mut self) {
+        if let Some(t) = self.inner.timing.as_mut() {
+            let _ = t.flush(&mut std::io::sink());
+        }
+        if let Some(p3) = self.inner.p3.as_ref() {
+            p3.drain_routing_trace();
+        }
+    }
+
     /// Runs one chat turn greedily with the session-wide `n_predict`
     /// (a [`TurnRequest`] with default sampling and no `max_tokens`). Piece
     /// bytes stream through `emit` as they complete UTF-8 characters

@@ -15,8 +15,8 @@ use std::time::Duration;
 pub use app::{AppState, router};
 pub use metrics::MetricsSnapshot;
 pub use worker::{
-    Event, HealthSnapshot, HealthState, Job, ReasoningMode, ServeState, ShutdownTimeout,
-    WorkerHandle, spawn_worker,
+    Event, HealthSnapshot, HealthState, Job, ReasoningMode, ServeState, ShutdownTimeout, TurnSinks,
+    WorkerHandle, check_sinks, spawn_worker,
 };
 
 /// Listener and API identity of one instance.
@@ -473,10 +473,12 @@ pub mod test_support {
 
     /// [`router_for_test`] with fault injection on its worker.
     pub async fn router_with_hooks(cfg: EngineConfig, hooks: TestHooks) -> axum::Router {
-        let w = tokio::task::spawn_blocking(move || spawn_worker_with_hooks(cfg, hooks))
-            .await
-            .expect("spawn_worker task")
-            .expect("tiny-moe worker loads");
+        let w = tokio::task::spawn_blocking(move || {
+            spawn_worker_with_hooks(cfg, hooks, TurnSinks::default())
+        })
+        .await
+        .expect("spawn_worker task")
+        .expect("tiny-moe worker loads");
         router(AppState {
             cfg: Arc::new(test_server_config()),
             jobs: w.jobs.clone(),
@@ -507,10 +509,25 @@ pub mod test_support {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<(), ServeError>>,
     ) {
-        let worker = tokio::task::spawn_blocking(move || spawn_worker_with_hooks(cfg, hooks))
-            .await
-            .expect("spawn_worker task")
-            .expect("tiny-moe worker loads");
+        serve_with_sinks(cfg, hooks, scfg, TurnSinks::default()).await
+    }
+
+    /// [`serve_with`] recording each turn into `sinks`.
+    pub async fn serve_with_sinks(
+        cfg: EngineConfig,
+        hooks: TestHooks,
+        scfg: ServerConfig,
+        sinks: TurnSinks,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), ServeError>>,
+    ) {
+        let worker =
+            tokio::task::spawn_blocking(move || spawn_worker_with_hooks(cfg, hooks, sinks))
+                .await
+                .expect("spawn_worker task")
+                .expect("tiny-moe worker loads");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -556,6 +573,7 @@ pub mod sse_support {
                     let worker = crate::worker::spawn_worker_with_hooks(
                         test_engine_config(),
                         TestHooks::slow_decode(SLOW_MS),
+                        TurnSinks::default(),
                     )
                     .expect("tiny-moe worker loads");
                     let l = tokio::net::TcpListener::bind("127.0.0.1:0")

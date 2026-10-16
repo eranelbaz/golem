@@ -136,14 +136,18 @@ pub struct EngineArgs {
     /// (engine version, fork commit, resolved config), then one row per
     /// generation decode step, flushed at each turn end. H2D columns are
     /// measured with `--async-h2d` (copy-stream event pairs), else
-    /// `unmeasured`.
+    /// `unmeasured`. Holds `--n-predict` rows per turn (extra rows are
+    /// counted as `# dropped_rows`): under `serve`, set it ≥ the clients'
+    /// `max_tokens`. `serve` appends each finished request; refused with
+    /// `--parallel` > 1.
     #[arg(long, value_name = "FILE")]
     pub timing_csv: Option<PathBuf>,
     /// Per-step routing-trace destination (design §2.3 step 4): a
     /// `# golem-routing-trace v1` header, then one `step\tphase\tlayer\tid,...`
     /// record per MoE layer per decode step, flushed at each turn end.
     /// Requires the RAM expert pool (`--ram-experts-gib`); consumes no
-    /// per-step heap when unset.
+    /// per-step heap when unset. `serve` appends each finished request;
+    /// refused with `--parallel` > 1.
     #[arg(long, value_name = "FILE")]
     pub routing_trace: Option<PathBuf>,
     /// P2 evict-first order among a layer's non-routed VRAM slots:
@@ -746,7 +750,7 @@ fn expert_plane_bytes(model: &Path, manifest: Option<&Path>) -> Result<u64, Box<
 /// checkout's `vendor/VENDOR_SHA` (`commit=` line) so the header carries the
 /// real fork; `GOLEM_FORK_COMMIT` env overrides (e.g. for out-of-tree builds
 /// without `vendor/`).
-fn fork_commit() -> String {
+pub(crate) fn fork_commit() -> String {
     if let Some(c) = option_env!("GOLEM_FORK_COMMIT") {
         return c.to_owned();
     }
@@ -832,7 +836,7 @@ fn flush_trace(
 }
 
 /// One-line resolved-config string for the CSV header comment (§11).
-fn resolved_config_line(config: &EngineConfig) -> String {
+pub(crate) fn resolved_config_line(config: &EngineConfig) -> String {
     format!(
         "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} cpu_moe={:?} \
          ram_experts_gib={} device_cache_experts={} io_threads={:?} manifest={:?} \
