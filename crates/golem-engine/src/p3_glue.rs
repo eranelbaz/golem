@@ -45,9 +45,10 @@ use golem_llama_sys::raw;
 use golem_llama_sys::{CtxRaw, GolemCtx, HookFns, Hooked};
 use golem_placement::pool::{
     AccessFeed, D2hIncoming, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats,
-    PolicySnapshot, PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource,
+    PolicySnapshot, PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource, WarmFeed,
     spawn_prefetch,
 };
+use golem_placement::scores::WarmShape;
 use golem_store::ChunkQueue;
 
 use crate::config::{EngineConfig, PrefetchMode, Residency, VramOrder};
@@ -107,8 +108,8 @@ struct TraceRing {
 /// tokens are bounded by `n_ctx + n_predict`. Pooled prefill chunks are
 /// `max(1, K / top_k)` tokens (K = 19, top-k 8 → 2), so chunks are bounded
 /// by tokens, not by `batch`. GLM at ctx 4096 + 512: 193.5k records × 32 B
-/// ≈ 6.2 MB + 1.55M ids × 4 B ≈ 6.2 MB; at ctx 131072: 5.5M records ≈ 177 MB
-/// + 44M ids ≈ 177 MB (opt-in `--routing-trace` only). With prediction on,
+/// ≈ 6.2 MB plus 1.55M ids × 4 B ≈ 6.2 MB; at ctx 131072: 5.5M records ≈
+/// 177 MB plus 44M ids ≈ 177 MB (opt-in `--routing-trace` only). With prediction on,
 /// each decode step adds `lookahead` records of `top_k + margin` ids per
 /// layer: 512 steps × 42 layers × 12 ids ≈ 21.5k records, 258k ids ≈ 1 MB.
 fn trace_caps(
@@ -515,7 +516,8 @@ struct PolicyState {
     /// Whether the routing readback books recency: false during prefill
     /// (§6.2: a prefill ubatch routes nearly every expert and would flatten
     /// the scores), true during generation decodes. Driven by `Session`
-    /// through [`set_scoring`].
+    /// through [`set_scoring`]; starts false so the load self-check decode,
+    /// which is not user traffic, books nothing (`Session::new` arms it).
     scoring: AtomicBool,
     /// Per-layer dirty flags: the routing readback marks; the publisher and
     /// the `copy_done` flush swap-to-claim and publish.
@@ -533,7 +535,7 @@ impl PolicyState {
             score: (0..keys).map(|_| AtomicU64::new(0)).collect(),
             vram_order,
             step: AtomicU64::new(0),
-            scoring: AtomicBool::new(true),
+            scoring: AtomicBool::new(false),
             dirty: (0..n_layers as usize)
                 .map(|_| AtomicBool::new(false))
                 .collect(),
@@ -541,6 +543,14 @@ impl PolicyState {
             n_layers: n_layers as usize,
             n_experts: n_experts as usize,
         }
+    }
+
+    /// A state with scoring armed (unit tests drive generation steps).
+    #[cfg(test)]
+    fn scored(n_layers: u32, n_experts: u32, vram_order: VramOrder) -> Self {
+        let p = Self::new(n_layers, n_experts, vram_order);
+        p.scoring.store(true, Ordering::Relaxed);
+        p
     }
 
     /// Books one step's routed ids of `layer` (the dense ids readback):
@@ -584,6 +594,49 @@ impl PolicyState {
     fn mark_dirty(&self, layer: usize) {
         self.dirty[layer].store(true, Ordering::Relaxed);
         self.dirty_any.store(true, Ordering::Relaxed);
+    }
+
+    /// Every booked key's `(key, last_access, score)` words and the step,
+    /// for the warm-start file. Relaxed loads: called between turns, when
+    /// the decode thread (the only writer) is idle.
+    fn warm_words(&self) -> (u64, Vec<(usize, u64, u64)>) {
+        let words = self
+            .last_access
+            .iter()
+            .zip(&self.score)
+            .enumerate()
+            .filter_map(|(i, (a, w))| {
+                let a = a.load(Ordering::Relaxed);
+                (a != 0).then(|| (i, a, w.load(Ordering::Relaxed)))
+            })
+            .collect();
+        (self.step.load(Ordering::Relaxed), words)
+    }
+
+    /// Restores a validated warm state verbatim (§6.3 warm-up) and marks
+    /// every layer dirty so the publisher pushes the seeded VRAM order.
+    /// Before hook registration: no reader or writer runs yet.
+    fn restore(&self, warm: &golem_placement::scores::WarmState) {
+        for &(i, a, w) in &warm.words {
+            self.last_access[i].store(a, Ordering::Relaxed);
+            self.score[i].store(w, Ordering::Relaxed);
+        }
+        self.step.store(warm.step, Ordering::Relaxed);
+        for layer in 0..self.n_layers {
+            self.mark_dirty(layer);
+        }
+    }
+
+    /// Booked keys ranked best-first by §6.2 score decayed to the current
+    /// step; ties by ascending key.
+    fn ranked_keys(&self) -> Vec<usize> {
+        let step = self.step.load(Ordering::Relaxed);
+        let mut rank: Vec<(f64, usize)> = (0..self.score.len())
+            .filter(|&i| self.last_access[i].load(Ordering::Relaxed) != 0)
+            .map(|i| (self.decayed(i, step), i))
+            .collect();
+        rank.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        rank.into_iter().map(|(_, i)| i).collect()
     }
 
     /// Last-access step of flat index `idx`; `None` = never accessed.
@@ -818,6 +871,17 @@ pub struct SessionHooks {
     /// §6.5 prefetch thread (`--prefetch read` only). Stopped before the
     /// hooks are torn down so its pool feed cannot outlive the pool state.
     prefetch: Option<PrefetchHandle>,
+    /// §6.3 warm-up pre-fill thread (restored warm state only); exits once
+    /// its one-shot feed is drained. Stopped/paused beside `prefetch`.
+    warm: Option<PrefetchHandle>,
+    /// Pre-fill inputs held from enable until [`Self::start_warm_fill`]
+    /// (K is final only after the post-load fit).
+    warm_fill: Option<WarmFill>,
+    /// Warm-start file and the shape it is keyed by; `None` = disabled.
+    warm_file: Option<(std::path::PathBuf, WarmShape)>,
+    /// Units the pre-fill was handed (test seam).
+    #[cfg(any(test, feature = "test-support"))]
+    warm_planned: Vec<(u32, u32)>,
     /// The eviction-order publisher (background thread).
     publisher: PublisherHandle,
     /// The live hook registration; also owns the ctx (`Arc` inside the
@@ -955,10 +1019,10 @@ impl SessionHooks {
         self.stats.clone()
     }
 
-    /// Switches recency booking (§6.2) — harness seam mirroring the free
-    /// [`set_scoring`] used by `Session`.
+    /// Switches recency booking (§6.2) on this session's own policy only;
+    /// the free [`set_scoring`] covers every live session (prefill scope).
     pub fn set_scoring(&self, on: bool) {
-        set_scoring(on);
+        self.state.policy.scoring.store(on, Ordering::Relaxed);
     }
 
     /// Derived-K fit (ruling R3), once the model, KV and compute buffer are
@@ -1058,7 +1122,7 @@ impl SessionHooks {
             return;
         }
         let ctx = self.ctx_ptr();
-        if let Some(p) = &self.prefetch {
+        for p in self.prefetch.iter().chain(&self.warm) {
             p.pause();
         }
         // SAFETY: FFI on the live ctx between computes (every decode
@@ -1090,7 +1154,7 @@ impl SessionHooks {
             "device cache resized"
         );
         self.device_cache_experts = k;
-        if let Some(p) = &self.prefetch {
+        for p in self.prefetch.iter().chain(&self.warm) {
             p.resume();
         }
     }
@@ -1197,12 +1261,12 @@ impl SessionHooks {
             return;
         };
         self.state.stream_armed.store(on, Ordering::Relaxed);
-        if on {
-            if let Some(p) = &self.prefetch {
+        for p in self.prefetch.iter().chain(&self.warm) {
+            if on {
                 p.pause();
+            } else {
+                p.resume();
             }
-        } else if let Some(p) = &self.prefetch {
-            p.resume();
         }
         // SAFETY: FFI flag setter on the live ctx; not concurrent with a
         // compute (called between llama_decode calls).
@@ -1308,6 +1372,100 @@ impl SessionHooks {
             .retain(|s| !Arc::ptr_eq(s, &self.state));
     }
 
+    /// Starts the §6.3 warm-up pre-fill once K is final (after
+    /// [`Self::fit_device_cache`]): the restored keys, best-first, truncated
+    /// per slot class to `slots − (layers_c × k + 1)` with k = min(max(K
+    /// stream, K decode), n_experts) — `class_layout`'s floor — so demand
+    /// keeps its in-flight headroom and the CLOCK sweep never evicts an
+    /// earlier, hotter warm unit. Background thread; no request waits on
+    /// it. No-op without a restored warm state or after the first call.
+    /// GLM, 59 GiB pool: ≈ 3,900 units ≈ 59 GiB / 4.7 GB/s ≈ 13 s of reads.
+    pub(crate) fn start_warm_fill(&mut self) {
+        let Some(fill) = self.warm_fill.take() else {
+            return;
+        };
+        let n = self.state.n_experts;
+        let k = self.k_stream.max(self.k_decode).min(n);
+        let mut budget: Vec<u64> = fill
+            .classes
+            .iter()
+            .map(|&(slots, layers)| slots.saturating_sub(layers * u64::from(k) + 1))
+            .collect();
+        let units: Vec<(u32, u32)> = self
+            .state
+            .policy
+            .ranked_keys()
+            .into_iter()
+            .filter_map(|i| {
+                let (layer, expert) = ((i / n as usize) as u32, (i % n as usize) as u32);
+                let b = &mut budget[usize::from(fill.class_of_layer[layer as usize])];
+                (*b > 0).then(|| {
+                    *b -= 1;
+                    (layer, expert)
+                })
+            })
+            .collect();
+        tracing::info!(units = units.len(), k, "warm-start pool pre-fill started");
+        if units.is_empty() {
+            return;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.warm_planned = units.clone();
+        }
+        self.warm = Some(spawn_prefetch(
+            self.state.pool.clone(),
+            Arc::new(WarmFeed::new(units)) as Arc<dyn AccessFeed>,
+            fill.io_cpuset,
+        ));
+    }
+
+    /// Writes the §6.2 policy words and step to the warm-start file
+    /// (atomic replace; parent created). Call between turns only. No-op
+    /// when no warm-start file is configured.
+    pub fn save_warm_state(&self) -> std::io::Result<()> {
+        let Some((path, shape)) = &self.warm_file else {
+            return Ok(());
+        };
+        let (step, words) = self.state.policy.warm_words();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        crate::atomic::write_atomic(
+            path,
+            &golem_placement::scores::format_scores(shape, step, &words),
+        )
+    }
+
+    /// Test seam: the live policy step and every booked key's words.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn warm_words_for_test(&self) -> (u64, Vec<(usize, u64, u64)>) {
+        self.state.policy.warm_words()
+    }
+
+    /// Test seam: true once the pre-fill thread has exited (feed drained),
+    /// or when none was started.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn warm_fill_done(&self) -> bool {
+        self.warm.as_ref().is_none_or(PrefetchHandle::finished)
+    }
+
+    /// Test seam: the `(layer, expert)` units the pre-fill was handed.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn warm_planned_for_test(&self) -> &[(u32, u32)] {
+        &self.warm_planned
+    }
+
+    /// Test seam: whether `(layer, expert)` is pool-resident.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn is_resident_for_test(&self, layer: u32, expert: u32) -> bool {
+        self.state.pool.is_resident(layer, expert)
+    }
+
     /// Flushes this turn's routing-trace records into `w` (header on first
     /// call, then one line per record; the ring clears for the next turn).
     /// No-op when the routing trace is disabled.
@@ -1349,7 +1507,7 @@ impl Drop for SessionHooks {
         if let Some(s) = &self.stream {
             s.stop();
         }
-        if let Some(p) = &self.prefetch {
+        for p in self.prefetch.iter().chain(&self.warm) {
             p.stop();
         }
         // 3. `ctx_keep` (last field) drops now — golem_ctx_free aborts while
@@ -1694,7 +1852,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         snapshots,
         Arc::new(P3Stats::new()),
         geo.clone(),
-        class_of_layer,
+        class_of_layer.clone(),
     )
     .map_err(|e| EngineError::PoolInit(e.to_string()))?;
 
@@ -1788,6 +1946,24 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // P2 state: per-expert recency and §6.2 decayed score; the evict-first
     // order sorts by `config.vram_order`.
     let policy = PolicyState::new(n_layers, geo.n_experts, config.vram_order);
+    let warm_file = config.warm_state_dir.as_ref().and_then(|dir| {
+        warm_shape(config, n_layers, geo.n_experts).map(|s| {
+            let name = golem_placement::scores::scores_file_name(&s.model);
+            (dir.join(name), s)
+        })
+    });
+    let warm_fill = warm_file
+        .as_ref()
+        .is_some_and(|(path, shape)| restore_warm(&policy, path, shape))
+        .then(|| WarmFill {
+            classes: classes
+                .iter()
+                .zip(&layout)
+                .map(|((_, layers), c)| (u64::from(c.slots), layers.len() as u64))
+                .collect(),
+            class_of_layer,
+            io_cpuset: config.io_cpuset.clone(),
+        });
     // Routing-trace ring (§11 pattern), preallocated at enable — overflow
     // drops and counts instead of reallocating on the hot path.
     let trace = config.routing_trace.as_ref().map(|_| {
@@ -1908,6 +2084,11 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         #[cfg(golem_backend_hip)]
         _pinned: pinned,
         prefetch,
+        warm: None,
+        warm_fill,
+        warm_file,
+        #[cfg(any(test, feature = "test-support"))]
+        warm_planned: Vec::new(),
         publisher,
         hooked: Some(hooked),
         stats: state.pool.stats.clone(),
@@ -1930,6 +2111,65 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         stream_slab_vram,
         slab_bytes_per_expert: slab,
     })
+}
+
+/// Pre-fill inputs captured at enable: per class `(slots, layers)`, the
+/// layer → class map, and the I/O cpuset the thread pins to.
+struct WarmFill {
+    classes: Vec<(u64, u64)>,
+    class_of_layer: Vec<u8>,
+    io_cpuset: Option<golem_store::sys::CpuSet>,
+}
+
+/// The shape a warm-start file is keyed by — the one fingerprint of the
+/// model, also naming the file; `None` (warned, warm start off) when the
+/// model cannot be fingerprinted.
+fn warm_shape(config: &EngineConfig, n_layers: u32, n_experts: u32) -> Option<WarmShape> {
+    match golem_placement::scores::model_fingerprint(&config.model_path) {
+        Ok(model) => Some(WarmShape {
+            layers: n_layers,
+            experts: n_experts,
+            half_life: HALF_LIFE_STEPS,
+            model,
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "warm start off: cannot fingerprint the model");
+            None
+        }
+    }
+}
+
+/// Loads and restores `path` into `policy`; false (cold start) when the
+/// file is absent, or — with a warning — unreadable, corrupt or recorded
+/// for another shape or model.
+fn restore_warm(policy: &PolicyState, path: &std::path::Path, shape: &WarmShape) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path = %path.display(), "no warm-start scores; starting cold");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "warm-start scores unreadable; starting cold");
+            return false;
+        }
+    };
+    match golem_placement::scores::parse_scores(&text, shape) {
+        Ok(warm) => {
+            policy.restore(&warm);
+            tracing::info!(
+                path = %path.display(),
+                step = warm.step,
+                keys = warm.words.len(),
+                "warm-start scores restored"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "warm-start scores refused; starting cold");
+            false
+        }
+    }
 }
 
 /// The device-cache K of a VRAM mode (#135).
@@ -3059,7 +3299,7 @@ mod tests {
 
     #[test]
     fn routing_books_recency_for_whole_layer_and_marks_dirty() {
-        let p = PolicyState::new(2, 4, VramOrder::Recency);
+        let p = PolicyState::scored(2, 4, VramOrder::Recency);
         p.step.store(5, Ordering::Relaxed);
         p.book_routed(1, &[2, 2, 7, -1]); // duplicates idempotent; out-of-range rejected
         p.mark_dirty(1); // the trampoline does this right after booking
@@ -3082,7 +3322,7 @@ mod tests {
     fn out_of_range_id_never_spills_into_the_next_layer() {
         // id == n_experts would have passed a loose bounds guard and booked
         // layer 1's row 0.
-        let p = PolicyState::new(2, 4, VramOrder::Recency);
+        let p = PolicyState::scored(2, 4, VramOrder::Recency);
         p.step.store(3, Ordering::Relaxed);
         p.book_routed(0, &[4, -1, 100]);
         assert!(
@@ -3095,7 +3335,7 @@ mod tests {
 
     #[test]
     fn order_built_once_per_call_and_content_is_correct() {
-        let p = PolicyState::new(2, 6, VramOrder::Recency);
+        let p = PolicyState::scored(2, 6, VramOrder::Recency);
         p.step.store(7, Ordering::Relaxed);
         p.book_routed(0, &[3]);
         p.step.store(9, Ordering::Relaxed);
@@ -3118,7 +3358,7 @@ mod tests {
         // never. Recency evicts the older 1 first; the §6.2 decayed score
         // (≈ 4 vs ≈ 1) evicts 2 first. Never-accessed lead both orders.
         let book = |order| {
-            let p = PolicyState::new(1, 4, order);
+            let p = PolicyState::scored(1, 4, order);
             for s in 0..4 {
                 p.step.store(s, Ordering::Relaxed);
                 p.book_routed(0, &[1]);
@@ -3146,7 +3386,7 @@ mod tests {
 
     #[test]
     fn published_order_is_identity_for_fresh_experts_and_a_permutation_otherwise() {
-        let p = PolicyState::new(1, 6, VramOrder::Recency);
+        let p = PolicyState::scored(1, 6, VramOrder::Recency);
         let mut s = OrderScratch::new(6);
         p.build_order(0, &mut s);
         assert_eq!(s.order, vec![0, 1, 2, 3, 4, 5], "no accesses → identity");

@@ -56,6 +56,7 @@ fn trace_records_one_row_per_layer_per_step_and_round_trips() {
     let path = dir.join("trace.tsv");
 
     let hooks = p3_glue::enable(&cfg(Some(path.clone()))).expect("pooled enable with trace");
+    hooks.set_scoring(true); // Session::new arms it after the self-check
     let layers: &[i32] = &ALL_BLKS;
     drive_steps(&hooks, 3, layers);
 
@@ -109,6 +110,7 @@ fn trace_records_one_row_per_layer_per_step_and_round_trips() {
 #[test]
 fn trace_disabled_writes_nothing() {
     let hooks = p3_glue::enable(&cfg(None)).expect("pooled enable without trace");
+    hooks.set_scoring(true); // Session::new arms it after the self-check
     drive_steps(&hooks, 2, &ALL_BLKS);
     let mut out = Vec::new();
     {

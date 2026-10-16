@@ -59,6 +59,10 @@ pub struct ServeArgs {
     /// prefer `GOLEM_API_KEY` or `api_key` in `golem.toml`.
     #[arg(long, value_name = "KEY")]
     pub api_key: Option<String>,
+    /// Start cold: neither restore nor save the warm-start scores
+    /// (`$GOLEM_DATA_DIR/journals/<instance>/scores-<fp>.txt`).
+    #[arg(long)]
+    pub no_warm_start: bool,
     #[command(flatten)]
     pub engine: EngineArgs,
 }
@@ -77,6 +81,7 @@ impl std::fmt::Debug for ServeArgs {
             .field("load_timeout", &self.load_timeout)
             .field("allow_overcommit", &self.allow_overcommit)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("no_warm_start", &self.no_warm_start)
             .field("engine", &self.engine)
             .finish()
     }
@@ -274,7 +279,7 @@ pub fn serve(
     )?;
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    let (config, requested_snapshot) = engine_config(
+    let (mut config, requested_snapshot) = engine_config(
         &args.engine,
         &args.model,
         l.parallel,
@@ -285,6 +290,12 @@ pub fn serve(
             sys.available_memory()
         },
     )?;
+    if !args.no_warm_start {
+        config.warm_state_dir = golem_placement::scores::journal_dir_from(
+            data_root().as_deref().and_then(Path::to_str),
+            std::env::var("GOLEM_INSTANCE").ok().as_deref(),
+        );
+    }
     check_sinks(
         config.parallel,
         config.timing_csv.is_some() || config.routing_trace.is_some(),
@@ -395,11 +406,16 @@ pub fn lingering() -> bool {
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "Linger=yes")
 }
 
+/// Root of per-instance state: `GOLEM_DATA_DIR`, else
+/// `$HOME/.local/share/golem`.
+fn data_root() -> Option<PathBuf> {
+    golem_store::data_dir()
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share/golem")))
+}
+
 /// Log file of a detached instance.
 pub fn log_path(id: &str) -> Option<PathBuf> {
-    let root = golem_store::data_dir()
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share/golem")))?;
-    Some(root.join("logs").join(format!("{id}.log")))
+    Some(data_root()?.join("logs").join(format!("{id}.log")))
 }
 
 #[cfg(test)]
@@ -498,6 +514,18 @@ mod tests {
         assert_eq!((file.port, file.host.to_string()), (7000, "0.0.0.0".into()));
         let d = super::listen(&bare, &crate::config::Layers::none()).unwrap();
         assert_eq!((d.port, d.parallel), (0, 1));
+    }
+
+    #[test]
+    fn no_warm_start_flag_and_default_path() {
+        #[derive(clap::Parser)]
+        struct P {
+            #[command(flatten)]
+            a: super::ServeArgs,
+        }
+        let parse = |a: &[&str]| <P as clap::Parser>::parse_from(a).a.no_warm_start;
+        assert!(!parse(&["serve", "m.gguf"]));
+        assert!(parse(&["serve", "m.gguf", "--no-warm-start"]));
     }
 
     #[test]

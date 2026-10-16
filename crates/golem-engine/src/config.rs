@@ -82,6 +82,11 @@ pub struct EngineConfig {
     /// `# golem-routing-trace v1` header; `None` (the default) traces
     /// nothing — the trampoline's only cost is one `Option` check.
     pub routing_trace: Option<PathBuf>,
+    /// Warm-start directory (§6.3 warm-up, §11): when set, the engine's
+    /// `scores-<model fingerprint>.txt` in it restores the §6.2 policy words and step at enable and pre-fills
+    /// the RAM pool in the background; [`crate::session::Session::save_warm_state`]
+    /// writes it. `None` (the default) starts cold and saves nothing.
+    pub warm_state_dir: Option<PathBuf>,
     /// P2 evict-first order (§6.2). The policy replay
     /// (`docs/baselines/m3.7-policy-replay.md`) puts the decayed score
     /// ahead of recency on real traces.
@@ -200,6 +205,7 @@ impl Default for EngineConfig {
             manifest_path: None,
             timing_csv: None,
             routing_trace: None,
+            warm_state_dir: None,
             vram_order: VramOrder::default(),
             prefetch: PrefetchMode::default(),
             prefetch_lookahead: 1,

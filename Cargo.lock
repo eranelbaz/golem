@@ -513,6 +513,7 @@ dependencies = [
  "golem-store",
  "libc",
  "loom",
+ "sha2",
  "thiserror",
  "tracing",
  "xtask",

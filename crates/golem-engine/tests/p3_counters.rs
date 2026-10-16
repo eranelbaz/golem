@@ -63,6 +63,7 @@ fn drive_step(hooks: &SessionHooks, gate: *mut raw::ggml_tensor) {
 #[test]
 fn p3_counters_move_cold_to_warm_and_live_session_is_refused() {
     let hooks = p3_glue::enable(&pooled_config()).expect("enable");
+    hooks.set_scoring(true); // Session::new arms it after the self-check
     let (_ctx, gate) = xt::gate_tensor();
     let stats = hooks.state_stats();
 

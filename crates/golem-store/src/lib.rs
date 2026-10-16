@@ -47,7 +47,7 @@ pub use stripe::{CHUNK, plan_aligned};
 use std::path::PathBuf;
 
 /// The one reader of `GOLEM_DATA_DIR` (§4.2): root for manifests, models,
-/// and placement journals. `None` when unset or non-UTF-8.
+/// and warm-start score files (`journals/<instance>/`). `None` when unset or non-UTF-8.
 #[must_use]
 pub fn data_dir() -> Option<PathBuf> {
     std::env::var_os("GOLEM_DATA_DIR").map(PathBuf::from)

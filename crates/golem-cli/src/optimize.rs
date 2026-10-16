@@ -550,7 +550,7 @@ fn apply(config: &mut EngineConfig, k: &Knobs) {
 
 /// Evicts the model's shards from the page cache (cold measurement).
 fn evict(model: &Path) -> Result<(), Box<dyn Error>> {
-    for p in profile::shards(model)? {
+    for p in golem_gguf::shards(model)? {
         let f = std::fs::File::open(&p)?;
         let len = usize::try_from(f.metadata()?.len())?;
         golem_store::sys::drop_page_cache(&f, 0, len);

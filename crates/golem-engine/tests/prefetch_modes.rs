@@ -12,14 +12,16 @@ use golem_engine::config::{EngineConfig, PrefetchMode};
 use golem_engine::p3_glue::{self, SessionHooks};
 
 fn hooks(mode: PrefetchMode) -> SessionHooks {
-    p3_glue::enable(&EngineConfig {
+    let h = p3_glue::enable(&EngineConfig {
         model_path: tiny_moe_path(),
         ram_experts_gib: 1,
         device_cache_experts: 4,
         prefetch: mode,
         ..EngineConfig::default()
     })
-    .expect("pooled enable")
+    .expect("pooled enable");
+    h.set_scoring(true); // Session::new arms it after the self-check
+    h
 }
 
 fn predict(h: &SessionHooks, ids: &[i32]) {

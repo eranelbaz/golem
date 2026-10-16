@@ -61,6 +61,7 @@ unsafe fn policy_order(hooks: &SessionHooks, gate: *mut raw::ggml_tensor) -> Opt
 #[test]
 fn routing_semantics_flush_publisher_and_epoch_gate() {
     let hooks = p3_glue::enable(&pooled_config()).expect("enable");
+    hooks.set_scoring(true); // Session::new arms it after the self-check
     let (_ctx, gate) = xt::gate_tensor();
 
     // Nothing pushed yet → C consumes the identity order fallback (NULL).

@@ -128,6 +128,11 @@ pub const STALL_MS: u64 = 2048 * 10_000 / 56 + 30_000;
 /// Published every [`METRICS_EVERY`] steps and at turn end.
 const METRICS_EVERY: u64 = 64;
 
+/// Periodic warm-start save (§6.3 warm-up): fires only at a finished turn
+/// with every slot idle and ≥ 300 s since the last save — one ≈ 360 KB
+/// write (GLM) at most every 5 minutes.
+const WARM_SAVE_EVERY: Duration = Duration::from_secs(300);
+
 /// Shared instance health; written by the worker and the drain path.
 #[derive(Debug)]
 pub struct HealthState {
@@ -405,7 +410,11 @@ fn spawn(
             };
             h.set(ServeState::Healthy);
             let _ = loaded_tx.send(Ok(sch.session().device_cache_experts()));
-            run(&mut sch, &rx, &h, &mut sinks);
+            // Graceful only (jobs channel closed after the drain): a fatal
+            // exit's policy state is not trusted.
+            if run(&mut sch, &rx, &h, &mut sinks) {
+                save_warm_state(&mut sch);
+            }
         })?;
     match loaded_rx.recv() {
         Ok(Ok(device_cache_experts)) => Ok(WorkerHandle {
@@ -471,8 +480,14 @@ impl SlotRun {
 
 /// The decode loop: admits jobs into free slots (never dequeuing one it
 /// cannot admit), steps every active slot through one batched decode, and
-/// answers each finished slot on its own event stream.
-fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mut TurnSinks) {
+/// answers each finished slot on its own event stream. True on a graceful
+/// exit (the jobs channel disconnected with every slot idle).
+fn run(
+    sch: &mut Scheduler,
+    rx: &Receiver<Job>,
+    health: &HealthState,
+    sinks: &mut TurnSinks,
+) -> bool {
     let n = sch.free_slots();
     let mut runs: Vec<Option<SlotRun>> = (0..n).map(|_| None).collect();
     // Per-step event buffers, reused: no allocation per step.
@@ -481,6 +496,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mu
     let mut changed = false;
     let mut slot_tokens = vec![0u64; n];
     let mut steps = 0u64;
+    let mut last_save = Instant::now();
     publish_metrics(sch, health, &slot_tokens);
     loop {
         // Before a blocking `recv`: a finished job must not stay "busy".
@@ -494,7 +510,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mu
             let job = if idle && runs.iter().all(Option::is_none) {
                 match rx.recv() {
                     Ok(j) => j,
-                    Err(_) => return,
+                    Err(_) => return true,
                 }
             } else {
                 match rx.try_recv() {
@@ -502,7 +518,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mu
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         if runs.iter().all(Option::is_none) {
-                            return;
+                            return true;
                         }
                         break;
                     }
@@ -525,7 +541,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mu
                             .events
                             .try_send(Event::Failed(crate::app::backend_gone_envelope()));
                     }
-                    return;
+                    return false;
                 }
                 Err(false) => {
                     health.queued.fetch_sub(1, Ordering::SeqCst);
@@ -543,7 +559,7 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mu
         }
         if storage_lost(sch, &mut runs, health) {
             refuse_all(rx, health);
-            return;
+            return false;
         }
         let stepped = catch_unwind(AssertUnwindSafe(|| {
             step(
@@ -568,12 +584,20 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mu
         let fatal = match stepped {
             Ok(Ok(finished)) => {
                 changed = finished;
+                // Between turns only: no slot may be mid-decode.
+                if finished
+                    && runs.iter().all(Option::is_none)
+                    && last_save.elapsed() >= WARM_SAVE_EVERY
+                {
+                    save_warm_state(sch);
+                    last_save = Instant::now();
+                }
                 false
             }
             // A page-in failed mid-decode on a dead shard (ABI v13).
             Ok(Err(EngineError::StorageUnavailable)) if storage_lost(sch, &mut runs, health) => {
                 refuse_all(rx, health);
-                return;
+                return false;
             }
             Ok(Err(e)) => {
                 tracing::error!("decode worker: {e}");
@@ -597,8 +621,15 @@ fn run(sch: &mut Scheduler, rx: &Receiver<Job>, health: &HealthState, sinks: &mu
         };
         if fatal {
             fail_all(&mut runs, health);
-            return;
+            return false;
         }
+    }
+}
+
+/// Best-effort warm-start save: an error is logged, never fails a request.
+fn save_warm_state(sch: &mut Scheduler) {
+    if let Err(e) = sch.session().save_warm_state() {
+        tracing::warn!("warm-start scores: {e}");
     }
 }
 
