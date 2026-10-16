@@ -53,8 +53,8 @@ pub enum Event {
     Text(String),
     /// Generated reasoning piece (`separate` mode only).
     Reasoning(String),
-    /// Tool-call delta: the first one per call carries `index`, `id`, `type`
-    /// and the name; later ones append to `arguments`.
+    /// One whole tool call (`index`, `id`, `type`, name and JSON
+    /// `arguments`), sent once the turn ends.
     ToolCall(ToolCall),
     /// Turn finished; sent after all post-turn work.
     Done(TurnOutcome),
@@ -931,12 +931,13 @@ enum Section {
 /// on no marker beginning with an alphanumeric character or space, which
 /// holds for every vendored parser without tools (firefunction-v2's tool
 /// marker ` functools[` breaks it), so tool-mode streams always parse.
+/// Tool calls are not streamed: each goes out whole from the final parse,
+/// once its arguments are complete JSON.
 struct OutputStream {
     text: String,
     content: String,
     reasoning: String,
-    /// Per announced call: arguments sent so far.
-    args: Vec<String>,
+    /// Calls sent by the final parse.
     calls: usize,
     /// Section whose text ends `text` verbatim.
     tail: Option<Section>,
@@ -962,7 +963,6 @@ impl OutputStream {
             text: String::new(),
             content: String::new(),
             reasoning: String::new(),
-            args: Vec::new(),
             calls: 0,
             tail: None,
             fast: false,
@@ -1011,7 +1011,6 @@ impl OutputStream {
                     parser.parse("x", true).is_ok_and(|m| m["content"] == "x")
                 });
                 if raw
-                    && self.args.is_empty()
                     && let Some(add) = self.text.strip_prefix(self.content.as_str())
                     && !add.is_empty()
                 {
@@ -1056,41 +1055,33 @@ impl OutputStream {
             }
         }
         let calls = msg["tool_calls"].as_array().map_or(&[][..], Vec::as_slice);
-        for (i, c) in calls.iter().enumerate() {
+        // Calls go out whole, from the final parse only, and only with
+        // complete JSON arguments: a partial parse can accept bytes the final
+        // parse rejects (an out-of-order argument), and a turn cut off
+        // mid-call (`max_tokens`) parses to an unterminated object.
+        for c in calls.iter().filter(|_| !partial) {
             let name = c["function"]["name"].as_str().unwrap_or_default();
             let args = c["function"]["arguments"].as_str().unwrap_or_default();
-            // Announce a call once its name is complete: arguments started,
-            // or the turn ended.
-            if i == self.args.len() {
-                if name.is_empty() || (partial && args.is_empty()) {
-                    break;
-                }
-                send(Event::ToolCall(ToolCall {
-                    index: Some(i as u32),
-                    id: Some(format!("call_{}", uuid::Uuid::new_v4().simple())),
-                    kind: Some("function".into()),
-                    function: FunctionCall {
-                        name: Some(name.into()),
-                        arguments: args.into(),
-                    },
-                }));
-                self.args.push(args.into());
-                self.calls += 1;
+            let json =
+                args.trim().is_empty() || serde_json::from_str::<serde_json::Value>(args).is_ok();
+            if name.is_empty() || !json {
+                tracing::warn!(
+                    name,
+                    args_len = args.len(),
+                    "dropped a tool call that did not parse"
+                );
                 continue;
             }
-            let seen = &mut self.args[i];
-            if let Some(add) = args.strip_prefix(seen.as_str()).filter(|a| !a.is_empty()) {
-                send(Event::ToolCall(ToolCall {
-                    index: Some(i as u32),
-                    id: None,
-                    kind: None,
-                    function: FunctionCall {
-                        name: None,
-                        arguments: add.into(),
-                    },
-                }));
-                *seen = args.into();
-            }
+            send(Event::ToolCall(ToolCall {
+                index: Some(self.calls as u32),
+                id: Some(format!("call_{}", uuid::Uuid::new_v4().simple())),
+                kind: Some("function".into()),
+                function: FunctionCall {
+                    name: Some(name.into()),
+                    arguments: args.into(),
+                },
+            }));
+            self.calls += 1;
         }
         let diverged =
             !partial && self.fast && (self.content != content || self.reasoning != reasoning);
@@ -1518,6 +1509,59 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 40, "{checked} parsers");
+    }
+
+    /// Streamed tool-call arguments always parse as JSON, including when a
+    /// partial parse accepted a prefix the final parse rejects (an optional
+    /// argument before a required one) and when the turn ends mid-call.
+    #[test]
+    fn streamed_tool_call_arguments_are_always_valid_json() {
+        let tools = r#"[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path"]}}}]"#;
+        let r = render(GLM, Some(tools));
+        let call = "x</think><tool_call>write<arg_key>";
+        for (text, want) in [
+            (
+                "content</arg_key><arg_value>a</arg_value><arg_key>path</arg_key><arg_value>p</arg_value></tool_call>",
+                None,
+            ),
+            (
+                "path</arg_key><arg_value>p</arg_value><arg_key>content</arg_key><arg_value>a</arg_value></tool_call>",
+                Some(serde_json::json!({"path": "p", "content": "a"})),
+            ),
+            ("path</arg_key><arg_value>p", None),
+        ] {
+            let text = format!("{call}{text}");
+            let args = std::cell::RefCell::new(Vec::new());
+            let send = |ev: Event| {
+                if let Event::ToolCall(c) = ev {
+                    args.borrow_mut().push(c.function.arguments);
+                }
+            };
+            let mut ts = OutputStream::new(false);
+            for (i, c) in text.char_indices() {
+                ts.push(&r.parser, &text[i..i + c.len_utf8()], true, &send);
+            }
+            ts.push(&r.parser, "", false, &send);
+            let got: Vec<serde_json::Value> = args
+                .into_inner()
+                .iter()
+                .map(|a| serde_json::from_str(a).unwrap_or_else(|e| panic!("{a:?}: {e}")))
+                .collect();
+            assert_eq!(ts.calls, got.len(), "{text}");
+            assert_eq!(got, want.into_iter().collect::<Vec<_>>(), "{text}");
+        }
+        let r = render(
+            GLM,
+            Some(
+                r#"[{"type":"function","function":{"name":"ls","parameters":{"type":"object","properties":{}}}}]"#,
+            ),
+        );
+        let (events, _) = stream(&r, &["x</think><tool_call>ls</tool_call>"], false);
+        let calls: Vec<_> = events
+            .iter()
+            .filter(|e| e.starts_with("ToolCall"))
+            .collect();
+        assert_eq!(calls.len(), 1, "{events:?}");
     }
 
     /// A failed partial parse never streams text a later parse could
