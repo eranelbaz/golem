@@ -822,7 +822,9 @@ pub struct SessionHooks {
     vram_stream: bool,
     /// Both stream slabs' bytes (0 without streaming).
     stream_slab_vram: u64,
-    /// Device bytes of one K slot across the model (§3.4).
+    /// Device bytes of one K slot across the model (§3.4). Read only on
+    /// the HIP path (`refit_stream_k`'s VRAM query).
+    #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
     slab_bytes_per_expert: u64,
 }
 
