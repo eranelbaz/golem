@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare parity dumps: exact tokens, logits within tolerance.
 
-Usage: t4_gate_cmp.py <baseline.jsonl> <candidate.jsonl>
+Usage: fork-parity-gate-cmp.py <baseline.jsonl> <candidate.jsonl>
 Tolerance: 1e-4 relative (covers codegen drift across machines, observed up
 a real numeric regression shifts logits far more, and flips tokens first
 under greedy decode).

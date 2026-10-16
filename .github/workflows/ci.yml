@@ -77,7 +77,7 @@ jobs:
   # No build-substrate.sh (HIP-only, no args): CPU substrate comes from
   # golem-llama-sys/build.rs via GOLEM_LLAMA_SYS_BACKEND=cpu; the gate's
   # cmake build is its own upstream-test tree (one substrate each).
-  t4-patch-p1:
+  fork-parity-patch-p1:
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -92,7 +92,7 @@ jobs:
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo run -p xtask -- gen-tiny-moe --out /tmp/tiny-moe.gguf
           cargo build -p golem-cli
-          scripts/t4_gate.sh --upstream-tests target/debug/golem /tmp/tiny-moe.gguf
+          scripts/fork-parity-gate.sh --upstream-tests target/debug/golem /tmp/tiny-moe.gguf
 
   # P3 functional acceptance: the split-scheduler
   # expert-copy path only executes where a GPU split exists, so this leg runs
