@@ -1010,6 +1010,10 @@ pub struct P3Stats {
     pub prefetch_hits: AtomicU64,
     /// Bytes of prefetched units evicted without a demand claim (§11).
     pub prefetch_wasted_bytes: AtomicU64,
+    /// Times the prefetcher stood down for an in-flight demand page-in
+    /// (§6.5 demand priority): once per demand window, whether it skipped
+    /// rounds or cut a batch short.
+    pub prefetch_standdowns: AtomicU64,
     /// Claims served from residency (no I/O).
     pub fast_hits: AtomicU64,
     /// Total bytes moved from source into pool slots.

@@ -21,8 +21,16 @@
 //! ```
 //!
 //! Prints per-replica expected chunk share, wall-clock and disk-time GB/s,
-//! and final replica health. Errors return `Err` from `run`; `main` exits
-//! nonzero on error (the one documented exit path in this binary).
+//! and final replica health.
+//!
+//! `--whole` bypasses the queue: one 4 KiB-aligned `O_DIRECT` `pread` per
+//! plane on replica `--replica <i>` (default 0). With `max_sectors_kb = 128`
+//! a 5.9 MB read is ≈45 device requests in flight (§5.4).
+//! `--piece <bytes>` (a multiple of 4096) splits each plane into back-to-back
+//! reads of that size on the same drive (e.g. 2097152 for the old 2 MiB cap).
+//!
+//! Errors return `Err` from `run`; `main` exits nonzero on error (the one
+//! documented exit path in this binary).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +50,9 @@ struct Args {
     seed: u64,
     io_threads: usize,
     sequential: bool,
+    whole: bool,
+    replica: usize,
+    piece: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -51,11 +62,31 @@ fn parse_args() -> Result<Args, String> {
     let mut seed = 0u64;
     let mut io_threads = 0usize;
     let mut sequential = false;
+    let mut whole = false;
+    let mut replica = 0usize;
+    let mut piece = 0usize;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--sequential" => {
                 sequential = true;
+            }
+            "--whole" => {
+                whole = true;
+            }
+            "--replica" => {
+                replica = it
+                    .next()
+                    .ok_or("--replica needs a value")?
+                    .parse()
+                    .map_err(|_| "--replica must be a usize")?;
+            }
+            "--piece" => {
+                piece = it
+                    .next()
+                    .ok_or("--piece needs a value")?
+                    .parse()
+                    .map_err(|_| "--piece must be a usize")?;
             }
             "--io-threads" => {
                 io_threads = it
@@ -90,10 +121,13 @@ fn parse_args() -> Result<Args, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>] [--sequential] [--io-threads <usize>]"
+                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>] [--sequential] [--whole [--replica <i>] [--piece <bytes>]] [--io-threads <usize>]"
                 ));
             }
         }
+    }
+    if piece != 0 && !whole {
+        return Err("--piece needs --whole".into());
     }
     Ok(Args {
         manifest: PathBuf::from(manifest.ok_or("--manifest <path> is required")?),
@@ -102,6 +136,9 @@ fn parse_args() -> Result<Args, String> {
         seed,
         io_threads,
         sequential,
+        whole,
+        replica,
+        piece,
     })
 }
 
@@ -113,6 +150,19 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Read `i`'s offset in a shard of `bytes`, shared by both modes.
+fn read_offset(args: &Args, bytes: u64, i: usize, shard_count: usize) -> u64 {
+    let usable = bytes.saturating_sub(args.plane_bytes as u64).max(1);
+    let steps = (usable / CHUNK as u64).max(1);
+    if args.sequential {
+        // Real page_in shape: a cold layer's planes are contiguous per
+        // shard, so consecutive reads walk the file forward.
+        ((i / shard_count) as u64 * args.plane_bytes as u64) % usable
+    } else {
+        (mix64(args.seed ^ mix64(i as u64)) % steps) * CHUNK as u64
+    }
+}
+
 fn run() -> Result<(), golem_store::StoreError> {
     let args = parse_args().map_err(|e| golem_store::StoreError::Invalid { msg: e })?;
     let manifest = load_manifest(&args.manifest)?;
@@ -120,6 +170,9 @@ fn run() -> Result<(), golem_store::StoreError> {
         return Err(golem_store::StoreError::Invalid {
             msg: "manifest has no shards".into(),
         });
+    }
+    if args.whole {
+        return run_whole(&args, &manifest);
     }
     let registry = ReplicaRegistry::open(&manifest)?;
     let queue = Arc::new(ChunkQueue::new(args.io_threads, None)); // 0 = one reader thread per physical drive (§5.2); 2 = two per drive (D-12)
@@ -156,16 +209,7 @@ fn run() -> Result<(), golem_store::StoreError> {
     let t0 = Instant::now();
     for i in 0..args.n {
         let s = i % shard_count;
-        let shard = &manifest.shards[s];
-        let usable = shard.bytes.saturating_sub(args.plane_bytes as u64).max(1);
-        let steps = (usable / CHUNK as u64).max(1);
-        let offset = if args.sequential {
-            // Real page_in shape: a cold layer's planes are contiguous per
-            // shard, so consecutive reads walk the file forward.
-            ((i / shard_count) as u64 * args.plane_bytes as u64) % usable
-        } else {
-            (mix64(args.seed ^ mix64(i as u64)) % steps) * CHUNK as u64
-        };
+        let offset = read_offset(&args, manifest.shards[s].bytes, i, shard_count);
         let plan = plan_aligned(offset, args.plane_bytes);
         let covering: usize = plan.iter().map(|c| c.1).sum();
         let (dst, rest) = buf.split_at_mut(covering);
@@ -240,6 +284,101 @@ fn run() -> Result<(), golem_store::StoreError> {
             .map(|r| r.path.display().to_string())
             .collect::<Vec<_>>()
     });
+    Ok(())
+}
+
+/// `--whole`: one aligned `O_DIRECT` read per plane, same offsets as the
+/// queued run, rotating over shards on replica `--replica`.
+fn run_whole(
+    args: &Args,
+    manifest: &golem_store::ModelManifest,
+) -> Result<(), golem_store::StoreError> {
+    use std::os::unix::fs::FileExt;
+    let align = golem_store::sys::DIRECT_ALIGN;
+    if !args.piece.is_multiple_of(align as usize) {
+        return Err(golem_store::StoreError::Invalid {
+            msg: format!("--piece {} is not a multiple of {align}", args.piece),
+        });
+    }
+    let files = manifest
+        .shards
+        .iter()
+        .map(|s| {
+            let root =
+                s.replicas
+                    .get(args.replica)
+                    .ok_or_else(|| golem_store::StoreError::Invalid {
+                        msg: format!("shard {} has no replica {}", s.file, args.replica),
+                    })?;
+            let path = root.join(&s.file);
+            golem_store::sys::open_direct(&path).map_err(|e| golem_store::StoreError::Invalid {
+                msg: format!("{}: O_DIRECT open: {e}", path.display()),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(s) = manifest
+        .shards
+        .iter()
+        .find(|s| s.bytes < args.plane_bytes as u64)
+    {
+        return Err(golem_store::StoreError::Invalid {
+            msg: format!("shard {} ({} B) is smaller than one plane", s.file, s.bytes),
+        });
+    }
+    let span = (args.plane_bytes as u64).div_ceil(align) * align + align;
+    let mut raw = vec![0u8; span as usize + align as usize];
+    let skip = (align as usize - raw.as_ptr() as usize % align as usize) % align as usize;
+    let buf = &mut raw[skip..skip + span as usize];
+    let shard_count = manifest.shards.len();
+    let mut device = 0u64;
+    let t0 = Instant::now();
+    for i in 0..args.n {
+        let s = i % shard_count;
+        let offset = read_offset(args, manifest.shards[s].bytes, i, shard_count);
+        let start = offset - offset % align;
+        let len = ((offset + args.plane_bytes as u64).div_ceil(align) * align - start) as usize;
+        let piece = if args.piece == 0 { len } else { args.piece };
+        let mut got = 0;
+        for at in (0..len).step_by(piece) {
+            let end = (at + piece).min(len);
+            let pos = start + at as u64;
+            let n = files[s].read_at(&mut buf[at..end], pos).map_err(|e| {
+                golem_store::StoreError::Invalid {
+                    msg: format!("shard {s} pread @{pos}+{}: {e}", end - at),
+                }
+            })?;
+            got += n;
+            if n < end - at {
+                break;
+            }
+        }
+        // The aligned tail may pass EOF; the logical plane must not.
+        if (start + got as u64) < offset + args.plane_bytes as u64 {
+            return Err(golem_store::StoreError::Invalid {
+                msg: format!("shard {s} short read @{start}: {got}/{len}"),
+            });
+        }
+        device += got as u64;
+    }
+    let wall = t0.elapsed();
+    let total = args.n as u64 * args.plane_bytes as u64;
+    println!(
+        "reads: {} × {} B (logical), O_DIRECT, piece {}",
+        args.n,
+        args.plane_bytes,
+        if args.piece == 0 {
+            "whole".to_owned()
+        } else {
+            args.piece.to_string()
+        }
+    );
+    let secs = wall.as_secs_f64();
+    println!(
+        "wall: {:.3?} → {:.2} GB/s logical, {:.2} GB/s device",
+        wall,
+        total as f64 / secs / 1e9,
+        device as f64 / secs / 1e9
+    );
     Ok(())
 }
 

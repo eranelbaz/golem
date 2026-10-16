@@ -28,8 +28,8 @@ pub struct MetricsSnapshot {
     pub h2d_copies: Option<(u64, u64)>,
     /// P3: demand page-ins, fast hits, evictions, bytes paged, source errors.
     pub p3: Option<[u64; 5]>,
-    /// §6.5: prefetch page-ins, hits, wasted bytes.
-    pub prefetch: Option<(u64, u64, u64)>,
+    /// §6.5: prefetch page-ins, hits, wasted bytes, demand stand-downs.
+    pub prefetch: Option<(u64, u64, u64, u64)>,
     /// §7.1 snapshot cache: hits, misses, restore failures, evictions,
     /// dropped oversize, used bytes.
     pub snapshots: Option<[u64; 6]>,
@@ -67,9 +67,14 @@ impl MetricsSnapshot {
                 p.source_errors.load(Ordering::Relaxed),
             ]
         });
-        self.prefetch = s
-            .prefetch_stats()
-            .map(|p| (p.prefetch_pageins, p.prefetch_hits, p.prefetch_wasted_bytes));
+        self.prefetch = s.prefetch_stats().map(|p| {
+            (
+                p.prefetch_pageins,
+                p.prefetch_hits,
+                p.prefetch_wasted_bytes,
+                p.prefetch_standdowns,
+            )
+        });
         self.snapshots = s.snapshot_stats().map(|x| {
             [
                 x.hits,
@@ -179,7 +184,7 @@ pub(crate) fn render(h: &HealthState) -> String {
             errs as f64,
         );
     }
-    if let Some((pageins, hits, wasted)) = m.prefetch {
+    if let Some((pageins, hits, wasted, standdowns)) = m.prefetch {
         let rate = if pageins == 0 {
             0.0
         } else {
@@ -196,6 +201,12 @@ pub(crate) fn render(h: &HealthState) -> String {
             "counter",
             "Prefetched bytes evicted unused",
             wasted as f64,
+        );
+        g(
+            "golem_prefetch_standdown_total",
+            "counter",
+            "Times the prefetcher stood down for a demand page-in",
+            standdowns as f64,
         );
     }
     if let Some([hits, misses, rf, ev, drop, used]) = m.snapshots {

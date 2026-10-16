@@ -57,10 +57,30 @@ use crate::error::EngineError;
 /// preallocated flat id buffer (§11 pattern — no per-id heap write).
 struct TraceRec {
     step: u64,
-    prefill: bool,
+    phase: TracePhase,
     layer: i32,
     start: usize,
     len: usize,
+}
+
+/// A trace record's phase column: routed ids of a prefill chunk (`pf`) or a
+/// decode step (`dc`), or a P5 prediction for the layer (`pr`, ids in
+/// descending router score, top k + margin).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TracePhase {
+    Prefill,
+    Decode,
+    Predict,
+}
+
+impl TracePhase {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Prefill => "pf",
+            Self::Decode => "dc",
+            Self::Predict => "pr",
+        }
+    }
 }
 
 /// Preallocated per-step routing-trace ring (§11 timing-CSV pattern): the
@@ -86,11 +106,22 @@ struct TraceRing {
 /// chunk or decode step, layer), `top_k` ids per token per layer; a turn's
 /// tokens are bounded by `n_ctx + n_predict`. GLM at ctx 4096 + 512, batch
 /// 512: 21.8k records, 1.5M ids ≈ 6 MiB; at ctx 131072: 33k records, 44M
-/// ids ≈ 177 MB (opt-in `--routing-trace` only).
-fn trace_caps(n_ctx: u32, n_predict: u32, batch: u32, n_layers: u32, top_k: u32) -> (usize, usize) {
-    let (ctx, pred, layers) = (n_ctx as usize, n_predict as usize, n_layers as usize);
-    let recs = (ctx.div_ceil(batch.max(1) as usize) + pred) * layers;
-    (recs, (ctx + pred) * layers * top_k as usize)
+/// ids ≈ 177 MB (opt-in `--routing-trace` only). With prediction on, each
+/// decode step adds `lookahead` records of `top_k + margin` ids per layer:
+/// 512 steps × 42 layers × 12 ids ≈ 21.5k records, 258k ids ≈ 1 MB more.
+fn trace_caps(
+    n_ctx: u32,
+    n_predict: u32,
+    batch: u32,
+    n_layers: u32,
+    top_k: u32,
+    pred: (u32, u32),
+) -> (usize, usize) {
+    let (ctx, steps, layers) = (n_ctx as usize, n_predict as usize, n_layers as usize);
+    let (lookahead, pred_ids) = (pred.0 as usize, pred.1 as usize);
+    let recs = (ctx.div_ceil(batch.max(1) as usize) + steps * (1 + lookahead)) * layers;
+    let ids = ((ctx + steps) * top_k as usize + steps * lookahead * pred_ids) * layers;
+    (recs, ids)
 }
 
 impl TraceRing {
@@ -108,7 +139,7 @@ impl TraceRing {
 
     /// Appends one routing readback. Pure push-into-capacity: no allocation
     /// on the decode hot path.
-    fn record(&mut self, step: u64, prefill: bool, layer: i32, ids: &[i32]) {
+    fn record(&mut self, step: u64, phase: TracePhase, layer: i32, ids: &[i32]) {
         if self.records.len() >= self.rec_cap || self.ids.len() + ids.len() > self.id_cap {
             self.dropped += 1;
             return;
@@ -117,7 +148,7 @@ impl TraceRing {
         self.ids.extend_from_slice(ids);
         self.records.push(TraceRec {
             step,
-            prefill,
+            phase,
             layer,
             start,
             len: ids.len(),
@@ -150,13 +181,7 @@ impl TraceRing {
             )?;
         }
         for r in &self.records {
-            write!(
-                w,
-                "{}\t{}\t{}\t",
-                r.step,
-                if r.prefill { "pf" } else { "dc" },
-                r.layer
-            )?;
+            write!(w, "{}\t{}\t{}\t", r.step, r.phase.tag(), r.layer)?;
             let ids = &self.ids[r.start..r.start + r.len];
             for (i, id) in ids.iter().enumerate() {
                 if i > 0 {
@@ -435,6 +460,8 @@ pub struct PrefetchStats {
     pub prefetch_hits: u64,
     /// Bytes of prefetched units evicted unused.
     pub prefetch_wasted_bytes: u64,
+    /// Times the prefetcher stood down for a demand page-in.
+    pub prefetch_standdowns: u64,
 }
 
 impl std::fmt::Display for PrefetchStats {
@@ -449,14 +476,15 @@ impl std::fmt::Display for PrefetchStats {
         write!(
             f,
             "prefetch mode={:?} prediction_recall={:.1}% ({}/{}) prefetch_pageins={} \
-             prefetch_hit_rate={:.1}% prefetch_wasted_bytes={}",
+             prefetch_hit_rate={:.1}% prefetch_wasted_bytes={} prefetch_standdowns={}",
             self.mode,
             pct(self.predicted_hits, self.predicted_routed),
             self.predicted_hits,
             self.predicted_routed,
             self.prefetch_pageins,
             pct(self.prefetch_hits, self.prefetch_pageins),
-            self.prefetch_wasted_bytes
+            self.prefetch_wasted_bytes,
+            self.prefetch_standdowns
         )
     }
 }
@@ -896,6 +924,7 @@ impl SessionHooks {
             prefetch_pageins: s.prefetch_pageins.load(Ordering::Relaxed),
             prefetch_hits: s.prefetch_hits.load(Ordering::Relaxed),
             prefetch_wasted_bytes: s.prefetch_wasted_bytes.load(Ordering::Relaxed),
+            prefetch_standdowns: s.prefetch_standdowns.load(Ordering::Relaxed),
         }
     }
 
@@ -1757,12 +1786,18 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // Routing-trace ring (§11 pattern), preallocated at enable — overflow
     // drops and counts instead of reallocating on the hot path.
     let trace = config.routing_trace.as_ref().map(|_| {
+        let pred = if config.prefetch == PrefetchMode::Off {
+            (0, 0)
+        } else {
+            (config.prefetch_lookahead, n_expert_used + PREDICT_MARGIN)
+        };
         let (rec_cap, id_cap) = trace_caps(
             config.n_ctx,
             config.n_predict,
             config.batch_tokens,
             n_layers,
             n_expert_used,
+            pred,
         );
         // Model file (hashed into the header), not the trace output path.
         Mutex::new(TraceRing::new(config.model_path.clone(), rec_cap, id_cap))
@@ -2553,7 +2588,8 @@ pub extern "C" fn evict_abandon(payload: *mut c_void, blk: i32, experts: *const 
 /// for `target_blk`, decode ubatches only. Adds them to the target layer's
 /// pending prediction and acts per mode: `protect` shields the union from
 /// RAM eviction, `read` queues it for the prefetch thread. One shard lock or
-/// one queue lock per call — never per expert.
+/// one queue lock per call — never per expert — plus the trace lock when
+/// `--routing-trace` is on.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn predict(
     payload: *mut c_void,
@@ -2578,6 +2614,14 @@ pub extern "C" fn predict(
         let layer = (target_blk - lead) as usize;
         // SAFETY: C passes `n_ids` ids it read this step.
         let ids = unsafe { std::slice::from_raw_parts(ids, n_ids as usize) };
+        if let Some(trace) = &h.trace {
+            trace.lock().unwrap_or_else(|e| e.into_inner()).record(
+                h.policy.step.load(Ordering::Relaxed),
+                TracePhase::Predict,
+                target_blk,
+                ids,
+            );
+        }
         let new = h.pred.add(layer, ids, h.n_experts);
         match (&h.pred.mode, &h.pred.queue) {
             (PrefetchMode::Protect, _) => {
@@ -2637,12 +2681,12 @@ pub extern "C" fn routing(
         }
         if let Some(trace) = &h.trace {
             let mut t = trace.lock().unwrap_or_else(|e| e.into_inner());
-            t.record(
-                h.policy.step.load(Ordering::Relaxed),
-                !h.policy.scoring.load(Ordering::Relaxed),
-                blk,
-                ids,
-            );
+            let phase = if h.policy.scoring.load(Ordering::Relaxed) {
+                TracePhase::Decode
+            } else {
+                TracePhase::Prefill
+            };
+            t.record(h.policy.step.load(Ordering::Relaxed), phase, blk, ids);
         }
         // Prefill-stream read-ahead (§7.6.3): this layer's ids are known —
         // warm its up/down planes and the next layer's whole gate plane.
@@ -2822,9 +2866,13 @@ mod tests {
     #[test]
     fn trace_caps_cover_every_layer_of_every_token() {
         // GLM: 1024-token ctx in 512-token chunks + 32 decode steps × 42 layers.
-        let (recs, ids) = trace_caps(1024, 32, 512, 42, 8);
+        let (recs, ids) = trace_caps(1024, 32, 512, 42, 8, (0, 0));
         assert_eq!(recs, (2 + 32) * 42);
         assert_eq!(ids, 1056 * 42 * 8);
+        // Lookahead 1 at top 12 adds one 12-id record per decode step per layer.
+        let (recs, ids) = trace_caps(1024, 32, 512, 42, 8, (1, 12));
+        assert_eq!(recs, (2 + 2 * 32) * 42);
+        assert_eq!(ids, (1056 * 8 + 32 * 12) * 42);
     }
 
     #[test]
