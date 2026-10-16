@@ -22,6 +22,8 @@ const EXCLUSIVE_EXTRA_GIB: f64 = 10.6;
 const GIB: f64 = (1u64 << 30) as f64;
 /// Decode steps per trace in the cold-start window (`Stats::d_early`).
 const EARLY_STEPS: usize = 32;
+/// Prediction margins beyond top-k scored against disk misses (§6.5).
+const MARGINS: [usize; 3] = [0, 2, 4];
 
 /// Expert geometry the replay needs: per-layer unit bytes (gate + up +
 /// down of one expert) and the per-unit-size classes of the RAM pool.
@@ -72,25 +74,37 @@ pub struct Compute {
     pub step: u64,
     /// (expert layer, routed ids) per MoE layer, in execution order.
     pub layers: Vec<(u32, Vec<u16>)>,
+    /// (expert layer, predicted ids in descending router score) from `pr`
+    /// records (§6.5 P5), made before that layer ran.
+    pub predicted: Vec<(u32, Vec<u16>)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Trace {
     pub name: String,
     pub computes: Vec<Compute>,
+    /// Header `top_k=`: the routed width a `pr` record's margin is cut on.
+    pub top_k: Option<usize>,
 }
 
 impl Trace {
     /// Parses a `# golem-routing-trace v1` file. Blk numbers map to expert
     /// layers by subtracting `lead`; a new compute starts whenever the blk
-    /// number does not increase or the step/phase changes.
+    /// number does not increase or the step/phase changes. `pr` rows attach
+    /// to the decode step they were made in, never start a compute.
     pub fn parse(name: &str, text: &str, lead: u32, geo: &Geo) -> Result<Self, String> {
         let mut lines = text.lines();
         let header = lines.next().ok_or("empty trace")?;
         if !header.starts_with("# golem-routing-trace v1") {
             return Err(format!("{name}: not a routing trace: {header}"));
         }
+        let top_k = header
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("top_k="))
+            .and_then(|v| v.parse().ok());
         let mut computes: Vec<Compute> = Vec::new();
+        // `pr` rows seen before their step's first `dc` row.
+        let mut pending: Vec<(u64, u32, Vec<u16>)> = Vec::new();
         let mut prev_blk = u32::MAX;
         for (n, line) in lines.enumerate() {
             let line = line.trim_end_matches('\r');
@@ -104,7 +118,7 @@ impl Trace {
             };
             let step: u64 = step.parse().map_err(|_| bad("step"))?;
             let decode = match phase {
-                "dc" => true,
+                "dc" | "pr" => true,
                 "pf" => false,
                 _ => return Err(bad("phase")),
             };
@@ -122,6 +136,15 @@ impl Trace {
                 })
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| bad("ids"))?;
+            if phase == "pr" {
+                // The prediction for blk is made after blk - lookahead ran,
+                // so it belongs to the step's open compute, if any.
+                match computes.last_mut().filter(|c| c.step == step && c.decode) {
+                    Some(c) => c.predicted.push((layer, ids)),
+                    None => pending.push((step, layer, ids)),
+                }
+                continue;
+            }
             // A multi-token prefill chunk repeats ids; P2 works on the set.
             ids.sort_unstable();
             ids.dedup();
@@ -129,10 +152,16 @@ impl Trace {
                 .last()
                 .is_some_and(|c| c.step == step && c.decode == decode && blk > prev_blk);
             if !same {
+                let predicted = pending
+                    .drain(..)
+                    .filter(|&(s, _, _)| decode && s == step)
+                    .map(|(_, l, p)| (l, p))
+                    .collect();
                 computes.push(Compute {
                     decode,
                     step,
                     layers: Vec::new(),
+                    predicted,
                 });
             }
             computes
@@ -145,6 +174,7 @@ impl Trace {
         Ok(Self {
             name: name.to_owned(),
             computes,
+            top_k,
         })
     }
 
@@ -359,6 +389,9 @@ pub struct Config {
     pub exclusive: bool,
     /// Background RAM → VRAM promotions per decode step (§6.3; 0 = off).
     pub promote: u32,
+    /// One VRAM arena per unit class holding `layers × K` slots, victims
+    /// chosen across layers, instead of K slots per layer (§3.4 P2).
+    pub global_vram: bool,
 }
 
 /// Decode-step totals (prefill computes move residency but are not counted).
@@ -377,6 +410,16 @@ pub struct Stats {
     pub prefill_disk_bytes: u64,
     /// Background promotions issued (each one unit of off-critical-path H2D).
     pub promoted: u64,
+    /// Decode layers with a `pr` prediction: routed units neither tier
+    /// held when the layer ran (would-be disk misses), and their bytes.
+    pub pred_disk_units: u64,
+    pub pred_disk_bytes: u64,
+    /// Per [`MARGINS`]: of those, units the top (k + margin) named, and
+    /// bytes of named units neither tier held that the layer did not route.
+    pub pred_caught: [u64; MARGINS.len()],
+    pub pred_wasted_bytes: [u64; MARGINS.len()],
+    /// `pr` records whose layer did not run later in the same compute.
+    pub pred_unmatched: u64,
 }
 
 impl Stats {
@@ -404,8 +447,25 @@ impl Stats {
         pct(self.prefill_disk_bytes, self.prefill_bytes)
     }
 
+    /// Recall at `MARGINS[m]` over would-be disk misses.
+    pub fn pred_recall(&self, m: usize) -> f64 {
+        pct(self.pred_caught[m], self.pred_disk_units)
+    }
+
+    /// Wasted prefetch bytes at `MARGINS[m]` as a share of demand disk bytes.
+    pub fn pred_waste(&self, m: usize) -> f64 {
+        pct(self.pred_wasted_bytes[m], self.pred_disk_bytes)
+    }
+
     fn add(&mut self, o: Stats) {
         self.promoted += o.promoted;
+        self.pred_disk_units += o.pred_disk_units;
+        self.pred_disk_bytes += o.pred_disk_bytes;
+        self.pred_unmatched += o.pred_unmatched;
+        for m in 0..MARGINS.len() {
+            self.pred_caught[m] += o.pred_caught[m];
+            self.pred_wasted_bytes[m] += o.pred_wasted_bytes[m];
+        }
         self.prefill_bytes += o.prefill_bytes;
         self.prefill_disk_bytes += o.prefill_disk_bytes;
         self.early_bytes += o.early_bytes;
@@ -442,7 +502,7 @@ impl<'g> Sim<'g> {
         let e = geo.n_experts;
         let n_keys = (geo.n_layers() * e) as usize;
         let slots = class_slots(&geo.classes, cfg.pool_bytes);
-        let ram_keys = geo
+        let ram_keys: Vec<Vec<u32>> = geo
             .classes
             .iter()
             .map(|(_, layers)| {
@@ -452,19 +512,29 @@ impl<'g> Sim<'g> {
                     .collect()
             })
             .collect();
-        let vram_keys = (0..geo.n_layers())
-            .map(|l| (0..e).map(|x| l * e + x).collect())
-            .collect();
+        // MUL_MAT_ID wants one plane type per `as` tensor, so a shared arena
+        // is per unit class; the routed layer's keys are leased, which keeps
+        // its top-k floor.
+        let (vram_keys, vram_cap) = if cfg.global_vram {
+            let cap = geo
+                .classes
+                .iter()
+                .map(|(_, layers)| layers.len() as u64 * u64::from(cfg.k))
+                .collect();
+            (ram_keys.clone(), cap)
+        } else {
+            (
+                (0..geo.n_layers())
+                    .map(|l| (0..e).map(|x| l * e + x).collect())
+                    .collect(),
+                vec![u64::from(cfg.k); geo.n_layers() as usize],
+            )
+        };
         Self {
             geo,
             exclusive: cfg.exclusive,
             ram: Tier::new(cfg.ram, n_keys, ram_keys, slots),
-            vram: Tier::new(
-                cfg.vram,
-                n_keys,
-                vram_keys,
-                vec![u64::from(cfg.k); geo.n_layers() as usize],
-            ),
+            vram: Tier::new(cfg.vram, n_keys, vram_keys, vram_cap),
             tick: 0,
             base: 0,
             promote_budget: cfg.promote,
@@ -555,6 +625,59 @@ impl<'g> Sim<'g> {
         fill(&mut self.ram, &|k| exclusive && vram.resident(k));
     }
 
+    /// Books `layer`'s `pr` predictions against the units it routes that
+    /// neither tier holds, before the layer's accesses move residency. The
+    /// prefetch reads themselves are not simulated, so waste is a lower
+    /// bound. Each record is cut at `k + margin`; with lookahead > 1 a layer
+    /// is scored on the union of its records, as `protect` shields it.
+    fn score_prediction(
+        &self,
+        c: &Compute,
+        k: usize,
+        layer: u32,
+        ids: &[u16],
+        bytes: u64,
+        st: &mut Stats,
+    ) {
+        let e = self.geo.n_experts;
+        let cold = |id: u16| {
+            let key = layer * e + u32::from(id);
+            !self.vram.resident(key) && !self.ram.resident(key)
+        };
+        let preds: Vec<&[u16]> = c
+            .predicted
+            .iter()
+            .filter(|(l, _)| *l == layer)
+            .map(|(_, p)| p.as_slice())
+            .collect();
+        if preds.is_empty() {
+            return;
+        }
+        let named = |id: u16, m: usize| {
+            preds
+                .iter()
+                .any(|p| p[..(k + m).min(p.len())].contains(&id))
+        };
+        for &id in ids.iter().filter(|&&id| cold(id)) {
+            st.pred_disk_units += 1;
+            st.pred_disk_bytes += bytes;
+            for (i, &m) in MARGINS.iter().enumerate() {
+                st.pred_caught[i] += u64::from(named(id, m));
+            }
+        }
+        for (i, &m) in MARGINS.iter().enumerate() {
+            let mut seen: Vec<u16> = Vec::new();
+            for p in &preds {
+                for &id in &p[..(k + m).min(p.len())] {
+                    if !seen.contains(&id) && !ids.contains(&id) && cold(id) {
+                        st.pred_wasted_bytes[i] += bytes;
+                    }
+                    seen.push(id);
+                }
+            }
+        }
+    }
+
     pub fn run(&mut self, trace: &Trace) -> Result<Stats, String> {
         let e = self.geo.n_experts;
         let mut st = Stats::default();
@@ -569,6 +692,10 @@ impl<'g> Sim<'g> {
             for (layer, ids) in &c.layers {
                 self.vram.epoch += 1;
                 let bytes = self.geo.unit[*layer as usize];
+                if c.decode {
+                    let k = trace.top_k.unwrap_or(ids.len());
+                    self.score_prediction(c, k, *layer, ids, bytes, &mut st);
+                }
                 for &id in ids {
                     let key = layer * e + u32::from(id);
                     self.vram.lease[key as usize] = self.vram.epoch;
@@ -623,6 +750,11 @@ impl<'g> Sim<'g> {
             }
             if c.decode {
                 st.promoted += self.promote(now);
+            }
+            for (i, (l, _)) in c.predicted.iter().enumerate() {
+                let ran = c.layers.iter().any(|(r, _)| r == l);
+                let earlier = c.predicted[..i].iter().any(|(p, _)| p == l);
+                st.pred_unmatched += u64::from(!ran && !earlier);
             }
         }
         self.base = now + 1;
@@ -685,6 +817,7 @@ pub fn report(geo: &Geo, traces: &[Trace], k: u32) -> Result<String, String> {
         vram: Policy::Lru,
         exclusive: false,
         promote: 0,
+        global_vram: false,
     };
     let run = |cfg: Config, warm: bool| replay(geo, traces, cfg, warm, None);
     let mark = |pool: f64| {
@@ -882,6 +1015,85 @@ pub fn report(geo: &Geo, traces: &[Trace], k: u32) -> Result<String, String> {
         let r = run(Config { k: kk, ..cur(63.0) }, false)?;
         let _ = writeln!(o, "| {kk} | {} | {} |", pct1(r.vram_hit()), pct1(r.d()));
     }
+
+    let _ = writeln!(
+        o,
+        "\n### VRAM arena: K per layer vs one arena per unit class at equal slots \
+         (63 GiB), cold\n\n\
+         | residency | RAM policy | VRAM policy | per-layer VRAM hit % | arena VRAM hit % | per-layer d % | arena d % |\n\
+         |---|---|---|---|---|---|---|"
+    );
+    for (exclusive, ram, vram) in [
+        (false, Policy::Clock, Policy::Clock),
+        (false, Policy::Clock, Policy::Lru),
+        (false, Policy::Clock, decay),
+        (true, decay, decay),
+    ] {
+        let base = Config {
+            ram,
+            vram,
+            exclusive,
+            ..cur(63.0)
+        };
+        let a = run(base, false)?;
+        let b = run(
+            Config {
+                global_vram: true,
+                ..base
+            },
+            false,
+        )?;
+        let _ = writeln!(
+            o,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            if exclusive { "exclusive" } else { "inclusive" },
+            ram.label(),
+            vram.label(),
+            pct1(a.vram_hit()),
+            pct1(b.vram_hit()),
+            pct1(a.d()),
+            pct1(b.d())
+        );
+    }
+
+    let pred_cfg = Config {
+        vram: decay,
+        ..cur(63.0)
+    };
+    let p = run(pred_cfg, false)?;
+    let _ = writeln!(
+        o,
+        "\n### P5 prediction vs would-be disk misses (RAM CLOCK, VRAM {}, 63 GiB), cold\n",
+        decay.label()
+    );
+    if p.pred_disk_units == 0 {
+        let _ = writeln!(
+            o,
+            "No `pr` records in these traces: capture with `--prefetch protect --routing-trace`."
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "{} would-be disk-miss units in predicted layers ({:.2} GB); {} `pr` \
+             records for a layer that did not run in the same compute. With \
+             lookahead > 1 a layer is scored on the union of its records. Waste \
+             counts named units neither tier held and the layer did not route \
+             (lower bound: prefetch-induced evictions are not simulated).\n\n\
+             | margin | ids per record | recall of disk misses % | wasted bytes % of demand disk bytes |\n\
+             |---|---|---|---|",
+            p.pred_disk_units,
+            p.pred_disk_bytes as f64 / 1e9,
+            p.pred_unmatched
+        );
+        for (i, m) in MARGINS.iter().enumerate() {
+            let _ = writeln!(
+                o,
+                "| {m} | top-k + {m} | {} | {} |",
+                pct1(p.pred_recall(i)),
+                pct1(p.pred_waste(i))
+            );
+        }
+    }
     Ok(o)
 }
 
@@ -958,8 +1170,10 @@ mod tests {
                     decode: true,
                     step: s as u64,
                     layers: vec![(0, vec![id])],
+                    predicted: Vec::new(),
                 })
                 .collect(),
+            top_k: None,
         }
     }
 
@@ -971,6 +1185,7 @@ mod tests {
             vram: Policy::Lru,
             exclusive: false,
             promote: 0,
+            global_vram: false,
         }
     }
 
@@ -1051,6 +1266,7 @@ mod tests {
             decode: true,
             step: s,
             layers: vec![(0, a.to_vec()), (1, b.to_vec())],
+            predicted: Vec::new(),
         };
         let t = Trace {
             name: "t".into(),
@@ -1059,6 +1275,7 @@ mod tests {
                 c(1, [2, 3], [2, 3]),
                 c(2, [4, 5], [4, 5]),
             ],
+            top_k: None,
         };
         let st = replay(&g, &[t], cfg(5, 2, Policy::Clock), false, None).unwrap();
         assert_eq!(st.disk_bytes, 12 << 20);
@@ -1149,5 +1366,119 @@ mod tests {
         let lru = replay(&g, &[trace(&seq)], cfg(3, 1, Policy::Lru), false, None).unwrap();
         assert_eq!(decay.disk_bytes, 4 << 20, "A survives B, C, D");
         assert_eq!(lru.disk_bytes, 5 << 20, "LRU evicted A at D");
+    }
+
+    #[test]
+    fn pr_rows_attach_to_their_decode_step_in_score_order() {
+        let g = Geo {
+            unit: vec![1, 1],
+            n_experts: 8,
+            classes: vec![(1, vec![0, 1])],
+        };
+        let text = "# golem-routing-trace v1 model=x layers=2 top_k=1\n\
+                    0\tpf\t3\t1\n0\tdc\t3\t1\n0\tpr\t4\t5,2,7\n0\tdc\t4\t2\n\
+                    1\tpr\t3\t6,1\n1\tdc\t3\t6\n";
+        let t = Trace::parse("t", text, 3, &g).unwrap();
+        let shape: Vec<(bool, u64, usize, usize)> = t
+            .computes
+            .iter()
+            .map(|c| (c.decode, c.step, c.layers.len(), c.predicted.len()))
+            .collect();
+        assert_eq!(shape, [(false, 0, 1, 0), (true, 0, 2, 1), (true, 1, 1, 1)]);
+        assert_eq!(t.computes[1].predicted[0], (1, vec![5, 2, 7]), "unsorted");
+        assert_eq!(t.top_k, Some(1));
+    }
+
+    #[test]
+    fn a_pr_row_before_its_steps_first_dc_row_waits_for_that_compute() {
+        // Lead 0: blk 0 is the first expert layer, so no prev_blk reset may
+        // split the step.
+        let g = Geo {
+            unit: vec![1, 1],
+            n_experts: 8,
+            classes: vec![(1, vec![0, 1])],
+        };
+        let text = "# golem-routing-trace v1 model=x layers=2 top_k=1\n\
+                    0\tpr\t1\t3\n0\tdc\t0\t1\n0\tdc\t1\t3\n";
+        let t = Trace::parse("t", text, 0, &g).unwrap();
+        assert_eq!(t.computes.len(), 1);
+        assert_eq!(t.computes[0].layers.len(), 2);
+        assert_eq!(t.computes[0].predicted, [(1, vec![3])]);
+    }
+
+    #[test]
+    fn prediction_scores_only_would_be_disk_misses() {
+        // Top-1. Step 0 routes 0 (cold, unpredicted). Step 1 predicts [1, 2, 0]
+        // and routes 1: 0 is resident, so only 1 is a disk miss; margin 0 names
+        // 1 (caught, no waste), margin 2 also names 2 (cold, unrouted: waste)
+        // and 0 (resident: no waste).
+        let g = geo(8);
+        let mut t = trace(&[0, 1]);
+        t.computes[1].predicted = vec![(0, vec![1, 2, 0])];
+        let st = replay(&g, &[t], cfg(4, 1, Policy::Clock), false, None).unwrap();
+        assert_eq!((st.pred_disk_units, st.pred_disk_bytes), (1, 1 << 20));
+        assert_eq!(st.pred_caught, [1, 1, 1]);
+        assert_eq!(st.pred_wasted_bytes, [0, 1 << 20, 1 << 20]);
+        assert_eq!(st.pred_unmatched, 0);
+    }
+
+    #[test]
+    fn lookahead_records_score_as_one_union_and_cut_at_top_k() {
+        // top_k 1 from the header, two records for one layer naming 2 twice:
+        // margin 0 names {1, 2} (2 wasted once); a stray record for layer 3
+        // never runs and is counted unmatched.
+        let g = geo(8);
+        let mut t = trace(&[0, 1]);
+        t.top_k = Some(1);
+        t.computes[1].predicted = vec![(0, vec![1, 2]), (0, vec![2, 3]), (3, vec![4])];
+        let st = replay(&g, &[t], cfg(4, 1, Policy::Clock), false, None).unwrap();
+        assert_eq!(st.pred_caught[0], 1);
+        assert_eq!(st.pred_wasted_bytes[0], 1 << 20, "2 counted once");
+        assert_eq!(st.pred_wasted_bytes[1], 2 << 20, "margin 2 adds 3");
+        assert_eq!(st.pred_unmatched, 1);
+    }
+
+    #[test]
+    fn a_global_arena_lends_an_idle_layer_its_slots() {
+        // Two layers in one class, K = 1 each. Layer 1 is routed once, then
+        // layer 0 alternates two experts: the shared 2-slot arena gives layer
+        // 1's idle slot to layer 0; per-layer K thrashes.
+        let g = Geo {
+            unit: vec![1 << 20, 1 << 20],
+            n_experts: 8,
+            classes: vec![(1 << 20, vec![0, 1])],
+        };
+        let mut computes = vec![Compute {
+            decode: true,
+            step: 0,
+            layers: vec![(1, vec![7])],
+            predicted: Vec::new(),
+        }];
+        computes.extend((1..13).map(|s| Compute {
+            decode: true,
+            step: s,
+            layers: vec![(0, vec![(s % 2) as u16])],
+            predicted: Vec::new(),
+        }));
+        let t = [Trace {
+            name: "t".into(),
+            computes,
+            top_k: None,
+        }];
+        let base = cfg(8, 1, Policy::Clock);
+        let per_layer = replay(&g, &t, base, false, None).unwrap();
+        let arena = replay(
+            &g,
+            &t,
+            Config {
+                global_vram: true,
+                ..base
+            },
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(per_layer.vram_hits, 0, "K = 1 thrashes a 2-cycle");
+        assert_eq!(arena.vram_hits, 10, "two first touches, then all hits");
     }
 }

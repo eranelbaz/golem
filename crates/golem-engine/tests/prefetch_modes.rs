@@ -86,3 +86,32 @@ fn off_ignores_predictions() {
     let s = h.prefetch_stats();
     assert_eq!((s.predicted_routed, s.prefetch_pageins), (0, 0));
 }
+
+#[test]
+fn routing_trace_logs_predictions_as_pr_rows_verbatim() {
+    let dir = std::env::temp_dir().join(format!("golem-pr-trace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let h = p3_glue::enable(&EngineConfig {
+        model_path: tiny_moe_path(),
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        prefetch: PrefetchMode::Protect,
+        routing_trace: Some(dir.join("t.tsv")),
+        ..EngineConfig::default()
+    })
+    .expect("pooled enable with trace");
+    predict(&h, &[3, 1, 2]);
+    route(&h, &[2, 5]);
+    let mut out = Vec::new();
+    h.write_routing_trace(&mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(
+        rows,
+        [
+            format!("0\tpr\t{}\t3,1,2", xt::BLK),
+            format!("0\tdc\t{}\t2,5", xt::BLK)
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -142,6 +142,7 @@ pub fn spawn_prefetch(
             {
                 tracing::warn!("prefetch thread pinning: {e}");
             }
+            let mut standing_down = false;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -153,10 +154,16 @@ pub fn spawn_prefetch(
                 // Demand priority: a demand page-in in flight wins the I/O;
                 // skip the whole round and re-check after one idle.
                 if pool.demand_inflight() > 0 {
+                    if !std::mem::replace(&mut standing_down, true) {
+                        pool.stats
+                            .prefetch_standdowns
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     // Not `idle`: it returns at once while work is queued.
                     std::thread::sleep(DEMAND_BACKOFF);
                     continue;
                 }
+                standing_down = false;
                 let batch: Vec<_> = access
                     .take()
                     .into_iter()
@@ -173,7 +180,14 @@ pub fn spawn_prefetch(
                 for (layer, expert) in batch {
                     // Dropping the rest is deliberate: by the time demand
                     // drains, those layers have run and the units are waste.
-                    if stop.load(Ordering::Relaxed) || pool.demand_inflight() > 0 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if pool.demand_inflight() > 0 {
+                        pool.stats
+                            .prefetch_standdowns
+                            .fetch_add(1, Ordering::Relaxed);
+                        standing_down = true;
                         break;
                     }
                     match pool.ensure_unit(false, layer, expert) {
@@ -398,6 +412,11 @@ mod tests {
             source.attempts((0, 2)),
             0,
             "prefetch read while demand was in flight"
+        );
+        assert_eq!(
+            pool.stats.prefetch_standdowns.load(Ordering::Relaxed),
+            1,
+            "one stand-down per demand window, not per backoff"
         );
 
         // Demand completes; the queued unit is then paged in.
