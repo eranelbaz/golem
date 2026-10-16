@@ -6,7 +6,17 @@ legs — see the README's Benchmarks table for the target-machine reference.
 
 Columns: `GPU | VRAM | RAM | SSD | Quant | Prefill TTFT (cold/warm) | Decode tok/s (cold/warm)`
 
-Cold = the model shards were evicted from the OS page cache before the run
-(`scripts/evict-model-cache.py` or a reboot); warm = the immediate re-run.
-Both numbers use a fixed prompt set, greedy decoding, and grayscale honesty:
-report the machine state (desktop idleness, GPU sharing) if it was unusual.
+Cold = the model's page cache dropped before the run; warm = the immediate
+re-run. `bench.sh` produces both legs via `scripts/ab-bench.sh` (`--ctx 1024`,
+128 greedy tokens, `--ram-experts-gib 59`), so set the same env defaults when
+comparing rows. Prerequisites (from `ab-bench.sh`):
+
+- release build (`scripts/build.sh build`)
+- `ulimit -l unlimited` (the pool is mlocked)
+- the cold leg needs a passwordless sudoers entry for `drop_caches`
+
+Report anything unusual about machine state (desktop idleness, GPU sharing).
+
+Note: the reference row in `RESULTS.md` was measured with `golem optimize` at
+ctx 262144 and a 62 GiB pool, so treat it as indicative rather than directly
+comparable to `bench.sh` rows.

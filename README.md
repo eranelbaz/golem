@@ -28,10 +28,14 @@ build (see [`docs/baselines/`](docs/baselines/) for methodology):
 
 | Metric | Value |
 |---|---|
+| Decode, cold (page cache evicted) | **2.42 tok/s** |
 | Decode, warm RAM cache | **2.12 tok/s** |
-| Decode, cold (`POSIX_FADV_DONTNEED` evicted) | **2.42 tok/s** |
-| Prefill TTFT p50 | 13.4 s warm / 11.1 s cold |
-| RAM→GPU cache hit rate | 69.9 % |
+| Prefill TTFT p50 | 11.1 s cold / 13.4 s warm |
+| RAM→GPU cache hit rate (warm) | 69.9 % |
+
+Measured 2026-10-10, ctx 262144, pool 62 GiB, greedy, release HIP build,
+desktop GPU sharing; methodology and the RAM arithmetic (72.7 GiB planned) in
+[`docs/baselines/m4.9-optimize.md`](docs/baselines/m4.9-optimize.md).
 
 Community results from other machines live in
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) — run
@@ -54,10 +58,10 @@ scripts/build.sh run serve ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Fl
   --port 8080 --ctx 32768 --n-predict 4096 --prefill-stream
 ```
 
-`golem import <dir>` ingests an HF cache layout into the store; `golem plan`
-prints the memory plan; `golem optimize` sweeps scheduling knobs on your
+`golem plan` prints the memory plan; `golem optimize` sweeps scheduling knobs on your
 machine and saves a winner that `serve`/`run` apply automatically; `--detach`
-runs in the background (`golem list`, `golem stop <id>`).
+runs in the background (`golem list`, `golem stop <id>`). (`golem import` —
+ingesting an HF cache layout into the store — is planned but not implemented.)
 
 Anthropic clients:
 
