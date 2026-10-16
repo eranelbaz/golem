@@ -49,20 +49,6 @@ fn read(p: impl AsRef<Path>) -> String {
         .unwrap_or_default()
 }
 
-/// Every shard of the split model whose first shard is `model`.
-pub fn shards(model: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let count = {
-        let mut f = std::fs::File::open(model)?;
-        golem_gguf::kv_int(&golem_gguf::read_kvs(&mut f)?, "split.count").unwrap_or(1)
-    };
-    if count <= 1 {
-        return Ok(vec![model.to_path_buf()]);
-    }
-    (0..count)
-        .map(|no| Ok(golem_gguf::shard_path(model, no, count)?))
-        .collect()
-}
-
 /// Reads the fingerprint inputs from sysfs, the model shards and the build.
 pub fn probe(model: &Path) -> Result<FingerprintInput, Box<dyn Error>> {
     let sys = sysinfo::System::new_all();
@@ -113,19 +99,7 @@ pub fn probe(model: &Path) -> Result<FingerprintInput, Box<dyn Error>> {
             ));
         }
     }
-    let mut model_shards = Vec::new();
-    for p in shards(model)? {
-        let m = std::fs::metadata(&p)?;
-        let mtime = m
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let name = p
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        model_shards.push((name, m.len(), mtime));
-    }
+    let model_shards = golem_gguf::shard_stamps(model)?;
     const VENDOR_SHA: &str = include_str!("../../../vendor/VENDOR_SHA");
     let pin = VENDOR_SHA
         .lines()

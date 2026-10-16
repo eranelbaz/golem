@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # One pool-size bench leg: evict (cold) -> golem run with --timing-csv.
-# usage: pool-size-bench.sh <leg-name> <ram-experts-gib> <cold|warm> <journal-mode: fresh|keep>
+# usage: pool-size-bench.sh <leg-name> <ram-experts-gib> <cold|warm>
 set -euo pipefail
 
-NAME="$1"; GIB="$2"; TEMP="$3"; JM="$4"
+NAME="$1"; GIB="$2"; TEMP="$3"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${GOLEM_BIN:-$REPO/target/release/golem}"
 MODEL="${GOLEM_MODEL:-$HOME/models/glm-5.3-flash-ud-q4k-xl/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}"

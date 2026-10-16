@@ -191,6 +191,11 @@ pub enum Policy {
     Decay {
         min_dwell: u64,
     },
+    /// Frequency-weighted: lowest score decayed at a long `half_life` first
+    /// (#120 O3; `u32::MAX` ≈ LFU).
+    Freq {
+        half_life: u32,
+    },
 }
 
 impl Policy {
@@ -199,6 +204,10 @@ impl Policy {
             Self::Clock => "CLOCK".into(),
             Self::Lru => "LRU".into(),
             Self::Decay { min_dwell } => format!("decay H={HALF_LIFE} D={min_dwell}"),
+            Self::Freq {
+                half_life: u32::MAX,
+            } => "LFU".into(),
+            Self::Freq { half_life } => format!("freq H={half_life}"),
         }
     }
 }
@@ -222,6 +231,9 @@ struct Tier {
     admitted: Vec<u64>,
     lease: Vec<u64>,
     epoch: u64,
+    half_life: f64,
+    /// Pinned hot set: resident for the whole run, never a victim.
+    pinned: Vec<bool>,
 }
 
 impl Tier {
@@ -248,6 +260,11 @@ impl Tier {
             admitted: vec![0; n_keys],
             lease: vec![0; n_keys],
             epoch: 1,
+            half_life: match policy {
+                Policy::Freq { half_life } => f64::from(half_life),
+                _ => HALF_LIFE,
+            },
+            pinned: vec![false; n_keys],
         }
     }
 
@@ -256,12 +273,12 @@ impl Tier {
     }
 
     fn leased(&self, key: u32) -> bool {
-        self.lease[key as usize] == self.epoch
+        self.lease[key as usize] == self.epoch || self.pinned[key as usize]
     }
 
     fn decayed(&self, key: u32, now: u64) -> f64 {
         let k = key as usize;
-        self.score[k] * decay_factor(now.saturating_sub(self.scored_at[k]), HALF_LIFE)
+        self.score[k] * decay_factor(now.saturating_sub(self.scored_at[k]), self.half_life)
     }
 
     /// Books one routed access (decode steps only, §6.2).
@@ -272,11 +289,11 @@ impl Tier {
         self.scored_at[k] = now;
     }
 
-    fn lookup(&mut self, key: u32) -> bool {
+    fn lookup(&mut self, key: u32, touch: bool) -> bool {
         if !self.resident(key) {
             return false;
         }
-        self.refbit[key as usize] = true;
+        self.refbit[key as usize] |= touch;
         self.lease[key as usize] = self.epoch;
         true
     }
@@ -344,6 +361,15 @@ impl Tier {
                 };
                 lowest(true).or_else(|| lowest(false))
             }
+            Policy::Freq { .. } => self.members[p]
+                .iter()
+                .copied()
+                .filter(|&k| unleased(self, k))
+                .min_by(|&a, &b| {
+                    self.decayed(a, now)
+                        .total_cmp(&self.decayed(b, now))
+                        .then(a.cmp(&b))
+                }),
         }
     }
 
@@ -369,7 +395,7 @@ impl Tier {
         if self.full(key) {
             let p = self.part[key as usize] as usize;
             let Some(v) = self.pick(p, now) else { return };
-            if matches!(self.policy, Policy::Decay { .. })
+            if matches!(self.policy, Policy::Decay { .. } | Policy::Freq { .. })
                 && self.decayed(v, now) > self.decayed(key, now)
             {
                 return;
@@ -392,6 +418,8 @@ pub struct Config {
     /// One VRAM arena per unit class holding `layers × K` slots, victims
     /// chosen across layers, instead of K slots per layer (§3.4 P2).
     pub global_vram: bool,
+    /// Prefill RAM hits set the CLOCK reference bit (`lease_if_resident`).
+    pub prefill_ref: bool,
 }
 
 /// Decode-step totals (prefill computes move residency but are not counted).
@@ -492,6 +520,7 @@ pub struct Sim<'g> {
     ram: Tier,
     vram: Tier,
     tick: u64,
+    prefill_ref: bool,
     /// Step offset so steps stay monotonic when caches carry across traces.
     base: u64,
     promote_budget: u32,
@@ -536,6 +565,7 @@ impl<'g> Sim<'g> {
             ram: Tier::new(cfg.ram, n_keys, ram_keys, slots),
             vram: Tier::new(cfg.vram, n_keys, vram_keys, vram_cap),
             tick: 0,
+            prefill_ref: cfg.prefill_ref,
             base: 0,
             promote_budget: cfg.promote,
         }
@@ -623,6 +653,29 @@ impl<'g> Sim<'g> {
         let vram = &self.vram;
         let exclusive = self.exclusive;
         fill(&mut self.ram, &|k| exclusive && vram.resident(k));
+    }
+
+    /// [`Sim::prefill`], then pins the top `frac` of each RAM class's slots
+    /// by `counts` (a long-horizon routing profile): never evicted, so the
+    /// rest of the class runs the tier's policy on what is left (#120 O3).
+    /// Inclusive residency, cold start only: an exclusive RAM hit would
+    /// drop a pinned key.
+    pub fn pin(&mut self, counts: &[u64], frac: f64) {
+        self.prefill(counts);
+        let t = &mut self.ram;
+        for p in 0..t.cap.len() {
+            let mut keys: Vec<u32> = t.clock_keys[p]
+                .iter()
+                .copied()
+                .filter(|&k| counts[k as usize] > 0)
+                .collect();
+            keys.sort_by_key(|&k| std::cmp::Reverse((counts[k as usize], std::cmp::Reverse(k))));
+            keys.truncate((t.cap[p] as f64 * frac) as usize);
+            for k in keys {
+                t.pinned[k as usize] = true;
+            }
+        }
+        t.epoch += 1;
     }
 
     /// Books `layer`'s `pr` predictions against the units it routes that
@@ -716,11 +769,11 @@ impl<'g> Sim<'g> {
                     if !c.decode {
                         st.prefill_bytes += bytes;
                     }
-                    if self.vram.lookup(key) {
+                    if self.vram.lookup(key, true) {
                         st.vram_hits += u64::from(c.decode);
                         continue;
                     }
-                    let ram_hit = self.ram.lookup(key);
+                    let ram_hit = self.ram.lookup(key, c.decode || self.prefill_ref);
                     if ram_hit {
                         st.ram_hits += u64::from(c.decode);
                     } else {
@@ -772,14 +825,39 @@ fn replay(
     warm: bool,
     profile: Option<&dyn Fn(usize) -> Vec<u64>>,
 ) -> Result<Stats, String> {
+    replay_pinned(geo, traces, cfg, warm, profile, 0.0)
+}
+
+/// [`replay`] with the top `pin` of each RAM class pinned from `profile(i)`
+/// (pre-filled, never a victim) instead of pre-filled.
+fn replay_pinned(
+    geo: &Geo,
+    traces: &[Trace],
+    cfg: Config,
+    warm: bool,
+    profile: Option<&dyn Fn(usize) -> Vec<u64>>,
+    pin: f64,
+) -> Result<Stats, String> {
+    if pin > 0.0 {
+        let floor_ok = |frac: f64| {
+            !Sim::below_floor(geo, (cfg.pool_bytes as f64 * (1.0 - frac)) as u64, cfg.k)
+        };
+        if warm || cfg.exclusive || !floor_ok(pin) {
+            return Err(format!(
+                "pin {pin}: needs a cold, inclusive run and unpinned slots above the floor"
+            ));
+        }
+    }
     let mut total = Stats::default();
     let mut sim = Sim::new(geo, cfg);
     for (i, t) in traces.iter().enumerate() {
         if !warm && i > 0 {
             sim = Sim::new(geo, cfg);
         }
-        if let Some(p) = profile {
-            sim.prefill(&p(i));
+        match profile {
+            Some(p) if pin > 0.0 => sim.pin(&p(i), pin),
+            Some(p) => sim.prefill(&p(i)),
+            None => {}
         }
         total.add(sim.run(t).map_err(|e| format!("{}: {e}", t.name))?);
     }
@@ -818,6 +896,7 @@ pub fn report(geo: &Geo, traces: &[Trace], k: u32) -> Result<String, String> {
         exclusive: false,
         promote: 0,
         global_vram: false,
+        prefill_ref: true,
     };
     let run = |cfg: Config, warm: bool| replay(geo, traces, cfg, warm, None);
     let mark = |pool: f64| {
@@ -1008,6 +1087,56 @@ pub fn report(geo: &Geo, traces: &[Trace], k: u32) -> Result<String, String> {
 
     let _ = writeln!(
         o,
+        "\n### Frequency-weighted RAM eviction and pinned hot set (#120 O3; inclusive, \
+         VRAM LRU), cold. Profile = leave-one-out decode counts; pin = that share of each \
+         class pinned from it, never evicted\n\n\
+         | pool GiB | RAM policy | start | RAM hit % | d % early | d % |\n|---|---|---|---|---|---|"
+    );
+    let freq = [
+        Policy::Decay { min_dwell: 0 },
+        Policy::Freq { half_life: 4096 },
+        Policy::Freq {
+            half_life: u32::MAX,
+        },
+    ];
+    // (RAM policy, start label, profile?, pinned share)
+    let mut rows: Vec<(Policy, &str, bool, f64)> = vec![(Policy::Clock, "cold", false, 0.0)];
+    rows.extend(freq.iter().map(|&p| (p, "cold", false, 0.0)));
+    rows.push((Policy::Clock, "profile pre-fill", true, 0.0));
+    for (frac, name) in [(0.25, "pin 25%"), (0.5, "pin 50%"), (0.75, "pin 75%")] {
+        rows.push((Policy::Clock, name, true, frac));
+    }
+    rows.push((Policy::Freq { half_life: 4096 }, "pin 50%", true, 0.5));
+    rows.push((Policy::Clock, "cold, prefill sets no ref bit", false, 0.0));
+    for pool in [63.0, 78.0] {
+        for &(ram, start, profiled, pin) in &rows {
+            let profile = profiled.then_some(&loo as &dyn Fn(usize) -> Vec<u64>);
+            let r = replay_pinned(
+                geo,
+                traces,
+                Config {
+                    ram,
+                    prefill_ref: !start.contains("no ref bit"),
+                    ..cur(pool)
+                },
+                false,
+                profile,
+                pin,
+            )?;
+            let _ = writeln!(
+                o,
+                "| {} | {} | {start} | {} | {} | {} |",
+                mark(pool),
+                ram.label(),
+                pct1(r.ram_hit()),
+                pct1(r.d_early()),
+                pct1(r.d())
+            );
+        }
+    }
+
+    let _ = writeln!(
+        o,
         "\n### VRAM slots per layer (RAM: CLOCK 63 GiB), cold\n\n\
          | K | VRAM hit % | d % |\n|---|---|---|"
     );
@@ -1186,7 +1315,81 @@ mod tests {
             exclusive: false,
             promote: 0,
             global_vram: false,
+            prefill_ref: true,
         }
+    }
+
+    #[test]
+    fn pinned_keys_are_never_victims() {
+        let g = geo(5);
+        // Key 0 is profiled hot but never routed; a scan of 1..4 through a
+        // 3-slot pool evicts it unless it is pinned.
+        let seq = [1u16, 2, 3, 4, 1, 2, 3, 4];
+        let mut counts = vec![0u64; 5];
+        counts[0] = 9;
+        let run = |pin: f64| {
+            let mut sim = Sim::new(&g, cfg(3, 1, Policy::Clock));
+            if pin > 0.0 {
+                sim.pin(&counts, pin);
+            } else {
+                sim.prefill(&counts);
+            }
+            sim.run(&trace(&seq)).unwrap();
+            sim.ram.resident(0)
+        };
+        assert!(!run(0.0), "unpinned pre-fill is evicted by the scan");
+        assert!(run(0.34), "pinned key survives the scan");
+    }
+
+    #[test]
+    fn prefill_ref_off_leaves_prefill_hits_unreferenced() {
+        let g = geo(3);
+        // VRAM K = 1, RAM 2 slots: 0, 1 fill RAM; the prefill re-routes 0
+        // (VRAM miss, RAM hit); admitting 2 then evicts 0 unless that hit
+        // set its CLOCK bit.
+        let mut t = trace(&[0, 1, 0, 2]);
+        t.computes[2].decode = false;
+        let kept = |prefill_ref: bool| {
+            let mut sim = Sim::new(
+                &g,
+                Config {
+                    prefill_ref,
+                    ..cfg(2, 1, Policy::Clock)
+                },
+            );
+            sim.run(&t).unwrap();
+            sim.ram.resident(0)
+        };
+        assert!(kept(true));
+        assert!(!kept(false));
+    }
+
+    #[test]
+    fn lfu_keeps_the_most_used_key_where_lru_drops_it() {
+        let g = geo(3);
+        // 0 is hot early; a scan of 1, 2 would evict it under LRU.
+        let seq = [0u16, 0, 0, 1, 2, 0];
+        let lfu = replay(
+            &g,
+            &[trace(&seq)],
+            cfg(
+                2,
+                1,
+                Policy::Freq {
+                    half_life: u32::MAX,
+                },
+            ),
+            false,
+            None,
+        )
+        .unwrap();
+        let lru = replay(&g, &[trace(&seq)], cfg(2, 1, Policy::Lru), false, None).unwrap();
+        assert!(
+            lfu.ram_hits > lru.ram_hits,
+            "{} vs {}",
+            lfu.ram_hits,
+            lru.ram_hits
+        );
     }
 
     #[test]

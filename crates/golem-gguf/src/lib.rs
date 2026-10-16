@@ -611,6 +611,46 @@ pub fn shard_path(first: &Path, no: u64, count: u64) -> std::io::Result<PathBuf>
     Ok(first.with_file_name(format!("{base}-{:0width$}-of-{counts}{ext_dot}", no + 1)))
 }
 
+/// Every shard of the split model whose first shard is `model`
+/// (`split.count` from its KV block; a single file when absent).
+///
+/// # Errors
+/// GGUF parse failures of `model`'s header, or an unparseable shard name.
+pub fn shards(model: &Path) -> Result<Vec<PathBuf>, Error> {
+    let count = {
+        let mut f = std::fs::File::open(model)?;
+        kv_int(&read_kvs(&mut f)?, "split.count").unwrap_or(1)
+    };
+    if count <= 1 {
+        return Ok(vec![model.to_path_buf()]);
+    }
+    (0..count)
+        .map(|no| Ok(shard_path(model, no, count)?))
+        .collect()
+}
+
+/// Per shard of `model`: file name, size and mtime (Unix seconds) — a
+/// stat-only model identity (no content hash).
+///
+/// # Errors
+/// As [`shards`], plus a failed `stat` of any shard.
+pub fn shard_stamps(model: &Path) -> Result<Vec<(String, u64, u64)>, Error> {
+    let mut out = Vec::new();
+    for p in shards(model)? {
+        let m = std::fs::metadata(&p)?;
+        let mtime = m
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        out.push((name, m.len(), mtime));
+    }
+    Ok(out)
+}
+
 /// Absolute file offset of the tensor-data section: end of the tensor table
 /// (which follows the KV block) aligned up to `general.alignment` — the layout
 /// gguf.h and the fixture writer produce. Rewinds to the start first.

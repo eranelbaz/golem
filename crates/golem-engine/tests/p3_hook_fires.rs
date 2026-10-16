@@ -60,6 +60,7 @@ fn drive_step(payload: *mut libc::c_void, gate: *mut raw::ggml_tensor) -> [*cons
 #[test]
 fn ensure_pages_once_claims_once_and_counts_calls() {
     let hooks = p3_glue::enable(&pooled_config()).expect("enable");
+    hooks.set_scoring(true); // Session::new arms it after the self-check
     let payload = hooks.payload_ptr();
     let (_ctx, gate) = xt::gate_tensor();
 
@@ -92,6 +93,7 @@ fn two_sequential_enable_drop_cycles_each_decode() {
     for cycle in 0..2 {
         let hooks = p3_glue::enable(&pooled_config())
             .unwrap_or_else(|e| panic!("cycle {cycle}: enable must succeed, got {e}"));
+        hooks.set_scoring(true); // Session::new arms it after the self-check
         let payload = hooks.payload_ptr();
         let (_ctx, gate) = xt::gate_tensor();
         let out = drive_step(payload, gate);
@@ -125,6 +127,7 @@ fn two_sessionhooks_run_their_hook_paths_concurrently() {
                         return;
                     }
                 };
+                hooks.set_scoring(true); // Session::new arms it after the self-check
                 let payload = hooks.payload_ptr();
                 let (_ctx, gate) = xt::gate_tensor();
                 for _ in 0..8 {
@@ -169,6 +172,7 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 #[test]
 fn trampolines_allocate_nothing_in_steady_state() {
     let hooks = p3_glue::enable(&pooled_config()).expect("enable");
+    hooks.set_scoring(true); // Session::new arms it after the self-check
     let payload = hooks.payload_ptr();
     let (_ctx, gate) = xt::gate_tensor();
     // Warm: first sight registers (allocates), first page-ins fill slots.

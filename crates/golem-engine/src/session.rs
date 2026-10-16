@@ -793,6 +793,12 @@ impl Session {
                 return Err(e);
             }
         };
+        if let Some(p) = p3.as_mut() {
+            // The load self-check decode is not user traffic (§6.2): scoring
+            // was off through it and arms only now.
+            p.set_scoring(true);
+            p.start_warm_fill();
+        }
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
 
         Ok({
@@ -1076,6 +1082,28 @@ impl Session {
         match self.inner.p3.as_ref() {
             Some(p3) => p3.write_routing_trace(w),
             None => Ok(()),
+        }
+    }
+
+    /// Writes the warm-start score file (§6.3 warm-up) when
+    /// `EngineConfig::warm_state_dir` is set; between turns only. No-op with
+    /// the pool off or warm start disabled.
+    pub fn save_warm_state(&self) -> std::io::Result<()> {
+        self.inner
+            .p3
+            .as_ref()
+            .map_or(Ok(()), |p3| p3.save_warm_state())
+    }
+
+    /// Drops the buffered timing rows and routing-trace records of a turn
+    /// that failed, keeping the trace header state (a sink flush would
+    /// swallow the header).
+    pub fn discard_turn_records(&mut self) {
+        if let Some(t) = self.inner.timing.as_mut() {
+            let _ = t.flush(&mut std::io::sink());
+        }
+        if let Some(p3) = self.inner.p3.as_ref() {
+            p3.drain_routing_trace();
         }
     }
 

@@ -24,6 +24,56 @@ pub trait AccessFeed: Send + Sync {
     fn idle(&self, timeout: Duration) {
         std::thread::park_timeout(timeout);
     }
+
+    /// Returns the untried tail of a taken batch when a round stops early
+    /// (demand in flight, stop). Default: dropped — a stale prediction is
+    /// worthless once its layer has run.
+    fn requeue(&self, _rest: Vec<(u32, u32)>) {}
+
+    /// True once the feed will never yield another unit: the loop then
+    /// exits instead of idling. Default: never.
+    fn exhausted(&self) -> bool {
+        false
+    }
+}
+
+/// One-shot ranked feed (§6.3 warm-up pre-fill): the best-first unit list,
+/// taken [`WarmFeed::CHUNK`] units at a time so a stop or a demand page-in
+/// is seen between chunks; an interrupted chunk's untried tail goes back to
+/// the front, so demand never costs a warm unit. Exhausted once empty.
+pub struct WarmFeed {
+    keys: Mutex<VecDeque<(u32, u32)>>,
+}
+
+impl WarmFeed {
+    /// Units per take.
+    pub const CHUNK: usize = 64;
+
+    /// Feed over `ranked` (best first).
+    pub fn new(ranked: Vec<(u32, u32)>) -> Self {
+        Self {
+            keys: Mutex::new(ranked.into()),
+        }
+    }
+}
+
+impl AccessFeed for WarmFeed {
+    fn take(&self) -> Vec<(u32, u32)> {
+        let mut q = self.keys.lock().unwrap();
+        let n = q.len().min(Self::CHUNK);
+        q.drain(..n).collect()
+    }
+
+    fn requeue(&self, rest: Vec<(u32, u32)>) {
+        let mut q = self.keys.lock().unwrap();
+        for k in rest.into_iter().rev() {
+            q.push_front(k);
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.keys.lock().unwrap().is_empty()
+    }
 }
 
 /// Bounded FIFO of predicted units (§6.5 `read`): the decode thread pushes
@@ -77,9 +127,6 @@ impl AccessFeed for PredictionQueue {
 
 /// Handle to the spawned prefetch thread. `stop()` signals; `Drop` signals
 /// and joins. The loop idles between empty rounds (25 ms bound) so stop
-/// latency is bounded by one idle.
-/// Handle to the spawned prefetch thread. `stop()` signals; `Drop` signals
-/// and joins. The loop idles between empty rounds (25 ms bound) so stop
 /// latency is bounded by one idle. `pause`/`resume` gate the whole loop
 /// (prefill stream, design §7.6.4: stream chunks must not contend for the
 /// disk queue or pool slots — decode-path demand keeps priority).
@@ -104,6 +151,12 @@ impl PrefetchHandle {
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Relaxed);
     }
+
+    /// True once the thread has exited (a drained one-shot feed).
+    #[cfg(not(loom))]
+    pub fn finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|t| t.is_finished())
+    }
 }
 
 impl Drop for PrefetchHandle {
@@ -121,6 +174,8 @@ impl Drop for PrefetchHandle {
 /// ([`ExpertPool::demand_inflight`]), the demand-priority rule. A prefetch
 /// that finds no cold victim skips the unit (P17: it never evicts a
 /// demand-hot key). Source errors warn and continue; they never kill the
+/// thread. An interrupted round hands its untried tail back
+/// ([`AccessFeed::requeue`]); an empty round on an exhausted feed ends the
 /// thread.
 /// `io_cpuset` pins the thread at spawn (R-15, off the V-cache CCD).
 pub fn spawn_prefetch(
@@ -174,13 +229,18 @@ pub fn spawn_prefetch(
                     })
                     .collect();
                 if batch.is_empty() {
+                    if access.exhausted() {
+                        return;
+                    }
                     access.idle(IDLE);
                     continue;
                 }
-                for (layer, expert) in batch {
-                    // Dropping the rest is deliberate: by the time demand
-                    // drains, those layers have run and the units are waste.
+                let mut units = batch.into_iter();
+                while let Some((layer, expert)) = units.next() {
+                    // The untried rest goes back to the feed: P5 drops it
+                    // (those layers have run), a warm fill keeps it.
                     if stop.load(Ordering::Relaxed) {
+                        access.requeue(std::iter::once((layer, expert)).chain(units).collect());
                         break;
                     }
                     if pool.demand_inflight() > 0 {
@@ -188,6 +248,7 @@ pub fn spawn_prefetch(
                             .prefetch_standdowns
                             .fetch_add(1, Ordering::Relaxed);
                         standing_down = true;
+                        access.requeue(std::iter::once((layer, expert)).chain(units).collect());
                         break;
                     }
                     match pool.ensure_unit(false, layer, expert) {
@@ -426,5 +487,105 @@ mod tests {
         assert_eq!(pool.stats.demand_slow_pageins.load(Ordering::Relaxed), 1);
         assert_eq!(pool.stats.prefetch_pageins.load(Ordering::Relaxed), 2);
         handle.stop();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn warm_feed_takes_chunks_requeues_to_the_front_and_exhausts() {
+        let feed = WarmFeed::new((0..140).map(|e| (0, e)).collect());
+        let first = feed.take();
+        assert_eq!(first.len(), WarmFeed::CHUNK);
+        feed.requeue(first[60..].to_vec());
+        let second = feed.take();
+        assert_eq!(&second[..4], &first[60..], "requeued tail comes first");
+        assert_eq!(second.len(), WarmFeed::CHUNK);
+        assert!(!feed.exhausted());
+        assert_eq!(feed.take().len(), 140 - 2 * WarmFeed::CHUNK + 4);
+        assert!(feed.exhausted() && feed.take().is_empty());
+    }
+
+    // Sequential unit test over loom-primitive pool types (see above).
+    #[test]
+    #[cfg(not(loom))]
+    fn warm_prefill_survives_demand_and_exits_when_exhausted() {
+        // Demand of expert 7 blocks in the source while the warm feed holds
+        // experts 0..4: no warm unit may be dropped by the demand yield, and
+        // the thread ends once every unit is in.
+        let source = StdArc::new(GateSource::new((0, 7)));
+        let pool = test_pool(8, arc_dyn(source.clone()));
+        let p2 = pool.clone();
+        let demand = std::thread::spawn(move || p2.ensure_unit(true, 0, 7).unwrap());
+        until(|| source.attempts((0, 7)) == 1);
+        let feed = StdArc::new(WarmFeed::new((0..4).map(|e| (0, e)).collect()));
+        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()), None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(pool.stats.prefetch_pageins.load(Ordering::Relaxed), 0);
+        assert!(!handle.finished(), "a deferred warm feed keeps the thread");
+        source.release();
+        demand.join().unwrap();
+        until(|| handle.finished());
+        assert!((0..4).all(|e| pool.residency.is_resident(0, e)));
+        assert_eq!(pool.stats.prefetch_pageins.load(Ordering::Relaxed), 4);
+    }
+
+    /// A demand page-in that starts after a round's take hands the whole
+    /// untried batch back to the feed instead of dropping it.
+    #[test]
+    #[cfg(not(loom))]
+    fn interrupted_round_requeues_its_untried_tail() {
+        struct DemandOnTake {
+            inner: WarmFeed,
+            pool: Arc<ExpertPool>,
+            demand: Mutex<Option<std::thread::JoinHandle<()>>>,
+            fired: std::sync::atomic::AtomicBool,
+            requeued: Mutex<Vec<(u32, u32)>>,
+        }
+        impl AccessFeed for DemandOnTake {
+            fn take(&self) -> Vec<(u32, u32)> {
+                let batch = self.inner.take();
+                let mut d = self.demand.lock().unwrap();
+                if !self.fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let p = self.pool.clone();
+                    *d = Some(std::thread::spawn(move || {
+                        p.ensure_unit(true, 0, 7).unwrap()
+                    }));
+                    // On the prefetch thread: bounded, so a demand that never
+                    // starts fails the test instead of hanging the join.
+                    until(|| self.pool.demand_inflight() > 0);
+                }
+                batch
+            }
+            fn requeue(&self, rest: Vec<(u32, u32)>) {
+                self.requeued.lock().unwrap().extend(&rest);
+                self.inner.requeue(rest);
+            }
+            fn exhausted(&self) -> bool {
+                self.inner.exhausted()
+            }
+        }
+        let source = StdArc::new(GateSource::new((0, 7)));
+        let pool = test_pool(8, arc_dyn(source.clone()));
+        let feed = StdArc::new(DemandOnTake {
+            inner: WarmFeed::new((0..4).map(|e| (0, e)).collect()),
+            pool: pool.clone(),
+            demand: Mutex::new(None),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            requeued: Mutex::new(Vec::new()),
+        });
+        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()), None);
+        until(|| !feed.requeued.lock().unwrap().is_empty());
+        assert_eq!(
+            *feed.requeued.lock().unwrap(),
+            [(0, 0), (0, 1), (0, 2), (0, 3)]
+        );
+        assert_eq!(
+            source.attempts((0, 0)),
+            0,
+            "no read while demand was in flight"
+        );
+        source.release();
+        feed.demand.lock().unwrap().take().unwrap().join().unwrap();
+        until(|| handle.finished());
+        assert!((0..4).all(|e| pool.residency.is_resident(0, e)));
     }
 }
