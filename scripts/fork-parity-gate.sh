@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# T4 gate (design §12.2): unset-hooks decode must match the pristine baseline
+# Fork-parity gate (design §12.2, gate T4): unset-hooks decode must match the pristine baseline
 # on tiny-moe. Tokens must be exact; logits compared within float tolerance
 # (the P1 vendor patch shifts codegen by last-ulp amounts across machines,
 # so byte-identity is unattainable in CI — a real regression flips a token
-# first under greedy decode). Usage: t4_gate.sh [--upstream-tests] <golem-cli-bin> <tiny-moe.gguf>
+# first under greedy decode). Usage: fork-parity-gate.sh [--upstream-tests] <golem-cli-bin> <tiny-moe.gguf>
 # --upstream-tests additionally builds the vendored pin's upstream test suite
 # (cmake, LLAMA_BUILD_TESTS=ON) and runs ctest.
 # <tiny-moe.gguf> is passed through as golem-cli's positional model arg.
@@ -12,7 +12,7 @@ run_upstream=0
 if [ "${1:-}" = "--upstream-tests" ]; then run_upstream=1; shift; fi
 bin=$1; model=$2   # model = positional model arg, passed through unchanged
 base_dir=$(cd "$(dirname "$0")" && pwd)
-base="$base_dir/../tests/fixtures/t4-p1-unset.jsonl"
+base="$base_dir/../tests/fixtures/fork-parity-p1-unset.jsonl"
 out=$(mktemp)
 cleanup() { rm -rf "$out" "${build:-}"; }; trap cleanup EXIT
 if [ "$run_upstream" = 1 ]; then
@@ -21,8 +21,8 @@ if [ "$run_upstream" = 1 ]; then
   cmake -S "$repo_root/vendor/llama.cpp" -B "$build" -DGGML_HIP=OFF -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
   # -j2: mtmd model TUs (deepseek-OCR etc.) are multi-GB under cc1plus; full
-  # -j OOMs the 16 GB CI runner. Override locally with GOLEM_T4_BUILD_JOBS.
-  cmake --build "$build" -j"${GOLEM_T4_BUILD_JOBS:-2}"
+  # -j OOMs the 16 GB CI runner. Override locally with GOLEM_PARITY_BUILD_JOBS (legacy GOLEM_T4_BUILD_JOBS still honored).
+  cmake --build "$build" -j"${GOLEM_PARITY_BUILD_JOBS:-${GOLEM_T4_BUILD_JOBS:-2}}"
   # Keep LLAMA_BUILD_SERVER at its default (ON): tests/CMakeLists.txt unconditionally
   # builds test-chat, which links server-context — only defined when the server builds.
   # Skip network/fixture-dependent tests; excluding only test-download-model would
@@ -43,10 +43,10 @@ if [ "$run_upstream" = 1 ]; then
 fi
 "$bin" run --greedy "$model" --prompt "Hello" --n-predict 16 \
   --allow-overcommit --parity-dump "$out" >/dev/null
-if python3 "$base_dir/t4_gate_cmp.py" "$base" "$out"; then
-  echo "t4-gate: PASS (unset-hooks dump matches pristine baseline: tokens exact, logits within tolerance)"
+if python3 "$base_dir/fork-parity-gate-cmp.py" "$base" "$out"; then
+  echo "fork-parity-gate: PASS (unset-hooks dump matches pristine baseline: tokens exact, logits within tolerance)"
 else
-  echo "t4-gate: FAIL (dump diverged from tests/fixtures/t4-p1-unset.jsonl)" >&2
+  echo "fork-parity-gate: FAIL (dump diverged from tests/fixtures/fork-parity-p1-unset.jsonl)" >&2
   diff "$base" "$out" | head -20 >&2 || true
   exit 1
 fi
