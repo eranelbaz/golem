@@ -179,12 +179,12 @@ fn walk(
         if is_root && (name == *".git" || name == *"build") {
             continue;
         }
+        if name == *"__pycache__" {
+            continue;
+        }
         let child_rel = join_rel(rel, &name);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if name == *"__pycache__" {
-                continue;
-            }
             walk(&entry.path(), &child_rel, false, out)?;
         } else if file_type.is_file() {
             out.push(child_rel);
