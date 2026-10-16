@@ -1,15 +1,18 @@
 //! §5.4 aligned chunk planning: reads are covered by 4 KiB-aligned chunks cut
-//! from a 2 MiB grid anchored at the aligned range start, so every chunk
+//! from a [`CHUNK`] grid anchored at the aligned range start, so every chunk
 //! satisfies the O_DIRECT offset+length alignment rule and no forced tiny head
 //! chunk exists.
 
 use crate::sys::DIRECT_ALIGN;
 
-/// Chunk size cap (§5.4): plans never exceed 2 MiB per chunk.
-pub const CHUNK: usize = 2 * 1024 * 1024;
+/// Chunk size cap (§5.4): plans never exceed 8 MiB per chunk. The grid is
+/// anchored at the aligned start, so a 4.7/5.8 MB expert plane is always one
+/// `pread`. With `max_sectors_kb =
+/// 128` that is ≈45 device requests in flight per read instead of 16.
+pub const CHUNK: usize = 8 * 1024 * 1024;
 
 /// Plans the aligned covering range `[align_down(base, 4096),
-/// align_up(base+len, 4096))` cut at 2 MiB boundaries counted from
+/// align_up(base+len, 4096))` cut at [`CHUNK`] boundaries counted from
 /// `align_down(base, 4096)`. Every chunk is 4 KiB-aligned in offset and
 /// length (§5.4 O_DIRECT rule) and `len <= CHUNK`. Deterministic: same
 /// inputs → same plan, always.
@@ -39,13 +42,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunks_cover_the_aligned_range_in_2mib_pieces() {
+    fn chunks_cover_the_aligned_range_in_chunk_pieces() {
         // std unit is 15,204,352 B but reads are per PLANE (≈4.7/5.8 MB):
         // a 5,898,496 B plane at file offset 4096 → covering [4096,
-        // 5_906_432), 4096-aligned covering length 5_902_336, cut: 2 MiB +
-        // 2 MiB + tail.
+        // 5_906_432), 4096-aligned covering length 5_902_336, one chunk.
         let plan = plan_aligned(4096, 5_898_496);
-        assert_eq!(plan.iter().map(|c| c.1).sum::<usize>(), 5_902_336);
+        assert_eq!(plan, vec![(4096, 5_902_336)]);
+        // A 15.2 MB unit spans two chunks: CHUNK + tail.
+        let plan = plan_aligned(4096, 15_204_352);
+        assert_eq!(plan.iter().map(|c| c.1).sum::<usize>(), 15_204_352);
         let mut at = 4096u64;
         for (off, len) in &plan {
             assert_eq!(off % 4096, 0); // file-offset aligned
@@ -57,13 +62,12 @@ mod tests {
     }
 
     #[test]
-    fn boundaries_are_2mib_grid_from_the_aligned_base() {
-        // plane at 512, CHUNK long: covering [0, align_up(512+CHUNK)) =
-        // [0, 2_101_248); cut at the 2 MiB grid from 0 → (0, 2 MiB) +
-        // (2 MiB, 4096).
+    fn boundaries_are_chunk_grid_from_the_aligned_base() {
+        // plane at 512, CHUNK long: covering [0, align_up(512+CHUNK)); cut
+        // at the CHUNK grid from 0 → (0, CHUNK) + (CHUNK, 4096).
         let plan = plan_aligned(512, CHUNK);
-        assert_eq!(plan[0], (0, 2_097_152));
-        assert_eq!(plan[1], (2_097_152, 4_096));
+        assert_eq!(plan[0], (0, CHUNK));
+        assert_eq!(plan[1], (CHUNK as u64, 4_096));
     }
 
     #[test]

@@ -111,10 +111,10 @@ impl IoEngine {
     }
 
     /// Read `[offset, offset+len)` of one shard into `buf` (§5.2–5.4): plan
-    /// the aligned covering range in ≤2 MiB chunks, drain them demand-first
-    /// across replicas (failed chunks requeue with the failed replica
-    /// excluded until a healthy one serves them), then verify the §5.3 plane
-    /// CRC32C. All healthy replicas exhausted → [`StoreError::Unavailable`];
+    /// the aligned covering range in ≤[`CHUNK`](crate::CHUNK) chunks, drain
+    /// them demand-first across replicas (failed chunks requeue with the
+    /// failed replica excluded until a healthy one serves them), then verify
+    /// the §5.3 plane CRC32C. All healthy replicas exhausted → [`StoreError::Unavailable`];
     /// checksum mismatch → [`StoreError::Crc`].
     ///
     /// `buf` must be exactly the aligned covering region
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_size_is_two_mib() {
-        assert_eq!(CHUNK, 2 * 1024 * 1024);
+    fn chunk_size_is_eight_mib() {
+        assert_eq!(CHUNK, 8 * 1024 * 1024);
     }
 }
