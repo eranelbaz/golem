@@ -40,9 +40,9 @@ GOLEM_AB_WORK="$WORK" "$AB" warm warm
 
 # Decode tok/s from a leg's timing.csv: tok/s = tokens ÷ Σwall_ms × 1000.
 # Data rows only (skip the # header/trailer lines). Cold and warm printed
-# in the RESULTS.md cold/warm order.
+# in the BENCHMARKS.md cold/warm order.
 toks() { awk -F, '!/^#/ && NR>2 && $2!="" {t+=$2; w+=$3} END {if (w>0) printf "%.2f", t/(w/1000)}' "$1/timing.csv"; }
 echo
-echo "Row for benchmarks/RESULTS.md (fill in SSD + TTFT columns):"
+echo "Row for BENCHMARKS.md (fill in the Prefill column):"
 echo "| $(gpu) | $(vram) | $(awk '/MemTotal/{printf "%.0f GiB", $2/1048576}' /proc/meminfo) | ${GOLEM_SSD:-<ssd>} | ${GOLEM_QUANT:-<quant>} | <ttft cold/warm> | $(toks "$WORK/cold") / $(toks "$WORK/warm") |"
 echo "Leg output: $WORK/{cold,warm} (stdout/stderr/timing.csv)"
