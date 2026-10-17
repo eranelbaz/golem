@@ -102,6 +102,7 @@ fn routing_trace_logs_predictions_as_pr_rows_verbatim() {
         ..EngineConfig::default()
     })
     .expect("pooled enable with trace");
+    h.set_scoring(true);
     predict(&h, &[3, 1, 2]);
     route(&h, &[2, 5]);
     let mut out = Vec::new();
