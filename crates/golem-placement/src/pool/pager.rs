@@ -144,6 +144,57 @@ impl Drop for Lease {
     }
 }
 
+/// Resident-unit leases taken by [`ExpertPool::lease_resident_take`] (CPU
+/// expert path), held until [`Self::release_all`] or drop. The key list is
+/// preallocated at construction and never grows: a take beyond the remaining
+/// capacity takes fewer units, so the decode path never allocates here.
+/// Keeps the arena alive while the handed-out plane pointers may be read.
+#[derive(Debug)]
+pub struct LeaseBatch {
+    map: Arc<ResidencyMap>,
+    _arena: Arc<Arena>,
+    /// `(layer, expert)` per held lease, in take order (runs of one layer).
+    keys: Vec<(u32, u32)>,
+}
+
+impl LeaseBatch {
+    /// An empty batch for `pool` holding at most `capacity` leases (the
+    /// engine sizes it `n_layers × n_expert_used`).
+    pub fn new(pool: &ExpertPool, capacity: usize) -> Self {
+        Self {
+            map: pool.residency.clone(),
+            _arena: pool.arena.clone(),
+            keys: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Leases currently held.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether no lease is held.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Releases every held lease: one shard lock per layer run, one wake per
+    /// affected class.
+    pub fn release_all(&mut self) {
+        if self.keys.is_empty() {
+            return;
+        }
+        self.map.release_batch(&self.keys);
+        self.keys.clear();
+    }
+}
+
+impl Drop for LeaseBatch {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
 /// `lease_of` entry of a unit not claimed this step.
 const UNCLAIMED: u32 = u32::MAX;
 
@@ -975,6 +1026,44 @@ impl ExpertPool {
         Some((ptr, lease))
     }
 
+    /// Leases the first `ceil(frac × n_resident)` RESIDENT units among `ids`
+    /// (in `ids` order) under one shard lock of `layer`, one lease per unit,
+    /// held by `batch` (CPU expert path: never pages in or evicts). Writes
+    /// each taken id to `out_ids[i]` and its gate/up/down plane pointers to
+    /// `out_ptrs3[3i..3i + 3]`; returns the count taken. Takes nothing for a
+    /// layer out of range, `frac` outside `(0, 1]`, or a batch of another
+    /// pool; takes fewer when `batch`, `out_ids` or `out_ptrs3` is short.
+    pub fn lease_resident_take(
+        &self,
+        layer: u32,
+        ids: &[u32],
+        frac: f32,
+        out_ids: &mut [i32],
+        out_ptrs3: &mut [*const u8],
+        batch: &mut LeaseBatch,
+    ) -> usize {
+        if (layer as usize) >= self.geometry.layers.len()
+            || !Arc::ptr_eq(&batch.map, &self.residency)
+        {
+            return 0;
+        }
+        let unit = &self.geometry.layers[layer as usize];
+        let cap = (batch.keys.capacity() - batch.keys.len())
+            .min(out_ids.len())
+            .min(out_ptrs3.len() / 3);
+        let mut n = 0;
+        self.residency
+            .lease_take(layer, ids, frac, cap, |expert, slot| {
+                batch.keys.push((layer, expert));
+                out_ids[n] = expert as i32;
+                for (k, p) in out_ptrs3[3 * n..3 * n + 3].iter_mut().enumerate() {
+                    let (off, _) = unit.plane(ExpertKind::ALL[k]);
+                    *p = self.arena.slot_ptr_at(slot, off).cast_const();
+                }
+                n += 1;
+            })
+    }
+
     /// Fills one slot from the source. The `Filled`/evict claim left this key
     /// mid-fill in the residency shard: the fill writes through the claim's
     /// exclusive view, and only `finish` (before the lease-held copy) lets
@@ -1739,6 +1828,108 @@ mod tests {
             pool.residency.class_generation(0) > gen1,
             "abandon must bump the class generation"
         );
+    }
+
+    /// Pool with experts 1, 3, 5, 6 resident and unleased.
+    fn take_pool() -> Arc<ExpertPool> {
+        let pool = test_pool(4);
+        for e in [1, 3, 5, 6] {
+            pool.ensure_unit(true, 0, e).unwrap();
+        }
+        pool
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn resident_take_leases_a_leading_fraction_in_id_order() {
+        let pool = take_pool();
+        let mut batch = LeaseBatch::new(&pool, 8);
+        let (mut ids, mut ptrs) = ([-1i32; 8], [std::ptr::null(); 24]);
+        // 4 of the 6 ids are resident (0 and 2 are not): ceil(0.5 × 4) = 2.
+        let n =
+            pool.lease_resident_take(0, &[6, 0, 3, 2, 5, 1], 0.5, &mut ids, &mut ptrs, &mut batch);
+        assert_eq!(n, 2);
+        assert_eq!(&ids[..2], &[6, 3]);
+        for (i, &e) in ids[..2].iter().enumerate() {
+            for (k, &kind) in ExpertKind::ALL.iter().enumerate() {
+                let (ptr, _lease) = pool.lease_resident(0, kind, e as u32).unwrap();
+                assert_eq!(ptrs[3 * i + k], ptr);
+            }
+        }
+        assert_eq!(batch.len(), 2);
+        assert_eq!(pool.outstanding_leases(0, 6), 1);
+        assert_eq!(pool.outstanding_leases(0, 3), 1);
+        assert_eq!(pool.outstanding_leases(0, 5), 0);
+        batch.release_all();
+        assert!(batch.is_empty());
+        for e in [1, 3, 5, 6] {
+            assert_eq!(pool.outstanding_leases(0, e), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn resident_take_rejects_bad_frac_layer_and_capacity() {
+        let pool = take_pool();
+        let mut batch = LeaseBatch::new(&pool, 2);
+        let (mut ids, mut ptrs) = ([-1i32; 8], [std::ptr::null(); 24]);
+        for frac in [0.0, -1.0, 1.5, f32::NAN] {
+            assert_eq!(
+                pool.lease_resident_take(0, &[1, 3], frac, &mut ids, &mut ptrs, &mut batch),
+                0
+            );
+        }
+        assert_eq!(
+            pool.lease_resident_take(1, &[1, 3], 1.0, &mut ids, &mut ptrs, &mut batch),
+            0
+        );
+        // Out-of-range and repeated ids are skipped; capacity 2 caps the take.
+        let n =
+            pool.lease_resident_take(0, &[99, 1, 1, 3, 5], 1.0, &mut ids, &mut ptrs, &mut batch);
+        assert_eq!(n, 2);
+        assert_eq!(&ids[..2], &[1, 3]);
+        assert_eq!(pool.outstanding_leases(0, 1), 1);
+        assert_eq!(
+            pool.lease_resident_take(0, &[5], 1.0, &mut ids, &mut ptrs, &mut batch),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn released_batch_lets_exclusive_release_free_the_slots() {
+        let pool = take_pool();
+        let mut out = [std::ptr::null(); 1];
+        pool.ensure_batch(0, &[(ExpertKind::Gate, 3)], &mut out)
+            .unwrap();
+        let mut batch = LeaseBatch::new(&pool, 8);
+        let (mut ids, mut ptrs) = ([-1i32; 8], [std::ptr::null(); 24]);
+        assert_eq!(
+            pool.lease_resident_take(0, &[3], 1.0, &mut ids, &mut ptrs, &mut batch),
+            1
+        );
+        assert_eq!(pool.outstanding_leases(0, 3), 2);
+        batch.release_all();
+        pool.end_batch_step_exclusive();
+        assert!(
+            !pool.is_resident(0, 3),
+            "exclusive release blocked by a CPU lease"
+        );
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn dropping_a_batch_releases_its_leases() {
+        let pool = take_pool();
+        let mut batch = LeaseBatch::new(&pool, 8);
+        let (mut ids, mut ptrs) = ([-1i32; 8], [std::ptr::null(); 24]);
+        assert_eq!(
+            pool.lease_resident_take(0, &[1, 5], 1.0, &mut ids, &mut ptrs, &mut batch),
+            2
+        );
+        drop(batch);
+        assert_eq!(pool.outstanding_leases(0, 1), 0);
+        assert_eq!(pool.outstanding_leases(0, 5), 0);
     }
 
     #[test]

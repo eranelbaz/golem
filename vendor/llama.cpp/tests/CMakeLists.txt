@@ -387,6 +387,12 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(golem-p3-copy PRIVATE ggml)
     target_include_directories(golem-p3-copy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+    # Golem O1 CPU expert kernel (exported by ggml-cpu as
+    # "golem_cpu_expert_iface") against a ggml CPU graph reference.
+    llama_build_and_test(golem-cpu-expert.cpp)
+    target_link_libraries(golem-cpu-expert PRIVATE ggml)
+    target_include_directories(golem-cpu-expert PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
     # Golem exclusive-residency regression: evicted fully-valid slab bytes
     # must reach the D2H destination for ALL three planes even when the
     # layer's planes span separate split segments (the segment owning each

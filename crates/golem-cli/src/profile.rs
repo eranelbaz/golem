@@ -132,6 +132,12 @@ pub struct Knobs {
     /// Share of the planner's device-expert-cache allowance (1.0, 0.75,
     /// 0.5); 0 = 1.0.
     pub vram_experts_frac: f32,
+    /// Decode-only CPU/GPU hybrid expert math.
+    #[serde(default)]
+    pub cpu_expert_math: bool,
+    /// Share of slab misses sent to the CPU (1.0, 0.7, 0.5); 0 = 0.7.
+    #[serde(default)]
+    pub cpu_expert_frac: f32,
 }
 
 /// One sweep dimension: the values coordinate descent tries for one knob.
@@ -151,6 +157,10 @@ pub enum Axis {
     VramExpertsFrac(Vec<f32>),
     /// [`Knobs::async_h2d`].
     AsyncH2d(Vec<bool>),
+    /// [`Knobs::cpu_expert_math`].
+    CpuExpertMath(Vec<bool>),
+    /// [`Knobs::cpu_expert_frac`].
+    CpuExpertFrac(Vec<f32>),
 }
 
 impl Axis {
@@ -173,6 +183,8 @@ impl Axis {
             Axis::IoDepth(v) => each(v, |k, x| k.io_depth = x, base),
             Axis::VramExpertsFrac(v) => each(v, |k, x| k.vram_experts_frac = x, base),
             Axis::AsyncH2d(v) => each(v, |k, x| k.async_h2d = x, base),
+            Axis::CpuExpertMath(v) => each(v, |k, x| k.cpu_expert_math = x, base),
+            Axis::CpuExpertFrac(v) => each(v, |k, x| k.cpu_expert_frac = x, base),
         }
     }
 }

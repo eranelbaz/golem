@@ -298,3 +298,34 @@ fn t6_demand_and_prefetch_same_key_one_fill_hit_iff_prefetch_filled() {
         );
     });
 }
+
+/// CPU-path resident take + batch release race a demand claim on the other
+/// unit of the 1-slot layer: a taken unit is never evicted under its lease
+/// (its planes keep their provenance until `release_all`), and once released
+/// the demand claim can proceed (`Busy` is the only legal failure).
+#[test]
+fn t6_resident_take_and_release_race_a_demand_claim() {
+    primitives::model(|| {
+        let pool = loom_pool();
+        pool.ensure_unit(true, 0, 0).unwrap();
+        let p2 = pool.clone();
+        let taker = primitives::spawn(move || {
+            let mut batch = golem_placement::pool::LeaseBatch::new(&p2, 2);
+            let (mut ids, mut ptrs) = ([-1i32; 2], [std::ptr::null(); 6]);
+            let n = p2.lease_resident_take(0, &[0, 1], 1.0, &mut ids, &mut ptrs, &mut batch);
+            for &e in &ids[..n] {
+                assert!(p2.outstanding_leases(0, e as u32) >= 1);
+                assert!(p2.is_resident(0, e as u32), "leased unit evicted");
+            }
+            batch.release_all();
+        });
+        let copies = counter();
+        ensure_counted(&pool, 1, &copies, ExpertKind::Gate);
+        taker.join().unwrap();
+    });
+}
+
+fn _lease_batch_is_send() {
+    fn send<T: Send>() {}
+    send::<golem_placement::pool::LeaseBatch>();
+}

@@ -824,6 +824,90 @@ impl ResidencyMap {
         Some(sh.slot_of[i] as u32)
     }
 
+    /// Leases a leading fraction of the RESIDENT keys among `ids` under ONE
+    /// shard lock (CPU expert path): resident = bit set, not mid-fill, lease
+    /// count not saturated; out-of-range and repeated ids are skipped. Takes
+    /// `min(ceil(frac × n_resident), cap)` keys in `ids` order, one lease
+    /// each (ref bit set, as [`Self::lease_if_resident`]), reporting each
+    /// through `grant(expert, slot)`. `frac` outside `(0, 1]` takes nothing.
+    pub(crate) fn lease_take(
+        &self,
+        layer: u32,
+        ids: &[u32],
+        frac: f32,
+        cap: usize,
+        mut grant: impl FnMut(u32, u32),
+    ) -> usize {
+        let Some(shard) = self.shards.get(layer as usize) else {
+            return 0;
+        };
+        if !(frac > 0.0 && frac <= 1.0) || cap == 0 {
+            return 0;
+        }
+        let mut sh = shard.shard.lock().unwrap();
+        let leasable = |sh: &Shard, j: usize| {
+            let e = ids[j];
+            e < self.n_experts
+                && !ids[..j].contains(&e)
+                && Self::bit_test(&sh.bits, self.local(e))
+                && !Self::bit_test(&sh.filling, self.local(e))
+                && sh.leases[self.local(e)] != u16::MAX
+        };
+        let n_res = (0..ids.len()).filter(|&j| leasable(&sh, j)).count();
+        let take = ((frac * n_res as f32).ceil() as usize).min(n_res).min(cap);
+        let mut taken = 0;
+        for (j, &e) in ids.iter().enumerate() {
+            if taken == take {
+                break;
+            }
+            if !leasable(&sh, j) {
+                continue;
+            }
+            let i = self.local(e);
+            Self::ref_set(&mut sh.ref_bits, i);
+            sh.leases[i] += 1;
+            grant(e, sh.slot_of[i] as u32);
+            taken += 1;
+        }
+        taken
+    }
+
+    /// Drops one lease per `(layer, expert)` key: one shard lock per run of
+    /// same-layer keys and one wake per affected class afterwards, with the
+    /// [`Self::release_lease`] semantics.
+    pub(crate) fn release_batch(&self, keys: &[(u32, u32)]) {
+        // One bit per class (`class_of_layer` is u8 ⇒ ≤ 256 classes).
+        let mut woken = [0u64; 4];
+        let mut start = 0;
+        while start < keys.len() {
+            let layer = keys[start].0;
+            let end = start
+                + keys[start..]
+                    .iter()
+                    .take_while(|&&(l, _)| l == layer)
+                    .count();
+            let li = layer as usize;
+            {
+                let mut sh = self.shards[li].shard.lock().unwrap();
+                for &(_, expert) in &keys[start..end] {
+                    let i = self.local(expert);
+                    debug_assert!(sh.leases[i] > 0, "release without a lease");
+                    sh.leases[i] = sh.leases[i].saturating_sub(1);
+                }
+                self.shards[li].fill_cv.notify_all();
+            }
+            let class = self.class_of_layer[li] as usize;
+            woken[class / 64] |= 1 << (class % 64);
+            start = end;
+        }
+        for (class, wake) in self.class_wake.iter().enumerate() {
+            if woken[class / 64] >> (class % 64) & 1 == 1 {
+                *wake.generation.lock().unwrap() += 1;
+                wake.cv.notify_all();
+            }
+        }
+    }
+
     /// The key's outstanding lease count (test/diagnostic seam: the D2H
     /// `Resident` path must not leak the probe's lease).
     pub(crate) fn lease_count(&self, layer: u32, expert: u32) -> u16 {

@@ -22,7 +22,9 @@ mod source;
 mod store_source;
 
 pub use arena::{Arena, SlotClass};
-pub use pager::{D2hIncoming, ExpertPool, Lease, PoolError, SnapshotHandle, StepClaims};
+pub use pager::{
+    D2hIncoming, ExpertPool, Lease, LeaseBatch, PoolError, SnapshotHandle, StepClaims,
+};
 pub use prefetch::{AccessFeed, PredictionQueue, PrefetchHandle, WarmFeed, spawn_prefetch};
 pub use residency::{ExpertKind, P3Stats, PolicySnapshot, PoolConfigError};
 pub use source::{

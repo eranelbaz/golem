@@ -12,6 +12,9 @@
 //   v15 GOLEM_STREAM_SRC_STORAGE_LOST; device-cache stats gain H2D expert
 //       copies; dedicated H2D copy stream (golem_set_async_h2d,
 //       golem_take_h2d_timing).
+//   v16 opt-in decode-only CPU expert math (design §1 O1):
+//       golem_set_cpu_expert_math, golem_cpu_lease_fn,
+//       golem_take_cpu_expert_stats, golem_sched_get_ctx.
 // Part of the vendored ggml include tree; the ABI is versioned -- a change
 // updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
@@ -38,7 +41,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 15
+#define GOLEM_HOOKS_ABI_VERSION 16
 int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -307,6 +310,38 @@ int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
  * or the per-step ring overflowed. Call between computes. */
 int32_t golem_take_h2d_timing(golem_ctx_t ctx, double *ms, uint64_t *bytes);
 
+/* Hook (ABI v16, design §1 O1): among ids[0..n) of layer `blk`, count the
+ * units RESIDENT in the host pool (no paging in, no scoring), and lease the
+ * first ceil(frac * n_resident) of them in id order -- one lease per resident
+ * unit taken, never one for a unit not taken. Writes the taken ids to
+ * out_ids[i] and their three plane pointers to out_ptrs3[3i + k]
+ * (k = kind - 1: gate, up, down); returns the count taken (0..n). The leases
+ * are released at the next copy_done(payload), before its exclusive-residency
+ * release, so the CPU reads the slots in place until the step's join. Decode
+ * thread, once per (layer, step). */
+typedef int32_t (*golem_cpu_lease_fn)(void *payload, int32_t blk, const int32_t *ids, int32_t n,
+                                      float frac, int32_t *out_ids, const void **out_ptrs3);
+
+/* Opt-in CPU expert math (ABI v16, design §1 O1). `on != 0` arms it: in
+ * decode, a share `frac` in (0, 1] of a layer's resident slab misses is
+ * computed on the CPU by an `n_threads` (>= 1) worker reading the leased
+ * pool slots, and joined into ffn_moe_out through the graph's
+ * golem_cpu_acc-<blk> input. Requires lease != NULL and the routing hook
+ * registered. Init-only (before the first graph build). The CPU worker is
+ * created lazily on the first eligible compute. Returns 0, or -1 when refused
+ * (bad arguments, no routing hook, already armed); `on == 0` arms nothing
+ * but still returns -1 for a NULL ctx, no routing hook or an armed ctx. */
+int32_t golem_set_cpu_expert_math(golem_ctx_t ctx, int32_t on, float frac, int32_t n_threads,
+                                  golem_cpu_lease_fn lease);
+/* Graph-build query: 1 when armed, 0 otherwise (0 for a NULL ctx). */
+int32_t golem_cpu_expert_math_on(golem_ctx_t ctx);
+/* Since the last call: experts computed on the CPU, their plane bytes, worker
+ * busy ms, decode-thread join wait ms, and ids remapped to the padding slot K
+ * (summed over planes); resets all five. Returns 1 when armed, 0 otherwise
+ * (outputs untouched). Call between computes. */
+int32_t golem_take_cpu_expert_stats(golem_ctx_t ctx, uint64_t *experts, uint64_t *bytes, double *ms,
+                                    double *join_wait_ms, uint64_t *padded);
+
 /* P4 counters. Opaque here (C++ side keeps the members atomic); each member
  * is a lock-free 8-byte counter read by Rust as u64. The pointer is stable
  * for the ctx's lifetime. */
@@ -342,6 +377,8 @@ void golem_set_expert_offload_min_batch(int n);
  * libllama re-applies it after EVERY ggml_backend_sched_new. */
 void golem_sched_set_ctx(struct ggml_backend_sched *sched, golem_ctx_t ctx);
 void golem_sched_detach_ctx(struct ggml_backend_sched *sched);
+/* The ctx attached to `sched` (ABI v16); NULL for a NULL or unattached sched. */
+golem_ctx_t golem_sched_get_ctx(struct ggml_backend_sched *sched);
 
 /* libllama seam: store `ctx` on the model before llama_init_from_model;
  * llama_context stores it and re-applies golem_sched_set_ctx to every sched

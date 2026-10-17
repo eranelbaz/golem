@@ -36,6 +36,8 @@ pub struct MetricsSnapshot {
     /// Process-cumulative expert `MUL_MAT_ID` nodes placed (on GPU, on CPU);
     /// `None` unless the session offloads (only then must CPU stay 0, I2).
     pub placement: Option<(u64, u64)>,
+    /// Decode-only CPU expert math (design §1 O1); all zero when off.
+    pub cpu_expert: golem_engine::timing::CpuExpertStats,
     /// Expert pool + snapshot arena bytes, mlocked.
     pub locked_ram_bytes: u64,
     /// Device free bytes (`hipMemGetInfo`); `None` off HIP.
@@ -88,6 +90,7 @@ impl MetricsSnapshot {
         self.placement = s
             .offloaded()
             .then(|| (s.expert_mul_mat_id_on_gpu(), s.expert_mul_mat_id_off_gpu()));
+        self.cpu_expert = s.cpu_expert_stats();
         self.locked_ram_bytes = s.locked_ram_bytes();
         let vram = device_mem();
         self.vram_free = vram.map(|v| v.0);
@@ -264,6 +267,37 @@ pub(crate) fn render(h: &HealthState) -> String {
              golem_expert_mul_mat_id_total{{device=\"cpu\"}} {on_cpu}"
         );
     }
+    let c = m.cpu_expert;
+    g(
+        "golem_cpu_expert_math_experts_total",
+        "counter",
+        "Routed experts multiplied on the CPU instead of copied to the device",
+        c.experts as f64,
+    );
+    g(
+        "golem_cpu_expert_math_bytes_total",
+        "counter",
+        "Expert plane bytes the CPU expert math read from the RAM pool",
+        c.bytes as f64,
+    );
+    g(
+        "golem_cpu_expert_math_ms_total",
+        "counter",
+        "CPU expert math worker busy milliseconds",
+        c.ms,
+    );
+    g(
+        "golem_cpu_expert_math_join_wait_ms_total",
+        "counter",
+        "Decode-thread milliseconds blocked joining the CPU expert math worker",
+        c.join_wait_ms,
+    );
+    g(
+        "golem_cpu_expert_math_padded_total",
+        "counter",
+        "Expert planes the GPU multiplied as zero-weight padding for CPU-run experts",
+        c.padded as f64,
+    );
     g(
         "golem_locked_ram_bytes",
         "gauge",

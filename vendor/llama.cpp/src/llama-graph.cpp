@@ -2157,6 +2157,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // Golem O1 (design §1 O1): in decode, the substrate computes some routed
+    // experts on the CPU from these two tensors (renamed only: no new uses,
+    // so topk-moe fusion and allocator liveness are unchanged) and adds their
+    // sum through golem_cpu_acc-<il>. Plain swiglu layers only.
+    const bool golem_cem = n_tokens == 1 && il >= 0 && il < n_layer &&
+        golem_cpu_expert_math_on(golem_sched_get_ctx(sched)) &&
+        (loras == nullptr || loras->empty()) &&
+        type_op == LLM_FFN_SILU && !weight_before_ffn && gate_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        (hparams.swiglu_clamp_exp[il] <= 1e-6f || arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 ||
+         arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4);
+    if (golem_cem) {
+        ggml_format_name(weights, "golem_cpu_w-%d", il);
+        ggml_format_name(cur, "golem_cpu_x-%d", il);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2348,6 +2364,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    if (golem_cem) {
+        ggml_tensor * acc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_format_name(acc, "golem_cpu_acc-%d", il);
+        ggml_set_input(acc);
+        moe_out = ggml_add(ctx0, moe_out, acc);
     }
 
     cb(moe_out, "ffn_moe_out", il);

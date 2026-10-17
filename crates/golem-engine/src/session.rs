@@ -265,6 +265,24 @@ pub(crate) fn load_with_hooks(
     Ok(loaded)
 }
 
+/// CPU expert math (design §1 O1) joins into a device-resident add per
+/// block: a block left on the CPU would read an accumulator the join never
+/// writes, so every block must be offloaded (`n_gpu_layers >= n_layer`).
+fn cpu_expert_math_offload(loaded: &LoadedModel, config: &EngineConfig) -> Result<(), EngineError> {
+    if !config.cpu_expert_math {
+        return Ok(());
+    }
+    // SAFETY: the model is loaded and outlives this call.
+    let n_layer = unsafe { raw::llama_model_n_layer(loaded.model().as_ptr()) };
+    if i64::from(config.n_gpu_layers) < i64::from(n_layer) {
+        return Err(EngineError::InvalidConfig(format!(
+            "cpu_expert_math: needs every layer offloaded (n_gpu_layers {} < {n_layer})",
+            config.n_gpu_layers
+        )));
+    }
+    Ok(())
+}
+
 /// u32 config value → the `i32` `n_gpu_layers` the FFI takes. Values beyond
 /// `i32::MAX` saturate to llama.h's "all layers" sentinel (-1): a caller asking
 /// for more than 2³¹ layers plainly wants the whole model offloaded.
@@ -595,6 +613,9 @@ pub(crate) struct SessionInner {
     /// chunks decoded (0 = off).
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) test_cancel_after_chunks: u32,
+    /// Test seam: every sampled logits row, appended when `Some`.
+    #[cfg(any(test, feature = "test-support"))]
+    test_logits: Option<Vec<f32>>,
     /// The one `llama_batch` every step fills (capacity `llama_n_batch`),
     /// allocated at load: no per-turn or per-step batch allocation.
     batch: Batch,
@@ -611,6 +632,9 @@ pub(crate) struct SessionInner {
     /// Test seam: the n-th generation step (1-based, counted from when it is
     /// set) fails with `Decode(1)` before reaching `llama_decode` (0 = off).
     test_fail_gen_step: u32,
+    /// Session-cumulative CPU expert math counters (`/metrics`); zero when
+    /// `cpu_expert_math` is off.
+    cpu_expert_total: crate::timing::CpuExpertStats,
 }
 
 impl Drop for Session {
@@ -703,6 +727,31 @@ impl Session {
                 "async_h2d: needs the RAM expert pool (ram_experts_gib > 0)".into(),
             ));
         }
+        // Decode-only CPU expert math (design §1 O1) reads RAM-pool slots in
+        // place of the H2D copy: it needs the pool and a GPU to overlap.
+        if config.cpu_expert_math
+            && !(config.cpu_expert_frac > 0.0 && config.cpu_expert_frac <= 1.0)
+        {
+            return Err(EngineError::InvalidConfig(format!(
+                "cpu_expert_frac {} outside (0, 1]",
+                config.cpu_expert_frac
+            )));
+        }
+        if config.cpu_expert_math && config.cpu_expert_threads == 0 {
+            return Err(EngineError::InvalidConfig(
+                "cpu_expert_threads must be >= 1".into(),
+            ));
+        }
+        if config.cpu_expert_math && substrate_backend() == Backend::Cpu {
+            return Err(EngineError::InvalidConfig(
+                "cpu_expert_math: the CPU substrate already runs every expert on the CPU".into(),
+            ));
+        }
+        if config.cpu_expert_math && config.ram_experts_gib == 0 {
+            return Err(EngineError::InvalidConfig(
+                "cpu_expert_math: needs the RAM expert pool (ram_experts_gib > 0)".into(),
+            ));
+        }
         if config.o_direct && (config.manifest_path.is_none() || config.ram_experts_gib == 0) {
             return Err(EngineError::InvalidConfig(
                 "o_direct needs the store-backed pool (a manifest and ram_experts_gib > 0)".into(),
@@ -776,9 +825,8 @@ impl Session {
         };
         // Derived K needs the resident weights, KV and compute buffer
         // (ruling R3).
-        let rest = p3
-            .as_mut()
-            .map_or(Ok(()), |p| p.fit_device_cache())
+        let rest = cpu_expert_math_offload(&loaded, config)
+            .and_then(|()| p3.as_mut().map_or(Ok(()), |p| p.fit_device_cache()))
             .and_then(|()| Ok((probe_templates(&loaded, config)?, snapshot_cache(config)?)));
         let (chat, snapshots) = match rest {
             Ok(r) => r,
@@ -821,6 +869,8 @@ impl Session {
                     snapshots,
                     #[cfg(any(test, feature = "test-support"))]
                     test_cancel_after_chunks: 0,
+                    #[cfg(any(test, feature = "test-support"))]
+                    test_logits: None,
                     batch,
                     batch_cap,
                     abort,
@@ -828,6 +878,7 @@ impl Session {
                     decode_since_stream: 0,
                     degraded: None,
                     test_fail_gen_step: 0,
+                    cpu_expert_total: Default::default(),
                 },
             }
         })
@@ -866,6 +917,8 @@ impl Session {
                     snapshots: None,
                     #[cfg(any(test, feature = "test-support"))]
                     test_cancel_after_chunks: 0,
+                    #[cfg(any(test, feature = "test-support"))]
+                    test_logits: None,
                     batch,
                     batch_cap,
                     abort,
@@ -873,6 +926,7 @@ impl Session {
                     decode_since_stream: 0,
                     degraded: None,
                     test_fail_gen_step: 0,
+                    cpu_expert_total: Default::default(),
                 },
             }
         })
@@ -1022,6 +1076,12 @@ impl Session {
             .snapshots
             .as_ref()
             .map_or(0, SnapshotCache::arena_bytes)
+    }
+
+    /// Session-cumulative CPU expert math counters (design §1 O1); all zero
+    /// when `cpu_expert_math` is off.
+    pub fn cpu_expert_stats(&self) -> crate::timing::CpuExpertStats {
+        self.inner.cpu_expert_total
     }
 
     /// Fraction of RAM-pool slots in use; `None` without the pool.
@@ -1247,6 +1307,22 @@ impl Session {
             Some(r) => r,
             None => unreachable!("loop exits on Done"),
         }
+    }
+
+    /// Test seam: from now on every sampled logits row (`n_vocab` f32 each)
+    /// is appended to a buffer that [`Session::take_logits_for_test`]
+    /// returns.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn record_logits_for_test(&mut self) {
+        self.inner.test_logits = Some(Vec::new());
+    }
+
+    /// Test seam: the rows recorded since [`Session::record_logits_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn take_logits_for_test(&mut self) -> Vec<f32> {
+        self.inner.test_logits.take().unwrap_or_default()
     }
 
     /// Test seam: the `n`-th generation batch from now (1-based) fails as if
@@ -1767,16 +1843,20 @@ impl SessionInner {
         // The lease-release contract: synchronize before the next compute.
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-        if let Some(t) = self.timing.as_mut() {
+        if self.timing.is_some() || self.config.cpu_expert_math {
             // §11 step boundary: snapshot (and reset) the P3/store
             // accumulators into this step's row; a prefill-only decode's
             // are discarded, not charged to the next generation row. H2D is
             // measured only on the async_h2d copy stream; policy stays
             // unmeasured.
             let io = p3_glue::take_step_io_stats();
-            if n_gen == 0 {
-                return Ok(true);
+            let cpu_expert = io.cpu_expert;
+            if let Some(c) = &cpu_expert {
+                self.cpu_expert_total.add(c);
             }
+            let Some(t) = self.timing.as_mut().filter(|_| n_gen > 0) else {
+                return Ok(true);
+            };
             let ns2ms = |ns: u64| ns as f64 / 1_000_000.0;
             t.row(crate::timing::StepTiming {
                 step,
@@ -1788,6 +1868,7 @@ impl SessionInner {
                 h2d_ms: io.h2d.map_or(f64::NAN, |h| h.0),
                 h2d_bytes: io.h2d.map_or(0, |h| h.1),
                 policy_ms: f64::NAN,
+                cpu_expert,
             });
         }
         Ok(true)
@@ -1855,7 +1936,7 @@ impl SessionInner {
     /// Samples from logits row `idx`, recording a [`ParityStep`] at
     /// `position` when `parity` is set.
     pub(crate) fn sample(
-        &self,
+        &mut self,
         sampler: &Sampler,
         ffi: &TurnFfi,
         idx: i32,
@@ -1866,6 +1947,16 @@ impl SessionInner {
         // SAFETY: sampler chain and ctx are live; the preceding successful
         // decode emitted logits for row idx.
         let token = unsafe { raw::llama_sampler_sample(sampler.as_ptr(), ctx.as_ptr(), idx) };
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(rows) = &mut self.test_logits {
+            // SAFETY: as above; a pure read of row idx (n_vocab f32).
+            rows.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(
+                    raw::llama_get_logits_ith(ctx.as_ptr(), idx),
+                    ffi.n_vocab,
+                )
+            });
+        }
         if let Some(steps) = parity {
             // Pure read of the same row — no decode behavior change.
             // SAFETY: row idx holds n_vocab logits (as above).

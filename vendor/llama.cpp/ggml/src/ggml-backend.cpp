@@ -13,6 +13,7 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "golem-p3-copy.h"
+#include "golem-cpu-expert.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -22,6 +23,7 @@
 #include <string.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -229,6 +231,59 @@ int32_t golem_take_h2d_timing(golem_ctx_t ctx, double * ms, uint64_t * bytes) {
     return ok ? 1 : 0;
 }
 
+int32_t golem_set_cpu_expert_math(golem_ctx_t ctx, int32_t on, float frac, int32_t n_threads,
+                                  golem_cpu_lease_fn lease) {
+    if (ctx == NULL || ctx->routing == nullptr || ctx->cem_on.load(std::memory_order_acquire)) {
+        return -1;
+    }
+    if (on == 0) {
+        return 0;
+    }
+    if (!(frac > 0.0f && frac <= 1.0f) || n_threads < 1 || lease == nullptr) {
+        return -1;
+    }
+    ctx->cem_frac = frac;
+    ctx->cem_threads = n_threads;
+    ctx->cem_lease = lease;
+    ctx->cem_on.store(1, std::memory_order_release);
+    return 0;
+}
+
+int32_t golem_cpu_expert_math_on(golem_ctx_t ctx) {
+    return ctx != NULL && ctx->cem_on.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+int32_t golem_take_cpu_expert_stats(golem_ctx_t ctx, uint64_t * experts, uint64_t * bytes, double * ms,
+                                    double * join_wait_ms, uint64_t * padded) {
+    if (!golem_cpu_expert_math_on(ctx)) {
+        return 0;
+    }
+    *experts = ctx->cem_experts;
+    *bytes = ctx->cem_bytes;
+    *ms = ctx->cem_ms;
+    *join_wait_ms = ctx->cem_join_wait_ms;
+    *padded = ctx->cem_padded;
+    ctx->cem_experts = 0;
+    ctx->cem_bytes = 0;
+    ctx->cem_ms = 0.0;
+    ctx->cem_join_wait_ms = 0.0;
+    ctx->cem_padded = 0;
+    return 1;
+}
+
+// Joins the submitted CPU expert job, if any: worker busy ms and the
+// decode thread's blocked time accrue separately (design §1 O1).
+static void golem_cem_join(golem_ctx_t ctx) {
+    if (ctx->cem_pending_blk < 0) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    ctx->cem_ms += ctx->cem_if->wait(ctx->cem_worker);
+    ctx->cem_join_wait_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ctx->cem_pending_blk = -1;
+}
+
 // Frees the prefill-stream slabs + events (device buffers: the owner must run
 // this while the backend is alive -- golem_reset_device_cache).
 static void golem_stream_slabs_free(golem_ctx_t ctx) {
@@ -258,6 +313,13 @@ static void golem_stream_slabs_free(golem_ctx_t ctx) {
 void golem_reset_device_cache(golem_ctx_t ctx) {
     if (ctx == NULL) {
         return;
+    }
+    GGML_ASSERT(ctx->cem_pending_blk == -1);
+    if (ctx->cem_acc_buf != nullptr) {
+        ggml_backend_buffer_free(ctx->cem_acc_buf);
+        ctx->cem_acc_buf = nullptr;
+        ctx->cem_acc = nullptr;
+        ctx->cem_acc_n_embd = 0;
     }
     golem_cs_free(ctx);
     golem_stream_slabs_free(ctx);
@@ -1983,6 +2045,51 @@ static void golem_in_flight_done(golem_ctx_t gctx) {
     gctx->join_cv.notify_all();
 }
 
+// O1 graph names are matched exactly: "<prefix><blk>" and nothing after
+// (the scheduler's "<name> (view)" deps and "<dev>#<name>#<c>" copies
+// never match). Returns the blk, or -1.
+static int golem_cem_name_blk(const char * name, const char * prefix) {
+    const size_t pl = strlen(prefix);
+    if (strncmp(name, prefix, pl) != 0 || name[pl] < '0' || name[pl] > '9') {
+        return -1;
+    }
+    char * end = nullptr;
+    const long v = strtol(name + pl, &end, 10);
+    return (*end == '\0' && v >= 0 && v < INT_MAX) ? (int) v : -1;
+}
+
+// Per-blk pinned accumulators (design §1 O1): n_blk x n_embd f32 in one host
+// buffer of the split device, (re)allocated once per n_embd. The old buffer
+// is freed only after every backend drained its H2Ds. false = no pinned
+// host buffer type or allocation failed.
+static bool golem_cem_acc_ensure(golem_ctx_t gctx, ggml_backend_sched_t sched, ggml_backend_t split_backend,
+                                 int32_t n_blk, int64_t n_embd) {
+    if (gctx->cem_acc_buf != nullptr && gctx->cem_acc_n_embd == n_embd) {
+        return true;
+    }
+    if (gctx->cem_acc_buf != nullptr) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
+        ggml_backend_buffer_free(gctx->cem_acc_buf);
+        gctx->cem_acc_buf = nullptr;
+        gctx->cem_acc = nullptr;
+        gctx->cem_acc_n_embd = 0;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(split_backend));
+    if (buft == nullptr) {
+        return false;
+    }
+    gctx->cem_acc_buf = ggml_backend_buft_alloc_buffer(buft, (size_t) n_blk * (size_t) n_embd * sizeof(float));
+    if (gctx->cem_acc_buf == nullptr) {
+        return false;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(gctx->cem_acc_buf));
+    gctx->cem_acc = (float *) ggml_backend_buffer_get_base(gctx->cem_acc_buf);
+    gctx->cem_acc_n_embd = (int32_t) n_embd;
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // Golem ABI v5: capture the sched-attached ctx once per entry.
@@ -2006,6 +2113,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // byte-identical to upstream.
     static thread_local ggml_tensor * prev_ids_tensor = nullptr;
     prev_ids_tensor = nullptr;
+    // O1 (design §1 O1): the per-blk accumulators and leases assume one
+    // attached sched and the copy_done entry drain.
+    const bool golem_cem_on = golem_hooked && gctx->cem_on.load(std::memory_order_relaxed) != 0;
+    if (golem_cem_on) {
+        GGML_ASSERT(gctx->cem_pending_blk == -1);
+        if (gctx->attach_refs.load(std::memory_order_acquire) != 1 || gctx->copy_done == NULL) {
+            golem_in_flight_done(gctx);
+            return GGML_STATUS_FAILED;
+        }
+    }
     // Golem: release the host-pool leases taken during the PREVIOUS compute.
     // Every llama_decode holds exactly one ubatch (the engine caps its prefill
     // chunk at n_ubatch); the leases must survive until here so eviction cannot
@@ -2128,6 +2245,93 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
     }
+    // O1 per-compute scan: per blk, [x, w, acc, gate, up, down] in
+    // golem_cem_t[blk * 6 + k], the swiglu_clamp limit (0 when absent) and a
+    // bad flag. Every acc must be a device-split input (the join writes it);
+    // an acc read on the CPU or never copied fails the compute. Planes are the ORIGINAL host weights from split->inputs
+    // (split_graph rewrote MUL_MAT_ID src[0] to a placeholder copy).
+    // golem_cem_mask holds one ggml_bitset row per blk, valid only while
+    // golem_cem_sel_step[blk] == golem_split_seq and golem_cem_n_cpu[blk] > 0.
+    static thread_local std::vector<struct ggml_tensor *> golem_cem_t;
+    static thread_local std::vector<float> golem_cem_limit;
+    static thread_local std::vector<uint8_t> golem_cem_bad;
+    static thread_local std::vector<uint8_t> golem_cem_has_acc;
+    bool golem_cem_acc_misplaced = false;
+    static thread_local std::vector<ggml_bitset_t> golem_cem_mask;
+    static thread_local std::vector<uint64_t> golem_cem_sel_step;
+    static thread_local std::vector<int32_t> golem_cem_n_cpu;
+    static thread_local std::vector<float> golem_cem_x;
+    static thread_local std::vector<float> golem_cem_wraw;
+    static thread_local std::vector<float> golem_cem_w;
+    const int32_t golem_cem_n_blk = golem_cem_on ? (int32_t) (gctx->orders.size() / 3) : 0;
+    const size_t golem_cem_row = golem_cem_on ? ggml_bitset_size((size_t) std::max<int32_t>(gctx->n_experts, 1)) : 0;
+    if (golem_cem_on) {
+        golem_cem_t.assign((size_t) golem_cem_n_blk * 6, nullptr);
+        golem_cem_limit.assign(golem_cem_n_blk, 0.0f);
+        golem_cem_bad.assign(golem_cem_n_blk, 0);
+        golem_cem_has_acc.assign(golem_cem_n_blk, 0);
+        golem_cem_mask.resize((size_t) golem_cem_n_blk * golem_cem_row);
+        golem_cem_sel_step.resize(golem_cem_n_blk, 0);
+        golem_cem_n_cpu.resize(golem_cem_n_blk, 0);
+        auto golem_cem_note = [&](struct ggml_tensor * t) {
+            int b;
+            if ((b = golem_cem_name_blk(t->name, "golem_cpu_x-")) >= 0 && b < golem_cem_n_blk) {
+                golem_cem_t[(size_t) b * 6 + 0] = t;
+            } else if ((b = golem_cem_name_blk(t->name, "golem_cpu_w-")) >= 0 && b < golem_cem_n_blk) {
+                golem_cem_t[(size_t) b * 6 + 1] = t;
+            } else if ((b = golem_cem_name_blk(t->name, "golem_cpu_acc-")) >= 0 && b < golem_cem_n_blk) {
+                if (t->op != GGML_OP_NONE || !(t->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    golem_cem_bad[b] = 1;
+                } else {
+                    golem_cem_has_acc[b] = 1;
+                }
+            } else if ((b = golem_cem_name_blk(t->name, "ffn_moe_swiglu_limited-")) >= 0 && b < golem_cem_n_blk) {
+                if (t->op == GGML_OP_GLU && ggml_get_glu_op(t) == GGML_GLU_OP_SWIGLU_CLAMP) {
+                    golem_cem_limit[b] = ggml_get_op_params_f32(t, 3);
+                } else {
+                    golem_cem_bad[b] = 1;
+                }
+            }
+        };
+        for (int i = 0; i < sched->graph.n_nodes; ++i) {
+            golem_cem_note(sched->graph.nodes[i]);
+        }
+        for (int i = 0; i < sched->graph.n_leafs; ++i) {
+            golem_cem_note(sched->graph.leafs[i]);
+        }
+        for (int s = 0; s < sched->n_splits; ++s) {
+            const struct ggml_backend_sched_split * sp = &sched->splits[s];
+            const bool on_cpu = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[sp->backend_id])) ==
+                                GGML_BACKEND_DEVICE_TYPE_CPU;
+            for (int j = 0; j < sp->n_inputs; ++j) {
+                struct ggml_tensor * in = sp->inputs[j];
+                const int kind = golem_expert_stem_kind(in->name);
+                if (kind != 0) {
+                    if (in->buffer != NULL && ggml_backend_buffer_get_usage(in->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        ggml_backend_buffer_is_host(in->buffer)) {
+                        const int b = golem_tensor_blk(in->name);
+                        if (b >= 0 && b < golem_cem_n_blk) {
+                            golem_cem_t[(size_t) b * 6 + 2 + kind] = in;
+                        }
+                    }
+                    continue;
+                }
+                const int b = golem_cem_name_blk(in->name, "golem_cpu_acc-");
+                if (b >= 0 && b < golem_cem_n_blk && in->op == GGML_OP_NONE && (in->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    if (on_cpu) {
+                        golem_cem_acc_misplaced = true;
+                    } else {
+                        golem_cem_t[(size_t) b * 6 + 2] = in;
+                    }
+                }
+            }
+        }
+        for (int32_t b = 0; b < golem_cem_n_blk; ++b) {
+            if (golem_cem_has_acc[b] && golem_cem_t[(size_t) b * 6 + 2] == nullptr) {
+                golem_cem_acc_misplaced = true;
+            }
+        }
+    }
     static thread_local std::vector<int32_t> golem_miss_kinds, golem_miss_ids;
     static thread_local std::vector<const void *> golem_miss_out;
     // Prefill-stream scratch (ABI v10): the id list handed to stream_source
@@ -2147,6 +2351,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         golem_ids_redirects.clear();
     };
     golem_restore_ids();
+    // O1 failure: join first, then the shared drain; the leases of
+    // a never-run job drop at the next copy_done.
+    auto golem_cem_fail = [&]() -> enum ggml_status {
+        golem_cem_join(gctx);
+        golem_restore_ids();
+        for (int i = 0; i < sched->n_backends; i++) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
+        golem_drain_copy_stream(gctx);
+        if (!golem_evict_d2h.empty()) {
+            golem_evict_abandon_unfinished();
+        }
+        golem_in_flight_done(gctx);
+        return GGML_STATUS_FAILED;
+    };
+    if (golem_cem_acc_misplaced) {
+        return golem_cem_fail();
+    }
+    static thread_local std::vector<int32_t> golem_cem_cand;
+    static thread_local std::vector<int32_t> golem_cem_took;
+    static thread_local std::vector<const void *> golem_cem_ptrs;
 
     int prev_backend_id = -1;
 
@@ -2333,6 +2558,149 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if ((slab_mode || stream_mode) && sched->n_copies != 1) {
                     GGML_ABORT("golem P2: requires n_copies == 1 (single GPU)");
                 }
+                // O1 selection + submit, once per (blk, compute), after the
+                // ids readback and before plan.routed is built; one job in flight
+                // at a time, so a second blk in the same pre-pass stays all-GPU.
+                if (golem_cem_on && slab_mode && !stream_mode && ids_orig->ne[1] == 1 &&
+                    blk >= 0 && blk < golem_cem_n_blk && golem_cem_sel_step[blk] != golem_split_seq &&
+                    gctx->cem_pending_blk == -1) {
+                    golem_cem_sel_step[blk] = golem_split_seq;
+                    golem_cem_n_cpu[blk] = 0;
+                    struct ggml_tensor * const * ct = &golem_cem_t[(size_t) blk * 6];
+                    struct ggml_tensor * cx = ct[0];
+                    struct ggml_tensor * cw = ct[1];
+                    struct ggml_tensor * cg = ct[3];
+                    struct ggml_tensor * cu = ct[4];
+                    struct ggml_tensor * cd = ct[5];
+                    const int64_t n_used = ids_orig->ne[0];
+                    bool ok = !golem_cem_bad[blk] && cx != nullptr && cw != nullptr && ct[2] != nullptr &&
+                              cg != nullptr && cu != nullptr && cd != nullptr &&
+                              n_used <= GOLEM_CPU_EXPERT_MAX && cg->ne[2] == n_expert &&
+                              n_expert <= gctx->n_experts;
+                    int64_t n_embd = 0;
+                    int64_t n_ff = 0;
+                    if (ok) {
+                        n_embd = cg->ne[0];
+                        n_ff = cg->ne[1];
+                        for (int k = 0; k < 3; ++k) {
+                            struct ggml_tensor * p = ct[3 + k];
+                            GGML_ASSERT(p->nb[2] == (size_t) golem_tensor_expert_stride_bytes(p));
+                            GGML_ASSERT(p->ne[0] == (k < 2 ? n_embd : n_ff) && p->ne[1] == (k < 2 ? n_ff : n_embd));
+                        }
+                        // Fail-safe block-size gate: the kernel's vec_dot
+                        // types (ggml-cpu traits) are not visible here.
+                        ok = n_embd % 256 == 0 && n_ff % 256 == 0 &&
+                             cx->type == GGML_TYPE_F32 && ggml_nelements(cx) == n_embd && ggml_is_contiguous(cx) &&
+                             cw->type == GGML_TYPE_F32 && cw->ne[0] == 1 && cw->ne[1] == n_used &&
+                             ct[2]->type == GGML_TYPE_F32 && ggml_nelements(ct[2]) == n_embd;
+                    }
+                    if (ok) {
+                        // Candidates: routed ids without a device slot.
+                        const int32_t K_c = std::min<int32_t>(gctx->k_cfg.load(std::memory_order_relaxed),
+                                                              (int32_t) n_expert);
+                        golem_cem_cand.clear();
+                        {
+                            std::lock_guard<std::mutex> lk(gctx->dc_mutex);
+                            auto it = gctx->layers.find(blk);
+                            const golem::GolemLayerSlots * L = it != gctx->layers.end() &&
+                                (int64_t) it->second.slot_of.size() == n_expert && it->second.K == K_c
+                                ? &it->second : nullptr;
+                            for (int64_t id3 = 0; id3 < n_expert; ++id3) {
+                                if (ggml_bitset_get(used_ids.data(), id3) && (L == nullptr || L->slot_of[id3] == -1)) {
+                                    golem_cem_cand.push_back((int32_t) id3);
+                                }
+                            }
+                        }
+                        if (!golem_cem_cand.empty()) {
+                            if (gctx->cem_if == nullptr) {
+                                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(
+                                    ggml_backend_get_device(sched->backends[sched->n_backends - 1]));
+                                gctx->cem_if = (const golem_cpu_expert_iface *)
+                                    ggml_backend_reg_get_proc_address(reg, "golem_cpu_expert_iface");
+                                if (gctx->cem_if == nullptr) {
+                                    return golem_cem_fail();
+                                }
+                            }
+                            if (gctx->cem_worker == nullptr) {
+                                gctx->cem_worker = gctx->cem_if->create(gctx->cem_threads);
+                                if (gctx->cem_worker == nullptr) {
+                                    return golem_cem_fail();
+                                }
+                            }
+                            if (!golem_cem_acc_ensure(gctx, sched, split_backend, golem_cem_n_blk, n_embd)) {
+                                return golem_cem_fail();
+                            }
+                            const int32_t n_cand = (int32_t) golem_cem_cand.size();
+                            golem_cem_took.resize(n_cand);
+                            golem_cem_ptrs.resize((size_t) n_cand * 3);
+                            int32_t took = 0;
+                            {
+                                golem_cb_guard cb;
+                                took = gctx->cem_lease(gctx->payload, blk, golem_cem_cand.data(), n_cand,
+                                                       gctx->cem_frac, golem_cem_took.data(), golem_cem_ptrs.data());
+                            }
+                            GGML_ASSERT(took >= 0 && took <= n_cand);
+                            if (took > 0) {
+                                ggml_backend_t ids_be = ggml_backend_sched_get_tensor_backend(sched, ids_orig);
+                                ggml_backend_t xb = ggml_backend_sched_get_tensor_backend(sched, cx);
+                                ggml_backend_t wb = ggml_backend_sched_get_tensor_backend(sched, cw);
+                                if (xb != NULL && xb != ids_be) {
+                                    ggml_backend_synchronize(xb);
+                                }
+                                if (wb != NULL && wb != ids_be && wb != xb) {
+                                    ggml_backend_synchronize(wb);
+                                }
+                                golem_cem_x.resize(n_embd);
+                                ggml_backend_tensor_get(cx, golem_cem_x.data(), 0, ggml_nbytes(cx));
+                                golem_cem_wraw.resize(ggml_nbytes(cw) / sizeof(float));
+                                ggml_backend_tensor_get(cw, golem_cem_wraw.data(), 0, ggml_nbytes(cw));
+                                golem_cem_w.resize(took);
+                                ggml_bitset_t * row = &golem_cem_mask[(size_t) blk * golem_cem_row];
+                                std::fill(row, row + golem_cem_row, 0);
+                                golem_cpu_expert_job job = {};
+                                job.x = golem_cem_x.data();
+                                job.n_embd = n_embd;
+                                job.n_ff = n_ff;
+                                job.n = took;
+                                golem_cpu_expert_plane * planes[3] = {&job.gate, &job.up, &job.down};
+                                for (int k = 0; k < 3; ++k) {
+                                    planes[k]->type = ct[3 + k]->type;
+                                    planes[k]->row_bytes = ct[3 + k]->nb[1];
+                                }
+                                for (int32_t e = 0; e < took; ++e) {
+                                    const int32_t id = golem_cem_took[e];
+                                    GGML_ASSERT(id >= 0 && id < n_expert && ggml_bitset_get(used_ids.data(), id));
+                                    int64_t pos = -1;
+                                    for (int64_t i0 = 0; i0 < n_used; ++i0) {
+                                        if (ids[i0 * ids_orig->nb[0] / sizeof(int32_t)] == id) {
+                                            pos = i0;
+                                            break;
+                                        }
+                                    }
+                                    GGML_ASSERT(pos >= 0);
+                                    golem_cem_w[e] = golem_cem_wraw[pos * cw->nb[1] / sizeof(float)];
+                                    for (int k = 0; k < 3; ++k) {
+                                        GGML_ASSERT(golem_cem_ptrs[(size_t) e * 3 + k] != nullptr);
+                                        planes[k]->data[e] = golem_cem_ptrs[(size_t) e * 3 + k];
+                                    }
+                                    ggml_bitset_set(row, id);
+                                }
+                                job.w = golem_cem_w.data();
+                                job.limit = golem_cem_limit[blk];
+                                job.acc = gctx->cem_acc + (size_t) blk * (size_t) n_embd;
+                                GGML_ASSERT(gctx->cem_pending_blk == -1);
+                                gctx->cem_if->submit(gctx->cem_worker, &job);
+                                gctx->cem_pending_blk = blk;
+                                golem_cem_n_cpu[blk] = took;
+                                gctx->cem_experts += (uint64_t) took;
+                                gctx->cem_bytes += (uint64_t) took * (cg->nb[2] + cu->nb[2] + cd->nb[2]);
+                            }
+                        }
+                    }
+                }
+                const ggml_bitset_t * golem_cem_blk_mask =
+                    golem_cem_on && blk >= 0 && blk < golem_cem_n_blk && golem_cem_sel_step[blk] == golem_split_seq &&
+                    golem_cem_n_cpu[blk] > 0 ? &golem_cem_mask[(size_t) blk * golem_cem_row] : nullptr;
                 golem_miss_kinds.clear();
                 golem_miss_ids.clear();
                 golem_evicts.clear();
@@ -2393,7 +2761,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     plan.ptrs.clear();
                     plan.out_off = golem_miss_ids.size();
                     for (int64_t id3 = 0; id3 < n_expert_j; ++id3) {
-                        if (ggml_bitset_get(used_ids.data(), id3)) {
+                        if (ggml_bitset_get(used_ids.data(), id3) &&
+                            (golem_cem_blk_mask == nullptr || !ggml_bitset_get(golem_cem_blk_mask, id3))) {
                             plan.routed.push_back((int32_t) id3);
                         }
                     }
@@ -2530,7 +2899,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             plan.dc = golem::golem_slab_step_ev(L, kind - 1, plan.routed, golem_dense.data(),
                                 (int64_t) golem_dense.size(), order, K, (int32_t) n_expert_j, st.remap,
                                 gctx->evict_batch != NULL ? &golem_evicts : nullptr,
-                                [&](int32_t slot, int32_t id5) { plan.pending.emplace_back(slot, id5); });
+                                [&](int32_t slot, int32_t id5) { plan.pending.emplace_back(slot, id5); },
+                                golem_cem_blk_mask);
+                            gctx->cem_padded += plan.dc.padded;
                             GGML_ASSERT((int64_t) st.remap.size() == ggml_nelements(st.ids_dev));
                             GGML_ASSERT(ggml_backend_buffer_is_host(st.ids_pin_buf));
                             GGML_ASSERT(ggml_backend_buffer_get_type(st.ids_pin_buf) == st.ids_pin_buft);
@@ -2566,6 +2937,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // earlier layers queued, then fail the compute
                     // (llama_decode -2). The slot tables already stepped
                     // are stale until the engine resets the cache.
+                    golem_cem_join(gctx);
                     golem_restore_ids();
                     for (int i = 0; i < sched->n_backends; i++) {
                         ggml_backend_synchronize(sched->backends[i]);
@@ -2637,6 +3009,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ensure_rc != 0) {
                         // ABI v13: the misses could not be paged in; drain
                         // what earlier layers queued and fail the compute.
+                        golem_cem_join(gctx);
                         golem_restore_ids();
                         for (int i = 0; i < sched->n_backends; i++) {
                             ggml_backend_synchronize(sched->backends[i]);
@@ -2678,6 +3051,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+                // O1 join: this blk's own job, or zeros when none ran;
+                // a different blk pending means its padded experts would be
+                // lost, so the compute fails.
+                const int ablk = golem_cem_on ? golem_cem_name_blk(input->name, "golem_cpu_acc-") : -1;
+                if (ablk >= 0 && ablk < golem_cem_n_blk && input->op == GGML_OP_NONE) {
+                    if (gctx->cem_pending_blk == ablk) {
+                        golem_cem_join(gctx);
+                    } else if (gctx->cem_pending_blk >= 0) {
+                        return golem_cem_fail();
+                    } else {
+                        if (!golem_cem_acc_ensure(gctx, sched, split_backend, golem_cem_n_blk, ggml_nelements(input))) {
+                            return golem_cem_fail();
+                        }
+                        memset(gctx->cem_acc + (size_t) ablk * (size_t) gctx->cem_acc_n_embd, 0, ggml_nbytes(input));
+                    }
+                    GGML_ASSERT(gctx->cem_acc != nullptr && gctx->cem_acc_n_embd == ggml_nelements(input));
+                    ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                                  gctx->cem_acc + (size_t) ablk * (size_t) gctx->cem_acc_n_embd,
+                                                  0, ggml_nbytes(input));
+                    continue;
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -2863,6 +3257,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // hand back every issued seq (leases + staging),
                             // and fail the compute; the graph never runs.
                             // Only a cancel aborts; storage loss fails.
+                            golem_cem_join(gctx);
                             golem_restore_ids();
                             // Leases are released below: drain all backends + copy stream (any may hold an earlier split's async copy).
                             for (int i = 0; i < sched->n_backends; i++) {
@@ -3094,6 +3489,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             golem_restore_ids();
             if (ec != GGML_STATUS_SUCCESS) {
+                if (golem_cem_on) {
+                    golem_cem_join(gctx);
+                }
                 for (int i = 0; i < sched->n_backends; i++) {
                     ggml_backend_synchronize(sched->backends[i]);
                 }
@@ -3126,6 +3524,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    if (golem_cem_on) {
+                        golem_cem_join(gctx);
+                    }
                     golem_restore_ids();
                     for (int i = 0; i < sched->n_backends; i++) {
                         ggml_backend_synchronize(sched->backends[i]);
@@ -3176,6 +3577,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // holds its own; the depth is per nested entry). Copy-stream work never
     // outlives the entry that queued it.
     if (golem_hooked) {
+        golem_cem_join(gctx);
         golem_drain_copy_stream(gctx);
         golem_in_flight_done(gctx);
     }
@@ -3965,6 +4367,14 @@ void golem_ctx_free(golem_ctx_t ctx) {
         GGML_ABORT("golem ctx_free with live prefill-stream slabs: the owner must "
                    "call golem_reset_device_cache while the backend is still alive");
     }
+    if (ctx->cem_acc_buf != nullptr) {
+        GGML_ABORT("golem ctx_free with a live CPU expert accumulator: the owner must "
+                   "call golem_reset_device_cache while the backend is still alive");
+    }
+    GGML_ASSERT(ctx->cem_pending_blk == -1);
+    if (ctx->cem_worker != nullptr) {
+        ctx->cem_if->destroy(ctx->cem_worker);
+    }
     delete ctx;
 }
 
@@ -4053,6 +4463,10 @@ void golem_sched_set_ctx(struct ggml_backend_sched *sched, golem_ctx_t ctx) {
 
 void golem_sched_detach_ctx(struct ggml_backend_sched *sched) {
     golem_sched_set_ctx(sched, NULL);
+}
+
+golem_ctx_t golem_sched_get_ctx(struct ggml_backend_sched *sched) {
+    return sched == NULL ? NULL : sched->golem_ctx;
 }
 
 const int32_t *golem_policy_order(golem_ctx_t ctx, const void *tensor, int32_t n_experts) {

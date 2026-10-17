@@ -4,13 +4,18 @@
 // tests/golem-p2-cache.cpp (fuzz harness): a single shared definition —
 // hand-copied declarations would be an ODR drift (silent wrong-layout crash).
 //
-// The device cache is a slab of K+1 expert-plane slots per tensor (+1 non-NaN
-// padding slot), and MUL_MAT_ID reads it
-// through a REMAPPED ids tensor (values in [0, K)): routing is untouched —
+// The device cache is a slab of K+1 expert-plane slots per tensor (+1 zeroed
+// padding slot K), and MUL_MAT_ID reads it
+// through a REMAPPED ids tensor (values in [0, K]): routing is untouched —
 // only the addressing moves. The three expert tensors of a layer consume the
 // same routed ids (llama-graph build_moe_ffn), so slot assignment and
 // eviction are decided once per layer; each tensor keeps only its own
 // per-slot validity bits.
+//
+// Slot K is referenced only by CPU-assigned ids (design §1 O1): a zeroed
+// quantized plane has every scale 0, so its MUL_MAT_ID contribution is
+// exactly 0 for finite activations (0 * inf/NaN is NaN) and the CPU
+// result is added once, outside the graph's expert sum.
 #ifndef GOLEM_DEVICE_CACHE_HPP
 #define GOLEM_DEVICE_CACHE_HPP
 
@@ -82,6 +87,7 @@ struct GolemSlabCounters {
     uint64_t copied = 0;   // expert planes written this step
     uint64_t skipped = 0;  // routed experts whose slot bytes were current
     uint64_t evicted = 0;  // slots stolen from non-routed experts
+    uint64_t padded = 0;   // ids remapped to the padding slot K (CPU-assigned)
 };
 
 // Gathers a strided int32 ids tensor (ggml_argsort_top_k is a view: nb[1] =
@@ -124,13 +130,16 @@ inline void golem_layer_invalidate(GolemLayerSlots &L, int kind) {
 //   `slot`. Called once per non-current routed expert.
 // - remap = the remapped ids (same element order/count as `ids`), ready for
 //   the caller's H2D of the ids_dev tensor.
+// - `cpu_mask` (n_experts bits, NULL = none): ids computed on the CPU (O1).
+//   They remap to the zeroed padding slot K and must be disjoint from
+//   `routed` (asserted), so they get no slot, copy or eviction.
 template <typename OnCopy>
 GolemSlabCounters golem_slab_step(GolemLayerSlots &L, int kind, const std::vector<int32_t> &routed,
                                   const int32_t *ids, int64_t ids_count, const int32_t *order,
                                   int32_t K, int32_t n_experts, std::vector<int32_t> &remap,
-                                  OnCopy &&on_copy) {
+                                  OnCopy &&on_copy, const ggml_bitset_t *cpu_mask = nullptr) {
     return golem_slab_step_ev(L, kind, routed, ids, ids_count, order, K, n_experts, remap,
-                              nullptr, std::forward<OnCopy>(on_copy));
+                              nullptr, std::forward<OnCopy>(on_copy), cpu_mask);
 }
 
 // Exclusive-residency extension (ABI v7): when `evicted` is non-NULL, every
@@ -143,7 +152,7 @@ GolemSlabCounters golem_slab_step_ev(GolemLayerSlots &L, int kind, const std::ve
                                      const int32_t *ids, int64_t ids_count, const int32_t *order,
                                      int32_t K, int32_t n_experts, std::vector<int32_t> &remap,
                                      std::vector<std::pair<int32_t, int32_t>> *evicted,
-                                     OnCopy &&on_copy) {
+                                     OnCopy &&on_copy, const ggml_bitset_t *cpu_mask = nullptr) {
     GolemSlabCounters c;
     GGML_ASSERT(K > 0 && K <= n_experts);
     GGML_ASSERT(kind >= 0 && kind < 3);
@@ -178,6 +187,8 @@ GolemSlabCounters golem_slab_step_ev(GolemLayerSlots &L, int kind, const std::ve
     is_routed.assign(ggml_bitset_size(n_experts), 0);
     for (int32_t id : routed) {
         GGML_ASSERT(id >= 0 && id < n_experts);
+        GGML_ASSERT((cpu_mask == nullptr || !ggml_bitset_get(cpu_mask, id)) &&
+                    "CPU-assigned ids must not be routed to the slab");
         ggml_bitset_set(is_routed.data(), id);
     }
 
@@ -242,12 +253,16 @@ GolemSlabCounters golem_slab_step_ev(GolemLayerSlots &L, int kind, const std::ve
         }
     }
 
-    // Build the remapped ids (values in [0, K); ids_dev's padding slot K is
-    // never referenced by remaps).
+    // Build the remapped ids: values in [0, K), or K for CPU-assigned ids.
     remap.resize(ids_count);
     for (int64_t i = 0; i < ids_count; ++i) {
         const int32_t v = ids[i];
         GGML_ASSERT(v >= 0 && v < n_experts);
+        if (cpu_mask != nullptr && ggml_bitset_get(cpu_mask, v)) {
+            remap[i] = K;
+            c.padded++;
+            continue;
+        }
         const int32_t s = L.slot_of[v];
         GGML_ASSERT(s != -1 && "routed bitset must cover every ids value");
         remap[i] = s;
@@ -262,9 +277,10 @@ inline GolemSlabCounters golem_slab_step_nop(GolemLayerSlots &L, int kind,
                                              const std::vector<int32_t> &routed,
                                              const int32_t *ids, int64_t ids_count,
                                              const int32_t *order, int32_t K, int32_t n_experts,
-                                             std::vector<int32_t> &remap) {
+                                             std::vector<int32_t> &remap,
+                                             const ggml_bitset_t *cpu_mask = nullptr) {
     return golem_slab_step_ev(L, kind, routed, ids, ids_count, order, K, n_experts, remap,
-                              nullptr, [](int32_t, int32_t) {});
+                              nullptr, [](int32_t, int32_t) {}, cpu_mask);
 }
 
 } // namespace golem

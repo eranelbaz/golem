@@ -16,8 +16,11 @@ H2D_GBPS = 27.0                   # GB/s pinned H2D
 DISK_GBPS = 4.73                  # GB/s disk
 
 COLS = ["step", "tokens", "wall_ms", "p3_wait_ms", "disk_worker_ms", "disk_bytes",
-        "h2d_ms", "h2d_bytes", "policy_ms", "compute_ms"]
-UNMEASURED = {"h2d_ms", "h2d_bytes", "policy_ms"}
+        "h2d_ms", "h2d_bytes", "policy_ms", "compute_ms",
+        "cpu_expert_math_experts", "cpu_expert_math_bytes", "cpu_expert_math_ms",
+        "cpu_expert_join_wait_ms"]
+UNMEASURED = {"h2d_ms", "h2d_bytes", "policy_ms", "cpu_expert_math_experts",
+              "cpu_expert_math_bytes", "cpu_expert_math_ms", "cpu_expert_join_wait_ms"}
 
 
 def parse_num(col, raw):

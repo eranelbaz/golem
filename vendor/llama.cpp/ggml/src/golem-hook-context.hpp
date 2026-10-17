@@ -30,6 +30,7 @@ struct ggml_context;
 struct ggml_tensor;
 struct ggml_backend_buffer;
 struct ggml_backend_event;
+struct golem_cpu_expert_iface; // golem-cpu-expert.h
 
 // P4 counters; layout mirrors the Rust [AtomicU64; 5] FFI cast (the
 // placement stats are process-global and stay in ggml-backend.cpp).
@@ -168,6 +169,29 @@ struct golem_ctx {
     int32_t cs_t_n = 0;
     bool cs_t_overflow = false;
     uint64_t cs_bytes = 0;
+
+    // --- O1 CPU expert math (golem_set_cpu_expert_math, design §1 O1) ---
+    // Config is init-only; everything else is decode-thread-only. The worker
+    // and iface are bound lazily on the first eligible compute. Per-blk
+    // pinned accumulators (n_blk x n_embd f32, one host buffer of the split
+    // device) are never reused within a compute; freed by
+    // golem_reset_device_cache. Invariant between computes:
+    // cem_pending_blk == -1 (every submitted job is joined).
+    std::atomic<int32_t> cem_on{0}; // read at graph build
+    float cem_frac = 0.0f;
+    int32_t cem_threads = 0;
+    golem_cpu_lease_fn cem_lease = nullptr;
+    const struct golem_cpu_expert_iface * cem_if = nullptr;
+    void * cem_worker = nullptr;
+    struct ggml_backend_buffer * cem_acc_buf = nullptr;
+    float * cem_acc = nullptr; // [n_blk * cem_acc_n_embd]
+    int32_t cem_acc_n_embd = 0;
+    int32_t cem_pending_blk = -1; // blk whose job is submitted and not yet joined
+    uint64_t cem_experts = 0;
+    uint64_t cem_bytes = 0;
+    double cem_ms = 0.0;
+    double cem_join_wait_ms = 0.0;
+    uint64_t cem_padded = 0;
 
     golem_ctx(int32_t n_layers, int32_t n_experts_)
         : orders((size_t) (n_layers > 0 ? n_layers : 1) * 3), n_experts(n_experts_) {

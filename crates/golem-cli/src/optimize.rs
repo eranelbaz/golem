@@ -51,7 +51,7 @@ pub struct OptimizeArgs {
     pub max_minutes: u64,
     /// Override the swept axes: `knob=v1,v2;knob=...` over threads,
     /// numa_interleave, o_direct, io_threads, io_depth, vram_experts_frac,
-    /// async_h2d.
+    /// async_h2d, cpu_expert_math, cpu_expert_frac.
     #[arg(long)]
     pub axes: Option<String>,
     /// Internal: measure one knob set (JSON) and print its metrics.
@@ -465,6 +465,8 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
                 "io_depth" => Axis::IoDepth(vals(v)?),
                 "async_h2d" => Axis::AsyncH2d(vals(v)?),
                 "vram_experts_frac" => Axis::VramExpertsFrac(vals(v)?),
+                "cpu_expert_math" => Axis::CpuExpertMath(vals(v)?),
+                "cpu_expert_frac" => Axis::CpuExpertFrac(vals(v)?),
                 other => return Err(format!("unknown knob {other:?}").into()),
             })
         })
@@ -472,8 +474,8 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
 }
 
 /// The swept axes for this machine. NUMA only with > 1 node, `O_DIRECT`
-/// and I/O only with a store-backed pool; `async_h2d` is opt-in via
-/// `--axes` (no measured win yet). Target: 16 physical cores → threads {8, 12, 16}.
+/// and I/O only with a store-backed pool; `async_h2d` and
+/// `cpu_expert_*` are opt-in via `--axes` (no measured win yet). Target: 16 physical cores → threads {8, 12, 16}.
 fn default_axes(config: &EngineConfig) -> Vec<Axis> {
     let phys = sysinfo::System::new().physical_core_count().unwrap_or(2) as u32;
     let mut threads = vec![(phys / 2).max(1), (phys * 3 / 4).max(1), phys.max(1)];
@@ -525,6 +527,8 @@ fn fold_defaults(axes: &mut [Axis], config: &EngineConfig) {
             Axis::IoDepth(v) => fold(v, |x| x == config.io_depth.max(1), 0),
             Axis::VramExpertsFrac(v) => fold(v, |x| x == config.vram_experts_frac, 0.0),
             Axis::AsyncH2d(v) => fold(v, |x| x == config.async_h2d, false),
+            Axis::CpuExpertMath(v) => fold(v, |x| x == config.cpu_expert_math, false),
+            Axis::CpuExpertFrac(v) => fold(v, |x| x == config.cpu_expert_frac, 0.0),
         }
     }
 }
@@ -545,6 +549,10 @@ fn apply(config: &mut EngineConfig, k: &Knobs) {
     config.async_h2d |= k.async_h2d;
     if k.vram_experts_frac > 0.0 {
         config.vram_experts_frac = k.vram_experts_frac;
+    }
+    config.cpu_expert_math |= k.cpu_expert_math;
+    if k.cpu_expert_frac > 0.0 {
+        config.cpu_expert_frac = k.cpu_expert_frac;
     }
 }
 

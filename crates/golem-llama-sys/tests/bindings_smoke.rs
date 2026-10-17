@@ -50,8 +50,10 @@ fn hook_abi_types_generated() {
     // constant the bindings came from matches the compiled substrate.
     // ABI v9 adds the abandoned-D2H hook (parked evictions whose plane
     // copies were not all issued must be reported, not committed).
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 15);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 15);
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 16);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 16);
+    // v16: CPU expert math surface.
+    assert_thin_fn_ptr::<raw::golem_cpu_lease_fn>();
     // v15: stream source return codes.
     assert_eq!(
         (
@@ -69,6 +71,14 @@ fn hook_abi_types_generated() {
         ),
         ("golem_ctx_create", raw::golem_ctx_create as *const ()),
         ("golem_ctx_free", raw::golem_ctx_free as *const ()),
+        (
+            "golem_set_cpu_expert_math",
+            raw::golem_set_cpu_expert_math as *const (),
+        ),
+        (
+            "golem_take_cpu_expert_stats",
+            raw::golem_take_cpu_expert_stats as *const (),
+        ),
         (
             "golem_register_hooks",
             raw::golem_register_hooks as *const (),

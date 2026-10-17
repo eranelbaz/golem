@@ -54,7 +54,18 @@ const EXPERT_TYPES: [u32; 3] = [GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K];
 /// Generates the split fixture under `.test-cache/tiny-hybrid/` and returns
 /// the first shard (the path llama.cpp loads). Safe to call concurrently.
 pub fn cached_fixture() -> PathBuf {
-    let dir = repo_root().join(".test-cache/tiny-hybrid");
+    cached("tiny-hybrid", None)
+}
+
+/// [`cached_fixture`] with `swiglu_clamp_exp = 0.5`, so the routed-expert
+/// SWIGLU_CLAMP path is exercised; a separate cache dir keeps the unclamped
+/// fixture's outputs unchanged.
+pub fn cached_fixture_clamped() -> PathBuf {
+    cached("tiny-hybrid-clamped", Some(0.5))
+}
+
+fn cached(name: &str, clamp_exp: Option<f32>) -> PathBuf {
+    let dir = repo_root().join(".test-cache").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let paths: Vec<PathBuf> = (1..=N_SHARDS)
         .map(|i| dir.join(format!("tiny-hybrid-{i:05}-of-{N_SHARDS:05}.gguf")))
@@ -65,7 +76,12 @@ pub fn cached_fixture() -> PathBuf {
             let shard: &[_] = if shard_no == 0 { &[] } else { &tensors };
             let tmp = path.with_extension(format!("gguf.{}.tmp", std::process::id()));
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
-            gguf::write_gguf(&mut w, &kvs(shard_no as u16, tensors.len()), shard).unwrap();
+            gguf::write_gguf(
+                &mut w,
+                &kvs(shard_no as u16, tensors.len(), clamp_exp),
+                shard,
+            )
+            .unwrap();
             w.flush().unwrap();
             // A concurrent generator may have won the rename; its bytes are identical.
             if let Err(e) = std::fs::rename(&tmp, path) {
@@ -77,12 +93,12 @@ pub fn cached_fixture() -> PathBuf {
     paths[0].clone()
 }
 
-fn kvs(shard_no: u16, n_tensors: usize) -> Vec<GgufKv> {
+fn kvs(shard_no: u16, n_tensors: usize, clamp_exp: Option<f32>) -> Vec<GgufKv> {
     let u = GgufValue::U32;
     let f = GgufValue::F32;
     let a = |k: &str| format!("glm5next.{k}");
     let toks = token_table();
-    vec![
+    let mut out = vec![
         kv("general.architecture", GgufValue::Str("glm5next".into())),
         kv("general.name", GgufValue::Str("tiny-hybrid".into())),
         kv("general.file_type", u(0)),
@@ -145,7 +161,11 @@ fn kvs(shard_no: u16, n_tensors: usize) -> Vec<GgufKv> {
             "split.tensors.count",
             GgufValue::I32(i32::try_from(n_tensors).unwrap()),
         ),
-    ]
+    ];
+    if let Some(c) = clamp_exp {
+        out.push(kv(&a("swiglu_clamp_exp"), f(c)));
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
