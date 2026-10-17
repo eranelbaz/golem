@@ -64,6 +64,16 @@ pub struct EngineConfig {
     /// Share of the §10 planner's `device_expert_cache` allowance the
     /// derived K may use (1.0 = all of it). No effect with an explicit K.
     pub vram_experts_frac: f32,
+    /// Decode-only CPU/GPU hybrid expert math (design §1 O1): a share of
+    /// each layer's RAM-resident slab misses is multiplied on the CPU from
+    /// the pool instead of copied to the device. Needs the RAM expert pool
+    /// and a GPU substrate. `false` keeps the output byte-identical.
+    pub cpu_expert_math: bool,
+    /// Share of a layer's eligible slab misses sent to the CPU, in (0, 1].
+    pub cpu_expert_frac: f32,
+    /// CPU expert math worker threads (8: measured sweet spot, ≈ 205 GB/s
+    /// cache-hot, DRAM-bound ≈ 60 GB/s).
+    pub cpu_expert_threads: u32,
     /// Model manifest (§4.2) for the store-backed expert source: when set,
     /// the P3 slow path reads expert planes from the manifest's replica set
     /// through the shared chunk queue; `None` (the default) reads the single
@@ -202,6 +212,9 @@ impl Default for EngineConfig {
             o_direct: false,
             async_h2d: false,
             vram_experts_frac: 1.0,
+            cpu_expert_math: false,
+            cpu_expert_frac: 0.7,
+            cpu_expert_threads: 8,
             manifest_path: None,
             timing_csv: None,
             routing_trace: None,
@@ -290,5 +303,8 @@ mod tests {
             c.io_threads, None,
             "io threads default to the derived per-drive count"
         );
+        assert!(!c.cpu_expert_math, "CPU expert math defaults off");
+        assert_eq!(c.cpu_expert_frac, 0.7);
+        assert_eq!(c.cpu_expert_threads, 8);
     }
 }

@@ -44,9 +44,9 @@ use golem_gguf::blk_of;
 use golem_llama_sys::raw;
 use golem_llama_sys::{CtxRaw, GolemCtx, HookFns, Hooked};
 use golem_placement::pool::{
-    AccessFeed, D2hIncoming, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, P3Stats,
-    PolicySnapshot, PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource, WarmFeed,
-    spawn_prefetch,
+    AccessFeed, D2hIncoming, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, LeaseBatch,
+    P3Stats, PolicySnapshot, PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource,
+    WarmFeed, spawn_prefetch,
 };
 use golem_placement::scores::WarmShape;
 use golem_store::ChunkQueue;
@@ -310,6 +310,9 @@ struct HookState {
     /// Per-eviction scratch the `evict_dest_batch` hook fills (expert, floor)
     /// once per layer — no per-expert allocation on the eviction path.
     evict_scratch: Mutex<Vec<(u32, f32)>>,
+    /// CPU expert math leases (design §1 O1, ABI v16): locked once per
+    /// `cpu_lease` layer call and once at `copy_done`, never per expert.
+    cpu_lease: Mutex<CpuLease>,
     /// §6.5 P5 prediction state (mode `Off`: never touched).
     pred: PredState,
     /// Prefill-stream state (§7.6, ABI v10); `None` when streaming is off
@@ -334,6 +337,14 @@ struct HookState {
     /// before its page-in reads, so the read itself fails.
     #[cfg(any(test, feature = "test-support"))]
     test_fail_storage_in_read: AtomicBool,
+}
+
+/// The `cpu_lease` hook's state: the step's leases (capacity `n_layers ×
+/// n_expert_used`; GLM 42 × 8 = 336 units ≤ 336 × 16.8 MB ≈ 5.6 GB pinned
+/// against the 57 GiB pool) and the i32 → u32 id scratch (`n_experts`).
+struct CpuLease {
+    batch: LeaseBatch,
+    ids: Vec<u32>,
 }
 
 /// One turn's registration of its cancel flag in `HookState.abort`.
@@ -786,6 +797,8 @@ pub(crate) struct StepIoStats {
     pub disk_bytes: Option<u64>,
     /// Copy-stream H2D (ms, bytes); `None` unless async_h2d measured it.
     pub h2d: Option<(f64, u64)>,
+    /// `None` unless cpu_expert_math is armed.
+    pub cpu_expert: Option<crate::timing::CpuExpertStats>,
 }
 
 fn current_states() -> Vec<Arc<HookState>> {
@@ -812,6 +825,21 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
             if unsafe { raw::golem_take_h2d_timing(ctx, &mut ms, &mut bytes) } == 1 {
                 let (m0, b0) = out.h2d.unwrap_or((0.0, 0));
                 out.h2d = Some((m0 + ms, b0 + bytes));
+            }
+            let mut c = crate::timing::CpuExpertStats::default();
+            // SAFETY: as above; writes only the five out-params.
+            if unsafe {
+                raw::golem_take_cpu_expert_stats(
+                    ctx,
+                    &mut c.experts,
+                    &mut c.bytes,
+                    &mut c.ms,
+                    &mut c.join_wait_ms,
+                    &mut c.padded,
+                )
+            } == 1
+            {
+                out.cpu_expert.get_or_insert_with(Default::default).add(&c);
             }
         }
     }
@@ -1327,6 +1355,16 @@ impl SessionHooks {
         }
     }
 
+    /// Leases the CPU expert worker holds until the next `copy_done`.
+    pub fn cpu_leases(&self) -> usize {
+        self.state
+            .cpu_lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .batch
+            .len()
+    }
+
     /// Leases the pool's batched step claims still hold (0 between turns).
     pub fn pool_batch_leases(&self) -> usize {
         self.state.pool.batch_leases()
@@ -1345,6 +1383,7 @@ impl SessionHooks {
     /// of units whose slab entries no longer exist and set stale VRAM bits —
     /// a unit in neither tier.
     pub fn device_cache_reset(&self) {
+        self.state.release_cpu_leases();
         self.state.pool.reset_exclusive_batch();
         self.state.pool.clear_all_vram();
     }
@@ -1498,6 +1537,7 @@ impl Drop for SessionHooks {
         //    clearing before the ctx free makes a subsequent enable() see a
         //    clean slate.
         self.unregister();
+        self.state.release_cpu_leases();
         // 2. Stop the publisher thread FIRST (it reads the ctx pointer
         //    window), then clear the pointer (post-join: no reader left).
         self.publisher.stop_and_join();
@@ -1998,6 +2038,10 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         },
         miss_scratch: Mutex::new(Vec::with_capacity(3 * k.min(geo.n_experts) as usize)),
         evict_scratch: Mutex::new(Vec::with_capacity(geo.n_experts as usize)),
+        cpu_lease: Mutex::new(CpuLease {
+            batch: LeaseBatch::new(&pool, (n_layers * n_expert_used) as usize),
+            ids: Vec::with_capacity(geo.n_experts as usize),
+        }),
         flush_scratch: Mutex::new(OrderScratch::new(geo.n_experts as usize)),
         exclusive: config.residency == Residency::Exclusive,
         policy,
@@ -2072,6 +2116,26 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // The ctx keep-alive: the registration owns one Arc; this clone orders
     // the free AFTER `llama_free` in the §3.4 Session teardown.
     let hooked_ctx_keep = hooked.ctx_arc();
+    // SAFETY: FFI init-only setter on the live ctx after the routing hook is
+    // registered and before the first graph build; `cpu_lease` is a valid C
+    // ABI fn receiving the registered payload.
+    if config.cpu_expert_math
+        && unsafe {
+            raw::golem_set_cpu_expert_math(
+                hooked.ctx_ptr(),
+                1,
+                config.cpu_expert_frac,
+                config.cpu_expert_threads as i32,
+                Some(cpu_lease),
+            )
+        } != 0
+    {
+        return Err(EngineError::InvalidConfig(
+            "cpu_expert_math: the substrate refused to arm it (routing hook not \
+             registered, already armed, or frac/threads out of range)"
+                .into(),
+        ));
+    }
 
     tracing::info!(
         layers = n_layers,
@@ -2455,6 +2519,61 @@ unsafe fn state_of<'a>(payload: *mut c_void) -> &'a HookState {
     unsafe { &*(payload as *const HookState) }
 }
 
+/// The ABI v16 `golem_cpu_lease_fn`: leases the first `ceil(frac ×
+/// n_resident)` pool-resident units among `blk`'s routed `ids` for the CPU
+/// expert worker, held until the next `copy_done`. One call per (layer,
+/// step); out-of-range `blk` or null arrays take nothing.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn cpu_lease(
+    payload: *mut c_void,
+    blk: i32,
+    ids: *const i32,
+    n: i32,
+    frac: f32,
+    out_ids: *mut i32,
+    out_ptrs3: *mut *const c_void,
+) -> i32 {
+    guarded("cpu_lease", || {
+        // SAFETY: see `state_of`.
+        let h = unsafe { state_of(payload) };
+        let layer = i64::from(blk) - i64::from(h.dense_lead);
+        if !(0..i64::from(h.n_layers)).contains(&layer)
+            || n <= 0
+            || ids.is_null()
+            || out_ids.is_null()
+            || out_ptrs3.is_null()
+        {
+            return 0;
+        }
+        let n = n as usize;
+        // SAFETY: C passes `n` ids, `n` out ids and `3n` out pointers, live
+        // and unaliased for the call.
+        let (ids, out_ids, out_ptrs3) = unsafe {
+            (
+                std::slice::from_raw_parts(ids, n),
+                std::slice::from_raw_parts_mut(out_ids, n),
+                std::slice::from_raw_parts_mut(out_ptrs3.cast::<*const u8>(), 3 * n),
+            )
+        };
+        let mut g = h.cpu_lease.lock().unwrap_or_else(|e| e.into_inner());
+        let CpuLease {
+            batch,
+            ids: scratch,
+        } = &mut *g;
+        scratch.clear();
+        let cap = scratch.capacity();
+        scratch.extend(
+            ids.iter()
+                .filter(|&&id| id >= 0 && (id as u32) < h.n_experts)
+                .map(|&id| id as u32)
+                .take(cap),
+        );
+        h.pool
+            .lease_resident_take(layer as u32, scratch, frac, out_ids, out_ptrs3, batch)
+            as i32
+    })
+}
+
 /// The P1 `ensure_host_resident` trampoline, ABI v5 batched form: ONE call
 /// per (layer, step, split-segment) with the whole miss list across ALL
 /// planes; the pool holds a lease on each returned slot until `copy_done`.
@@ -2578,6 +2697,9 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         h.copy_done_calls.fetch_add(1, Ordering::Relaxed);
+        // C joined the CPU expert worker before this hook; releasing its
+        // leases BEFORE the exclusive release keeps that release unblocked.
+        h.release_cpu_leases();
         if h.exclusive {
             // Exclusive residency (O10): the eviction D2Hs issued last
             // compute landed (C drained its backends above) — open their
@@ -2943,6 +3065,15 @@ pub extern "C" fn routing(
 }
 
 impl HookState {
+    /// Drops the CPU expert worker's leases. Call only after C joined it.
+    fn release_cpu_leases(&self) {
+        self.cpu_lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .batch
+            .release_all();
+    }
+
     /// Marks every replica of every store shard unreadable (fault seam).
     #[cfg(any(test, feature = "test-support"))]
     fn fail_storage(&self) {

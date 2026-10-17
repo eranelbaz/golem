@@ -123,6 +123,18 @@ pub struct EngineArgs {
     /// `--device-cache-experts` may use, in (0, 1] (default 1).
     #[arg(long, value_name = "FRAC")]
     pub vram_experts_frac: Option<f32>,
+    /// Decode-only CPU/GPU hybrid expert math: multiply a share of each
+    /// layer's RAM-resident slab misses on the CPU instead of copying them
+    /// to the GPU (needs the RAM expert pool; refused on the CPU substrate).
+    #[arg(long)]
+    pub cpu_expert_math: bool,
+    /// Share of a layer's eligible slab misses `--cpu-expert-math` sends to
+    /// the CPU, in (0, 1] (default 0.7).
+    #[arg(long, value_name = "FRAC")]
+    pub cpu_expert_frac: Option<f32>,
+    /// `--cpu-expert-math` worker threads (default 8).
+    #[arg(long, hide = true, value_name = "N")]
+    pub cpu_expert_threads: Option<u32>,
     /// Ignore the saved `golem optimize` profile for this model.
     #[arg(long)]
     pub no_optimize_profile: bool,
@@ -270,6 +282,13 @@ impl EngineArgs {
                 self.vram_experts_frac,
                 "vram_experts_frac",
                 d.vram_experts_frac,
+            )?,
+            cpu_expert_math: l.get(flag(self.cpu_expert_math), "cpu_expert_math", false)?,
+            cpu_expert_frac: l.get(self.cpu_expert_frac, "cpu_expert_frac", d.cpu_expert_frac)?,
+            cpu_expert_threads: l.get(
+                self.cpu_expert_threads,
+                "cpu_expert_threads",
+                d.cpu_expert_threads,
             )?,
             manifest_path: l.opt(self.manifest.clone(), "manifest")?,
             timing_csv: l.opt(self.timing_csv.clone(), "timing_csv")?,

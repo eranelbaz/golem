@@ -102,6 +102,26 @@ int main() {
             GGML_ASSERT(c.copied == 2 && c.skipped == 0);
         }
     }
+    {   // leg (O1): CPU-masked ids remap to the padding slot K and get no slot or copy.
+        golem::GolemLayerSlots L;
+        const int32_t K = 2, n = 8;
+        std::vector<int32_t> remap, order = {0, 1, 2, 3, 4, 5, 6, 7};
+        std::vector<ggml_bitset_t> mask(ggml_bitset_size(n), 0);
+        ggml_bitset_set(mask.data(), 5);
+        const std::vector<int32_t> routed = {1}, ids = {1, 5};
+        for (int k = 0; k < 3; ++k) {
+            const auto c = golem::golem_slab_step_ev(
+                L, k, routed, ids.data(), 2, order.data(), K, n, remap, nullptr,
+                [&](int32_t s, int32_t id) {
+                    GGML_ASSERT(s != K && id != 5); // the padding slot is never written
+                },
+                mask.data());
+            GGML_ASSERT(remap[0] == L.slot_of[1] && remap[0] >= 0 && remap[0] < K);
+            GGML_ASSERT(remap[1] == K);
+            GGML_ASSERT(L.slot_of[5] == -1);
+            GGML_ASSERT(c.padded == 1 && c.copied == 1 && c.evicted == 0);
+        }
+    }
 
     {   // leg: ids tensor = ggml_argsort_top_k view (nb[1] = n_expert*4, n_tokens > 1).
         // The dense gather must yield exactly ne0*ne1 selected ids; walking the raw
@@ -246,7 +266,24 @@ int main() {
         REQUIRE(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT, "duplicate order must abort");
     }
 
-    // --- golem_ctx eviction-order API (plan Task 3): NULL before first push,
+    // Abort: a routed id also in the CPU mask (O1 disjointness).
+    if (fork() == 0) {
+        golem::GolemLayerSlots L2;
+        std::vector<int32_t> remap2, routed = {1}, ids = {1}, order(n);
+        for (int32_t i = 0; i < n; ++i) order[i] = i;
+        std::vector<ggml_bitset_t> mask(ggml_bitset_size(n), 0);
+        ggml_bitset_set(mask.data(), 1);
+        golem::golem_slab_step_nop(L2, 0, routed, ids.data(), 1, order.data(), K, n, remap2,
+                                   mask.data());
+        _exit(0);
+    } else {
+        int status = 0;
+        wait(&status);
+        REQUIRE(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+                "routed id in the CPU mask must abort");
+    }
+
+    // --- golem_ctx eviction-order API: NULL before first push,
     // push → acquire returns the published permutation without re-entry, and
     // the epoch gate never hands a reader a torn buffer. ---
     {
@@ -303,7 +340,7 @@ int main() {
     }
 
     // --- one decode step over one layer: routing fires exactly once, with a
-    // dense ids vector of ne0*ne1 entries (plan Task 3). ---
+    // dense ids vector of ne0*ne1 entries. ---
     {
         using namespace golem_test;
         pool_init();

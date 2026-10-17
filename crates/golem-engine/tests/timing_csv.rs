@@ -3,7 +3,7 @@
 #[cfg(feature = "hip-tests")]
 mod common;
 
-use golem_engine::timing::{StepTiming, TimingRecorder};
+use golem_engine::timing::{CpuExpertStats, StepTiming, TimingRecorder};
 
 #[test]
 fn csv_header_carries_version_fork_commit_and_config() {
@@ -21,6 +21,42 @@ fn csv_header_carries_version_fork_commit_and_config() {
             && s.contains("fork_commit=deadbeef")
             && s.contains("ctx=4096")
     );
+    assert!(
+        s.lines().nth(1).unwrap().ends_with(
+            ",policy_ms,compute_ms,cpu_expert_math_experts,cpu_expert_math_bytes,\
+             cpu_expert_math_ms,cpu_expert_join_wait_ms"
+        ),
+        "{s}"
+    );
+}
+
+/// CPU expert math on: the four columns are numbers, and `compute_ms` does
+/// not subtract the worker's ms (it overlaps the GPU).
+#[test]
+fn cpu_expert_columns_measured_and_not_subtracted_from_compute() {
+    let mut r = TimingRecorder::new(64);
+    r.row(StepTiming {
+        step: 0,
+        tokens: 1,
+        wall_ms: 100.0,
+        p3_wait_ms: 60.0,
+        disk_worker_ms: f64::NAN,
+        disk_bytes: 0,
+        h2d_ms: f64::NAN,
+        h2d_bytes: 0,
+        policy_ms: f64::NAN,
+        cpu_expert: Some(CpuExpertStats {
+            experts: 12,
+            bytes: 69_206_016,
+            ms: 25.0,
+            join_wait_ms: 3.5,
+            padded: 36,
+        }),
+    });
+    let mut out = Vec::new();
+    r.flush(&mut out).unwrap();
+    let line = std::str::from_utf8(&out).unwrap().lines().last().unwrap();
+    assert!(line.ends_with(",40.0,12,69206016,25.0,3.5"), "row: {line}");
 }
 
 #[test]
@@ -36,6 +72,7 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
         h2d_ms: f64::NAN,
         h2d_bytes: 0,
         policy_ms: f64::NAN,
+        cpu_expert: None,
     });
     let mut out = Vec::new();
     r.flush(&mut out).unwrap();
@@ -46,6 +83,10 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
         .unwrap()
         .to_string();
     assert!(line.contains("unmeasured"));
+    assert!(
+        line.ends_with(",unmeasured,unmeasured,unmeasured,unmeasured"),
+        "cpu_expert columns off: {line}"
+    );
     assert!(!line.contains(",0,")); // no silent zero for unmeasured
     assert!(line.contains("55") && line.contains("121634816"));
 }
@@ -65,6 +106,7 @@ fn compute_is_wall_minus_p3_h2d_policy_not_disk_worker() {
         h2d_ms: f64::NAN,
         h2d_bytes: 0,
         policy_ms: 4.5,
+        cpu_expert: None,
     });
     let mut out = Vec::new();
     r.flush(&mut out).unwrap();

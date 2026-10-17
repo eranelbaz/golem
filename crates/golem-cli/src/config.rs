@@ -123,6 +123,12 @@ pub fn profile_table(knobs: Option<&crate::profile::Knobs>) -> toml::Table {
         k.vram_experts_frac > 0.0,
         f64::from(k.vram_experts_frac).into(),
     );
+    put("cpu_expert_math", k.cpu_expert_math, true.into());
+    put(
+        "cpu_expert_frac",
+        k.cpu_expert_frac > 0.0,
+        f64::from(k.cpu_expert_frac).into(),
+    );
     t
 }
 

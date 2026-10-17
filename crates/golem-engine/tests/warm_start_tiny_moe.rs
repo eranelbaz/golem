@@ -2,16 +2,17 @@
 //! policy words and step; the next session restores them verbatim, pre-fills
 //! the RAM pool in the background before any request, and decodes exactly
 //! what a cold session decodes (T3/I1). A corrupt file starts cold with a
-//! warning. Pooled tiny-moe through the engine-registered hooks.
+//! warning. Pooled tiny-moe through the engine-registered hooks. The
+//! restore leg needs HIP: the routing readback that books the words fires
+//! only on a GPU expert split.
 mod common;
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use golem_engine::config::EngineConfig;
-use golem_engine::session::{ChatTurn, Session};
+use golem_engine::session::Session;
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("golem-warm-{tag}-{}", std::process::id()));
@@ -30,7 +31,9 @@ fn pooled(warm_state_dir: Option<PathBuf>) -> EngineConfig {
     }
 }
 
+#[cfg(feature = "hip-tests")]
 fn greedy(s: &mut Session) -> String {
+    use golem_engine::session::ChatTurn;
     let mut out = String::new();
     s.chat_turn(
         &[ChatTurn {
@@ -48,6 +51,7 @@ fn words(s: &Session) -> (u64, Vec<(usize, u64, u64)>) {
     s.p3_hooks().expect("pooled").warm_words_for_test()
 }
 
+#[cfg(feature = "hip-tests")]
 #[test]
 fn saved_state_restores_verbatim_prefills_and_decodes_like_cold() {
     let dir = tmp_dir("restore");
@@ -79,10 +83,13 @@ fn saved_state_restores_verbatim_prefills_and_decodes_like_cold() {
         let mut b = Session::new(&pooled(Some(dir.clone()))).expect("session B");
         assert_eq!(words(&b), saved, "step and words restored verbatim");
         let hooks = b.p3_hooks().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !hooks.warm_fill_done() {
-            assert!(Instant::now() < deadline, "warm pre-fill never completed");
-            std::thread::sleep(Duration::from_millis(5));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "warm pre-fill never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         // Completed before the request: every planned unit is resident.
         let planned = hooks.warm_planned_for_test();

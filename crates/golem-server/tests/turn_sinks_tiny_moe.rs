@@ -50,6 +50,7 @@ async fn two_turns_one_header_no_rows_from_a_failed_turn() {
         routing_trace: Some(trace.clone()),
         ..golem_server::test_engine_config()
     };
+    #[cfg(feature = "hip-tests")]
     let model = cfg.model_path.clone();
     // The CLI writes the CSV header; the worker only appends rows.
     let mut timing = std::fs::File::create(&csv).unwrap();
@@ -102,27 +103,31 @@ async fn two_turns_one_header_no_rows_from_a_failed_turn() {
 
     let text = std::fs::read_to_string(&trace).unwrap();
     assert_eq!(text.matches("# golem-routing-trace v1").count(), 1);
-    let phase_steps = |phase: &str| {
-        text.lines()
-            .filter_map(|l| {
-                let mut f = l.split('\t');
-                let step = f.next()?;
-                (f.next()? == phase).then_some(step)
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    // One prefill per good turn: neither the failed turn's records nor the
-    // load self-check's.
-    assert_eq!(phase_steps("pf").len(), 2, "{text}");
-    let first = text.lines().nth(1).unwrap_or_default();
-    assert_eq!(first.split('\t').nth(1), Some("pf"), "{text}");
-    assert!(phase_steps("dc").len() >= steps.len(), "{text}");
-    let geo = xtask::replay::Geo::from_gguf(&model).unwrap();
-    let mut f = std::fs::File::open(&model).unwrap();
-    let lead = golem_gguf::live_layers(&golem_gguf::read_kvs(&mut f).unwrap())
-        .unwrap()
-        .start;
-    xtask::replay::Trace::parse("serve", &text, lead, &geo).expect("replay parses it");
+    // Records need the routing readback, which fires only on a GPU expert split.
+    #[cfg(feature = "hip-tests")]
+    {
+        let phase_steps = |phase: &str| {
+            text.lines()
+                .filter_map(|l| {
+                    let mut f = l.split('\t');
+                    let step = f.next()?;
+                    (f.next()? == phase).then_some(step)
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        // One prefill per good turn: neither the failed turn's records nor the
+        // load self-check's.
+        assert_eq!(phase_steps("pf").len(), 2, "{text}");
+        let first = text.lines().nth(1).unwrap_or_default();
+        assert_eq!(first.split('\t').nth(1), Some("pf"), "{text}");
+        assert!(phase_steps("dc").len() >= steps.len(), "{text}");
+        let geo = xtask::replay::Geo::from_gguf(&model).unwrap();
+        let mut f = std::fs::File::open(&model).unwrap();
+        let lead = golem_gguf::live_layers(&golem_gguf::read_kvs(&mut f).unwrap())
+            .unwrap()
+            .start;
+        xtask::replay::Trace::parse("serve", &text, lead, &geo).expect("replay parses it");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

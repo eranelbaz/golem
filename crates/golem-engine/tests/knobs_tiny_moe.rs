@@ -175,6 +175,85 @@ fn async_h2d_without_pool_is_refused() {
     assert!(e.contains("ram_experts_gib > 0"), "{e}");
 }
 
+/// CPU substrate: every expert already runs on the CPU, so
+/// `cpu_expert_math` is refused; its default keeps today's output.
+#[cfg(not(feature = "hip-tests"))]
+#[test]
+fn cpu_expert_math_default_keeps_output_and_on_is_refused_on_cpu() {
+    let d = EngineConfig::default().cpu_expert_math;
+    assert!(!d, "GPU expert math only is today's behaviour");
+    let (base, _) = assert_default_unchanged(|c| c.cpu_expert_math = d);
+    let on = EngineConfig {
+        cpu_expert_math: true,
+        ..base
+    };
+    if golem_llama_sys::substrate_backend() == golem_llama_sys::Backend::Cpu {
+        let e = greedy(&on).unwrap_err().to_string();
+        assert!(e.contains("cpu_expert_math"), "{e}");
+    }
+}
+
+/// HIP: CPU expert math reads RAM-pool slots; without the pool it is refused.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn cpu_expert_math_without_pool_is_refused() {
+    let cfg = EngineConfig {
+        cpu_expert_math: true,
+        ram_experts_gib: 0,
+        ..pooled()
+    };
+    let e = greedy(&cfg).unwrap_err().to_string();
+    assert!(
+        e.contains("cpu_expert_math") && e.contains("ram_experts_gib > 0"),
+        "{e}"
+    );
+}
+
+/// HIP: CPU expert math joins on the device per block; a partial offload
+/// would leave a block's accumulator on the CPU, so it is refused.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn cpu_expert_math_partial_offload_is_refused() {
+    let cfg = EngineConfig {
+        cpu_expert_math: true,
+        n_gpu_layers: 1,
+        ..pooled()
+    };
+    let e = greedy(&cfg).unwrap_err().to_string();
+    assert!(
+        e.contains("cpu_expert_math") && e.contains("every layer offloaded"),
+        "{e}"
+    );
+}
+
+/// `cpu_expert_frac` outside (0, 1] and zero worker threads are refused on
+/// any substrate; with the flag off neither is checked.
+#[test]
+fn cpu_expert_frac_and_threads_out_of_range_are_refused() {
+    for frac in [0.0, -0.5, 1.5, f32::NAN] {
+        let cfg = EngineConfig {
+            cpu_expert_math: true,
+            cpu_expert_frac: frac,
+            ..pooled()
+        };
+        let e = greedy(&cfg).unwrap_err().to_string();
+        assert!(e.contains("cpu_expert_frac"), "{frac}: {e}");
+    }
+    let cfg = EngineConfig {
+        cpu_expert_math: true,
+        cpu_expert_threads: 0,
+        ..pooled()
+    };
+    let e = greedy(&cfg).unwrap_err().to_string();
+    assert!(e.contains("cpu_expert_threads"), "{e}");
+    let off = EngineConfig {
+        cpu_expert_frac: 0.0,
+        cpu_expert_threads: 0,
+        ..pooled()
+    };
+    greedy(&off).expect("flag off ignores frac and threads");
+}
+
 /// HIP: GGML_CUDA_GRAPH_OPT=1 owns the copy-stream index. The workspace
 /// denies `unsafe` (`env::set_var`), so the test re-runs itself in a child
 /// process with the variable set; nothing else sees it.

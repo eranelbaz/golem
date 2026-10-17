@@ -5,6 +5,7 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include "golem-cpu-expert.h"
 
 #include <cctype>
 #include <string>
@@ -665,6 +666,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_numa_init") == 0) {
         return (void *)ggml_numa_init;
+    }
+    if (strcmp(name, "golem_cpu_expert_iface") == 0) {
+        return const_cast<golem_cpu_expert_iface *>(golem_cpu_expert_get_iface());
     }
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;

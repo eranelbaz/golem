@@ -5,7 +5,8 @@
 //! `wall − p3_wait − h2d − policy`; the store disk time is NOT subtracted
 //! because it runs inside the `p3_wait` window on a parallel worker (it can
 //! even exceed the step wall time), so subtracting it would double-count.
-//! Unmeasured parts contribute nothing to the remainder.
+//! Unmeasured parts contribute nothing to the remainder. The CPU expert
+//! math worker's time is not subtracted either: it overlaps the GPU.
 //!
 //! Hot-path cost (§11-allowed): a few `Instant::now()` per layer plus
 //! per-step atomic take-snapshots. The recorder is fixed-capacity and
@@ -40,6 +41,35 @@ pub struct StepTiming {
     pub h2d_bytes: u64,
     /// P2 policy order-building time (unmeasured today).
     pub policy_ms: f64,
+    /// Decode-only CPU expert math (design §1 O1); `None` unless
+    /// `cpu_expert_math` measured it.
+    pub cpu_expert: Option<CpuExpertStats>,
+}
+
+/// One step's (or a session's cumulative) CPU expert math counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct CpuExpertStats {
+    /// Routed experts computed on the CPU instead of copied to the device.
+    pub experts: u64,
+    /// Expert plane bytes the CPU read in place of an H2D copy.
+    pub bytes: u64,
+    /// Worker busy time.
+    pub ms: f64,
+    /// Decode-thread time blocked joining the worker.
+    pub join_wait_ms: f64,
+    /// Expert planes the GPU still multiplied as zero-weight padding.
+    pub padded: u64,
+}
+
+impl CpuExpertStats {
+    /// Adds `o` into `self`.
+    pub fn add(&mut self, o: &Self) {
+        self.experts += o.experts;
+        self.bytes += o.bytes;
+        self.ms += o.ms;
+        self.join_wait_ms += o.join_wait_ms;
+        self.padded += o.padded;
+    }
 }
 
 /// Fixed-capacity row buffer for one chat turn; no per-row allocation.
@@ -84,7 +114,8 @@ impl TimingRecorder {
         )?;
         writeln!(
             w,
-            "step,tokens,wall_ms,p3_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,h2d_bytes,policy_ms,compute_ms"
+            "step,tokens,wall_ms,p3_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,h2d_bytes,policy_ms,compute_ms,\
+             cpu_expert_math_experts,cpu_expert_math_bytes,cpu_expert_math_ms,cpu_expert_join_wait_ms"
         )
     }
 
@@ -111,10 +142,16 @@ impl TimingRecorder {
                 .iter()
                 .filter(|v| !v.is_nan())
                 .sum::<f64>();
+            // The CPU expert worker overlaps the GPU: not subtracted.
             let compute = (t.wall_ms - measured).max(0.0);
+            let cpu = |f: fn(&CpuExpertStats) -> String| {
+                t.cpu_expert
+                    .as_ref()
+                    .map_or_else(|| "unmeasured".to_owned(), f)
+            };
             writeln!(
                 w,
-                "{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 t.step,
                 t.tokens,
                 ms(t.wall_ms),
@@ -133,6 +170,10 @@ impl TimingRecorder {
                 },
                 ms(t.policy_ms),
                 ms(compute),
+                cpu(|c| c.experts.to_string()),
+                cpu(|c| c.bytes.to_string()),
+                cpu(|c| ms(c.ms)),
+                cpu(|c| ms(c.join_wait_ms)),
             )?;
         }
         if self.dropped > 0 {
@@ -159,6 +200,7 @@ mod tests {
             h2d_ms: f64::NAN,
             h2d_bytes: 0,
             policy_ms: f64::NAN,
+            cpu_expert: None,
         }
     }
 
@@ -195,7 +237,7 @@ mod tests {
         let l0 = s.lines().next().unwrap();
         assert!(l0.contains(",8.0"), "compute = wall − p3_wait: {l0}");
         let l1 = s.lines().nth(1).unwrap();
-        assert!(l1.ends_with(",0.0"), "clamped: {l1}");
+        assert!(l1.contains(",0.0,unmeasured"), "clamped: {l1}");
     }
 
     /// Overflow past the fixed capacity is counted and reported by flush.

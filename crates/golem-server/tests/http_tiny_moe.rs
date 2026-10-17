@@ -369,6 +369,16 @@ async fn metrics_parse_as_prometheus_text() {
         val.parse::<f64>().unwrap_or_else(|_| panic!("{line}"));
     }
     assert!(body.contains("golem_queue_depth "), "{body}");
+    // CPU expert math is off by default: the counters read 0.
+    for c in [
+        "golem_cpu_expert_math_experts_total 0\n",
+        "golem_cpu_expert_math_bytes_total 0\n",
+        "golem_cpu_expert_math_ms_total 0\n",
+        "golem_cpu_expert_math_join_wait_ms_total 0\n",
+        "golem_cpu_expert_math_padded_total 0\n",
+    ] {
+        assert!(body.contains(c), "{body}");
+    }
     assert!(
         body.contains("golem_errors_total{code=\"golem_busy\"} "),
         "{body}"
