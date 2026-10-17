@@ -157,7 +157,7 @@ fn spurious_stream_cancel_is_decode_error_and_next_turn_succeeds() {
         .expect("the turn after a spurious cancel succeeds");
 }
 
-/// Real-target leg (GOLEM_HW=1, `GOLEM_HW_MODEL` = first UD-Q4_K_XL shard):
+/// Real-target leg (GOLEM_HW=1, `GOLEM_HW_MODEL` = shard 1 of a GLM-5.3-Flash quant):
 /// cancel inside a streamed 2048-token prefill ubatch. Budget: one plane
 /// ≈ 13.4 s / (42 × 3) ≈ 0.11 s cold, so cancel → return must be ≲ one
 /// plane plus the drain. Prints `HW cancel_to_return_ms=…`.

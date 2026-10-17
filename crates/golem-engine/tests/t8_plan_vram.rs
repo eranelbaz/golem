@@ -2,7 +2,7 @@
 //! after load + one streamed prefill, on the real target, over a ctx ×
 //! ubatch sweep at parallel 1. Pass: |predicted − actual| ≤ 256 MiB at every
 //! point. Opt-in hardware leg (GOLEM_HW=1, GOLEM_HW_MODEL = shard 1 of
-//! GLM-5.3-Flash UD-Q4_K_XL): each point is a full real-model load. Budget
+//! any GLM-5.3-Flash quant): each point is a full real-model load. Budget
 //! ≤ 60 loads; `GOLEM_T8_MAX_POINTS` caps the sweep (record the cap in
 //! docs/baselines/m4.6-plan-t8.md). `golem_plan::WS_MEASURED` is fitted from
 //! that baseline's compute-buffer table; this sweep re-checks the fit and

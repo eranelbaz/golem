@@ -165,7 +165,7 @@ fn short_delta_takes_routed_only_fill() {
     );
 }
 
-/// Real-target leg (GOLEM_HW=1, `GOLEM_HW_MODEL` = first UD-Q4_K_XL shard):
+/// Real-target leg (GOLEM_HW=1, `GOLEM_HW_MODEL` = shard 1 of a GLM-5.3-Flash quant):
 /// 5-turn chat, per-turn TTFT with snapshots off (`0`) vs on (2 GiB), each
 /// session cold (fresh pool) then warm (same session, second pass);
 /// `GOLEM_HW_ORDER=on,off` flips the A/B order. Prints one line per turn.

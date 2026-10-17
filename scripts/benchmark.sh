@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Opt-in hardware benchmark legs. Usage: benchmark.sh plan
 set -euo pipefail
-MODEL="${GOLEM_HW_MODEL:?set GOLEM_HW_MODEL to shard 1 of GLM-5.3-Flash UD-Q4_K_XL}"
+MODEL="${GOLEM_HW_MODEL:?set GOLEM_HW_MODEL to shard 1 of a GLM-5.3-Flash quant}"
 [[ -f $MODEL ]] || { echo "no such model shard: $MODEL" >&2; exit 1; }
 POINTS="${T8_POINTS:-60}"
 case "${1:?usage: benchmark.sh plan}" in
