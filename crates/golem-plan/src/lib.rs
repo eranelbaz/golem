@@ -279,10 +279,9 @@ impl WsModel {
 /// ctx 2048 logged 685.00 / 1370.00 MiB at ubatch 1024 / 2048 = 701 445
 /// B/token, where the sparse slope over-predicted 2048 by +790 MiB. Dense
 /// fit domain: those two points. ubatch × ctx slope: 15 B, from ctx 131072
-/// at ubatch 256 / 512 / 1024 (478.63 / 956.64 / 1944.66 MiB ≈ 1.96 MB per
-/// ubatch token = 15 × 131072; the 256 row sits outside the ubatch ≥ 512
-/// domain, where the ctx branch over-predicts by +484 MiB); below ctx 73 729 (1 105 975 / 15) the flat
-/// slope wins, so the ctx-65536 rows are unchanged. ws is quant-independent:
+/// at ubatch 512 / 1024 (956.64 / 1944.66 MiB ≈ 1.96 MB per ubatch token =
+/// 15 × 131072). Below ctx 73 732 (1 105 975 / 15) the flat slope wins, so
+/// the ctx-65536 rows are unchanged. ws is quant-independent:
 /// UD-IQ3_XXS logged the UD-Q4_K_XL bytes at 131072/512 and 65536/2048.
 pub const WS_MEASURED: WsModel = WsModel {
     base: 320 << 20,
@@ -326,9 +325,12 @@ pub const ROCM_OVERHEAD: u64 = 2_834_678_415;
 /// llama-logged buffer: ggml's legacy HIP scratch pool (VMM off; 320–359 MB
 /// peak measured) plus runtime workspaces. Measured on gfx1100 as T8 actual
 /// minus every logged term: 414–564 MiB over 20 points, ubatch 256–4096,
-/// ctx 8192–131072 (UD-IQ3_XXS). The remainder is the one-time HIP context
-/// that a before/after `hipMemGetInfo` does not see.
+/// ctx 8192–131072 (UD-IQ3_XXS); 544 MiB is the ubatch-≥-512 max short of
+/// the one 563 MiB outlier, inside T8's 256 MiB under-prediction bound. The
+/// remainder is the one-time HIP context that a before/after
+/// `hipMemGetInfo` does not see.
 pub const ROCM_SESSION_OVERHEAD: u64 = 544 << 20;
+const _: () = assert!(ROCM_SESSION_OVERHEAD < ROCM_OVERHEAD);
 
 /// Per-layer device-slab experts `budget` bytes hold: `⌊budget / slab⌋ − 1`
 /// (ruling R3). Shared by the plan's feasibility and the engine's derived K.
@@ -792,6 +794,30 @@ mod tests {
             2 * get(&a.vram, "recurrent_state")
         );
         assert_eq!(get(&a.vram, "kv"), 19_712 * 4096);
+    }
+
+    /// Target at ctx 131072, where the ubatch × ctx slope binds: ws at 2048
+    /// = 2048 × 15 × 131072 = 3.75 GiB; t_ne 8 + kv 2.41 + rs 0.14 + slabs
+    /// 3.69 + ROCm 2.64 + cache 5.4 (K 8) ≈ 26 GiB > 24, so the plan must
+    /// still find a fitting ubatch ≥ 512.
+    #[test]
+    fn ctx_131072_still_fits_at_a_smaller_ubatch() {
+        let m = ModelFacts {
+            expert_bytes_total: 185_478_414_336,
+            ..glm()
+        };
+        let i = PlanInput {
+            ctx: 131_072,
+            parallel: 1,
+            prefill_stream: true,
+            prefill_ubatch: 8192,
+            ws: WS_MEASURED,
+            ..Default::default()
+        };
+        let r = plan(&m, &box24(), &i);
+        assert!(!r.feasible);
+        let u = r.largest_fitting_ubatch.expect("a smaller ubatch fits");
+        assert!(u >= 512, "{u}");
     }
 
     /// Target at ubatch 8192 with 1 MiB/token ws: 8 + 8.5 + 6 + 3.69 + 2.64

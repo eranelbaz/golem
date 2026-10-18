@@ -1,8 +1,9 @@
 //! T8 (§12, M4.6): `golem_plan::plan` predicted VRAM vs `hipMemGetInfo` used
 //! after load + one streamed prefill, on the real target, over a ctx ×
 //! ubatch sweep at parallel 1. Pass: under-prediction ≤ 256 MiB and
-//! over-prediction ≤ 1 GiB at every point. Opt-in hardware leg (GOLEM_HW=1, GOLEM_HW_MODEL = shard 1 of
-//! any GLM-5.3-Flash quant): each point is a full real-model load. Budget
+//! over-prediction ≤ 1 GiB at every point. Opt-in hardware leg (GOLEM_HW=1,
+//! GOLEM_HW_MODEL = shard 1 of any GLM-5.3-Flash quant; last measured on
+//! UD-IQ3_XXS): each point is a full real-model load. Budget
 //! ≤ 60 loads; `GOLEM_T8_MAX_POINTS` caps the sweep (record the cap in
 //! docs/baselines/m4.6-plan-t8.md). `golem_plan::WS_MEASURED` is fitted from
 //! that baseline's compute-buffer table; this sweep re-checks the fit and
@@ -17,7 +18,7 @@ const TOL: i64 = 256 << 20;
 // prediction only shrinks the derived cache: ≤ 1 GiB, since ws is a max of
 // fitted slopes and llama's per-ubatch-token buffer is not monotone in ctx
 // (909 KB at ctx 32768 vs 1.106 MB at 65536; +767 MiB at ubatch 4096).
-// Target: 24 GiB VRAM, 1 GiB ≈ 4.2% of cache, K − 1.6 of ~30.
+// Target UD-IQ3_XXS: 1 GiB = 2.8 slab experts (381 MB) of K 21–37.
 const OVER_TOL: i64 = 1 << 30;
 // The plan's candidate ubatches (`golem_plan` never suggests below 512) and
 // the ws fit domain.
@@ -94,14 +95,16 @@ fn t8_plan_matches_hip_used_vram() {
     let m = golem_plan::ModelFacts::from_gguf(&model).expect("header");
     // Warm-up load: the first session leaves the HIP runtime's one-time init
     // resident (measured 233–256 MB, constant over 5 reloads), which is
-    // ROCM_OVERHEAD, not a per-session leak; free0 is taken after it.
+    // ROCM_OVERHEAD, not a per-session leak; free0 is taken after it. 4096 /
+    // 512 is the smallest sweep-grid load.
     drop(Session::new(&cfg(&model, 4_096, 512)).expect("warm-up load"));
     #[cfg(golem_backend_hip)]
     golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
     let (free0, _) = device_vram().expect("HIP VRAM query");
     // Points sit TOL inside the fit edge so normal drift between loads does
     // not fail them; drift past TOL still does. Target: 24 GiB VRAM, TOL
-    // 256 MiB ≈ 1.0%; observed drift 25671237632 → 25461522432 B = 209.7 MB < TOL.
+    // 256 MiB ≈ 1.0%; pre-warm-up drift 25671237632 → 25461522432 B =
+    // 209.7 MB < TOL (#116).
     let free_sel = free0.saturating_sub(TOL as u64);
     let points: Vec<(u32, u32)> = CTXS
         .into_iter()
