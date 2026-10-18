@@ -24,10 +24,16 @@ golem_chat * golem_chat_init(const struct llama_model * model, const char * tmpl
 // out_prompt/out_grammar are malloc'd; out_handle indexes the parser params kept
 // in `chat` until golem_chat_release. `reasoning_inline` != 0 leaves reasoning
 // and its markers in `content` when parsing. `reasoning_effort` (may be NULL)
-// is passed to the template as the `reasoning_effort` variable. Returns 0 on success.
+// is passed to the template as the `reasoning_effort` variable; when `no_think`
+// != 0 and `reasoning_effort` is empty, it is pinned to "low". `no_think` != 0
+// appends the template's empty-think closer ("</think>") to the prompt and the
+// generation prompt. Returns 0 on success.
+// generation prompt. Return codes: 0 success; 1 bad arguments; 2 named
+// tool_choice not among tools; 3 allocation failure; 4 `no_think` set but the
+// template's generation prompt has no `<think>` to close; 5 internal error.
 int golem_chat_apply(golem_chat * chat, const char * messages_json, const char * tools_json,
                      const char * tool_choice, int reasoning_inline, const char * reasoning_effort,
-                     char ** out_prompt, char ** out_grammar, int * out_handle);
+                     int no_think, char ** out_prompt, char ** out_grammar, int * out_handle);
 
 // Grammar sampler for `handle` (lazy with its triggers, or eager with the
 // generation prompt prefilled), or *out = NULL when the request has no

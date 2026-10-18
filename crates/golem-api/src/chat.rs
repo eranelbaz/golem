@@ -63,7 +63,8 @@ pub struct ChatCompletionRequest {
     /// Golem extension: top-k sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
-    /// `low`/`high`, passed to the chat template as `reasoning_effort`.
+    /// `low`/`high`/`none`, passed to the chat template as `reasoning_effort`.
+    /// Absent → max (template default); `none` → no-think; anything else → 400.
     #[serde(
         default,
         deserialize_with = "glm_effort",
@@ -83,13 +84,19 @@ impl ChatCompletionRequest {
     }
 }
 
-/// GLM-5.3-Flash model card: only `low`/`high` are explicit; absent or any
-/// other value is `max`, the template default, so nothing is sent.
+/// GLM-5.3-Flash: absent → max (template default), `none` → no-think,
+/// `low`/`high` as-is; any other value is a deserialization error (400),
+/// never silently max.
 fn glm_effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    Ok(serde_json::Value::deserialize(d)?
-        .as_str()
-        .filter(|e| matches!(*e, "low" | "high"))
-        .map(str::to_owned))
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) if matches!(s.as_str(), "low" | "high" | "none") => {
+            Ok(Some(s))
+        }
+        _ => Err(serde::de::Error::custom(
+            "reasoning_effort must be `low`, `high` or `none`",
+        )),
+    }
 }
 
 /// `stop` is a string or a list of strings.

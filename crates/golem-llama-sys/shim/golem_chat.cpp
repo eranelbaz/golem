@@ -84,7 +84,7 @@ golem_chat * golem_chat_init(const llama_model * model, const char * tmpl_overri
 
 int golem_chat_apply(golem_chat * chat, const char * messages_json, const char * tools_json,
                      const char * tool_choice, int reasoning_inline, const char * reasoning_effort,
-                     char ** out_prompt, char ** out_grammar, int * out_handle) {
+                     int no_think, char ** out_prompt, char ** out_grammar, int * out_handle) {
     if (!chat || !messages_json || !out_prompt || !out_grammar || !out_handle) {
         return 1;
     }
@@ -94,6 +94,8 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         in.reasoning_format = reasoning_inline ? COMMON_REASONING_FORMAT_NONE : COMMON_REASONING_FORMAT_DEEPSEEK;
         if (reasoning_effort && *reasoning_effort) {
             in.chat_template_kwargs["reasoning_effort"] = common_json(std::string(reasoning_effort)).dump();
+        } else if (no_think) {
+            in.chat_template_kwargs["reasoning_effort"] = common_json(std::string("low")).dump();
         }
         std::string named;
         in.tool_choice = parse_tool_choice(tool_choice, named);
@@ -116,6 +118,23 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         }
         in.parallel_tool_calls = false;
         auto params            = common_chat_templates_apply(chat->tmpls.get(), in);
+        if (no_think) {
+            // GLM-5.3-Flash: no-think is the template's own empty-think form. The
+            // suffix must reach the prompt AND the generation prefix, which
+            // `common_sampler_init` (vendor/llama.cpp/common/sampling.cpp)
+            // prefills into the grammar sampler so its eager walk-forward skips
+            // over it — or the answer is classified as reasoning and forced
+            // calls never match. Guarded: a template without a `<think>`
+            // generation prompt has no no-think form to prefill.
+            if (params.prompt.size() < 7 ||
+                params.prompt.compare(params.prompt.size() - 7, 7, "<think>") != 0) {
+                return 4;
+            }
+            params.prompt += "</think>";
+            if (!params.generation_prompt.empty()) {
+                params.generation_prompt += "</think>";
+            }
+        }
 
         request r;
         r.parser                  = common_chat_parser_params(params);
@@ -145,7 +164,7 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         *out_handle       = h;
         return 0;
     } catch (...) {
-        return 4;
+        return 5;
     }
 }
 

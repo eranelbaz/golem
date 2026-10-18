@@ -74,6 +74,25 @@ per-tier models; unset, they name a `claude-*` model and get
 `golem_model_mismatch`. Claude Code's first request carries ≈ 53 KB of system
 prompt and tool schemas, so `--ctx` must exceed that plus the conversation.
 
+## Reasoning control
+
+Reasoning (thinking) output can be turned off per request:
+
+- OpenAI protocol (`/v1/chat/completions`): `"reasoning_effort": "none"`.
+- Anthropic protocol (`/v1/messages`): `"thinking": {"type": "disabled"}`.
+
+The GLM-5.3-Flash template has no `enable_thinking` switch, so no-think is
+rendered as the template's own empty-think prefill (`<think></think>`): the
+model emits content directly, with no reasoning tokens.
+
+Honoured `reasoning_effort` values are exactly `low`, `high` and `none`
+(case-sensitive); `thinking.type` accepts `enabled`, `adaptive` and
+`disabled`. Unknown values of any type are rejected with a 400, never
+silently mapped to the maximum effort. Omitting the field keeps the
+template default (`max`). Combining `thinking: disabled` with
+`output_config.effort` is a 400 conflict; `output_config.effort: "max"`
+maps to the template default.
+
 ## Repository layout
 
 ```
