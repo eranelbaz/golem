@@ -2592,9 +2592,10 @@ mod tests {
 
     /// Issue #102, real target: `--device-cache-experts 512` at ctx 262,144
     /// on 23.9 GiB free priced 513 × 644 MB ≈ 307 GiB + 4.8 GiB KV. Now the
-    /// other terms are 8.35 t_ne + 4.81 kv + 0.14 rs + 1.57 ws + 2.64 ROCm =
-    /// 18,803,322,759 B (17.5 GiB), leaving 6.4 GiB → ⌊6.86 / 0.644⌋ − 1 =
-    /// K = 9. The top-k boundary: others + 9 slots fits K = 8 exactly; one
+    /// other terms are 8.35 t_ne + 4.81 kv + 0.14 rs + 1.88 ws (512 × 15 ×
+    /// 262,144) + 2.64 ROCm = 19,134,148,487 B (17.8 GiB), leaving 6.1 GiB →
+    /// ⌊6.53 / 0.644⌋ − 1 = K = 9. The top-k boundary: others + 9
+    /// slots fits K = 8 exactly; one
     /// byte less leaves K = 7 < 8, refused naming the max. At 12 GiB free
     /// less than one slab slot (644 MB) is left: max 0. Never the raw
     /// 328.5 GiB inequality.
@@ -2609,7 +2610,7 @@ mod tests {
         let (r, k) = check_plan(&cfg, &glm(), (239 << 30) / 10).unwrap();
         assert_eq!(k, Some(9));
         assert_eq!(r.term("device_expert_cache"), 10 * 644_022_272);
-        let at_top_k = 18_803_322_759 + 9 * 644_022_272;
+        let at_top_k = 19_134_148_487 + 9 * 644_022_272;
         assert_eq!(check_plan(&cfg, &glm(), at_top_k).unwrap().1, Some(8));
         let e = check_plan(&cfg, &glm(), at_top_k - 1).unwrap_err();
         assert!(e.to_string().contains("at most 7 fit"), "{e}");

@@ -5,7 +5,7 @@
 - A test that cannot meet its precondition **fails**. Opt-in skips use `#[ignore]` plus an explicit env flag and are reported as skipped.
 - GPU-path changes (substrate hooks, pool, device cache) need HIP test output with zero `SKIPPED` lines, run through the engine-registered hooks, not test-installed ones.
 - Every memory, VRAM or throughput decision carries one line of arithmetic against the real target, not just the tiny fixture:
-  - Model: GLM-5.3-Flash UD-Q4_K_XL, 42 MoE layers × 288 experts × 3 planes (~4.7/5.8 MB per plane), hybrid linear/sparse attention with recurrent state, 6 split shards.
+  - Model: GLM-5.3-Flash, any quant (name the one measured), 42 MoE layers × 288 experts × 3 planes (plane size per quant, e.g. ~4.7/5.8 MB at UD-Q4_K_XL), hybrid linear/sparse attention with recurrent state, split shards.
   - Machine: 24 GiB VRAM, 93 GiB RAM.
 - Fixtures match the real shape where it matters: `.weight` tensor names, split GGUF, quantized mixed-stride planes, a device budget smaller than one expert tensor.
 - Performance claims cite a number measured on this machine, cold and warm separately, A/B in both orders.
