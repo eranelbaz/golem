@@ -246,11 +246,15 @@ pub struct WsModel {
     pub per_ubatch_token: u64,
     /// Bytes per ubatch token below [`ModelFacts::dense_below_ctx`].
     pub dense_per_ubatch_token: u64,
+    /// Bytes per ubatch × ctx token; overtakes `per_ubatch_token` at large
+    /// ctx (the ubatch × ctx score buffers).
+    pub per_ubatch_ctx_token: u64,
 }
 
 impl WsModel {
-    /// Workspace bytes at this ctx × ubatch: `max(base + a·ctx, b·ubatch)`,
-    /// with the dense slope for `b` when `ctx < dense_below_ctx`.
+    /// Workspace bytes at this ctx × ubatch: `max(base + a·ctx,
+    /// ubatch·max(b, c·ctx))`, with the dense slope for `b` when
+    /// `ctx < dense_below_ctx`.
     #[must_use]
     pub fn bytes(&self, ctx: u32, ubatch: u32, dense_below_ctx: u32) -> u64 {
         let b = if ctx < dense_below_ctx {
@@ -258,6 +262,7 @@ impl WsModel {
         } else {
             self.per_ubatch_token
         };
+        let b = b.max(self.per_ubatch_ctx_token.saturating_mul(u64::from(ctx)));
         self.base
             .saturating_add(self.per_ctx_token.saturating_mul(u64::from(ctx)))
             .max(b.saturating_mul(u64::from(ubatch)))
@@ -273,25 +278,33 @@ impl WsModel {
 /// ctx 2052 (indexer top_k 2048 + kpool 4) llama skips indexer scoring;
 /// ctx 2048 logged 685.00 / 1370.00 MiB at ubatch 1024 / 2048 = 701 445
 /// B/token, where the sparse slope over-predicted 2048 by +790 MiB. Dense
-/// fit domain: those two points.
+/// fit domain: those two points. ubatch × ctx slope: 15 B, from ctx 131072
+/// at ubatch 256 / 512 / 1024 (478.63 / 956.64 / 1944.66 MiB ≈ 1.96 MB per
+/// ubatch token = 15 × 131072; the 256 row sits outside the ubatch ≥ 512
+/// domain, where the ctx branch over-predicts by +484 MiB); below ctx 73 729 (1 105 975 / 15) the flat
+/// slope wins, so the ctx-65536 rows are unchanged. ws is quant-independent:
+/// UD-IQ3_XXS logged the UD-Q4_K_XL bytes at 131072/512 and 65536/2048.
 pub const WS_MEASURED: WsModel = WsModel {
     base: 320 << 20,
     per_ctx_token: 5_138,
     per_ubatch_token: 1_105_975,
     dense_per_ubatch_token: 701_445,
+    per_ubatch_ctx_token: 15,
 };
 
 /// The T8 measured compute-buffer points (ctx, ubatch, bytes).
 #[cfg(test)]
-const T8_MEASURED: [(u32, u32, u64); 8] = [
+const T8_MEASURED: [(u32, u32, u64); 10] = [
     (2_048, 1_024, 718_274_560),
     (2_048, 2_048, 1_436_549_120),
     (4_096, 512, 359_137_280),
+    (4_096, 1_024, 1_062_228_460),
     (65_536, 512, 633_685_934),
     (65_536, 1_024, 1_132_818_596),
     (65_536, 2_048, 2_265_312_133),
     (65_536, 4_096, 4_530_299_208),
     (131_072, 512, 1_003_109_745),
+    (131_072, 1_024, 2_039_123_804),
 ];
 
 /// Fit regression: `WS_MEASURED` reproduces every T8 point within 256 MiB.
@@ -782,6 +795,7 @@ mod tests {
             per_ctx_token: 0,
             per_ubatch_token: 1 << 20,
             dense_per_ubatch_token: 1 << 20,
+            per_ubatch_ctx_token: 0,
         };
         let r = plan(
             &glm(),
