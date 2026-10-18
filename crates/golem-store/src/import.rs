@@ -209,11 +209,11 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
 
     // Shard-1 gates: arch, chat template, live range, tensor total.
     let arch = match kv_str(&first_kvs, "general.architecture") {
-        Some(a) if a == "glm5next" => a.to_owned(),
+        Some(a) if is_glm5next(a) => a.to_owned(),
         other => {
             return Err(source(
                 &first_path,
-                format!("general.architecture {other:?} != \"glm5next\""),
+                format!("general.architecture {other:?} is not glm5next/glm5-next"),
             ));
         }
     };
@@ -363,6 +363,12 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
         chat_template_sha,
         planes,
     })
+}
+
+/// `general.architecture` gate with '-' folded out, as the substrate's
+/// `llm_arch_from_string` does (unsloth ships "glm5next" and "glm5-next").
+fn is_glm5next(arch: &str) -> bool {
+    arch.replace('-', "") == "glm5next"
 }
 
 /// Lowercase hex.
@@ -1154,6 +1160,14 @@ mod tests {
     use super::*;
 
     use std::io::Write;
+
+    #[test]
+    fn arch_gate_folds_hyphens() {
+        assert!(is_glm5next("glm5next"));
+        assert!(is_glm5next("glm5-next"));
+        assert!(!is_glm5next("glm4moe"));
+        assert!(!is_glm5next("glm5nex"));
+    }
 
     #[test]
     fn tmpfile_drop_removes_and_commit_keeps() {
