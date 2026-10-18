@@ -646,7 +646,7 @@ KV per token without loading the model: read from the arch table (glm5next entry
 | T5 | Store: striping correctness across 1/2/4 replicas, per-chunk failover mid-read, checksum-rot detection (injected), same-drive warning | reads correct under all replica-count/failure combos |
 | T6 | Placement concurrency: loom test over (access, page-in, evict, promote) interleavings; 24 h soak on hardware (amended 2026-09-29: default I/O engine; io_uring dropped, R-17) | no races, no residency-bitset drift vs pool contents |
 | T7 | API contract: field-policy table (§8.2) becomes generated round-trip tests; SSE framing golden tests | unknown field ⇒ typed 400; stream shape stable |
-| T8 | Plan vs reality: `golem plan` predicted VRAM vs actual after load, on hardware, over ctx sweep | \|predicted − actual\| ≤ 256 MiB across sweep |
+| T8 | Plan vs reality: `golem plan` predicted VRAM vs actual after load, on hardware, over ctx sweep | ~~\|predicted − actual\| ≤ 256 MiB across sweep~~ (2026-10-18, #116) actual − predicted ≤ 256 MiB, predicted − actual ≤ 1 GiB across sweep (ws is a max of fitted slopes; over-prediction only shrinks the derived cache) |
 
 ### 12.3 Benchmarks and the documented baseline
 

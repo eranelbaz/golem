@@ -322,6 +322,14 @@ fn ws_fitted_model_matches_t8_points() {
 /// Combined ROCm overhead on gfx1100, measured in M0 (2.64 GiB, m0-notes).
 pub const ROCM_OVERHEAD: u64 = 2_834_678_415;
 
+/// Part of [`ROCM_OVERHEAD`] each session allocates and frees, outside every
+/// llama-logged buffer: ggml's legacy HIP scratch pool (VMM off; 320–359 MB
+/// peak measured) plus runtime workspaces. Measured on gfx1100 as T8 actual
+/// minus every logged term: 414–564 MiB over 20 points, ubatch 256–4096,
+/// ctx 8192–131072 (UD-IQ3_XXS). The remainder is the one-time HIP context
+/// that a before/after `hipMemGetInfo` does not see.
+pub const ROCM_SESSION_OVERHEAD: u64 = 544 << 20;
+
 /// Per-layer device-slab experts `budget` bytes hold: `⌊budget / slab⌋ − 1`
 /// (ruling R3). Shared by the plan's feasibility and the engine's derived K.
 #[must_use]
