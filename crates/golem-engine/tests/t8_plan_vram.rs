@@ -81,7 +81,17 @@ fn t8_plan_matches_hip_used_vram() {
     let cap: usize = std::env::var("GOLEM_T8_MAX_POINTS")
         .ok()
         .map_or(60, |v| v.parse().expect("GOLEM_T8_MAX_POINTS: integer"));
+    // llama's compute-buffer line is the ws ground truth; info-level only.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new("llama=info").unwrap())
+        .try_init();
     let m = golem_plan::ModelFacts::from_gguf(&model).expect("header");
+    // Warm-up load: the first session leaves the HIP runtime's one-time init
+    // resident (measured 233–256 MB, constant over 5 reloads), which is
+    // ROCM_OVERHEAD, not a per-session leak; free0 is taken after it.
+    drop(Session::new(&cfg(&model, 4_096, 512)).expect("warm-up load"));
+    #[cfg(golem_backend_hip)]
+    golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
     let (free0, _) = device_vram().expect("HIP VRAM query");
     // Points sit TOL inside the fit edge so normal drift between loads does
     // not fail them; drift past TOL still does. Target: 24 GiB VRAM, TOL
@@ -134,15 +144,22 @@ fn t8_plan_matches_hip_used_vram() {
             s.prefill_streaming(),
             "ctx {ctx} ubatch {ub}: fit dropped prefill streaming"
         );
-        let k = s.device_cache_experts().expect("derived device cache");
-        let cache_pred = (i64::from(k) + 1) * m.slab_bytes_per_expert() as i64;
-        let pred = pred + cache_pred;
         let msgs = [ChatTurn {
             role: "user",
             content: &prompt,
         }];
         s.turn(&TurnRequest::new(&msgs), &mut |_| {})
             .expect("one prefill");
+        assert!(
+            s.prefill_streaming(),
+            "ctx {ctx} ubatch {ub}: streaming dropped mid-turn"
+        );
+        // Measured in decode mode: the stream slabs are freed and their bytes
+        // go to the decode K (§7.6.1), so the cache term is the live K and the
+        // plan's stream term is swapped out for it.
+        let k = s.device_cache_experts().expect("derived device cache");
+        let cache_pred = (i64::from(k) + 1) * m.slab_bytes_per_expert() as i64;
+        let pred = pred - stream_pred as i64 + cache_pred;
         let (free_after, _) = device_vram().unwrap();
         let (slab_res, stream_res) = s.device_cache_resident_bytes().expect("pool on");
         let copied = s.device_cache_stats().map_or(0, |d| d.bytes_copied);
@@ -150,12 +167,10 @@ fn t8_plan_matches_hip_used_vram() {
         #[cfg(golem_backend_hip)]
         golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
         let actual = free_before as i64 - free_after as i64;
-        // The per-term attribution, gated: stream slabs exact, cache slabs
+        // The per-term attribution, gated: stream slabs released, cache slabs
         // the K + 1 reservation plus remapped-ids tensors (16 KiB measured).
-        assert_eq!(
-            stream_res, stream_pred,
-            "ctx {ctx} ubatch {ub}: stream slabs"
-        );
+        assert_eq!(stream_res, 0, "ctx {ctx} ubatch {ub}: stream slabs kept");
+        assert!(copied > 0, "ctx {ctx} ubatch {ub}: no expert bytes copied");
         assert!(
             slab_res > 0 && (slab_res as i64 - cache_pred).abs() <= 1 << 20,
             "ctx {ctx} ubatch {ub}: resident slabs {slab_res} vs predicted {cache_pred}"
