@@ -58,7 +58,8 @@ pub struct TurnRequest<'a> {
     pub tool_choice: Option<&'a str>,
     /// Parse reasoning and its markers into `content` (`--reasoning inline`).
     pub reasoning_inline: bool,
-    /// Template `reasoning_effort` variable (OpenAI `reasoning_effort`).
+    /// Template `reasoning_effort` variable (OpenAI `reasoning_effort`);
+    /// `"none"` selects no-think (the empty-think prefill).
     pub reasoning_effort: Option<&'a str>,
     /// Pre-rendered prompt from [`crate::Session::render`]; overrides the
     /// three fields above.

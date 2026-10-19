@@ -1468,6 +1468,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
             )
             .unwrap();
         let out = std::cell::RefCell::new(String::new());
@@ -1497,6 +1498,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
             )
             .unwrap()
     }
@@ -1629,7 +1631,7 @@ mod tests {
                 continue;
             };
             let msgs = r#"[{"role":"user","content":"hi"}]"#;
-            let Ok(r) = t.render(msgs, None, None, false, None) else {
+            let Ok(r) = t.render(msgs, None, None, false, None, false) else {
                 continue;
             };
             assert_eq!(stream(&r, &pieces, false).0, stream(&r, &pieces, true).0);

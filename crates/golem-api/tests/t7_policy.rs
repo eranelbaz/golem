@@ -181,30 +181,41 @@ fn max_completion_tokens_aliases_max_tokens() {
 }
 
 #[test]
-fn reasoning_effort_keeps_low_high_else_max() {
+fn reasoning_effort_accepts_low_high_none_else_400() {
     let with = |e: serde_json::Value| {
         let mut r = base();
         r["reasoning_effort"] = e;
-        validate(&r, "tiny-moe").unwrap().reasoning_effort
+        validate(&r, "tiny-moe")
     };
-    assert_eq!(with(json!("low")).as_deref(), Some("low"));
-    assert_eq!(with(json!("high")).as_deref(), Some("high"));
-    for e in [
+    for ok in [json!("low"), json!("high"), json!("none")] {
+        assert_eq!(
+            with(ok.clone()).unwrap().reasoning_effort,
+            Some(ok.as_str().unwrap().to_string()),
+            "{ok}"
+        );
+    }
+    assert_eq!(with(json!(null)).unwrap().reasoning_effort, None);
+    for bad in [
         json!("max"),
         json!("medium"),
         json!("minimal"),
-        json!("none"),
         json!(""),
         json!("LOW"),
         json!(" low"),
         json!("low\0"),
-        json!(null),
         json!(5),
         json!(true),
         json!({"level": "low"}),
     ] {
-        assert_eq!(with(e.clone()), None, "{e}");
+        let e = with(bad.clone()).unwrap_err().error;
+        assert_eq!(e.code, ErrorCode::InvalidRequest, "{bad}: {}", e.message);
+        assert!(
+            e.message.contains("reasoning_effort"),
+            "{bad}: {}",
+            e.message
+        );
     }
+    // Absent field → max (template default), nothing sent.
     assert_eq!(
         validate(&base(), "tiny-moe").unwrap().reasoning_effort,
         None

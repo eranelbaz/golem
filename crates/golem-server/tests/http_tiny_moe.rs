@@ -555,3 +555,112 @@ async fn separate_mode_glm_streams_reasoning_without_markers() {
     assert!(!field("content").contains("think>"), "{body}");
     assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
 }
+
+/// The tiny-moe fixture ships chatml (no `<think>` generation prompt), so the
+/// no-think tests run with the GLM-5.3-Flash template override — the same
+/// template `golem-engine` pins against the real GGUF.
+fn glm_no_think_engine_config() -> golem_engine::config::EngineConfig {
+    golem_engine::config::EngineConfig {
+        chat_template: Some(
+            include_str!("../../golem-engine/tests/fixtures/glm-5.3-flash.jinja").to_string(),
+        ),
+        ..golem_server::test_engine_config()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn messages_thinking_disabled_is_200_without_thinking_block() {
+    let app = router_for_test(glm_no_think_engine_config()).await;
+    let body = serde_json::json!({"model":"tiny-moe","max_tokens":8,"temperature":0,
+        "messages":[{"role":"user","content":"hi"}],
+        "thinking":{"type":"disabled"}});
+    let r = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = r.status();
+    let v = json(r).await;
+    assert_eq!(status, 200, "body: {v}");
+    assert_eq!(v["type"], "message");
+    let blocks = v["content"].as_array().expect("content blocks");
+    assert!(
+        blocks.iter().all(|b| b["type"] != "thinking"),
+        "no-think must not emit a thinking block: {v}"
+    );
+}
+
+/// Streaming variant: `thinking: disabled` yields a 200 SSE stream whose
+/// blocks are text only — no `thinking` `content_block_start`, no
+/// `thinking_delta`.
+#[tokio::test(flavor = "multi_thread")]
+async fn messages_thinking_disabled_stream_has_no_thinking_events() {
+    let app = router_for_test(glm_no_think_engine_config()).await;
+    let body = serde_json::json!({"model":"tiny-moe","max_tokens":8,"temperature":0,
+        "messages":[{"role":"user","content":"hi"}],
+        "thinking":{"type":"disabled"},"stream":true});
+    let r = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let events: Vec<(String, serde_json::Value)> = body
+        .split("\n\n")
+        .filter_map(|f| {
+            let name = f
+                .lines()
+                .find_map(|l| l.strip_prefix("event: "))?
+                .to_owned();
+            let data = f
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .map(|d| serde_json::from_str::<serde_json::Value>(d).unwrap())
+                .unwrap_or_default();
+            Some((name, data))
+        })
+        .collect();
+    assert!(events.iter().any(|(n, _)| *n == "message_start"), "{body}");
+    assert!(events.iter().any(|(n, _)| *n == "message_stop"), "{body}");
+    let thinking_block = events
+        .iter()
+        .any(|(n, d)| *n == "content_block_start" && d["content_block"]["type"] == "thinking");
+    let thinking_delta = events.iter().any(|(n, d)| {
+        *n == "content_block_delta"
+            && matches!(
+                d["delta"]["type"].as_str(),
+                Some("thinking_delta") | Some("signature_delta")
+            )
+    });
+    assert!(
+        !thinking_block,
+        "no-think must not open a thinking block: {body}"
+    );
+    assert!(!thinking_delta, "{body}");
+    assert!(
+        events
+            .iter()
+            .any(|(n, d)| *n == "content_block_delta" && d["delta"]["type"] == "text_delta"),
+        "{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_reasoning_effort_medium_is_400() {
+    let app = router_for_test(golem_server::test_engine_config()).await;
+    let mut body = hi(4);
+    body["reasoning_effort"] = "medium".into();
+    let r = app.clone().oneshot(chat(body)).await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(json(r).await["error"]["code"], "golem_invalid_request");
+}

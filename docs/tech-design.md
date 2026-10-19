@@ -501,7 +501,7 @@ Strict allowlist — anything requested-but-unsupported gets an explicit typed e
 | `temperature`, `top_p`, `max_tokens` (`max_completion_tokens` aliased), `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `n` (must be 1) | supported |
 | `stream`, `stream_options.include_usage` | supported (SSE; final frame carries usage) |
 | `tools`, `tool_choice` | **Decided 2026-09-29 (O2, review R-14):** supported. Tools are rendered through the pinned chat template, and tool calls are parsed from the model output by llama.cpp's chat layer for that template, then returned as OpenAI `tool_calls` (streaming: `delta.tool_calls`). `tool_choice`: `auto`, `none`, `required`, and a named function (enforced by the template/grammar where the substrate supports it, else a typed 400). Parallel tool calls follow the template. Acceptance: a T7 golden test per template path, plus a T2-style parity check that the rendered prompt is byte-identical to the reference runtime's. |
-| `reasoning_effort` | *Amended 2026-10-14 (#117):* supported, per the GLM-5.3-Flash model card. Exactly `low` and `high` (case-sensitive) are passed to the chat template as `reasoning_effort`; absent or any other value of any type (`max`, `medium`, `minimal`, `none`, …) sends nothing, so the template default `max` applies. Never an error. |
+| `reasoning_effort` | *Amended 2026-10-14 (#117), re-amended 2026-10-18 (#134):* supported, per the GLM-5.3-Flash model card. Exactly `low`, `high` and `none` (case-sensitive strings) are honoured: `low`/`high` are passed to the chat template as `reasoning_effort`; `none` renders the template's no-think form (§8.6). Any other value of any type (`max`, `medium`, `minimal`, numbers, objects, …) is a 400 `golem_invalid_request` — never silently mapped to `max`. `null`/absent sends nothing, so the template default `max` applies. |
 | `response_format` (json schema), `logit_bias`, `logprobs` | **400 `golem_unsupported_field`** naming the field and the reason. Clients probing capabilities get answers, not silence |
 | `top_k` | Golem extension, supported |
 
@@ -543,7 +543,8 @@ Binds `127.0.0.1` by default (port: auto-select, recorded in the registry; `--ho
 - **Tool choice.** `auto`/`any`/`tool`/`none` map to `auto`/`required`/named/`none`.
 - **Thinking.** Reasoning is always split into `thinking` blocks (`signature: ""`), whatever `--reasoning` is set to.
   - `enabled` and `adaptive` keep the template default. `budget_tokens` and `display` have no effect.
-  - `disabled` is 400 until the template's no-think form is verified.
+  - `disabled` renders the template's no-think form: the request carries `reasoning_effort: "none"` on the §8.2 side. The GLM-5.3-Flash template has no `enable_thinking` kwarg, so no-think is the template's own empty-think form — a `<|assistant|><think></think>` prefill — with the `Reasoning Effort: Low` header retained (the header cannot be suppressed; no-think pins it to `low`). Template provenance: the UD-Q4_K_XL GGUF kv `tokenizer.chat_template`, pinned by the checked-in fixture `crates/golem-engine/tests/fixtures/glm-5.3-flash.jinja` (verified byte-identical).
+  - `disabled` together with `output_config.effort` is a 400 conflict — never a silent re-enable. `output_config.effort: "max"` maps to absent (the template default); other unrecognised strings are 400.
 - **Response.** Blocks come in the order `thinking`, `text`, `tool_use` (`input` is the parsed arguments; unparseable arguments are a 500, never `{}`).
   - `stop_reason` is `end_turn`, `max_tokens`, `tool_use`, or `stop_sequence`, which echoes the matched string via `TurnOutcome::stop_sequence`.
   - `usage` carries `input_tokens`/`output_tokens`.

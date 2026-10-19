@@ -94,7 +94,9 @@ impl ChatTemplates {
     /// Renders OpenAI `messages` (+ optional `tools`/`tool_choice` JSON) with
     /// the generation prompt appended. `reasoning_inline` keeps reasoning and
     /// its markers in the parsed `content`; `reasoning_effort` is the
-    /// template's `reasoning_effort` variable.
+    /// template's `reasoning_effort` variable; `no_think` prefills the
+    /// template's empty-think form (§8.6: `"none"` never reaches this layer —
+    /// the session maps it to this flag).
     pub fn render(
         &self,
         messages_json: &str,
@@ -102,6 +104,7 @@ impl ChatTemplates {
         tool_choice: Option<&str>,
         reasoning_inline: bool,
         reasoning_effort: Option<&str>,
+        no_think: bool,
     ) -> Result<Rendered, EngineError> {
         let m = cstr(messages_json, "messages")?;
         let t = tools_json.map(|t| cstr(t, "tools")).transpose()?;
@@ -120,6 +123,7 @@ impl ChatTemplates {
                 c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
                 i32::from(reasoning_inline),
                 e.as_ref().map_or(std::ptr::null(), |e| e.as_ptr()),
+                i32::from(no_think),
                 &mut prompt,
                 &mut grammar,
                 &mut handle,
@@ -217,7 +221,14 @@ mod tests {
     fn glm_auto_parses_canned_tool_call() {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let r = t
-            .render(&user(), Some(&tools()), Some("\"auto\""), false, None)
+            .render(
+                &user(),
+                Some(&tools()),
+                Some("\"auto\""),
+                false,
+                None,
+                false,
+            )
             .unwrap();
         assert!(
             r.prompt.contains("get_weather"),
@@ -242,7 +253,7 @@ mod tests {
     fn glm_plain_answer_has_no_tool_calls() {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let r = t
-            .render(&user(), Some(&tools()), None, false, None)
+            .render(&user(), Some(&tools()), None, false, None, false)
             .unwrap();
         let msg = r.parser.parse("</think>It is sunny.", false).unwrap();
         assert_eq!(msg["content"], "It is sunny.");
@@ -254,7 +265,7 @@ mod tests {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let choice = r#"{"type":"function","function":{"name":"nope"}}"#;
         assert!(
-            t.render(&user(), Some(&tools()), Some(choice), false, None)
+            t.render(&user(), Some(&tools()), Some(choice), false, None, false)
                 .is_err()
         );
     }
@@ -267,7 +278,7 @@ mod tests {
         let t = ChatTemplates::from_source(GLM).unwrap();
         let choice = r#"{"type":"function","function":{"name":"get_weather"}}"#;
         let r = t
-            .render(&user(), Some(&tools()), Some(choice), false, None)
+            .render(&user(), Some(&tools()), Some(choice), false, None, false)
             .unwrap();
         assert!(!r.grammar.is_empty());
         let root = r
@@ -289,7 +300,9 @@ mod tests {
     #[test]
     fn glm_inline_reasoning_stays_in_content() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let r = t.render(&user(), Some(&tools()), None, true, None).unwrap();
+        let r = t
+            .render(&user(), Some(&tools()), None, true, None, false)
+            .unwrap();
         let msg = r.parser.parse("hmm</think>It is sunny.", false).unwrap();
         assert!(
             msg["content"].as_str().unwrap().contains("hmm</think>"),
@@ -306,7 +319,11 @@ mod tests {
     #[test]
     fn glm_reasoning_effort_reaches_template() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let p = |e| t.render(&user(), None, None, false, e).unwrap().prompt;
+        let p = |e| {
+            t.render(&user(), None, None, false, e, false)
+                .unwrap()
+                .prompt
+        };
         assert!(p(None).contains("Reasoning Effort: Max"), "{}", p(None));
         assert!(p(Some("max")).contains("Reasoning Effort: Max"));
         assert!(p(Some("medium")).contains("Reasoning Effort: Max"));
@@ -317,10 +334,116 @@ mod tests {
     #[test]
     fn glm_no_tools_render_starts_like_legacy() {
         let t = ChatTemplates::from_source(GLM).unwrap();
-        let p = t.render(&user(), None, None, false, None).unwrap().prompt;
+        let p = t
+            .render(&user(), None, None, false, None, false)
+            .unwrap()
+            .prompt;
         assert!(p.starts_with("[gMASK]<sop>"), "{p}");
         assert_eq!(p.matches("[gMASK]<sop>").count(), 1, "{p}");
         assert!(p.contains("<|user|>"), "{p}");
         assert!(p.contains("weather in Paris?<|assistant|>"), "{p}");
+    }
+}
+
+#[cfg(test)]
+mod no_think_tests {
+    use super::*;
+
+    const GLM: &str = include_str!("../tests/fixtures/glm-5.3-flash.jinja");
+
+    fn tools() -> String {
+        serde_json::json!([{"type":"function","function":{"name":"get_weather","parameters":{
+            "type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])
+        .to_string()
+    }
+
+    fn user() -> String {
+        serde_json::json!([{"role":"user","content":"weather in Paris?"}]).to_string()
+    }
+
+    /// No-think closes the `<|assistant|><think>` generation prompt with the
+    /// template's own empty form; the effort header cannot be suppressed, so
+    /// the shim pins it to `Low`.
+    #[test]
+    fn no_think_prefills_empty_think_block() {
+        let t = ChatTemplates::from_source(GLM).unwrap();
+        let r = t.render(&user(), None, None, false, None, true).unwrap();
+        assert!(
+            r.prompt.ends_with("<|assistant|><think></think>"),
+            "got: {:?}",
+            r.prompt
+        );
+        assert!(
+            r.prompt.contains("Reasoning Effort: Low"),
+            "got: {:?}",
+            r.prompt
+        );
+    }
+
+    /// Same pin against the GGUF-verified fixture path used by the other
+    /// template tests (byte-identical to the real UD-Q4_K_XL GGUF's
+    /// `tokenizer.chat_template`).
+    #[test]
+    fn no_think_prefills_empty_think_block_gguf_fixture() {
+        let t = ChatTemplates::from_source(include_str!(
+            "../../golem-engine/tests/fixtures/glm-5.3-flash.jinja"
+        ))
+        .unwrap();
+        let r = t.render(&user(), None, None, false, None, true).unwrap();
+        assert!(
+            r.prompt.ends_with("<|assistant|><think></think>"),
+            "got: {:?}",
+            r.prompt
+        );
+    }
+
+    /// The whole point of the prefill: output generated after the closed
+    /// think block parses as `content`, never as reasoning.
+    #[test]
+    fn no_think_output_parses_as_content_not_reasoning() {
+        let t = ChatTemplates::from_source(GLM).unwrap();
+        let r = t.render(&user(), None, None, false, None, true).unwrap();
+        let msg = r.parser.parse("It is sunny.", false).unwrap();
+        assert_eq!(msg["content"], "It is sunny.");
+        assert!(msg.get("reasoning_content").is_none(), "{msg}");
+    }
+
+    /// Forced tool calls must still work with the prefill: the shim patches
+    /// the generation prefix the eager grammar walk-forward skips over.
+    #[test]
+    fn no_think_with_named_choice_forced_tool_call() {
+        let t = ChatTemplates::from_source(GLM).unwrap();
+        let choice = r#"{"type":"function","function":{"name":"get_weather"}}"#;
+        let r = t
+            .render(&user(), Some(&tools()), Some(choice), false, None, true)
+            .unwrap();
+        assert!(
+            r.prompt.ends_with("<|assistant|><think></think>"),
+            "got: {:?}",
+            r.prompt
+        );
+        assert!(!r.grammar.is_empty());
+        let root = r
+            .grammar
+            .lines()
+            .find(|l| l.starts_with("root ::="))
+            .unwrap();
+        assert!(
+            !root
+                .split_whitespace()
+                .any(|w| w.starts_with("until-") && w.ends_with('?')),
+            "{root}"
+        );
+        assert!(root.ends_with("tool-call"), "{root}");
+        let msg = r
+            .parser
+            .parse(
+                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+                false,
+            )
+            .unwrap();
+        let tc = &msg["tool_calls"][0]["function"];
+        assert_eq!(tc["name"], "get_weather");
+        assert!(msg.get("reasoning_content").is_none(), "{msg}");
     }
 }

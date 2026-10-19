@@ -246,20 +246,23 @@ fn tool_choice(c: &Value) -> Result<Value, ErrorEnvelope> {
 }
 
 /// `thinking`: `enabled`/`adaptive` keep the template's reasoning (the
-/// default); `disabled` is refused until the no-think form is verified.
+/// default); `disabled` selects the template's no-think form (design §8.6).
+/// `disabled` together with `output_config.effort` is a conflict — the
+/// effort kwarg would silently re-enable thinking — and is a 400, never a
+/// silent re-enable.
 fn check_thinking(t: &Value) -> Result<(), ErrorEnvelope> {
     match t.get("type").and_then(Value::as_str) {
-        Some("enabled" | "adaptive") => Ok(()),
-        Some("disabled") => Err(unsupported(
-            "field `thinking` is not supported: `disabled` (the chat template's no-think form is unverified)",
-        )),
+        Some("enabled" | "adaptive" | "disabled") => Ok(()),
         _ => Err(invalid(
             "`thinking.type` must be `enabled`, `adaptive` or `disabled`",
         )),
     }
 }
 
-/// `output_config.effort` → `reasoning_effort`; other keys are refused.
+/// `output_config.effort` → `reasoning_effort`; other keys are refused
+/// (design §8.6). `low`/`high`/`none` pass through verbatim; `max` maps to
+/// absent (the template's default); anything else is a 400, never a silent
+/// drop.
 fn effort(c: &Value) -> Result<Option<Value>, ErrorEnvelope> {
     let o = c
         .as_object()
@@ -269,7 +272,16 @@ fn effort(c: &Value) -> Result<Option<Value>, ErrorEnvelope> {
             "field `output_config.{k}` is not supported"
         )));
     }
-    Ok(o.get("effort").cloned())
+    match o.get("effort") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_str() {
+            Some("low" | "high" | "none") => Ok(Some(v.clone())),
+            Some("max") => Ok(None),
+            _ => Err(invalid(
+                "`output_config.effort` must be `low`, `high`, `none` or `max`",
+            )),
+        },
+    }
 }
 
 /// Translates a raw `/v1/messages` body into the OpenAI chat body fed to
@@ -336,10 +348,22 @@ pub fn to_chat(raw: &Value) -> Result<Value, ErrorEnvelope> {
     if let Some(c) = raw.get("tool_choice") {
         out.insert("tool_choice".into(), tool_choice(c)?);
     }
-    if let Some(t) = raw.get("thinking") {
-        check_thinking(t)?;
+    let thinking_disabled = raw
+        .get("thinking")
+        .map(|t| {
+            check_thinking(t)?;
+            Ok(t.get("type").and_then(Value::as_str) == Some("disabled"))
+        })
+        .transpose()?;
+    let effort = raw.get("output_config").map(effort).transpose()?.flatten();
+    if thinking_disabled == Some(true) && effort.is_some() {
+        return Err(invalid(
+            "`thinking: disabled` conflicts with `output_config.effort`",
+        ));
     }
-    if let Some(e) = raw.get("output_config").map(effort).transpose()?.flatten() {
+    if thinking_disabled == Some(true) {
+        out.insert("reasoning_effort".into(), "none".into());
+    } else if let Some(e) = effort {
         out.insert("reasoning_effort".into(), e);
     }
     Ok(Value::Object(out))
@@ -515,17 +539,38 @@ mod tests {
     }
 
     #[test]
-    fn thinking_enabled_and_adaptive_pass_disabled_is_400() {
+    fn thinking_disabled_maps_to_no_think() {
         let mut b = base(json!([{"role": "user", "content": "q"}]));
         for t in [
             json!({"type": "enabled", "budget_tokens": 1024}),
             json!({"type": "adaptive", "display": "omitted"}),
         ] {
             b["thinking"] = t;
-            assert!(ok(b.clone()).get("thinking").is_none());
+            let c = ok(b.clone());
+            assert!(c.get("thinking").is_none() && c.get("reasoning_effort").is_none());
         }
         b["thinking"] = json!({"type": "disabled"});
-        assert_eq!(code(b), ErrorCode::UnsupportedField);
+        let c = ok(b);
+        assert!(c.get("thinking").is_none());
+        assert_eq!(c["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn thinking_disabled_with_output_config_effort_is_400() {
+        let mut b = base(json!([{"role": "user", "content": "q"}]));
+        b["thinking"] = json!({"type": "disabled"});
+        b["output_config"] = json!({"effort": "high"});
+        assert_eq!(code(b), ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn output_config_effort_max_maps_to_absent() {
+        let mut b = base(json!([{"role": "user", "content": "q"}]));
+        b["output_config"] = json!({"effort": "max"});
+        let c = ok(b.clone());
+        assert!(c.get("reasoning_effort").is_none());
+        b["output_config"] = json!({"effort": "medium"});
+        assert_eq!(code(b), ErrorCode::InvalidRequest);
     }
 
     #[test]

@@ -542,6 +542,7 @@ fn probe_templates(
         None,
         false,
         None,
+        false,
     )?;
     if probe.prompt.is_empty() {
         return Err(EngineError::TemplateUnavailable);
@@ -565,12 +566,16 @@ fn render(chat: &ChatTemplates, req: &TurnRequest<'_>) -> Result<Rendered, Engin
             &built
         }
     };
+    // §8.6 mapping, in exactly one place: `"none"` means no-think, so it is
+    // stripped from the effort variable and carried by `no_think` instead.
+    let no_think = req.reasoning_effort == Some("none");
     chat.render(
         messages,
         req.tools_json,
         req.tool_choice,
         req.reasoning_inline,
-        req.reasoning_effort,
+        req.reasoning_effort.filter(|e| *e != "none"),
+        no_think,
     )
 }
 
@@ -2535,6 +2540,36 @@ fn prefill_chunk_cap(batch_tokens: usize, n_ctx: usize, pool: Option<(u32, u32)>
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// The §8.6 mapping lives at the session call site: `"none"` effort →
+    /// no-think (empty-think prefill), effort header pinned to Low; other
+    /// efforts pass through and never prefill.
+    #[test]
+    fn session_render_maps_none_effort_to_no_think() {
+        let chat =
+            ChatTemplates::from_source(include_str!("../tests/fixtures/glm-5.3-flash.jinja"))
+                .unwrap();
+        let turns = [ChatTurn {
+            role: "user",
+            content: "ping",
+        }];
+        let none = render(
+            &chat,
+            &TurnRequest::new(&turns).reasoning_effort(Some("none")),
+        )
+        .unwrap()
+        .prompt;
+        assert!(none.ends_with("<|assistant|><think></think>"), "{none}");
+        assert!(none.contains("Reasoning Effort: Low"), "{none}");
+        let low = render(
+            &chat,
+            &TurnRequest::new(&turns).reasoning_effort(Some("low")),
+        )
+        .unwrap()
+        .prompt;
+        assert!(low.contains("Reasoning Effort: Low"), "{low}");
+        assert!(!low.ends_with("<think></think>"), "{low}");
+    }
 
     fn glm() -> golem_plan::ModelFacts {
         golem_plan::ModelFacts {
