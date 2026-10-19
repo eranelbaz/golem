@@ -43,9 +43,10 @@ const PROMPTS: [&str; 2] = [
 /// Arguments of the `optimize` subcommand.
 #[derive(Debug, clap::Args)]
 pub struct OptimizeArgs {
-    /// Path to the GGUF model file (first shard of a split).
+    /// Path to the GGUF model file (first shard of a split); else
+    /// `GOLEM_MODEL`, else `model` in `golem.toml`.
     #[arg(long)]
-    pub model: PathBuf,
+    pub model: Option<PathBuf>,
     /// Wall-clock bound; coordinate descent stops early with the best so far.
     #[arg(long, default_value_t = 120)]
     pub max_minutes: u64,
@@ -87,21 +88,21 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     }
     // Baseline = today's resolved config: env and file apply, no profile.
     let layers = crate::config::Layers::from_process()?;
+    let model = layers.model(args.model.clone())?;
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut mach = machine();
     let (config, requested_snapshot) = engine_config(
         &args.engine,
-        &args.model,
+        &model,
         1,
         &layers,
         engine_ram_free(args, &mach),
     )?;
     let facts = config.model_facts.ok_or("model facts unresolved")?;
-    let fp = profile::fingerprint(&args.model)?;
+    let fp = profile::fingerprint(&model)?;
     let (free_vram, free_ram) = (profile::sysfs_vram().map_or(0, |(f, _)| f), mach.ram_free);
     let eff = crate::serve::effective(&config, requested_snapshot)?;
-    let model_name = args
-        .model
+    let model_name = model
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -167,7 +168,7 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         let t0 = Instant::now();
         let r = plan_check(&config, &facts, &mach, k, &base_plan).and_then(|()| {
             println!("plan ok: {}", serde_json::to_string(k)?);
-            run_child(&id, &guard, k)
+            run_child(&id, &guard, k, &model)
         });
         let line = serde_json::to_string(k)?;
         match &r {
@@ -398,9 +399,16 @@ fn run_child(
     parent: &str,
     guard: &golem_registry::Guard,
     k: &Knobs,
+    model: &Path,
 ) -> Result<Measured, Box<dyn Error>> {
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .args(std::env::args_os().skip(1))
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(std::env::args_os().skip(1));
+    // The child resolves exactly the parent's model, even if env or
+    // `golem.toml` change mid-sweep; argv already has `--model` if it was given.
+    if !std::env::args_os().any(|a| a == "--model" || a.to_string_lossy().starts_with("--model=")) {
+        cmd.arg("--model").arg(model);
+    }
+    let mut child = cmd
         .args(["--measure-one", &serde_json::to_string(k)?])
         .args(["--parent-entry", parent])
         .stdin(std::process::Stdio::piped())
@@ -667,15 +675,16 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
         return Err(format!("entry `{parent}` does not own this measurement").into());
     }
     let layers = crate::config::Layers::from_process()?;
+    let model = layers.model(args.model.clone())?;
     let (mut config, _) = engine_config(
         &args.engine,
-        &args.model,
+        &model,
         1,
         &layers,
         engine_ram_free(args, &machine()),
     )?;
     apply(&mut config, knobs);
-    evict(&args.model)?;
+    evict(&model)?;
     let t = Instant::now();
     let mut s = Session::new(&config)?;
     let load_s = t.elapsed().as_secs_f64();
