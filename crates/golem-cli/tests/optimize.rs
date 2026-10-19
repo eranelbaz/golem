@@ -340,14 +340,15 @@ fn explicit_flag_beats_profile() {
 /// per layer, below one expert tensor (8 experts): a 2-candidate sweep runs
 /// to completion under a machine budget that admits the parent's
 /// reservation once but would refuse it twice (children register nothing).
+/// No `--model`: resolved from `GOLEM_MODEL` like `run` (#163).
 #[test]
 fn optimize_on_fixture_with_budget_below_one_expert_tensor() {
     let rt = common::tempdir_env();
     let model = xtask::tiny_hybrid::cached_fixture();
     let out = common::golem_cmd(&rt)
         .env("XDG_CONFIG_HOME", rt.join("config"))
-        .args(["optimize", "--model"])
-        .arg(&model)
+        .env("GOLEM_MODEL", &model)
+        .arg("optimize")
         .args([
             "--ram-experts-gib",
             "1",
