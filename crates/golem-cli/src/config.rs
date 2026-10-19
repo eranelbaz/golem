@@ -585,4 +585,19 @@ mod tests {
         assert!(e.contains("golem.toml"), "{e}");
         std::fs::remove_dir_all(&tmp).unwrap();
     }
+
+    #[test]
+    fn cache_types_resolve_through_layers() {
+        use golem_plan::KvCacheType::{F16, Q4_0, Q8_0};
+        let l = Layers {
+            file: toml::from_str("cache_type_k = \"q8_0\"\ncache_type_v = \"q8\"").unwrap(),
+            profile: toml::Table::new(),
+            path: None,
+            env: &|k| (k == "GOLEM_CACHE_TYPE_K").then(|| "q4_0".to_owned()),
+        };
+        assert_eq!(l.get(None, "cache_type_k", F16).unwrap(), Q4_0);
+        assert_eq!(l.get(Some(Q8_0), "cache_type_k", F16).unwrap(), Q8_0);
+        let e = l.get(None, "cache_type_v", F16).unwrap_err().to_string();
+        assert!(e.contains("q8_0") && e.contains("\"q8\""), "{e}");
+    }
 }

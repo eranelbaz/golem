@@ -27,6 +27,11 @@ pub struct EngineConfig {
     /// Force Flash Attention (`LLAMA_FLASH_ATTN_TYPE_ENABLED` on the context
     /// params); `false` leaves llama.cpp's `AUTO` default untouched.
     pub flash_attn_on: bool,
+    /// K cache element type (`llama_context_params::type_k`, `--cache-type-k`).
+    pub cache_type_k: golem_plan::KvCacheType,
+    /// V cache element type (`llama_context_params::type_v`, `--cache-type-v`);
+    /// a quantized V needs Flash Attention, which llama turns on from AUTO.
+    pub cache_type_v: golem_plan::KvCacheType,
     /// Expert (MoE) FFN weights of the first N layers pinned to CPU buffers via
     /// `tensor_buft_overrides` — the public-API equivalent of the vendor's
     /// `-ncmoe N` flag (a common/arg.cpp path unreachable through libllama at
@@ -203,6 +208,8 @@ impl Default for EngineConfig {
             threads: default_threads(),
             n_gpu_layers: 0,
             flash_attn_on: false,
+            cache_type_k: golem_plan::KvCacheType::F16,
+            cache_type_v: golem_plan::KvCacheType::F16,
             cpu_moe_layers: None,
             ram_experts_gib: 0,
             device_cache_experts: 0,

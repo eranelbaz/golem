@@ -116,6 +116,14 @@ pub struct EffectiveConfig {
     pub ram_experts_gib: u64,
     /// Requested snapshot arena; `None` = planner default.
     pub snapshot_ram_bytes: Option<u64>,
+    /// KV cache element types, `k/v` (e.g. `f16/f16`); entries written
+    /// before the field existed ran llama's f16 default.
+    #[serde(default = "f16_cache_types")]
+    pub cache_types: String,
+}
+
+fn f16_cache_types() -> String {
+    "f16/f16".into()
 }
 
 impl EffectiveConfig {
@@ -142,6 +150,12 @@ pub fn compatible(running: &EffectiveConfig, want: &EffectiveConfig) -> Result<(
         ));
     }
     let mut conflicts = Vec::new();
+    if want.cache_types != running.cache_types {
+        conflicts.push(format!(
+            "KV cache types {} != running {}",
+            want.cache_types, running.cache_types
+        ));
+    }
     if want.ctx > running.ctx {
         conflicts.push(format!("--ctx {} > running {}", want.ctx, running.ctx));
     }

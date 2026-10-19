@@ -15,13 +15,12 @@ TIMEF="$LOGDIR/$NAME.time"
 mkdir -p "$LOGDIR"
 
 vram_sample() {
-  rocm-smi --showmeminfo vram --json | python3 -c \
-    'import json,sys,time; d=json.load(sys.stdin); k=next(iter(d)); print(time.time(), d[k]["VRAM Total Used Memory (B)"])'
+  cat /sys/class/drm/card*/device/mem_info_vram_used | awk -v t="$(date +%s.%N)" '{s += $1} END {print t, s}'
 }
-vram_sample > "$VLOG"
+vram_sample > "$VLOG" || true
 IDLE=$(tail -1 "$VLOG" | awk '{print $2}')
 if ! [[ "$IDLE" =~ ^[0-9]+$ ]]; then
-  echo "FATAL: could not read idle VRAM from rocm-smi (got '$IDLE')" >&2
+  echo "FATAL: could not read idle VRAM from sysfs (got '$IDLE')" >&2
   exit 2
 fi
 : > "$LOG"
