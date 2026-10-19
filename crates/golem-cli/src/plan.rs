@@ -45,6 +45,13 @@ pub struct PlanArgs {
     /// Device VRAM; omitted = the HIP device's total (HIP builds), else 24.
     #[arg(long, value_name = "GIB")]
     pub vram_gib: Option<f64>,
+    /// K cache element type the KV term is priced at; resolved like
+    /// `run --cache-type-k` (flag > env > golem.toml > f16).
+    #[arg(long, value_name = "TYPE")]
+    pub cache_type_k: Option<golem_plan::KvCacheType>,
+    /// V cache element type the KV term is priced at (as `--cache-type-k`).
+    #[arg(long, value_name = "TYPE")]
+    pub cache_type_v: Option<golem_plan::KvCacheType>,
     /// Machine-readable report on stdout.
     #[arg(long)]
     pub json: bool,
@@ -133,7 +140,13 @@ pub fn machine(vram_gib: Option<f64>) -> Machine {
 /// Runs `golem plan`; returns the process exit code (0 fits, 2 infeasible).
 pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
     let model = crate::config::Layers::from_process()?.model(args.model.clone())?;
-    let m = ModelFacts::from_gguf(&model)?;
+    let l = crate::config::Layers::from_process()?;
+    let f16 = golem_plan::KvCacheType::F16;
+    let m = ModelFacts::from_gguf_kv(
+        &model,
+        l.get(args.cache_type_k, "cache_type_k", f16)?,
+        l.get(args.cache_type_v, "cache_type_v", f16)?,
+    )?;
     let mach = machine(args.vram_gib);
     let snapshot_ram = match args.snapshot_ram_gib {
         Some(g) => bytes(Some(g)),

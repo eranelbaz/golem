@@ -11,10 +11,114 @@ use golem_gguf::{
 };
 use serde::Serialize;
 
-/// Bytes per element of the default KV cache type (f16) and of the
-/// recurrent-state types `type_r`/`type_s` (f32).
-const KV_ELEM: u64 = 2;
+/// Bytes per element of the recurrent-state types `type_r`/`type_s` (f32).
 const RS_ELEM: u64 = 4;
+
+/// KV cache element type (`llama_context_params::type_k`/`type_v`); the set
+/// llama.cpp's `--cache-type-k/v` accepts (common/arg.cpp `kv_cache_types`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvCacheType {
+    /// 32-bit float.
+    F32,
+    /// 16-bit float (llama.cpp's default).
+    #[default]
+    F16,
+    /// bfloat16.
+    Bf16,
+    /// 8-bit quant, block 32.
+    Q8_0,
+    /// 4-bit quant, block 32.
+    Q4_0,
+    /// 4-bit quant with minimum, block 32.
+    Q4_1,
+    /// 4-bit non-linear quant, block 32.
+    Iq4Nl,
+    /// 5-bit quant, block 32.
+    Q5_0,
+    /// 5-bit quant with minimum, block 32.
+    Q5_1,
+}
+
+impl KvCacheType {
+    const ALL: [Self; 9] = [
+        Self::F32,
+        Self::F16,
+        Self::Bf16,
+        Self::Q8_0,
+        Self::Q4_0,
+        Self::Q4_1,
+        Self::Iq4Nl,
+        Self::Q5_0,
+        Self::Q5_1,
+    ];
+
+    /// ggml type name (`ggml_type_name`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+            Self::Q4_1 => "q4_1",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
+        }
+    }
+
+    /// GGML type tag (ggml.h `GGML_TYPE_*`).
+    #[must_use]
+    pub fn ggml_type(self) -> u32 {
+        match self {
+            Self::F32 => golem_gguf::GGML_TYPE_F32,
+            Self::F16 => golem_gguf::GGML_TYPE_F16,
+            Self::Bf16 => golem_gguf::GGML_TYPE_BF16,
+            Self::Q8_0 => golem_gguf::GGML_TYPE_Q8_0,
+            Self::Q4_0 => golem_gguf::GGML_TYPE_Q4_0,
+            Self::Q4_1 => golem_gguf::GGML_TYPE_Q4_1,
+            Self::Iq4Nl => golem_gguf::GGML_TYPE_IQ4_NL,
+            Self::Q5_0 => golem_gguf::GGML_TYPE_Q5_0,
+            Self::Q5_1 => golem_gguf::GGML_TYPE_Q5_1,
+        }
+    }
+
+    fn is_quantized(self) -> bool {
+        !matches!(self, Self::F32 | Self::F16 | Self::Bf16)
+    }
+
+    /// Bytes of one cached row of `n` elements; `None` when `n` is not a
+    /// multiple of the block (llama refuses such a cache at context init).
+    fn row_bytes(self, n: u64) -> Option<u64> {
+        ggml_row_bytes(self.ggml_type(), n)
+    }
+}
+
+impl std::fmt::Display for KvCacheType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The `k/v` pair as logged and registered (e.g. `q8_0/f16`).
+#[must_use]
+pub fn kv_cache_types(type_k: KvCacheType, type_v: KvCacheType) -> String {
+    format!("{type_k}/{type_v}")
+}
+
+impl std::str::FromStr for KvCacheType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.name() == s)
+            .ok_or_else(|| {
+                let all: Vec<_> = Self::ALL.iter().map(|t| t.name()).collect();
+                format!("want one of {}, got {s:?}", all.join(", "))
+            })
+    }
+}
 
 /// Loader + activations host overhead (§10, starts at 2 GiB until measured).
 pub const HOST_OVERHEAD: u64 = 2 << 30;
@@ -59,7 +163,8 @@ pub struct ModelFacts {
     pub max_plane_stride: u64,
     /// Σ routed-expert plane bytes over live layers.
     pub expert_bytes_total: u64,
-    /// KV bytes per token per sequence, attention layers only.
+    /// KV bytes per token per sequence, attention layers only, at the
+    /// cache types the facts were read for ([`Self::from_gguf_kv`]).
     pub kv_per_token: u64,
     /// Recurrent-state bytes per sequence (constant in ctx).
     pub rs_bytes: u64,
@@ -78,6 +183,20 @@ impl ModelFacts {
     /// # Errors
     /// Unreadable/corrupt shard, or missing hparams.
     pub fn from_gguf(path: &Path) -> Result<Self, PlanError> {
+        Self::from_gguf_kv(path, KvCacheType::F16, KvCacheType::F16)
+    }
+
+    /// [`Self::from_gguf`] with `kv_per_token` priced at the `type_k` /
+    /// `type_v` cache types.
+    ///
+    /// # Errors
+    /// As [`Self::from_gguf`]; also a cache type llama would refuse (mixed
+    /// types on an MLA model, a row not a multiple of the type's block).
+    pub fn from_gguf_kv(
+        path: &Path,
+        type_k: KvCacheType,
+        type_v: KvCacheType,
+    ) -> Result<Self, PlanError> {
         let gguf = |p: &Path, e| PlanError::Gguf {
             path: p.to_path_buf(),
             source: e,
@@ -138,7 +257,7 @@ impl ModelFacts {
         }
         m.expert_layers = expert_blk.iter().filter(|&&b| b).count() as u32;
         m.first_expert_block = expert_blk.iter().position(|&b| b).unwrap_or(0) as u32;
-        m.state_terms(&kvs, live.end as usize)?;
+        m.state_terms(&kvs, live.end as usize, type_k, type_v)?;
         Ok(m)
     }
 
@@ -171,13 +290,29 @@ impl ModelFacts {
 
     /// KV per token and recurrent-state bytes, mirroring the vendored
     /// llama.cpp allocation: `head_count_kv == 0` marks a recurrent (KDA)
-    /// layer (glm5next); MLA caches K only; a pooling indexer caches 3 heads.
-    fn state_terms(&mut self, kvs: &[(String, KvVal)], n_layer: usize) -> Result<(), PlanError> {
+    /// layer (glm5next); MLA caches K only; a pooling indexer caches 3 heads
+    /// at `type_k` (f16 on glm5next under a quantized K). Target, 11 MLA
+    /// layers × (512 K + 3 × 128 indexer): f16 19,712 B/token; q8_0
+    /// 11 × (16 × 34 + 384 × 2) = 14,432 B/token, matching llama's logged
+    /// 748 + 1,056 MiB at 131,072 cells.
+    fn state_terms(
+        &mut self,
+        kvs: &[(String, KvVal)],
+        n_layer: usize,
+        type_k: KvCacheType,
+        type_v: KvCacheType,
+    ) -> Result<(), PlanError> {
         let heads_kv = arch_kv_per_layer(kvs, "attention.head_count_kv", n_layer)
             .ok_or_else(|| PlanError::Invalid("missing attention.head_count_kv".into()))?;
         let opt = |k: &str| arch_kv_int(kvs, k).unwrap_or(0);
         let k_len = u64::from(hp_u32(kvs, "attention.key_length")?);
-        let v_len = if opt("attention.key_length_mla") > 0 {
+        let mla = opt("attention.key_length_mla") > 0;
+        if mla && type_k != type_v {
+            return Err(PlanError::Invalid(format!(
+                "MLA model needs equal K and V cache types, got {type_k} / {type_v}"
+            )));
+        }
+        let v_len = if mla {
             0
         } else {
             arch_kv_int(kvs, "attention.value_length").unwrap_or(k_len)
@@ -187,7 +322,17 @@ impl ModelFacts {
         } else {
             1
         };
-        let idx = idx_heads * opt("attention.indexer.key_length");
+        let idx_len = opt("attention.indexer.key_length");
+        // glm5next's indexer cache also holds the compressor gates, so the
+        // vendor keeps it f16 under a quantized K (llama-model.cpp). The
+        // arch match folds '-' like llm_arch_from_string ("glm5-next").
+        let glm5next = golem_gguf::kv_str(kvs, "general.architecture")
+            .is_some_and(|a| a.replace('-', "") == "glm5next");
+        let type_idx = if glm5next && type_k.is_quantized() {
+            KvCacheType::F16
+        } else {
+            type_k
+        };
         let kpool = opt("attention.indexer.kpool");
         self.dense_below_ctx = if kpool > 0 {
             u32::try_from(opt("attention.indexer.top_k") + kpool).unwrap_or(u32::MAX)
@@ -202,12 +347,20 @@ impl ModelFacts {
                 "recurrent layers without kda.head_dim".into(),
             ));
         }
+        let row = |t: KvCacheType, n: u64| {
+            t.row_bytes(n).ok_or_else(|| {
+                PlanError::Invalid(format!(
+                    "{t} KV cache: head length {n} is not a multiple of the type's block"
+                ))
+            })
+        };
         for &h in &heads_kv {
             if h == 0 {
                 self.rs_bytes += (conv + ssm) * RS_ELEM;
             } else {
                 self.sparse_attn_layers += 1;
-                self.kv_per_token += (h * (k_len + v_len) + idx) * KV_ELEM;
+                self.kv_per_token += h * (row(type_k, k_len)? + row(type_v, v_len)?)
+                    + idx_heads * row(type_idx, idx_len)?;
             }
         }
         Ok(())
@@ -1113,13 +1266,78 @@ mod tests {
         v
     }
     fn facts(kvs: &[(String, KvVal)], n: usize) -> Result<ModelFacts, PlanError> {
+        facts_kv(kvs, n, KvCacheType::F16, KvCacheType::F16)
+    }
+    fn facts_kv(
+        kvs: &[(String, KvVal)],
+        n: usize,
+        k: KvCacheType,
+        v: KvCacheType,
+    ) -> Result<ModelFacts, PlanError> {
         let mut m = ModelFacts {
             kv_per_token: 0,
             rs_bytes: 0,
             sparse_attn_layers: 0,
             ..glm()
         };
-        m.state_terms(kvs, n).map(|()| m)
+        m.state_terms(kvs, n, k, v).map(|()| m)
+    }
+
+    /// Target MLA shape (512 K + 3 × 128 indexer per layer): a DSA-style
+    /// indexer follows `type_k` (q8_0 28 blocks × 34 B = 952 B/layer against
+    /// f16's 1,792); mixed types are refused like llama does for MLA.
+    #[test]
+    fn kv_per_token_follows_cache_type() {
+        use KvCacheType::{F16, Q4_0, Q8_0};
+        let mla = kvs(&[
+            ("attention.head_count_kv", KvVal::Int(1)),
+            ("attention.key_length", KvVal::Int(512)),
+            ("attention.key_length_mla", KvVal::Int(192)),
+            ("attention.indexer.key_length", KvVal::Int(128)),
+            ("attention.indexer.kpool", KvVal::Int(4)),
+        ]);
+        assert_eq!(facts_kv(&mla, 1, F16, F16).unwrap().kv_per_token, 1_792);
+        assert_eq!(facts_kv(&mla, 1, Q8_0, Q8_0).unwrap().kv_per_token, 952);
+        assert!(matches!(
+            facts_kv(&mla, 1, Q8_0, F16),
+            Err(PlanError::Invalid(_))
+        ));
+        // glm5next keeps the indexer f16: 16 × 34 + 384 × 2 = 1,312 B/layer.
+        // Both GGUF spellings: unsloth ships "glm5-next".
+        for arch in ["glm5next", "glm5-next"] {
+            let mut glm5 = mla.clone();
+            glm5[0].1 = KvVal::Str(arch.into());
+            glm5.iter_mut()
+                .for_each(|(k, _)| *k = k.replacen("a.", &format!("{arch}."), 1));
+            assert_eq!(facts_kv(&glm5, 1, Q8_0, Q8_0).unwrap().kv_per_token, 1_312);
+        }
+        // Non-MLA prices K and V independently: 1 head × 128 each.
+        let gqa = kvs(&[
+            ("attention.head_count_kv", KvVal::Int(1)),
+            ("attention.key_length", KvVal::Int(128)),
+        ]);
+        assert_eq!(
+            facts_kv(&gqa, 1, Q8_0, F16).unwrap().kv_per_token,
+            136 + 256
+        );
+        assert_eq!(facts_kv(&gqa, 1, F16, Q4_0).unwrap().kv_per_token, 256 + 72);
+        // A row that is not whole blocks is refused.
+        let odd = kvs(&[
+            ("attention.head_count_kv", KvVal::Int(1)),
+            ("attention.key_length", KvVal::Int(8)),
+        ]);
+        assert!(matches!(
+            facts_kv(&odd, 1, Q8_0, Q8_0),
+            Err(PlanError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn kv_cache_type_round_trips_its_name() {
+        for t in KvCacheType::ALL {
+            assert_eq!(t.name().parse::<KvCacheType>(), Ok(t));
+        }
+        assert!("q8".parse::<KvCacheType>().is_err());
     }
 
     #[test]

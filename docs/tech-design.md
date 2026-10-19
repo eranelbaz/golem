@@ -147,7 +147,7 @@ Reading the table:
 The original text assumed an MLA/KV-cache model. GLM-5.3-Flash (`glm5next`) is a **hybrid**:
 
 - 45 trunk layers (`config.json` `layer_types`): **34 `linear_attention`** layers with a fixed-size recurrent state, and **11 `deepseek_sparse_attention`** layers with MLA-style K-only KV plus a sparse-attention indexer (`indexer.*` tensors). Layers 0–2 are dense, layers 3–44 are MoE (288 routed + 1 shared, top-8), and blk.45 is the MTP/NextN block.
-- Memory per sequence is **constant-size recurrent state** (m0-notes: 145.56 MiB R/S state) **plus** KV for the 11 attention layers only (19,712 B/token measured).
+- Memory per sequence is **constant-size recurrent state** (m0-notes: 145.56 MiB R/S state) **plus** KV for the 11 attention layers only (19,712 B/token measured at f16; 14,432 B/token at q8_0, §10).
 - Recurrent state **cannot be partially rewound** (`llama-memory-recurrent.cpp:182`). Anything that assumes "truncate the KV to position p" (slot cancel with rollback, stop-sequence rollback, prefix reuse) must instead **snapshot and restore** state (§7.1).
 - Long-context cost is governed by the sparse indexer, not dense attention, so the §12.3 ctx sweep must be chosen from measurement.
 
@@ -200,7 +200,7 @@ Every "MLA" reference below means the 11 sparse-attention layers only.
 |---------|--------|
 | GGUF parsing, tensor loading, mmap | llama.cpp loader, driven through `llama.h` |
 | Model graph (glm5next text path), attention, RoPE, norms, router | llama.cpp |
-| KV cache (allocation, quantized-KV options, defrag) | llama.cpp (`-ctk/-ctv` exposed as config) |
+| KV cache (allocation, quantized-KV options, defrag) | llama.cpp (`--cache-type-k/--cache-type-v`, config `cache_type_k`/`cache_type_v`, default f16) |
 | K-quant GEMV/GEMM kernels on HIP | ggml HIP backend |
 | Tokenization (BPE + GGUF chat template) | llama.cpp — *not* a Rust tokenizer; byte-parity with the reference runtime matters more than library purity |
 | Sampling | llama.cpp sampler chain, driven by `llama.h` with an explicit seed — reproducibility is an acceptance requirement (§12.2) |
@@ -615,6 +615,8 @@ DISK =
 Output: table per tier, the four governing numbers (VRAM headroom, RAM pool, per-token KV cost, max cold-expert latency estimate from measured bandwidth), and a verdict. Infeasible → exit code 2, `golem_plan_infeasible` with the failing inequality printed with actual numbers. `--json` for tooling. *(Amended 2026-09-29: the `staging` and `device_expert_cache` terms assume upstream's full-size transient expert copy. They change when the P2 slot-indirected device cache lands (review C-3/H-5): staging goes to ≈0 and the cache becomes `K` slots × stride per (layer, kind). `golem plan` also reports the §2.4 ceilings per candidate quant.)* The same functions serve the runtime's load-time feasibility check (§6.4) — one implementation, two callers, no drift.
 
 KV per token without loading the model: read from the arch table (glm5next entry created in M0 from the loaded context's actual allocation, then frozen as a formula in metadata keys); when the GGUF carries the needed dims, the formula computes exactly.
+
+*Amended 2026-10-19 (#107):* `kv_per_token` is priced per cache type: each attention layer costs `heads_kv · (row(type_k, key_length) + row(type_v, value_length)) + idx_heads · row(type_idx, indexer_key_length)`, where `row` is ggml's block size (q8_0 = 34 B per 32 elements). MLA stores no V, so it requires `type_k == type_v` (as llama does). On glm5next the indexer cache stays f16 under a quantized K, because it also holds the compressor gates (`llama-model.cpp`). Target at ctx 131,072: f16 19,712 B/token (2.41 GiB), q8_0 11 × (16 × 34 + 384 × 2) = 14,432 B/token (748 + 1,056 MiB, matching llama's log). The quantized V turns on flash attention. A/B on UD-IQ3_XXS (`scripts/kv-ab.sh`, both orders): needle recall at 10/50/90 % of 129k tokens passed for both types, prefill ≈ 78–84 tok/s and decode ≈ 3.3 tok/s for both, and the 660 MiB saved fit 2 more device-cache slots (`k_decode` 21 vs 19). The registry records the types, so `compatible` refuses to reuse an instance with different ones.
 
 ---
 

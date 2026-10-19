@@ -242,6 +242,8 @@ pub(crate) fn load_with_hooks(
     if config.flash_attn_on {
         params.flash_attn_type = raw::llama_flash_attn_type::LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
+    params.type_k = kv_ggml_type(config.cache_type_k);
+    params.type_v = kv_ggml_type(config.cache_type_v);
 
     let ctx = {
         // SAFETY: model is a live llama_model handle; params are default-derived per llama.h.
@@ -263,6 +265,23 @@ pub(crate) fn load_with_hooks(
         return Err(e);
     }
     Ok(loaded)
+}
+
+/// The bindgen `ggml_type` of a KV cache type.
+fn kv_ggml_type(t: golem_plan::KvCacheType) -> raw::ggml_type {
+    use golem_plan::KvCacheType as K;
+    use raw::ggml_type as G;
+    match t {
+        K::F32 => G::GGML_TYPE_F32,
+        K::F16 => G::GGML_TYPE_F16,
+        K::Bf16 => G::GGML_TYPE_BF16,
+        K::Q8_0 => G::GGML_TYPE_Q8_0,
+        K::Q4_0 => G::GGML_TYPE_Q4_0,
+        K::Q4_1 => G::GGML_TYPE_Q4_1,
+        K::Iq4Nl => G::GGML_TYPE_IQ4_NL,
+        K::Q5_0 => G::GGML_TYPE_Q5_0,
+        K::Q5_1 => G::GGML_TYPE_Q5_1,
+    }
 }
 
 /// CPU expert math (design §1 O1) joins into a device-resident add per
@@ -2463,8 +2482,12 @@ fn load_plan(
     };
     let facts = match config.model_facts {
         Some(f) => f,
-        None => golem_plan::ModelFacts::from_gguf(&config.model_path)
-            .map_err(|e| EngineError::InvalidModel(format!("plan: {e}")))?,
+        None => golem_plan::ModelFacts::from_gguf_kv(
+            &config.model_path,
+            config.cache_type_k,
+            config.cache_type_v,
+        )
+        .map_err(|e| EngineError::InvalidModel(format!("plan: {e}")))?,
     };
     check_plan(config, &facts, free).map(Some)
 }
@@ -2479,8 +2502,12 @@ fn snapshot_cache(config: &EngineConfig) -> Result<Option<SnapshotCache>, Engine
     }
     let facts = match config.model_facts {
         Some(f) => f,
-        None => golem_plan::ModelFacts::from_gguf(&config.model_path)
-            .map_err(|e| EngineError::InvalidModel(format!("snapshot sizing: {e}")))?,
+        None => golem_plan::ModelFacts::from_gguf_kv(
+            &config.model_path,
+            config.cache_type_k,
+            config.cache_type_v,
+        )
+        .map_err(|e| EngineError::InvalidModel(format!("snapshot sizing: {e}")))?,
     };
     let (floor, default) = golem_plan::snapshot_arena(&facts, config.parallel, config.n_ctx);
     let bytes = match config.snapshot_ram_bytes {

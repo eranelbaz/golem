@@ -80,6 +80,15 @@ pub struct EngineArgs {
     /// applies. Hardware parity legs run `fa = on` on both backends.
     #[arg(long)]
     pub flash_attn: bool,
+    /// K cache element type (f16 default; f32, bf16, q8_0, q4_0, q4_1,
+    /// iq4_nl, q5_0, q5_1). The plan prices the KV term at this type.
+    #[arg(long, value_name = "TYPE")]
+    pub cache_type_k: Option<golem_plan::KvCacheType>,
+    /// V cache element type (same set as `--cache-type-k`); llama.cpp turns
+    /// Flash Attention on for a quantized V. MLA models need it equal to
+    /// `--cache-type-k`.
+    #[arg(long, value_name = "TYPE")]
+    pub cache_type_v: Option<golem_plan::KvCacheType>,
     /// Expert (MoE) FFN weights of the first N layers pinned to CPU buffers
     /// (`EngineConfig::cpu_moe_layers` — the public-API equivalent of the
     /// vendor's `-ncmoe N`; unset keeps the llama.cpp default). The hardware
@@ -267,6 +276,8 @@ impl EngineArgs {
             threads: l.get(self.threads, "threads", d.threads)?,
             n_gpu_layers: l.get(self.n_gpu_layers, "n_gpu_layers", 0)?,
             flash_attn_on: l.get(flag(self.flash_attn), "flash_attn", false)?,
+            cache_type_k: l.get(self.cache_type_k, "cache_type_k", d.cache_type_k)?,
+            cache_type_v: l.get(self.cache_type_v, "cache_type_v", d.cache_type_v)?,
             cpu_moe_layers: l.opt(self.cpu_moe_layers, "cpu_moe_layers")?,
             // Fractional GiB floor to the engine's whole-GiB unit; a value in
             // (0, 1) therefore disables the pool — the help text says so.
@@ -396,7 +407,8 @@ pub fn engine_config(
                 .into(),
         );
     }
-    let facts = golem_plan::ModelFacts::from_gguf(model)?;
+    let facts =
+        golem_plan::ModelFacts::from_gguf_kv(model, config.cache_type_k, config.cache_type_v)?;
     let (snap, pool) = fit_ram(&facts, ram_free, &config)?;
     if pool != config.ram_experts_gib {
         eprintln!(
@@ -854,7 +866,7 @@ fn flush_trace(
 /// One-line resolved-config string for the CSV header comment (§11).
 pub(crate) fn resolved_config_line(config: &EngineConfig) -> String {
     format!(
-        "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} cpu_moe={:?} \
+        "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} kv={} cpu_moe={:?} \
          ram_experts_gib={} device_cache_experts={} io_threads={:?} manifest={:?} \
          vram_order={:?} prefetch={:?} prefetch_lookahead={} model_size={}",
         config.n_ctx,
@@ -863,6 +875,7 @@ pub(crate) fn resolved_config_line(config: &EngineConfig) -> String {
         config.threads,
         config.n_gpu_layers,
         config.flash_attn_on,
+        golem_plan::kv_cache_types(config.cache_type_k, config.cache_type_v),
         config.cpu_moe_layers,
         config.ram_experts_gib,
         config.device_cache_experts,

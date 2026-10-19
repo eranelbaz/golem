@@ -207,10 +207,22 @@ fn compatible_requires_same_model_and_smaller_budgets() {
         parallel: 1,
         ram_experts_gib: 8,
         snapshot_ram_bytes: None,
+        cache_types: "f16/f16".into(),
     };
     let mut want = run.clone();
     want.ctx = 2048;
     assert!(compatible(&run, &want).is_ok());
+    want.cache_types = "q8_0/q8_0".into();
+    assert!(
+        compatible(&run, &want)
+            .unwrap_err()
+            .contains("KV cache types")
+    );
+    want.cache_types = run.cache_types.clone();
+    let mut old = serde_json::to_value(&run).unwrap();
+    old.as_object_mut().unwrap().remove("cache_types");
+    let old: EffectiveConfig = serde_json::from_value(old).unwrap();
+    assert!(compatible(&old, &run).is_ok());
     want.ctx = 8192;
     assert!(compatible(&run, &want).unwrap_err().contains("--ctx 8192"));
     want.ctx = 2048;

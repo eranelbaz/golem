@@ -146,6 +146,7 @@ pub fn effective(
         parallel: config.parallel,
         ram_experts_gib: config.ram_experts_gib,
         snapshot_ram_bytes,
+        cache_types: golem_plan::kv_cache_types(config.cache_type_k, config.cache_type_v),
     })
 }
 

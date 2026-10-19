@@ -4,6 +4,8 @@ mod common;
 fn plan(extra: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_golem"))
         .arg("plan")
+        .env("XDG_CONFIG_HOME", common::tempdir_env())
+        .env_remove("GOLEM_CONFIG_DIR")
         .arg(common::tiny_moe_path())
         .args(extra)
         .output()
@@ -83,4 +85,24 @@ fn model_resolves_from_default_config_file() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// tiny-moe rows are 8 elements per head: f32 doubles the f16 KV term; a
+/// block-32 q8_0 cannot hold them and is refused before any arithmetic.
+#[test]
+fn cache_types_price_the_kv_term() {
+    let kv = |extra: &[&str]| {
+        let out = plan(&[&["--json", "--vram-gib", "24", "--ctx", "256"], extra].concat());
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["governing"]["kv_per_token"].as_u64().unwrap()
+    };
+    let f16 = kv(&[]);
+    assert_eq!(
+        kv(&["--cache-type-k", "f32", "--cache-type-v", "f32"]),
+        2 * f16
+    );
+    assert_eq!(kv(&["--cache-type-k", "f32"]), f16 * 3 / 2);
+    let out = plan(&["--cache-type-k", "q8_0"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a multiple of the type's block"));
 }
