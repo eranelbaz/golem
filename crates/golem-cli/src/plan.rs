@@ -17,8 +17,9 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// Arguments of the `plan` subcommand.
 #[derive(Debug, clap::Args)]
 pub struct PlanArgs {
-    /// Path to the GGUF model file (first shard of a split).
-    pub model: PathBuf,
+    /// Path to the GGUF model file (first shard of a split); else
+    /// `GOLEM_MODEL`, else `model` in `golem.toml`.
+    pub model: Option<PathBuf>,
     /// Context length per sequence.
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(2..))]
     pub ctx: u32,
@@ -131,7 +132,8 @@ pub fn machine(vram_gib: Option<f64>) -> Machine {
 
 /// Runs `golem plan`; returns the process exit code (0 fits, 2 infeasible).
 pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
-    let m = ModelFacts::from_gguf(&args.model)?;
+    let model = crate::config::Layers::from_process()?.model(args.model.clone())?;
+    let m = ModelFacts::from_gguf(&model)?;
     let mach = machine(args.vram_gib);
     let snapshot_ram = match args.snapshot_ram_gib {
         Some(g) => bytes(Some(g)),

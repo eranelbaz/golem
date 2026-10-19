@@ -21,8 +21,9 @@ use crate::run::{EngineArgs, engine_config, fork_commit, resolved_config_line};
 /// Arguments of the `serve` subcommand.
 #[derive(clap::Args)]
 pub struct ServeArgs {
-    /// Path to the GGUF model file (first shard of a split).
-    pub model: PathBuf,
+    /// Path to the GGUF model file (first shard of a split); else
+    /// `GOLEM_MODEL`, else `model` in `golem.toml`.
+    pub model: Option<PathBuf>,
     /// Bind address [default: 127.0.0.1].
     #[arg(long)]
     pub host: Option<IpAddr>,
@@ -270,8 +271,9 @@ pub fn serve(
     id: String,
     ready: impl FnOnce(&str) + Send,
 ) -> Result<(), Box<dyn Error>> {
-    let layers = crate::config::Layers::from_process()?
-        .with_profile(&args.model, args.engine.no_optimize_profile);
+    let layers = crate::config::Layers::from_process()?;
+    let model = layers.model(args.model.clone())?;
+    let layers = layers.with_profile(&model, args.engine.no_optimize_profile);
     let l = listen(args, &layers)?;
     check_parallel(
         l.parallel,
@@ -281,7 +283,7 @@ pub fn serve(
     sys.refresh_memory();
     let (mut config, requested_snapshot) = engine_config(
         &args.engine,
-        &args.model,
+        &model,
         l.parallel,
         &layers,
         if args.allow_overcommit {
@@ -313,11 +315,11 @@ pub fn serve(
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;
     let model_name = match l.model_name {
         Some(n) => n,
-        None => read_metadata(&args.model)?
+        None => read_metadata(&model)?
             .kv_str("general.name")
             .map(str::to_owned)
             .unwrap_or_else(|| {
-                args.model
+                model
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
@@ -501,6 +503,7 @@ mod tests {
         let layers = |env: &'static dyn Fn(&str) -> Option<String>| crate::config::Layers {
             file: toml::from_str("port = 7000\nhost = \"0.0.0.0\"").unwrap(),
             profile: toml::Table::new(),
+            path: None,
             env,
         };
         let env: &'static dyn Fn(&str) -> Option<String> =

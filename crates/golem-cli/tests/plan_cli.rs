@@ -48,3 +48,39 @@ fn infeasible_exits_2_with_the_inequality() {
     assert!(stderr.contains("> 1.0 GiB"), "{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("verdict: infeasible"));
 }
+
+/// §9.4: with no positional, the model comes from `golem.toml` in
+/// `$XDG_CONFIG_HOME/golem`; with none anywhere the error names all three.
+#[test]
+fn model_resolves_from_default_config_file() {
+    let rt = common::tempdir_env();
+    let run = || {
+        common::golem_cmd(&rt)
+            .args(["plan", "--json", "--vram-gib", "24", "--ctx", "256"])
+            .output()
+            .unwrap()
+    };
+    let out = run();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("GOLEM_MODEL") && err.contains("golem.toml"),
+        "{err}"
+    );
+    let dir = rt.join("config/golem");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("golem.toml"),
+        format!(
+            "model = {:?}\n",
+            common::tiny_moe_path().display().to_string()
+        ),
+    )
+    .unwrap();
+    let out = run();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -1,5 +1,5 @@
 //! §9.4 config precedence: flag > env (`GOLEM_<FLAG>`) > file
-//! (`$GOLEM_CONFIG_DIR/golem.toml`) > profile > built-in default. A present
+//! (`golem.toml` in [`config_dir`]) > profile > built-in default. A present
 //! but unparsable layer is an error naming source, key and value — never a
 //! fall-through to a lower layer.
 
@@ -28,6 +28,42 @@ pub enum ConfigError {
         /// What failed.
         msg: String,
     },
+}
+
+/// No layer supplies the model path.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "no model: pass it as an argument, set GOLEM_MODEL, or set `model` in {}",
+    .0.as_deref().map_or("golem.toml".into(), |p| p.display().to_string())
+)]
+pub struct NoModel(pub Option<std::path::PathBuf>);
+
+/// `$XDG_CONFIG_HOME/golem`, else `$HOME/.config/golem`.
+pub fn config_home(env: &dyn Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    env("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| env("HOME").map(|h| std::path::Path::new(&h).join(".config")))
+        .map(|d| d.join("golem"))
+}
+
+/// Directory holding `golem.toml`: `$GOLEM_CONFIG_DIR`, else [`config_home`].
+pub fn config_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    env("GOLEM_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| config_home(env))
+}
+
+/// `~` or `~/…` against `$HOME`; anything else unchanged.
+fn expand_tilde(p: std::path::PathBuf, env: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    let Some(home) = env("HOME") else {
+        return p;
+    };
+    match p.strip_prefix("~") {
+        Ok(rest) => std::path::Path::new(&home).join(rest),
+        Err(_) => p,
+    }
 }
 
 /// Raw string of a TOML value as the flag would have spelled it.
@@ -138,37 +174,66 @@ pub struct Layers<'a> {
     pub file: toml::Table,
     /// `golem optimize` profile knobs ([`profile_table`]).
     pub profile: toml::Table,
+    /// Where `golem.toml` was looked for.
+    pub path: Option<std::path::PathBuf>,
     /// Env lookup (`std::env::var` in production).
     pub env: &'a dyn Fn(&str) -> Option<String>,
 }
 
 impl Layers<'_> {
-    /// Process env + `$GOLEM_CONFIG_DIR/golem.toml` (none when unset).
+    /// Process env + `golem.toml` in [`config_dir`].
     pub fn from_process() -> Result<Layers<'static>, ConfigError> {
-        let file = match std::env::var_os("GOLEM_CONFIG_DIR") {
-            Some(dir) => {
-                let path = std::path::Path::new(&dir).join("golem.toml");
-                match std::fs::read_to_string(&path) {
-                    Ok(s) => toml::from_str(&s).map_err(|e| ConfigError::File {
-                        path,
+        Layers::from_env(&|k| std::env::var(k).ok())
+    }
+
+    /// `env` + `golem.toml` in [`config_dir`] (no file layer when absent).
+    pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Layers<'_>, ConfigError> {
+        let path = config_dir(env).map(|d| d.join("golem.toml"));
+        let file = match &path {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(s) => {
+                    let t = toml::from_str(&s).map_err(|e| ConfigError::File {
+                        path: path.clone(),
                         msg: e.to_string(),
-                    })?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-                    Err(e) => {
-                        return Err(ConfigError::File {
-                            path,
-                            msg: e.to_string(),
-                        });
-                    }
+                    })?;
+                    tracing::info!("golem: config file {} loaded", path.display());
+                    t
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::info!("golem: no config file at {}", path.display());
+                    toml::Table::new()
+                }
+                Err(e) => {
+                    return Err(ConfigError::File {
+                        path: path.clone(),
+                        msg: e.to_string(),
+                    });
+                }
+            },
+            None => {
+                tracing::info!(
+                    "golem: no config file: GOLEM_CONFIG_DIR, XDG_CONFIG_HOME and HOME unset"
+                );
+                toml::Table::new()
             }
-            None => toml::Table::new(),
         };
         Ok(Layers {
             file,
             profile: toml::Table::new(),
-            env: &|k| std::env::var(k).ok(),
+            path,
+            env,
         })
+    }
+
+    /// The model path: `flag` > `GOLEM_MODEL` > file `model`, `~` expanded.
+    pub fn model(
+        &self,
+        flag: Option<std::path::PathBuf>,
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        match self.opt(flag, "model")? {
+            Some(m) => Ok(expand_tilde(m, self.env)),
+            None => Err(NoModel(self.path.clone()).into()),
+        }
     }
 
     /// Adds the saved `golem optimize` profile for `model` as the profile
@@ -206,6 +271,7 @@ impl Layers<'_> {
         Layers {
             file: toml::Table::new(),
             profile: toml::Table::new(),
+            path: None,
             env: &|_| None,
         }
     }
@@ -418,6 +484,7 @@ mod tests {
         let l = Layers {
             file: toml::from_str("prefetch = \"read\"\nflash_attn = true").unwrap(),
             profile: toml::Table::new(),
+            path: None,
             env: &|k| (k == "GOLEM_N_PREDICT").then(|| "7".to_owned()),
         };
         assert_eq!(l.get(None, "n_predict", 64u32).unwrap(), 7);
@@ -427,5 +494,95 @@ mod tests {
             golem_engine::config::PrefetchMode::Read
         );
         assert!(l.get(None, "flash_attn", false).unwrap());
+    }
+
+    #[test]
+    fn config_dir_prefers_golem_then_xdg_then_home() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        let all = env(&[
+            ("GOLEM_CONFIG_DIR", "/g"),
+            ("XDG_CONFIG_HOME", "/x"),
+            ("HOME", "/h"),
+        ]);
+        let xdg = env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")]);
+        let home = env(&[("HOME", "/h")]);
+        assert_eq!(config_dir(&all), Some("/g".into()));
+        assert_eq!(config_dir(&xdg), Some("/x/golem".into()));
+        assert_eq!(config_dir(&home), Some("/h/.config/golem".into()));
+        assert_eq!(config_dir(&|_| None), None);
+        assert_eq!(config_home(&all), Some("/x/golem".into()));
+    }
+
+    #[test]
+    fn model_flag_beats_env_beats_file_and_expands_tilde() {
+        let layers = |env: &'static dyn Fn(&str) -> Option<String>| Layers {
+            file: toml::from_str(r#"model = "~/m/file.gguf""#).unwrap(),
+            profile: toml::Table::new(),
+            path: None,
+            env,
+        };
+        let home: &'static dyn Fn(&str) -> Option<String> =
+            &|k| (k == "HOME").then(|| "/h".to_owned());
+        let with_env: &'static dyn Fn(&str) -> Option<String> = &|k| match k {
+            "HOME" => Some("/h".to_owned()),
+            "GOLEM_MODEL" => Some("/e.gguf".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            layers(with_env).model(Some("/f.gguf".into())).unwrap(),
+            std::path::PathBuf::from("/f.gguf")
+        );
+        assert_eq!(
+            layers(with_env).model(None).unwrap(),
+            std::path::PathBuf::from("/e.gguf")
+        );
+        assert_eq!(
+            layers(home).model(None).unwrap(),
+            std::path::PathBuf::from("/h/m/file.gguf")
+        );
+    }
+
+    #[test]
+    fn missing_model_names_all_three_ways() {
+        let l = Layers {
+            path: Some("/c/golem.toml".into()),
+            ..Layers::none()
+        };
+        let e = l.model(None).unwrap_err();
+        assert!(e.is::<NoModel>());
+        let e = e.to_string();
+        assert!(
+            e.contains("argument") && e.contains("GOLEM_MODEL") && e.contains("/c/golem.toml"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn from_env_reads_default_dir_file_and_errors_on_bad_toml() {
+        let tmp = std::env::temp_dir().join(format!("golem-cfg-{}-from-env", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join(".config/golem");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("golem.toml"), "model = \"/m.gguf\"\nctx = 512").unwrap();
+        let home = tmp.to_str().unwrap().to_owned();
+        let env = move |k: &str| (k == "HOME").then(|| home.clone());
+        let l = Layers::from_env(&env).unwrap();
+        assert_eq!(l.model(None).unwrap(), std::path::PathBuf::from("/m.gguf"));
+        assert_eq!(l.get(None, "ctx", 1u32).unwrap(), 512);
+        let other = tmp.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_s = other.to_str().unwrap().to_owned();
+        let golem_dir = move |k: &str| (k == "GOLEM_CONFIG_DIR").then(|| other_s.clone());
+        assert!(Layers::from_env(&golem_dir).unwrap().file.is_empty());
+        std::fs::write(dir.join("golem.toml"), "ctx = = 1").unwrap();
+        let e = Layers::from_env(&env).err().unwrap().to_string();
+        assert!(e.contains("golem.toml"), "{e}");
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
