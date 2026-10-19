@@ -27,8 +27,9 @@ use sha2::{Digest, Sha256};
 /// through §9.4 precedence ([`crate::config`]).
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    /// Path to the GGUF model file (first shard of a split).
-    /// When omitted, `golem run` prints the full flag list and exits.
+    /// Path to the GGUF model file (first shard of a split); else
+    /// `GOLEM_MODEL`, else `model` in `golem.toml`. When none is set,
+    /// `golem run` prints the full flag list and exits.
     pub model: Option<PathBuf>,
     /// One-shot prompt text; when omitted, the stdin chat REPL runs instead.
     #[arg(long)]
@@ -503,13 +504,9 @@ fn parse_gib(s: &str) -> Result<f64, String> {
 /// decode errors (process unusable); per-turn REPL errors are printed and the
 /// loop continues.
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
-    let model = match args.model.clone() {
-        Some(m) => m,
-        // No model: main() already printed the run help.
-        None => return Ok(()),
-    };
-    let layers = crate::config::Layers::from_process()?
-        .with_profile(&model, args.engine.no_optimize_profile);
+    let layers = crate::config::Layers::from_process()?;
+    let model = layers.model(args.model.clone())?;
+    let layers = layers.with_profile(&model, args.engine.no_optimize_profile);
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let ram_free = if args.allow_overcommit {

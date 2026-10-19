@@ -301,10 +301,7 @@ pub fn sysfs_vram() -> Option<(u64, u64)> {
 
 /// `$XDG_CONFIG_HOME/golem/tuning` (`~/.config` when unset).
 pub fn tuning_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .map(|d| d.join("golem/tuning"))
+    crate::config::config_home(&|k| std::env::var(k).ok()).map(|d| d.join("tuning"))
 }
 
 /// The profile file for `fp`.

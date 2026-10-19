@@ -84,9 +84,13 @@ enum Command {
     },
 }
 
-/// `serve` default filter: request lines (method, URI, status, tok/s) and
-/// cancels are INFO.
-const SERVE_LOG: &str = "warn,golem_server=info,tower_http=info,golem_engine::slot=info";
+/// Default filter: the CLI's own config-file and optimize-profile lines are
+/// INFO.
+const CLI_LOG: &str = "warn,golem=info";
+
+/// `serve` default filter: [`CLI_LOG`] plus request lines (method, URI,
+/// status, tok/s) and cancels at INFO.
+const SERVE_LOG: &str = "warn,golem=info,golem_server=info,tower_http=info,golem_engine::slot=info";
 
 /// Engine diagnostics (store health transitions, pool/stream warnings) go
 /// to stderr; `RUST_LOG` overrides `default`. `json`: one JSON object per
@@ -120,17 +124,17 @@ fn main() {
     }
     match &cli.command {
         Some(Command::Serve { args }) => init_tracing(serve_json_logs(args.detach), SERVE_LOG),
-        _ => init_tracing(false, "warn"),
+        _ => init_tracing(false, CLI_LOG),
     }
     let status = match cli.command {
         None => {
             println!("golem {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(Command::Run { args, .. }) => {
-            // No model path → print the run help (every valid flag) instead
-            // of clap's bare "required arguments" error.
-            if args.model.is_none() {
+        Some(Command::Run { args, .. }) => match run::run(&args) {
+            // No model in any layer → print the run help (every valid flag)
+            // instead of a bare "no model" error.
+            Err(e) if e.is::<config::NoModel>() => {
                 use clap::CommandFactory as _;
                 let mut cmd = Cli::command();
                 cmd.find_subcommand_mut("run")
@@ -139,8 +143,8 @@ fn main() {
                     .expect("write help");
                 std::process::exit(0);
             }
-            run::run(&args)
-        }
+            r => r,
+        },
         Some(Command::Serve { args }) => golem_registry::Registry::open()
             .map_err(Into::into)
             .and_then(|reg| serve::serve(&args, &reg, serve::new_id(), |_| {})),

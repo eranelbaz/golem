@@ -298,6 +298,7 @@ fn explicit_flag_beats_profile() {
     let with = |env: &'static dyn Fn(&str) -> Option<String>, k: Option<&Knobs>| config::Layers {
         file: toml::Table::new(),
         profile: config::profile_table(k),
+        path: None,
         env,
     };
     let none: &'static dyn Fn(&str) -> Option<String> = &|_| None;
