@@ -533,12 +533,12 @@ impl Registry {
         }
     }
 
-    /// A serving instance (`healthy`/`degraded`) started with `config_hash`.
+    /// A serving instance (`healthy`/`degraded`/`idle`) started with `config_hash`.
     pub fn find_compatible(&self, config_hash: &str) -> Result<Option<Instance>, RegistryError> {
         Ok(self.list_live()?.into_iter().find(|i| {
             i.kind == "serve"
                 && i.config_hash == config_hash
-                && matches!(i.health.as_str(), "healthy" | "degraded")
+                && matches!(i.health.as_str(), "healthy" | "degraded" | "idle")
         }))
     }
 

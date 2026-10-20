@@ -1079,7 +1079,7 @@ fn attachable(
     }
     for i in reg.list_live()? {
         let Some(running) = &i.config else { continue };
-        if i.kind != "serve" || !matches!(i.health.as_str(), "healthy" | "degraded") {
+        if i.kind != "serve" || !matches!(i.health.as_str(), "healthy" | "degraded" | "idle") {
             continue;
         }
         match golem_registry::compatible(running, want) {

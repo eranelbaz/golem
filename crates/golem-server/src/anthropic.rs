@@ -65,13 +65,13 @@ async fn inner(
         ApiError::from(ErrorEnvelope::new(ErrorCode::InvalidRequest, e.body_text()))
     })?;
     let chat = golem_api::anthropic::to_chat(&raw)?;
-    let req = golem_api::policy::validate(&chat, &st.cfg.model_name)?;
+    let req = crate::app::resolve_model(&st.cfg, chat)?;
     let stream = req.stream == Some(true);
     let stops = req.stop_list();
+    let model = req.model.clone();
     // Reasoning always arrives as `thinking` blocks, never inline in `text`.
     let (mut rx, guard) = submit(&st, req, ReasoningMode::Separate).await?;
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-    let model = st.cfg.model_name.clone();
     if stream {
         let start = json!({
             "type": "message_start",

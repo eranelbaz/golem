@@ -153,6 +153,8 @@ The original text assumed an MLA/KV-cache model. GLM-5.3-Flash (`glm5next`) is a
 
 Every "MLA" reference below means the 11 sparse-attention layers only.
 
+*Amended 2026-10-20 (#165): DeepSeek-V4.1-Flash (`deepseek41`).* A second supported architecture: 40 blocks, n_embd 5120, 64 heads MLA (kv 512, q_lora 1280), 384 routed experts top-6 + 1 shared (expert FFN 2304, sqrt-softplus gating), SWA 128 with per-layer compressed attention plus a 32-head indexer (top_k 512), 4-way hyper-connections, and an engram table (`per_layer_token_embd`, ≈ 126 GiB) read lazily from disk and never placed in VRAM. Its KV is priced per cache by `golem-plan` (`dsv41_state_terms`): raw SWA rows `pad256(n_swa + n_ubatch)` plus compressed rows `n_ctx / ratio` per layer; target at q8_0 ≈ 1,700 B/token. Expert planes are mixed-quant (IQ2/MXFP4); the stream slabs carry one stride of slack for HIP's 512-element row padding (expert ne0 2304 → 2560). P5 prediction nodes mirror its router (sqrt-softplus + `exp_probs_b`). Unmeasured: the `ws` compute-buffer fit (fitted on GLM), cold/warm throughput, snapshot restore (diverges on hybrids at this pin; serve with snapshots off).
+
 ---
 
 ## 3. Compute substrate
@@ -170,6 +172,7 @@ Every "MLA" reference below means the 11 sparse-attention layers only.
 
 ### 3.2 The fork
 
+- *Amended 2026-10-20 (#165):* re-pinned to ggml-org/llama.cpp PR #30817 head `b72050d` (base `f174553`), which adds `deepseek41` and upstream `glm5-next` (the unsloth `glm5next` name is folded onto it). Golem's patches were replayed; `engine/llama-cpp.lock` is authoritative. The original pin follows.
 - Upstream: the **unslothai/llama.cpp** fork, pinned to the head of PR #27754 (the PR itself is hosted on `ggml-org/llama.cpp`; its head branch `glm5next/upstream` lives on the unslothai fork) — a commit that contains GLM-5.3-Flash (`glm5next`) text support. The spec itself flags that this support is unmerged/moving; therefore the commit is selected and frozen during **M0** (§14) and recorded in `engine/llama-cpp.lock`:
 
   ```
@@ -485,10 +488,12 @@ Writing a draft model is not part of it.
 |----------|--------|-------|
 | `POST /v1/chat/completions` | v1 | streaming (`stream: true`, SSE) and non-streaming |
 | `POST /v1/messages` | v1 | Anthropic Messages API, streaming and non-streaming (§8.6, #106) |
-| `GET /v1/models` | v1 | the instance's single model |
+| `GET /v1/models` | v1 | the instance model, then each `[models.<name>]` entry (*amended 2026-10-20*) |
 | `GET /health` | v1 | Golem extension: `state`, `tiers{vram_fill,ram_fill}`, `degraded`, `model`, `turns`, `device_cache_skip_ratio` (§11) |
 | `GET /metrics` | v1 | Prometheus-format (§11) |
 | everything else | — | 404 `golem_not_found` (typed, §8.4) |
+
+*Amended 2026-10-20 (several models, idle unload):* `golem.toml` `[models.<name>]` tables add served models to one instance. Each has `path` (GGUF) and optional engine keys that override the file layer for that model only (flags and env still win); its own `golem optimize` profile applies (fingerprint per path). `/v1/models` lists the instance model then each entry; `model` must name one, else `golem_model_mismatch`. At most one model is resident — on the target GLM-5.3-Flash UD-IQ3_XXS (~24 GiB VRAM, `ram_experts_gib` 50 + KV/snapshots ≈ 70 GiB RAM) and DS41 UD-IQ2_XXS (24 GiB VRAM planned, 69.8 GiB RAM planned) sum to ≈ 48 GiB VRAM and ≈ 140 GiB RAM, against 24 and 93 — so the worker swaps on demand: a job naming the unloaded model is dequeued only with every slot idle (parallel 1), the loaded session saves warm scores and is dropped, the other loads, then the job runs. A cancelled or draining job is refused rather than swapped for. A failed load answers that job `golem_backend_unavailable` and leaves the instance `idle`. `idle_unload_min` > 0 starts the instance `idle` (no model; `/health` 200 `idle`) and drops the loaded model after that many minutes without a job; the next request loads its model. Load/unload state changes never leave `draining`/`releasing`/`fatal`. All models must agree on forcing expert offload: the first load fixes the process-wide op-offload threshold (`init_backend`). Sampling is client-side. The registry and the admission check see the start model only; the operator keeps every served model within the machine.
 
 ### 8.2 Request field policy
 

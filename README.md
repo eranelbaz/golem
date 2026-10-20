@@ -8,6 +8,13 @@ used — with the hard guarantee that **every selected expert's matrix
 multiplication executes on the GPU**, including cold experts fetched from disk
 on demand. v1 target model: [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (hence the name).
 
+Supported models:
+
+| Model | `general.architecture` | Status |
+|---|---|---|
+| [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) | `glm5next` / `glm5-next` | target, measured |
+| [DeepSeek-V4.1-Flash](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | `deepseek41` | experimental (serves UD-IQ2_XXS; no baseline yet) |
+
 ## Target hardware
 
 Road-tested on one machine; smaller configs work, larger ones just add headroom:
@@ -58,6 +65,38 @@ scripts/build.sh run serve ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Fl
 machine and saves a winner that `serve`/`run` apply automatically; `--detach`
 runs in the background (`golem list`, `golem stop <id>`). (`golem import` —
 ingesting an HF cache layout into the store — is planned but not implemented.)
+
+DeepSeek-V4.1-Flash: pull a quant the same way (UD-IQ2_XXS ≈ 280 GiB) and
+serve its first shard. Until the hybrid snapshot restore is fixed, serve with
+`--snapshot-ram-gib 0`; on CPUs with an integrated GPU, set
+`HIP_VISIBLE_DEVICES=0` so only the discrete GPU is used.
+
+### Several models, one endpoint
+
+`[models.<name>]` tables in `golem.toml` add served models. Each lists in
+`/v1/models`; a request's `model` picks one. At most one is loaded: a
+request naming another waits while the loaded one is dropped and the other
+loads (warm-start scores are kept per model). Sampling stays with the
+client.
+
+```toml
+model = "~/models/glm/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+model_name = "glm-5.3-flash"
+idle_unload_min = 30   # unload after 30 min without a request; 0/unset keeps it
+
+[models."deepseek-v4.1-flash"]
+path = "~/models/ds/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf"
+snapshot_ram_gib = 0   # any engine key here overrides golem.toml for this model
+```
+
+With `idle_unload_min` set, `serve` starts with nothing loaded
+(`/health` → `idle`), the first request loads its model, and the model is
+unloaded again after that many idle minutes. Without a top-level `model`,
+the `[models.*]` entry named by `model_name` (else the first by name) is the
+default. Each model gets its own `golem optimize` profile. Several models or
+idle unload need `parallel = 1` and no `timing_csv`/`routing_trace`, and all
+models must agree on setting `ram_experts_gib`/`cpu_moe_layers`. Engine
+flags and `GOLEM_*` env apply to every model and beat per-model keys.
 
 Anthropic clients:
 
