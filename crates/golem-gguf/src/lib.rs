@@ -228,6 +228,10 @@ pub const GGML_TYPE_IQ4_XS: u32 = 23;
 pub const GGML_TYPE_IQ1_M: u32 = 29;
 /// bfloat16.
 pub const GGML_TYPE_BF16: u32 = 30;
+/// 4-bit microscaling float (E2M1, E8M0 scale), block 32.
+pub const GGML_TYPE_MXFP4: u32 = 39;
+/// 8-bit microscaling float (E4M3, E8M0 scale), block 32.
+pub const GGML_TYPE_MXFP8: u32 = 43;
 
 /// (`elements_per_block`, `bytes_per_block`) for the types the pool reads.
 /// `None` for types without a fixed block layout.
@@ -257,6 +261,8 @@ pub fn ggml_type_block(ggml_type: u32) -> Option<(u64, u64)> {
         GGML_TYPE_IQ4_XS => (256, 136),
         GGML_TYPE_IQ1_M => (256, 56),
         GGML_TYPE_BF16 => (1, 2),
+        GGML_TYPE_MXFP4 => (32, 17),
+        GGML_TYPE_MXFP8 => (32, 33),
         _ => return None,
     };
     Some((blck, size))
@@ -449,13 +455,25 @@ fn read_int_array(r: &mut impl Read) -> Result<Option<Vec<u64>>, Error> {
 /// Looks up an arch-prefixed integer-or-array KV, expanded to `n` per-layer
 /// values (a scalar applies to every layer, as llama.cpp's `get_key_or_arr`).
 pub fn arch_kv_per_layer(kvs: &[(String, KvVal)], suffix: &str, n: usize) -> Option<Vec<u64>> {
-    let arch = kv_str(kvs, "general.architecture")?;
-    let key = format!("{arch}.{suffix}");
-    match &kvs.iter().find(|(k, _)| *k == key)?.1 {
+    match arch_kv(kvs, suffix)? {
         KvVal::Int(v) => Some(vec![*v; n]),
         KvVal::IntArr(v) if v.len() >= n => Some(v[..n].to_vec()),
         _ => None,
     }
+}
+
+/// Looks up an arch-prefixed integer array of any length (e.g. a layer-index
+/// list such as `attention.kv_source_layers`).
+pub fn arch_kv_int_arr<'a>(kvs: &'a [(String, KvVal)], suffix: &str) -> Option<&'a [u64]> {
+    match arch_kv(kvs, suffix)? {
+        KvVal::IntArr(v) => Some(v),
+        _ => None,
+    }
+}
+
+fn arch_kv<'a>(kvs: &'a [(String, KvVal)], suffix: &str) -> Option<&'a KvVal> {
+    let key = format!("{}.{suffix}", kv_str(kvs, "general.architecture")?);
+    kvs.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
 /// Reads the tensor-table rows following the KV block.

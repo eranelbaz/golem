@@ -142,6 +142,11 @@ pub enum PlanError {
 /// Input-embedding tensor; llama keeps it on the CPU, so it is not VRAM.
 pub const TOKEN_EMBD: &str = "token_embd.weight";
 
+/// deepseek41 Engram table (`LLM_TENSOR_LAYER_INPUT`, `TENSOR_READ_LAZY`):
+/// host mmap, row-gathered per token, so neither VRAM nor pool RAM. Target
+/// UD-Q2_K_XL: 135,172,021,600 B Q5_K.
+pub const PER_LAYER_TOKEN_EMBD: &str = "per_layer_token_embd.weight";
+
 /// Header-derived model facts the memory model needs (§10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ModelFacts {
@@ -245,7 +250,7 @@ impl ModelFacts {
                     }
                     // llama pins the input embedding to the CPU (dev_input);
                     // never VRAM. Target: 674,037,760 B Q8_0.
-                    _ if t.name == TOKEN_EMBD => {}
+                    _ if t.name == TOKEN_EMBD || t.name == PER_LAYER_TOKEN_EMBD => {}
                     _ => {
                         m.t_ne += bytes;
                         if t.name.contains("_shexp") {
@@ -302,6 +307,9 @@ impl ModelFacts {
         type_k: KvCacheType,
         type_v: KvCacheType,
     ) -> Result<(), PlanError> {
+        if golem_gguf::kv_str(kvs, "general.architecture") == Some("deepseek41") {
+            return self.dsv41_state_terms(kvs, n_layer, type_k);
+        }
         let heads_kv = arch_kv_per_layer(kvs, "attention.head_count_kv", n_layer)
             .ok_or_else(|| PlanError::Invalid("missing attention.head_count_kv".into()))?;
         let opt = |k: &str| arch_kv_int(kvs, k).unwrap_or(0);
@@ -361,6 +369,54 @@ impl ModelFacts {
                 self.sparse_attn_layers += 1;
                 self.kv_per_token += h * (row(type_k, k_len)? + row(type_v, v_len)?)
                     + idx_heads * row(type_idx, idx_len)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// deepseek41 (llama-kv-cache-dsv4.cpp, single device so no mirrors):
+    /// the raw K cache is all-SWA, `pad256(n_swa + n_ubatch)` rows per layer
+    /// (llama-kv-cache-iswa.cpp), priced into `rs_bytes` at the engine's
+    /// default prefill ubatch 2048 (each further 1,024 rows adds
+    /// 40 × 1,024 × 544 B = 22.3 MB at q8_0); only KV-source layers own
+    /// compressed rows, `key_length + indexer.key_length` wide, one per
+    /// `ratio` tokens. Target, f16: raw 40 × 2,304 × 1,024 = 94,371,840 B;
+    /// sources 2/8/14 (ratio 2) + 20 (ratio 1) → 3 × 640 + 1,280 =
+    /// 3,200 B/token.
+    fn dsv41_state_terms(
+        &mut self,
+        kvs: &[(String, KvVal)],
+        n_layer: usize,
+        type_k: KvCacheType,
+    ) -> Result<(), PlanError> {
+        const PRICED_UBATCH: u64 = 2048;
+        let k_len = u64::from(hp_u32(kvs, "attention.key_length")?);
+        let comp_len = k_len + u64::from(hp_u32(kvs, "attention.indexer.key_length")?);
+        let ratios = arch_kv_per_layer(kvs, "attention.compress_ratios", n_layer)
+            .ok_or_else(|| PlanError::Invalid("missing attention.compress_ratios".into()))?;
+        let sources = golem_gguf::arch_kv_int_arr(kvs, "attention.kv_source_layers")
+            .ok_or_else(|| PlanError::Invalid("missing attention.kv_source_layers".into()))?;
+        let row = |n: u64| {
+            type_k.row_bytes(n).ok_or_else(|| {
+                PlanError::Invalid(format!(
+                    "{type_k} KV cache: head length {n} is not a multiple of the type's block"
+                ))
+            })
+        };
+        let n_swa = arch_kv_int(kvs, "attention.sliding_window").unwrap_or(0);
+        let swa_rows = (n_swa + PRICED_UBATCH).next_multiple_of(256);
+        self.rs_bytes += n_layer as u64 * swa_rows * row(k_len)?;
+        for &il in sources {
+            match ratios.get(il as usize) {
+                Some(&r) if r > 0 => {
+                    self.sparse_attn_layers += 1;
+                    self.kv_per_token += row(comp_len)? / r;
+                }
+                _ => {
+                    return Err(PlanError::Invalid(format!(
+                        "kv source layer {il} has no compress ratio"
+                    )));
+                }
             }
         }
         Ok(())
@@ -710,7 +766,7 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
         },
         Term {
             name: "stream_slabs",
-            bytes: stream_bytes(m, i),
+            bytes: stream_bytes(m, i) + u64::from(i.prefill_stream) * 2 * m.max_plane_stride,
         },
         Term {
             name: "rocm_overhead",
@@ -834,7 +890,8 @@ pub fn snapshot_arena(m: &ModelFacts, parallel: u32, ctx: u32) -> (u64, u64) {
 }
 
 /// Double-buffered per-layer expert slabs for prefill streaming (§7.6).
-/// Target: 2 × 288 × 6,881,280 = 3,963,617,280 B (3.69 GiB).
+/// Target: 2 × 288 × 6,881,280 = 3,963,617,280 B (3.69 GiB); the device
+/// slabs add one stride each of row-padding slack (+13.8 MB).
 fn stream_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
     if i.prefill_stream {
         2 * u64::from(m.n_expert) * m.max_plane_stride
@@ -918,7 +975,7 @@ mod tests {
                 ..PlanInput::default()
             },
         );
-        assert_eq!(get(&r.vram, "stream_slabs"), 3_963_617_280);
+        assert_eq!(get(&r.vram, "stream_slabs"), 3_977_379_840);
         assert_eq!(get(&r.ram, "staging_ring"), 3_963_617_280);
     }
 
@@ -1311,6 +1368,42 @@ mod tests {
                 .for_each(|(k, _)| *k = k.replacen("a.", &format!("{arch}."), 1));
             assert_eq!(facts_kv(&glm5, 1, Q8_0, Q8_0).unwrap().kv_per_token, 1_312);
         }
+        // deepseek41 (DeepSeek-V4.1-Flash header): only the 4 KV-source
+        // layers own compressed rows; the all-SWA raw cache is fixed state.
+        let mut ratios = vec![0, 0];
+        ratios.extend([2; 18]);
+        ratios.extend([1; 20]);
+        let ds = [
+            (
+                "general.architecture".to_string(),
+                KvVal::Str("deepseek41".into()),
+            ),
+            ("deepseek41.attention.key_length".into(), KvVal::Int(512)),
+            (
+                "deepseek41.attention.indexer.key_length".into(),
+                KvVal::Int(128),
+            ),
+            (
+                "deepseek41.attention.sliding_window".into(),
+                KvVal::Int(128),
+            ),
+            (
+                "deepseek41.attention.compress_ratios".into(),
+                KvVal::IntArr(ratios),
+            ),
+            (
+                "deepseek41.attention.kv_source_layers".into(),
+                KvVal::IntArr(vec![2, 8, 14, 20]),
+            ),
+        ];
+        let f = facts_kv(&ds, 40, F16, F16).unwrap();
+        assert_eq!(f.kv_per_token, 3 * 640 + 1_280);
+        assert_eq!(f.rs_bytes, 40 * 2_304 * 1_024);
+        assert_eq!(f.sparse_attn_layers, 4);
+        assert_eq!(
+            facts_kv(&ds, 40, Q8_0, Q8_0).unwrap().kv_per_token,
+            3 * 340 + 680
+        );
         // Non-MLA prices K and V independently: 1 head × 128 each.
         let gqa = kvs(&[
             ("attention.head_count_kv", KvVal::Int(1)),

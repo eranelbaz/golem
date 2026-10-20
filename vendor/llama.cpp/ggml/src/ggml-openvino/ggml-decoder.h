@@ -28,7 +28,9 @@ struct ModelParams {
     std::map<int, int> n_heads_kv_per_layer;
     int head_size = -1;
     int state_size = -1;  // for SSM molels, eg qwen35
-    int32_t rope_params[16];
+    int32_t rope_params[16] = {};
+    int n_rs_slots = -1;
+    bool has_rs_rollback = false;
     bool mixed_rope_params = false;
     bool is_cacheless_attn = false;
     std::vector<int> swa_layers;
@@ -45,9 +47,15 @@ struct ModelParams {
                memcmp(rope_params, other.rope_params, sizeof(int32_t) * 16) == 0;
     }
 
-    bool can_reuse_dynamically(const ModelParams & other) const { return same_rope_params(other); }
+    bool can_reuse_dynamically(const ModelParams & other) const {
+        return same_rope_params(other) && n_rs_slots == other.n_rs_slots &&
+               has_rs_rollback == other.has_rs_rollback;
+    }
 
-    bool can_reuse_statically(const ModelParams & other) const { return same_rope_params(other) && ctx == other.ctx; }
+    bool can_reuse_statically(const ModelParams & other) const {
+        return same_rope_params(other) && ctx == other.ctx && n_rs_slots == other.n_rs_slots &&
+               has_rs_rollback == other.has_rs_rollback;
+    }
 
     bool kv_buffer_changed(const ModelParams & other) const { return kv_buffer_ctx_id != other.kv_buffer_ctx_id; }
 };
@@ -100,7 +108,7 @@ struct ComputeParams {
 
     struct RsWriteback {
         int slot_begin = 0;  // first cache slot written by the CPY
-        int src_begin = 0;   // first source row or column copied by the CPY
+        int src_begin = -1;  // first source column copied by a conv-state CPY
     };
 
     std::map<std::string, RsWriteback> rs_writebacks;
@@ -353,43 +361,59 @@ public:
     void add_extra_inputs();
 
     void update_io(ggml_cgraph * cgraph);
+    bool is_bound_to(const ggml_cgraph * cgraph) const;
 
-    inline static bool is_inp_tok(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_inp_tok(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_GET_ROWS && tensor == op->src[1] && op->src[0]->op == GGML_OP_NONE;
     }
 
-    inline static bool is_inp_pos(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_inp_pos(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_ROPE && tensor == op->src[1];
     }
 
-    // IMROPE packs 4 stacked position planes (t/h/w/e) into inp_pos, each of length
+    // IMROPE and VISION pack 4 stacked position planes (t/h/w/e) into inp_pos, each of length
     // n_tokens; other modes carry a single position per token.
-    inline static int get_inp_pos_n_planes(const ggml_tensor * op) {
-        return op->op_params[2] == GGML_ROPE_TYPE_IMROPE ? 4 : 1;
+    static int get_inp_pos_n_planes(const ggml_tensor * op) {
+        const int mode = op->op_params[2];
+        return (mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION || (mode & GGML_ROPE_TYPE_MROPE)) ? 4 : 1;
     }
 
-    inline static bool is_inp_emb(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_inp_emb(const ggml_tensor * tensor, const ggml_tensor * op) {
         return tensor->op == GGML_OP_GET_ROWS && op->op == GGML_OP_RMS_NORM;
     }
 
-    inline static bool is_inp_mask(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_inp_mask(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_CPY || (op->op == GGML_OP_FLASH_ATTN_EXT && tensor == op->src[3]) ||
                (op->op == GGML_OP_SOFT_MAX && tensor == op->src[1]);
     }
 
-    inline static bool is_inp_mean(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_inp_mean(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_MUL_MAT && tensor == op->src[1] && tensor->op == GGML_OP_NONE &&
                (tensor->flags & GGML_TENSOR_FLAG_INPUT) && tensor->type == GGML_TYPE_F32 &&
                op->src[0] != nullptr && op->src[0]->op != GGML_OP_NONE;
     }
 
-    inline static bool is_rope_freqs_weight(const ggml_tensor * tensor, const ggml_tensor * op) {
+    // per-token embedding scale [1, n_tokens] (inp->scale_rows in llama-graph.cpp)
+    static bool is_inp_scale_rows(const ggml_tensor * tensor, const ggml_tensor * op) {
+        return op->op == GGML_OP_MUL && tensor == op->src[1] && strcmp(tensor->name, "inp_scale_rows") == 0;
+    }
+
+    static bool is_rope_freqs_weight(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_ROPE && tensor == op->src[2];
     }
 
-    // also returns true for cache_s and cache_r in SSM/DeltaNet models
+    inline static bool is_recurrent_cache(const ggml_tensor * tensor) {
+        return tensor != nullptr && (strncmp(tensor->name, "cache_r_l", strlen("cache_r_l")) == 0 ||
+                                     strncmp(tensor->name, "cache_s_l", strlen("cache_s_l")) == 0 ||
+                                     strncmp(tensor->name, "cache_ple_r_l", strlen("cache_ple_r_l")) == 0);
+    }
+
+    inline static bool is_cache(const ggml_tensor * tensor, const ggml_tensor * op) {
+        return is_recurrent_cache(tensor) || is_kvcache(tensor, op);
+    }
+
     inline static bool is_kvcache(const ggml_tensor * tensor, const ggml_tensor * op) {
-        if (tensor == nullptr) {
+        if (tensor == nullptr || is_recurrent_cache(tensor)) {
             return false;
         }
         return (tensor->buffer != nullptr && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY) ||
@@ -397,13 +421,13 @@ public:
     }
 
     inline static bool is_conv_state_writeback(const ggml_tensor * node) {
-        return node->op == GGML_OP_CPY && node->view_src != nullptr && is_kvcache(node->view_src, nullptr) &&
+        return node->op == GGML_OP_CPY && node->view_src != nullptr && is_recurrent_cache(node->view_src) &&
                node->src[0] != nullptr && node->src[0]->op == GGML_OP_VIEW && node->src[0]->src[0] != nullptr &&
                node->src[0]->src[0]->op == GGML_OP_CONCAT && node->src[1] != nullptr &&
                node->src[1]->op == GGML_OP_VIEW && node->src[1]->view_src == node->view_src;
     }
 
-    inline static bool is_kv_idx(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_kv_idx(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_SET_ROWS && op->src[1] == tensor;
     }
 
@@ -411,13 +435,13 @@ public:
         return m_model_params.swa_mask != nullptr && tensor == m_model_params.swa_mask;
     }
 
-    inline static bool is_output_idx(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_output_idx(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_GET_ROWS && tensor == op->src[1] && op->src[0]->op != GGML_OP_NONE &&
                op->src[1]->op == GGML_OP_NONE;
     }
 
     // the state permutation index input used in SSM/DeltaNet models (inp->s_copy in llama-graph.cpp)
-    inline static bool is_inp_s_copy(const ggml_tensor * tensor, const ggml_tensor * op) {
+    static bool is_inp_s_copy(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_GET_ROWS && tensor == op->src[1] &&
                op->src[0]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY;
     }
@@ -481,5 +505,3 @@ private:
 };
 
 void print_tensor_address_map(const ggml_cgraph * cgraph);
-
-std::optional<int> extract_layer_from_name(const std::string & name);

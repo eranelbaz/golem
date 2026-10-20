@@ -56,7 +56,10 @@ pub fn config_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<std::path::Pat
 }
 
 /// `~` or `~/…` against `$HOME`; anything else unchanged.
-fn expand_tilde(p: std::path::PathBuf, env: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+pub(crate) fn expand_tilde(
+    p: std::path::PathBuf,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
     let Some(home) = env("HOME") else {
         return p;
     };

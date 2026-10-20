@@ -16,7 +16,7 @@ pub use app::{AppState, router};
 pub use metrics::MetricsSnapshot;
 pub use worker::{
     Event, HealthSnapshot, HealthState, Job, ReasoningMode, ServeState, ShutdownTimeout, TurnSinks,
-    WorkerHandle, check_sinks, spawn_worker,
+    WorkerHandle, check_sinks, spawn_worker, spawn_worker_models,
 };
 
 /// Listener and API identity of one instance.
@@ -28,6 +28,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Model id clients must send and `/v1/models` lists.
     pub model_name: String,
+    /// Further served models (§8.1), loaded on demand by the worker.
+    pub models: Vec<String>,
     /// When set, `/v1/*` and `/metrics` require `Authorization: Bearer <key>`
     /// (`/health` stays open).
     pub api_key: Option<String>,
@@ -45,6 +47,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("model_name", &self.model_name)
+            .field("models", &self.models)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("reasoning", &self.reasoning)
             .field("drain_grace", &self.drain_grace)
@@ -433,6 +436,7 @@ pub mod test_support {
             host: IpAddr::from([127, 0, 0, 1]),
             port: 0,
             model_name: "tiny-moe".into(),
+            models: Vec::new(),
             api_key: None,
             reasoning: ReasoningMode::Separate,
             // Shutdown tests exercise the cancel path; drain tests set it.

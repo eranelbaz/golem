@@ -81,6 +81,8 @@ pub enum ServeState {
     FatalIo = 5,
     /// Drained; tearing down (pool munlock, unregister).
     Releasing = 6,
+    /// No model loaded (idle unload, §8.1); the next request loads one.
+    Idle = 7,
 }
 
 impl ServeState {
@@ -94,6 +96,7 @@ impl ServeState {
             Self::Fatal => "fatal",
             Self::FatalIo => "fatal-io",
             Self::Releasing => "releasing",
+            Self::Idle => "idle",
         }
     }
 
@@ -105,6 +108,7 @@ impl ServeState {
             3 => Self::Draining,
             4 => Self::Fatal,
             5 => Self::FatalIo,
+            7 => Self::Idle,
             _ => Self::Releasing,
         }
     }
@@ -187,6 +191,29 @@ impl HealthState {
                     ServeState::from_u8(cur),
                     ServeState::Fatal | ServeState::FatalIo
                 ))
+                .then_some(s as u8)
+            });
+    }
+
+    /// Draining or past it: no new load may start.
+    fn stopping(&self) -> bool {
+        self.cancelling.load(Ordering::SeqCst)
+            || matches!(self.get(), ServeState::Draining | ServeState::Releasing)
+    }
+
+    /// Load/unload transitions: never leaves draining, releasing or fatal,
+    /// so a drain begun mid-swap keeps refusing new requests.
+    fn swap_state(&self, s: ServeState) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                matches!(
+                    ServeState::from_u8(cur),
+                    ServeState::Healthy
+                        | ServeState::Degraded
+                        | ServeState::Loading
+                        | ServeState::Idle
+                )
                 .then_some(s as u8)
             });
     }
@@ -328,7 +355,42 @@ pub struct TurnSinks {
 /// Loads `cfg` on a new thread (the `Session` never leaves it) and returns
 /// once the model is loaded, or the load error.
 pub fn spawn_worker(cfg: EngineConfig, sinks: TurnSinks) -> Result<WorkerHandle, EngineError> {
-    spawn(cfg, HealthState::new(), sinks)
+    spawn(vec![(String::new(), cfg)], None, HealthState::new(), sinks)
+}
+
+/// [`spawn_worker`] serving several named models, at most one loaded (§8.1).
+/// A job naming an unloaded model drops the loaded one, loads it, then runs.
+/// `idle_unload` set: nothing loads at start, and the loaded model is
+/// dropped after that long with no job. Several models need `parallel` 1 (a
+/// job is dequeued only with the slot idle, so a swap never cuts a turn), no
+/// turn sinks (one per session), and agreeing expert offload (the first load
+/// fixes the process-wide op-offload threshold, `init_backend`).
+pub fn spawn_worker_models(
+    models: Vec<(String, EngineConfig)>,
+    idle_unload: Option<Duration>,
+    sinks: TurnSinks,
+) -> Result<WorkerHandle, EngineError> {
+    let Some((_, first)) = models.first() else {
+        return Err(EngineError::InvalidConfig("no model to serve".into()));
+    };
+    let lazy = models.len() > 1 || idle_unload.is_some();
+    if lazy
+        && (models.iter().any(|(_, c)| c.parallel != 1)
+            || sinks.timing.is_some()
+            || sinks.trace.is_some())
+    {
+        return Err(EngineError::InvalidConfig(
+            "several models or idle unload need parallel 1 and no timing_csv/routing_trace".into(),
+        ));
+    }
+    let offload =
+        |c: &EngineConfig| c.ram_experts_gib > 0 || c.cpu_moe_layers.is_some_and(|n| n > 0);
+    if models.iter().any(|(_, c)| offload(c) != offload(first)) {
+        return Err(EngineError::InvalidConfig(
+            "served models must agree on setting ram_experts_gib/cpu_moe_layers".into(),
+        ));
+    }
+    spawn(models, idle_unload, HealthState::new(), sinks)
 }
 
 /// [`spawn_worker`] with fault injection scoped to this worker.
@@ -339,7 +401,8 @@ pub fn spawn_worker_with_hooks(
     sinks: TurnSinks,
 ) -> Result<WorkerHandle, EngineError> {
     spawn(
-        cfg,
+        vec![(String::new(), cfg)],
+        None,
         HealthState {
             hooks,
             ..HealthState::new()
@@ -361,10 +424,12 @@ pub fn check_sinks(parallel: u32, recording: bool) -> Result<(), EngineError> {
 }
 
 fn spawn(
-    cfg: EngineConfig,
+    models: Vec<(String, EngineConfig)>,
+    idle_unload: Option<Duration>,
     health: HealthState,
     mut sinks: TurnSinks,
 ) -> Result<WorkerHandle, EngineError> {
+    let cfg = models[0].1.clone();
     check_sinks(
         cfg.parallel,
         sinks.timing.is_some() || sinks.trace.is_some(),
@@ -388,32 +453,99 @@ fn spawn(
     let join = std::thread::Builder::new()
         .name("golem-decode".into())
         .spawn(move || {
-            let loaded = Session::new(&cfg)
-                .and_then(Scheduler::new)
-                .and_then(|mut s| {
-                    // The header hashes the model file: paid at load, not by
-                    // the first request.
-                    if let Some(f) = sinks.trace.as_mut() {
-                        // Not the load self-check decode's records.
-                        s.session().discard_turn_records();
-                        s.session().write_routing_trace(f)?;
+            let names: Vec<&str> = models.iter().map(|(n, _)| n.as_str()).collect();
+            let mut cur: Option<(usize, Scheduler)> = None;
+            let mut first = None;
+            if idle_unload.is_some() {
+                h.set(ServeState::Idle);
+                let _ = loaded_tx.send(Ok(None));
+            } else {
+                let loaded = Session::new(&cfg)
+                    .and_then(Scheduler::new)
+                    .and_then(|mut s| {
+                        // The header hashes the model file: paid at load, not
+                        // by the first request.
+                        if let Some(f) = sinks.trace.as_mut() {
+                            // Not the load self-check decode's records.
+                            s.session().discard_turn_records();
+                            s.session().write_routing_trace(f)?;
+                        }
+                        Ok(s)
+                    });
+                match loaded {
+                    Ok(mut s) => {
+                        h.set(ServeState::Healthy);
+                        let _ = loaded_tx.send(Ok(s.session().device_cache_experts()));
+                        cur = Some((0, s));
                     }
-                    Ok(s)
-                });
-            let mut sch = match loaded {
-                Ok(s) => s,
-                Err(e) => {
-                    h.set(ServeState::Fatal);
-                    let _ = loaded_tx.send(Err(e));
-                    return;
+                    Err(e) => {
+                        h.set(ServeState::Fatal);
+                        let _ = loaded_tx.send(Err(e));
+                        return;
+                    }
                 }
-            };
-            h.set(ServeState::Healthy);
-            let _ = loaded_tx.send(Ok(sch.session().device_cache_experts()));
-            // Graceful only (jobs channel closed after the drain): a fatal
-            // exit's policy state is not trusted.
-            if run(&mut sch, &rx, &h, &mut sinks) {
-                save_warm_state(&mut sch);
+            }
+            loop {
+                let Some((i, sch)) = cur.as_mut() else {
+                    // Nothing loaded: the next job picks the model.
+                    let Ok(job) = rx.recv() else { return };
+                    let next = names.iter().position(|n| *n == job.req.model).unwrap_or(0);
+                    if job.cancel.load(Ordering::SeqCst) {
+                        h.queued.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    if h.stopping() {
+                        h.queued.fetch_sub(1, Ordering::SeqCst);
+                        let _ = job.events.try_send(Event::Failed(draining()));
+                        continue;
+                    }
+                    if let Some(s) = load_for(&models, next, &job, &h) {
+                        cur = Some((next, s));
+                        first = Some(job);
+                    }
+                    continue;
+                };
+                match run(
+                    sch,
+                    &rx,
+                    &h,
+                    &mut sinks,
+                    Served {
+                        models: &names,
+                        cur: *i,
+                        idle_unload,
+                    },
+                    first.take(),
+                ) {
+                    // Graceful only (jobs channel closed after the drain): a
+                    // fatal exit's policy state is not trusted.
+                    Exit::Graceful => {
+                        save_warm_state(sch);
+                        return;
+                    }
+                    Exit::Fatal => return,
+                    exit => {
+                        save_warm_state(sch);
+                        // Dropped before any next load: two never fit.
+                        cur = None;
+                        // `/health` tiers and `/metrics` must not report the
+                        // dropped model's residency.
+                        *h.metrics.lock().unwrap_or_else(|p| p.into_inner()) =
+                            MetricsSnapshot::default();
+                        h.swap_state(ServeState::Idle);
+                        match exit {
+                            Exit::Swap(job) => first = Some(*job),
+                            _ => tracing::info!("idle: model unloaded"),
+                        }
+                        if let Some(job) = first.take() {
+                            let next = names.iter().position(|n| *n == job.req.model).unwrap_or(0);
+                            if let Some(s) = load_for(&models, next, &job, &h) {
+                                cur = Some((next, s));
+                                first = Some(job);
+                            }
+                        }
+                    }
+                }
             }
         })?;
     match loaded_rx.recv() {
@@ -478,16 +610,74 @@ impl SlotRun {
     }
 }
 
+/// Loads `models[next]` for `job`; on failure answers it (it leaves the
+/// queue) and stays `idle`.
+fn load_for(
+    models: &[(String, EngineConfig)],
+    next: usize,
+    job: &Job,
+    h: &HealthState,
+) -> Option<Scheduler> {
+    h.swap_state(ServeState::Loading);
+    tracing::info!("loading model `{}`", models[next].0);
+    match Session::new(&models[next].1).and_then(Scheduler::new) {
+        // A drain begun mid-load: `admit` refuses the job, `run` then exits.
+        Ok(s) => {
+            h.swap_state(ServeState::Healthy);
+            Some(s)
+        }
+        Err(e) => {
+            tracing::error!("loading `{}`: {e}", models[next].0);
+            h.queued.fetch_sub(1, Ordering::SeqCst);
+            let _ = job.events.try_send(Event::Failed(ErrorEnvelope::new(
+                ErrorCode::BackendUnavailable,
+                format!("loading model `{}`: {e}", models[next].0),
+            )));
+            h.swap_state(ServeState::Idle);
+            None
+        }
+    }
+}
+
+/// What [`run`] knows of the served models (§8.1).
+#[derive(Clone, Copy)]
+struct Served<'a> {
+    models: &'a [&'a str],
+    /// Index of the loaded one.
+    cur: usize,
+    /// Return [`Exit::Idle`] after this long without a job.
+    idle_unload: Option<Duration>,
+}
+
+/// How [`run`] ended.
+enum Exit {
+    /// The jobs channel disconnected with every slot idle.
+    Graceful,
+    /// The worker is no longer usable.
+    Fatal,
+    /// A job names another served model; still counted queued.
+    Swap(Box<Job>),
+    /// No job for the idle-unload span.
+    Idle,
+}
+
 /// The decode loop: admits jobs into free slots (never dequeuing one it
 /// cannot admit), steps every active slot through one batched decode, and
-/// answers each finished slot on its own event stream. True on a graceful
-/// exit (the jobs channel disconnected with every slot idle).
+/// answers each finished slot on its own event stream. `first` is admitted
+/// before any queued job.
 fn run(
     sch: &mut Scheduler,
     rx: &Receiver<Job>,
     health: &HealthState,
     sinks: &mut TurnSinks,
-) -> bool {
+    served: Served<'_>,
+    mut first: Option<Job>,
+) -> Exit {
+    let Served {
+        models,
+        cur,
+        idle_unload,
+    } = served;
     let n = sch.free_slots();
     let mut runs: Vec<Option<SlotRun>> = (0..n).map(|_| None).collect();
     // Per-step event buffers, reused: no allocation per step.
@@ -507,10 +697,19 @@ fn run(
         let idle = runs.iter().all(Option::is_none);
         let mut taken = 0;
         while sch.free_slots() > 0 {
-            let job = if idle && runs.iter().all(Option::is_none) {
-                match rx.recv() {
+            let job = if let Some(j) = first.take() {
+                j
+            } else if idle && runs.iter().all(Option::is_none) {
+                let got = match idle_unload {
+                    Some(d) => rx
+                        .recv_timeout(d)
+                        .map_err(|e| matches!(e, std::sync::mpsc::RecvTimeoutError::Timeout)),
+                    None => rx.recv().map_err(|_| false),
+                };
+                match got {
                     Ok(j) => j,
-                    Err(_) => return true,
+                    Err(true) => return Exit::Idle,
+                    Err(false) => return Exit::Graceful,
                 }
             } else {
                 match rx.try_recv() {
@@ -518,12 +717,25 @@ fn run(
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         if runs.iter().all(Option::is_none) {
-                            return true;
+                            return Exit::Graceful;
                         }
                         break;
                     }
                 }
             };
+            // A cancelled or draining job takes `admit`'s refusal, never a
+            // minutes-long swap.
+            if models
+                .iter()
+                .position(|n| *n == job.req.model)
+                .is_some_and(|n| n != cur)
+                && runs.iter().all(Option::is_none)
+                && !job.cancel.load(Ordering::SeqCst)
+                && !health.stopping()
+            {
+                health.queued.fetch_sub(taken, Ordering::SeqCst);
+                return Exit::Swap(Box::new(job));
+            }
             match admit(sch, &mut runs, job, health) {
                 Ok(()) => {
                     changed = true;
@@ -541,7 +753,7 @@ fn run(
                             .events
                             .try_send(Event::Failed(crate::app::backend_gone_envelope()));
                     }
-                    return false;
+                    return Exit::Fatal;
                 }
                 Err(false) => {
                     health.queued.fetch_sub(1, Ordering::SeqCst);
@@ -559,7 +771,7 @@ fn run(
         }
         if storage_lost(sch, &mut runs, health) {
             refuse_all(rx, health);
-            return false;
+            return Exit::Fatal;
         }
         let stepped = catch_unwind(AssertUnwindSafe(|| {
             step(
@@ -597,7 +809,7 @@ fn run(
             // A page-in failed mid-decode on a dead shard (ABI v13).
             Ok(Err(EngineError::StorageUnavailable)) if storage_lost(sch, &mut runs, health) => {
                 refuse_all(rx, health);
-                return false;
+                return Exit::Fatal;
             }
             Ok(Err(e)) => {
                 tracing::error!("decode worker: {e}");
@@ -621,7 +833,7 @@ fn run(
         };
         if fatal {
             fail_all(&mut runs, health);
-            return false;
+            return Exit::Fatal;
         }
     }
 }

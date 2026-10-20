@@ -2633,7 +2633,7 @@ mod tests {
         };
         let r = check_plan(&cfg, &glm(), 24 << 30).unwrap().0;
         assert_eq!(r.term("device_expert_cache"), 9 * 644_022_272);
-        assert_eq!(r.term("stream_slabs"), 3_963_617_280);
+        assert_eq!(r.term("stream_slabs"), 3_977_379_840);
         cfg.device_cache_experts = 12;
         let (r, k) = check_plan(&cfg, &glm(), 24 << 30).unwrap();
         assert_eq!(k, Some(9));

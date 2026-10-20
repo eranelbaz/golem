@@ -209,11 +209,11 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
 
     // Shard-1 gates: arch, chat template, live range, tensor total.
     let arch = match kv_str(&first_kvs, "general.architecture") {
-        Some(a) if is_glm5next(a) => a.to_owned(),
+        Some(a) if is_supported_arch(a) => a.to_owned(),
         other => {
             return Err(source(
                 &first_path,
-                format!("general.architecture {other:?} is not glm5next/glm5-next"),
+                format!("general.architecture {other:?} is not glm5next/glm5-next/deepseek41"),
             ));
         }
     };
@@ -367,8 +367,8 @@ pub fn scan_source(dir: &Path) -> Result<SourceScan, ImportError> {
 
 /// `general.architecture` gate with '-' folded out, as the substrate's
 /// `llm_arch_from_string` does (unsloth ships "glm5next" and "glm5-next").
-fn is_glm5next(arch: &str) -> bool {
-    arch.replace('-', "") == "glm5next"
+fn is_supported_arch(arch: &str) -> bool {
+    matches!(arch.replace('-', "").as_str(), "glm5next" | "deepseek41")
 }
 
 /// Lowercase hex.
@@ -1163,10 +1163,12 @@ mod tests {
 
     #[test]
     fn arch_gate_folds_hyphens() {
-        assert!(is_glm5next("glm5next"));
-        assert!(is_glm5next("glm5-next"));
-        assert!(!is_glm5next("glm4moe"));
-        assert!(!is_glm5next("glm5nex"));
+        assert!(is_supported_arch("glm5next"));
+        assert!(is_supported_arch("glm5-next"));
+        assert!(is_supported_arch("deepseek41"));
+        assert!(!is_supported_arch("deepseek4"));
+        assert!(!is_supported_arch("glm4moe"));
+        assert!(!is_supported_arch("glm5nex"));
     }
 
     #[test]

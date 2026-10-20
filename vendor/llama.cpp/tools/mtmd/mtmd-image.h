@@ -83,6 +83,17 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
     slice_output slice_image(const clip_image_u8 & img, const slice_instructions & inst) const;
 
 protected:
+    // align slices to a multiple of the merger factor (integer merger tokens per slice)
+    virtual int get_slice_align() const {
+        const int merge = hparams.n_merge > 0 ? hparams.n_merge : 1;
+        return hparams.patch_size * merge;
+    }
+
+    // rounding for snapping a length to a multiple of the align size
+    virtual int align_round(double v) const {
+        return static_cast<int>(std::round(v));
+    }
+
     clip_image_size get_best_resize(const clip_image_size & original_size, int scale_resolution, int patch_size, bool allow_upscale = false) const;
 
     /**
@@ -123,9 +134,16 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
-// similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio
+// GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
+struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_glm5v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
+// similar to mtmd_image_preprocessor_dyn_size, but cap the longest edge at hparams.image_longest_edge, while preserving aspect ratio
 struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
     mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    static clip_image_size get_target_size(const clip_hparams & hparams, const clip_image_size & original_size);
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
@@ -145,10 +163,39 @@ private:
     static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
 };
 
+// ref: inference/image_processor.py in the HF repo (DeepSeek-V4.1-Flash): plan_image_grid / load_image
+struct mtmd_image_preprocessor_deepseek41v : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_deepseek41v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+    // target pixel size (multiples of patch_size) for an image of the given size, exposed for tests
+    static void plan_grid(int width, int height, int p, int r, int max_n_token, int min_pixels,
+                          int & best_width, int & best_height);
+};
+
 // custom llava-uhd slicing logic for MiniCPM-V
 struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
     using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;
     slice_instructions get_slice_instructions(const clip_image_size & original_size) const override;
+
+protected:
+    // always patch_size * 4, even in 4x mode (the 2x2 vit_merger slot stays)
+    int get_slice_align() const override {
+        return hparams.patch_size * 4;
+    }
+
+    // Python's round() breaks ties to even, unlike std::round
+    int align_round(double v) const override {
+        const double fl = std::floor(v);
+        const double diff = v - fl;
+        if (diff > 0.5) {
+            return static_cast<int>(fl) + 1;
+        }
+        if (diff < 0.5) {
+            return static_cast<int>(fl);
+        }
+        const int lo = static_cast<int>(fl);
+        return (lo % 2 == 0) ? lo : lo + 1;
+    }
 };
 
 // custom llava-uhd slicing logic for LFM2
@@ -183,6 +230,14 @@ struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
 struct mtmd_image_preprocessor_internvl : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preprocessor_internvl(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
+// stretch the image to a grid of tiles, add a thumbnail if there is more than 1 tile
+// ref: https://github.com/huggingface/transformers/blob/main/src/transformers/models/cohere2_vision/image_processing_cohere2_vision.py
+struct mtmd_image_preprocessor_cohere2v : mtmd_image_preprocessor_llava_uhd {
+    mtmd_image_preprocessor_cohere2v(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+    slice_instructions get_slice_instructions(const clip_image_size & original_size) const override;
 };
 
 // DeepSeek-OCR (v1/v2) global view + optional local tile grid
@@ -254,20 +309,4 @@ struct mtmd_image_preprocessor_granite : mtmd_image_preprocessor_llava_uhd {
 struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
     mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
-};
-
-// ref: Glm5NextImageProcessor.{smart_resize,resize}. unlike the Qwen-style smart_resize in
-// mtmd_image_preprocessor_dyn_size, an over-budget image is pasted top-left, not centred
-struct mtmd_image_preprocessor_glm5next : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_glm5next(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
-    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
-
-    struct geometry {
-        clip_image_size canvas;  // aligned, padded output size
-        clip_image_size content; // resized image, placed at the top-left of the canvas
-    };
-
-    // static so tests can reach it without a clip_ctx
-    static clip_image_size smart_resize(const clip_hparams & hparams, const clip_image_size & size);
-    static geometry        get_geometry(const clip_hparams & hparams, const clip_image_size & size);
 };

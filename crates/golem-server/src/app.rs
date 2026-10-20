@@ -202,17 +202,18 @@ async fn chat_inner(
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(raw) = body.map_err(|e| api_err(ErrorCode::InvalidRequest, e.body_text()))?;
-    let req = golem_api::policy::validate(&raw, &st.cfg.model_name)?;
+    let req = resolve_model(&st.cfg, raw)?;
     let stream = req.stream == Some(true);
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let reasoning = st.cfg.reasoning;
+    let req_model = req.model.clone();
     let (mut rx, guard) = submit(&st, req, reasoning).await?;
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     if stream {
         let meta = crate::sse::ChunkMeta {
             id,
             created: now_secs(),
-            model: st.cfg.model_name.clone(),
+            model: req_model.clone(),
             include_usage,
             health: st.health.clone(),
         };
@@ -230,7 +231,7 @@ async fn chat_inner(
         id,
         object: "chat.completion".into(),
         created: now_secs(),
-        model: st.cfg.model_name.clone(),
+        model: req_model,
         choices: vec![Choice {
             index: 0,
             message: ChatMessage {
@@ -351,15 +352,35 @@ fn merge_tool_call(calls: &mut Vec<ToolCall>, d: ToolCall) {
     calls[i].function.arguments.push_str(&d.function.arguments);
 }
 
+/// Validates `raw` against §8.2 for whichever served model it names (§8.1).
+pub(crate) fn resolve_model(
+    cfg: &ServerConfig,
+    raw: serde_json::Value,
+) -> Result<golem_api::ChatCompletionRequest, ErrorEnvelope> {
+    let name = raw
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    let served = cfg
+        .models
+        .iter()
+        .find(|m| *m == name)
+        .unwrap_or(&cfg.model_name);
+    golem_api::policy::validate(&raw, served)
+}
+
 async fn models(State(st): State<AppState>) -> Result<Json<ModelList>, ApiError> {
+    let names = std::iter::once(&st.cfg.model_name).chain(&st.cfg.models);
     Ok(Json(ModelList {
         object: "list".into(),
-        data: vec![ModelCard {
-            id: st.cfg.model_name.clone(),
-            object: "model".into(),
-            created: now_secs(),
-            owned_by: "golem".into(),
-        }],
+        data: names
+            .map(|n| ModelCard {
+                id: n.clone(),
+                object: "model".into(),
+                created: now_secs(),
+                owned_by: "golem".into(),
+            })
+            .collect(),
     }))
 }
 
@@ -369,7 +390,7 @@ async fn health(State(st): State<AppState>) -> Response {
     let snap = st.health.snapshot();
     let m = *st.health.metrics.lock().unwrap_or_else(|p| p.into_inner());
     let status = match state {
-        ServeState::Healthy | ServeState::Degraded => StatusCode::OK,
+        ServeState::Healthy | ServeState::Degraded | ServeState::Idle => StatusCode::OK,
         ServeState::Loading
         | ServeState::Draining
         | ServeState::Releasing
@@ -563,5 +584,24 @@ pub(crate) mod tests {
         assert_eq!(data[2]["choices"][0]["delta"]["content"], "answer");
         assert_eq!(data[3]["choices"][0]["finish_reason"], "stop");
         assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn requests_route_to_any_served_model() {
+        let cfg = ServerConfig {
+            models: vec!["tiny-two".into()],
+            ..crate::test_support::test_server_config()
+        };
+        let msgs = serde_json::json!([{"role": "user", "content": "hi"}]);
+        for m in ["tiny-moe", "tiny-two"] {
+            let r = resolve_model(&cfg, serde_json::json!({"model": m, "messages": msgs})).unwrap();
+            assert_eq!(r.model, m);
+        }
+        let e = resolve_model(
+            &cfg,
+            serde_json::json!({"model": "other", "messages": msgs}),
+        )
+        .unwrap_err();
+        assert_eq!(e.error.code, ErrorCode::ModelMismatch);
     }
 }

@@ -13,7 +13,9 @@ use golem_engine::gguf::read_metadata;
 use golem_engine::timing::TimingRecorder;
 use golem_llama_sys::{Backend, substrate_backend};
 use golem_registry::{EffectiveConfig, Guard, Instance, Registry};
-use golem_server::{ReasoningMode, ServeError, ServerConfig, TurnSinks, check_sinks, spawn_worker};
+use golem_server::{
+    ReasoningMode, ServeError, ServerConfig, TurnSinks, check_sinks, spawn_worker_models,
+};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::run::{EngineArgs, engine_config, fork_commit, resolved_config_line};
@@ -125,6 +127,61 @@ fn listen(
         reasoning: layers.get(args.reasoning, "reasoning", Reasoning::Separate)?,
         model_name: layers.opt(args.model_name.clone(), "model_name")?,
     })
+}
+
+/// `[models.<name>]` tables of `golem.toml` (§8.1): each names a further
+/// served model. `path` is its GGUF; every other key overrides the file
+/// layer for that model only (`ctx`, `device_cache_experts`, …), and its own
+/// `golem optimize` profile applies. Returns `(name, path, layers)`.
+fn served_models<'a>(
+    layers: &crate::config::Layers<'a>,
+    no_profile: bool,
+) -> Result<Vec<(String, PathBuf, crate::config::Layers<'a>)>, crate::config::ConfigError> {
+    let Some(models) = layers.file.get("models") else {
+        return Ok(Vec::new());
+    };
+    let invalid = |key: String, value: String, msg: &str| crate::config::ConfigError::Invalid {
+        layer: "file",
+        key,
+        value,
+        msg: msg.into(),
+    };
+    let models = models.as_table().ok_or_else(|| {
+        invalid(
+            "models".into(),
+            models.to_string(),
+            "must be a table of tables",
+        )
+    })?;
+    models
+        .iter()
+        .map(|(name, t)| {
+            let key = format!("models.{name}");
+            let t = t
+                .as_table()
+                .ok_or_else(|| invalid(key.clone(), t.to_string(), "must be a table"))?;
+            let path = t.get("path").and_then(toml::Value::as_str).ok_or_else(|| {
+                invalid(format!("{key}.path"), t.to_string(), "missing GGUF path")
+            })?;
+            let path = crate::config::expand_tilde(PathBuf::from(path), layers.env);
+            let mut file = layers.file.clone();
+            file.remove("models");
+            file.remove("model");
+            file.extend(
+                t.iter()
+                    .filter(|(k, _)| *k != "path")
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            let l = crate::config::Layers {
+                file,
+                profile: toml::Table::new(),
+                path: layers.path.clone(),
+                env: layers.env,
+            }
+            .with_profile(&path, no_profile);
+            Ok((name.clone(), path, l))
+        })
+        .collect()
 }
 
 /// The requested (pre-RAM-fit) configuration identity; `snapshot_ram_bytes`
@@ -272,9 +329,39 @@ pub fn serve(
     id: String,
     ready: impl FnOnce(&str) + Send,
 ) -> Result<(), Box<dyn Error>> {
-    let layers = crate::config::Layers::from_process()?;
-    let model = layers.model(args.model.clone())?;
-    let layers = layers.with_profile(&model, args.engine.no_optimize_profile);
+    let base = crate::config::Layers::from_process()?;
+    let mut extra = served_models(&base, args.engine.no_optimize_profile)?;
+    // No `model` anywhere: the `[models.*]` entry named by `model_name`
+    // loads at start, with its own keys.
+    // No `model` and none named: start idle on the first entry.
+    let (model, first_name, layers) = match base.model(args.model.clone()) {
+        Ok(m) => {
+            let mut file = base.file.clone();
+            file.remove("models");
+            let l = crate::config::Layers {
+                file,
+                profile: toml::Table::new(),
+                path: base.path.clone(),
+                env: base.env,
+            }
+            .with_profile(&m, args.engine.no_optimize_profile);
+            (m, None, l)
+        }
+        Err(e) => {
+            if extra.is_empty() {
+                return Err(e);
+            }
+            let i = match listen(args, &base)?.model_name {
+                Some(w) => extra
+                    .iter()
+                    .position(|(n, _, _)| *n == w)
+                    .ok_or_else(|| format!("model_name `{w}` names no [models.*] entry"))?,
+                None => 0,
+            };
+            let (n, p, l) = extra.remove(i);
+            (p, Some(n), l)
+        }
+    };
     let l = listen(args, &layers)?;
     check_parallel(
         l.parallel,
@@ -282,17 +369,13 @@ pub fn serve(
     )?;
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    let (mut config, requested_snapshot) = engine_config(
-        &args.engine,
-        &model,
-        l.parallel,
-        &layers,
-        if args.allow_overcommit {
-            u64::MAX
-        } else {
-            sys.available_memory()
-        },
-    )?;
+    let ram_free = if args.allow_overcommit {
+        u64::MAX
+    } else {
+        sys.available_memory()
+    };
+    let (mut config, requested_snapshot) =
+        engine_config(&args.engine, &model, l.parallel, &layers, ram_free)?;
     if !args.no_warm_start {
         config.warm_state_dir = golem_placement::scores::journal_dir_from(
             data_root().as_deref().and_then(Path::to_str),
@@ -314,7 +397,7 @@ pub fn serve(
             .transpose()?,
     };
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;
-    let model_name = match l.model_name {
+    let model_name = match l.model_name.or(first_name) {
         Some(n) => n,
         None => read_metadata(&model)?
             .kv_str("general.name")
@@ -348,7 +431,31 @@ pub fn serve(
         )
     };
     let mut timing = sinks.timing.as_ref().map(File::try_clone).transpose()?;
-    let worker = spawn_worker(config.clone(), sinks)?;
+    let mut models = vec![(model_name.clone(), config.clone())];
+    let mut paths = vec![model.canonicalize().unwrap_or_else(|_| model.clone())];
+    for (name, path, ml) in &extra {
+        if *name == model_name {
+            return Err(format!(
+                "[models.{name}] reuses the served name of {}",
+                model.display()
+            )
+            .into());
+        }
+        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if paths.contains(&canon) {
+            return Err(format!("[models.{name}] repeats served path {}", path.display()).into());
+        }
+        paths.push(canon);
+        let (mut c, _) = engine_config(&args.engine, path, l.parallel, ml, ram_free)?;
+        c.warm_state_dir.clone_from(&config.warm_state_dir);
+        models.push((name.clone(), c));
+    }
+    // 0 or unset: the start model stays loaded.
+    let idle_unload = base
+        .opt::<u64>(None, "idle_unload_min")?
+        .filter(|m| *m > 0)
+        .map(|m| std::time::Duration::from_secs(m * 60));
+    let worker = spawn_worker_models(models, idle_unload, sinks)?;
     if let Some(f) = timing.as_mut() {
         TimingRecorder::header(
             f,
@@ -367,6 +474,7 @@ pub fn serve(
     let cfg = ServerConfig {
         host: l.host,
         port: l.port,
+        models: extra.into_iter().map(|(n, _, _)| n).collect(),
         model_name,
         api_key,
         drain_grace: golem_server::DRAIN_GRACE,
@@ -542,5 +650,33 @@ mod tests {
         let p = <P as clap::Parser>::parse_from(["serve", "m.gguf", "--api-key", "s3cret"]);
         let d = format!("{:?}", p.a);
         assert!(!d.contains("s3cret") && d.contains("<redacted>"), "{d}");
+    }
+
+    #[test]
+    fn models_tables_name_paths_and_override_knobs() {
+        let file: toml::Table = toml::from_str(
+            "ctx = 8192\n[models.ds]\npath = \"~/m/ds.gguf\"\nctx = 4096\n[models.glm]\npath = \"/m/glm.gguf\"\n",
+        )
+        .unwrap();
+        let env = |k: &str| (k == "HOME").then(|| "/h".to_string());
+        let l = crate::config::Layers {
+            file,
+            profile: toml::Table::new(),
+            path: None,
+            env: &env,
+        };
+        let m = super::served_models(&l, true).unwrap();
+        let (n, p, ml) = &m[0];
+        assert_eq!((n.as_str(), p.to_str().unwrap()), ("ds", "/h/m/ds.gguf"));
+        assert_eq!(ml.get(None, "ctx", 0u32).unwrap(), 4096);
+        assert!(ml.file.get("models").is_none() && ml.file.get("path").is_none());
+        assert_eq!(m[1].2.get(None, "ctx", 0u32).unwrap(), 8192);
+        for bad in ["models = 3", "[models.x]\nctx = 1"] {
+            let l = crate::config::Layers {
+                file: toml::from_str(bad).unwrap(),
+                ..crate::config::Layers::none()
+            };
+            assert!(super::served_models(&l, true).is_err(), "{bad}");
+        }
     }
 }
