@@ -41,9 +41,8 @@ ggml_cgraph * clip_graph_glm4v::build() {
     inp = ggml_add(ctx0, inp, model.patch_bias);
     cb(inp, "patch_bias", -1);
 
-    // pos-conv norm
-    // GLM-OCR has none, and build_norm still normalizes on a null weight, so skip the call
-    if (model.norm_embd_w != nullptr) {
+    // pos-conv norm (absent in GLM-5.3-Flash)
+    if (model.norm_embd_w) {
         inp = build_norm(inp, model.norm_embd_w, model.norm_embd_b, norm_t, eps, -1);
     }
 

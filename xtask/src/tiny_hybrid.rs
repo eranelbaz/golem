@@ -28,7 +28,7 @@ pub mod dims {
     pub const N_EXPERT_SHARED: u32 = 1;
     pub const N_FF: u32 = 256;
     pub const N_FF_EXP: u32 = 256;
-    pub const N_FF_SHEXP: u32 = 128;
+    pub const N_FF_SHEXP: u32 = N_FF_EXP * N_EXPERT_SHARED;
     pub const N_CTX: u32 = 256;
     pub const KDA_HEAD_DIM: u32 = 128;
     pub const SSM_CONV: u32 = 4;

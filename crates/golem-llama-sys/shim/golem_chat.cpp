@@ -97,6 +97,11 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         } else if (no_think) {
             in.chat_template_kwargs["reasoning_effort"] = common_json(std::string("low")).dump();
         }
+        if (no_think) {
+            // DeepSeek-V4.x renders its chat (no-think) form, a bare `</think>`,
+            // from this; GLM's template ignores it.
+            in.chat_template_kwargs["enable_thinking"] = "false";
+        }
         std::string named;
         in.tool_choice = parse_tool_choice(tool_choice, named);
         if (tools_json && *tools_json) {
@@ -126,23 +131,23 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
             // over it — or the answer is classified as reasoning and forced
             // calls never match. Guarded: a template without a `<think>`
             // generation prompt has no no-think form to prefill.
-            if (params.prompt.size() < 7 ||
-                params.prompt.compare(params.prompt.size() - 7, 7, "<think>") != 0) {
+            const std::string prompt = params.prompt.str();
+            const auto ends   = [&](const char * t, size_t n) {
+                return prompt.size() >= n && prompt.compare(prompt.size() - n, n, t) == 0;
+            };
+            if (ends("<think>", 7)) {
+                params.prompt.append("</think>");
+                if (!params.generation_prompt.empty()) {
+                    params.generation_prompt += "</think>";
+                }
+            } else if (!ends("</think>", 8)) {
                 return 4;
-            }
-            params.prompt += "</think>";
-            if (!params.generation_prompt.empty()) {
-                params.generation_prompt += "</think>";
             }
         }
 
         request r;
-        r.parser                  = common_chat_parser_params(params);
-        r.parser.reasoning_format = in.reasoning_format;
-        r.parser.parse_tool_calls = !in.tools.empty() && in.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
-        if (!params.parser.empty()) {
-            r.parser.parser.load(params.parser);
-        }
+        r.parser        = common_chat_parser_params(params);
+        r.parser.parser = params.parser;
         // Some templates (GLM) keep a required grammar lazy; a lazy grammar never
         // forces anything, so a required call is always eager.
         bool required  = in.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED && !params.grammar.empty();
@@ -150,7 +155,7 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         r.grammar_lazy = params.grammar_lazy && !required;
         r.triggers     = params.grammar_triggers;
 
-        char * p = dup(params.prompt);
+        char * p = dup(params.prompt.str());
         char * g = dup(r.grammar);
         if (!p || !g) {
             std::free(p);
@@ -225,7 +230,7 @@ int golem_chat_grammar_sampler(golem_chat * chat, int handle, const llama_vocab 
         // skipped: upstream skips one, but a byte-fallback vocab spells `▁` as
         // several byte tokens.
         if (!r.grammar_lazy && !r.parser.generation_prompt.empty()) {
-            const auto & gp = r.parser.generation_prompt;
+            const auto & gp = r.parser.generation_prompt.text;
             auto toks       = common_tokenize(vocab, gp, false, true);
             std::vector<std::string> pieces;
             for (auto t : toks) {
@@ -265,7 +270,7 @@ int golem_chat_parse(golem_chat * chat, int handle, const char * text, int is_pa
         if (it == chat->requests.end()) {
             return 2;
         }
-        auto msg = common_chat_parse(text, is_partial != 0, it->second.parser);
+        auto msg = common_chat_parse(common_chat_input(text), is_partial != 0, it->second.parser);
         msg.role = "assistant";
         char * s = dup(msg.to_json_oaicompat().dump());
         if (!s) {

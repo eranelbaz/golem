@@ -132,6 +132,7 @@ set(GGML_OPENCL_KERNELS
     gemm_moe_q6_k_q8_1_dp4a
     gemm_moe_q8_1_dp4a
     moe_reorder_quant_a_q8_1
+    transpose_activation_q8
     gemm_noshuffle_q4_k_q8_1_dp4a
     gemm_noshuffle_q5_k_q8_1_dp4a
     gemm_noshuffle_q6_k_q8_1_dp4a
@@ -191,8 +192,10 @@ set(GGML_OPENCL_KERNELS
     gemv_noshuffle_q6_k_f32_tiled
     gemm_noshuffle_q6_k_f32
     gemm_noshuffle_q6_k_f32_tiled
+    gemv_noshuffle_q6_k_f32_32b_trans
     gemv_noshuffle_q5_k_f32
     gemm_noshuffle_q5_k_f32
+    gemv_noshuffle_q5_k_f32_32b_trans
     mul
     neg
     norm
@@ -232,6 +235,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_f16_f32_kq_kqv
     conv2d
     conv2d_f16_f32
+    flash_attn_repack
     flash_attn_pre_f16
     flash_attn_f32_f16
     flash_attn_f32_q8_0
