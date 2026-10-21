@@ -355,6 +355,9 @@ fn plan_for(
             ram_experts: config.ram_experts_gib << 30,
         },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
+        vram_reserve: config
+            .vram_reserve_bytes
+            .unwrap_or_else(|| golem_plan::default_vram_reserve(mach.vram_total)),
         ws: golem_plan::WS_MEASURED,
     };
     input.vram_experts = crate::serve::explicit_cache_bytes(config, facts, mach, &input);

@@ -69,6 +69,11 @@ pub struct EngineConfig {
     /// Share of the §10 planner's `device_expert_cache` allowance the
     /// derived K may use (1.0 = all of it). No effect with an explicit K.
     pub vram_experts_frac: f32,
+    /// VRAM the §10 plan holds back for other GPU clients (`vram_reserve`):
+    /// `None` = [`golem_plan::default_vram_reserve`] of the device total,
+    /// `Some(0)` = none (headless). Neither `vram_experts_frac` nor an
+    /// explicit K can claim it.
+    pub vram_reserve_bytes: Option<u64>,
     /// Decode-only CPU/GPU hybrid expert math (design §1 O1): a share of
     /// each layer's RAM-resident slab misses is multiplied on the CPU from
     /// the pool instead of copied to the device. Needs the RAM expert pool
@@ -219,6 +224,7 @@ impl Default for EngineConfig {
             o_direct: false,
             async_h2d: false,
             vram_experts_frac: 1.0,
+            vram_reserve_bytes: None,
             cpu_expert_math: false,
             cpu_expert_frac: 0.7,
             cpu_expert_threads: 8,
