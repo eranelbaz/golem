@@ -511,7 +511,6 @@ fn fit_ram(
     )))
 }
 
-/// Finite, non-negative GiB (clap parser).
 /// A [`parse_gib`]-checked GiB value, so env and `golem.toml` layers are
 /// held to the same rule as the flag.
 #[derive(Clone, Copy)]
@@ -524,7 +523,8 @@ impl std::str::FromStr for Gib {
     }
 }
 
-fn parse_gib(s: &str) -> Result<f64, String> {
+/// Finite, non-negative GiB (clap parser).
+pub(crate) fn parse_gib(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(g) if g.is_finite() && g >= 0.0 => Ok(g),
         _ => Err(format!("expected a finite GiB value >= 0, got {s:?}")),

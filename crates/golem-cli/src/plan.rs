@@ -38,7 +38,7 @@ pub struct PlanArgs {
     pub vram_experts_frac: f32,
     /// VRAM held back for other GPU clients (compositor, browsers); omitted =
     /// max(1.5 GiB, 6 % of device VRAM), the `run` default.
-    #[arg(long, value_name = "GIB", value_parser = non_negative_gib)]
+    #[arg(long, value_name = "GIB", value_parser = crate::run::parse_gib)]
     pub vram_reserve_gib: Option<f64>,
     /// Host expert-pool cap; omitted = min(0.75 · free RAM, Σ expert bytes).
     #[arg(long, value_name = "GIB")]
@@ -67,13 +67,6 @@ fn frac(s: &str) -> Result<f32, String> {
         Ok(f)
     } else {
         Err(format!("{s} outside (0, 1]"))
-    }
-}
-
-fn non_negative_gib(s: &str) -> Result<f64, String> {
-    match s.parse::<f64>() {
-        Ok(g) if g.is_finite() && g >= 0.0 => Ok(g),
-        _ => Err(format!("expected a finite GiB value >= 0, got {s:?}")),
     }
 }
 
