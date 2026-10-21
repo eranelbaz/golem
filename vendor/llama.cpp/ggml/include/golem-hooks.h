@@ -29,6 +29,14 @@
 extern "C" {
 #endif
 
+/* libllama (a separate shared object) calls these; ggml-base is built with
+ * hidden visibility. */
+#if defined(_WIN32) && !defined(__MINGW32__)
+#    define GOLEM_LIBLLAMA_API
+#else
+#    define GOLEM_LIBLLAMA_API __attribute__((visibility("default")))
+#endif
+
 struct ggml_backend_sched;
 struct golem_ctx;
 /* Opaque per-model hook context (state defined cpp-side in
@@ -255,9 +263,9 @@ void golem_set_device_cache_experts(golem_ctx_t ctx, int32_t k);
  * (built graphs keep the node set they were built with). */
 void golem_set_predict(golem_ctx_t ctx, int32_t lookahead, int32_t margin, golem_predict_fn predict);
 /* Graph-build query: prediction lookahead (0 = off, also for a NULL ctx). */
-int32_t golem_predict_lookahead(golem_ctx_t ctx);
+GOLEM_LIBLLAMA_API int32_t golem_predict_lookahead(golem_ctx_t ctx);
 /* Graph-build query: prediction margin beyond n_expert_used. */
-int32_t golem_predict_margin(golem_ctx_t ctx);
+GOLEM_LIBLLAMA_API int32_t golem_predict_margin(golem_ctx_t ctx);
 /* Current budget (<= 0 = unset). */
 int32_t golem_device_cache_experts(golem_ctx_t ctx);
 /* ABI v12: a device-slab allocation that fails (VRAM taken after load)
@@ -334,7 +342,7 @@ typedef int32_t (*golem_cpu_lease_fn)(void *payload, int32_t blk, const int32_t 
 int32_t golem_set_cpu_expert_math(golem_ctx_t ctx, int32_t on, float frac, int32_t n_threads,
                                   golem_cpu_lease_fn lease);
 /* Graph-build query: 1 when armed, 0 otherwise (0 for a NULL ctx). */
-int32_t golem_cpu_expert_math_on(golem_ctx_t ctx);
+GOLEM_LIBLLAMA_API int32_t golem_cpu_expert_math_on(golem_ctx_t ctx);
 /* Since the last call: experts computed on the CPU, their plane bytes, worker
  * busy ms, decode-thread join wait ms, and ids remapped to the padding slot K
  * (summed over planes); resets all five. Returns 1 when armed, 0 otherwise
@@ -375,10 +383,10 @@ void golem_set_expert_offload_min_batch(int n);
 /* Attach/detach a ctx to a scheduler. set_ctx increments the ctx's attach
  * refcount; the sched destructor and detach decrement it. NULL ctx detaches.
  * libllama re-applies it after EVERY ggml_backend_sched_new. */
-void golem_sched_set_ctx(struct ggml_backend_sched *sched, golem_ctx_t ctx);
-void golem_sched_detach_ctx(struct ggml_backend_sched *sched);
+GOLEM_LIBLLAMA_API void golem_sched_set_ctx(struct ggml_backend_sched *sched, golem_ctx_t ctx);
+GOLEM_LIBLLAMA_API void golem_sched_detach_ctx(struct ggml_backend_sched *sched);
 /* The ctx attached to `sched` (ABI v16); NULL for a NULL or unattached sched. */
-golem_ctx_t golem_sched_get_ctx(struct ggml_backend_sched *sched);
+GOLEM_LIBLLAMA_API golem_ctx_t golem_sched_get_ctx(struct ggml_backend_sched *sched);
 
 /* libllama seam: store `ctx` on the model before llama_init_from_model;
  * llama_context stores it and re-applies golem_sched_set_ctx to every sched
