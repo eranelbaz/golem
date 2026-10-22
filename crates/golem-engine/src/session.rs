@@ -2389,6 +2389,7 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
             }
         },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
+        vram_reserve: 0,
         ws: golem_plan::WS_MEASURED,
     }
 }
@@ -2417,11 +2418,14 @@ fn resident_expert_bytes(config: &EngineConfig, m: &golem_plan::ModelFacts) -> u
 /// an explicit K is not refit after load, so a short estimate falls back to
 /// `shrink_after_slab_failure`. Below top-k there is no
 /// usable K: `InvalidConfig` naming the max. Otherwise Err = `PlanInfeasible`
-/// with the failing inequality.
+/// with the failing inequality. The `vram_reserve` term (default from
+/// `vram_total`, the device size) comes off the free VRAM before any cache
+/// is sized, so clients that grow after load keep it (#168).
 fn check_plan(
     config: &EngineConfig,
     m: &golem_plan::ModelFacts,
     vram_free: u64,
+    vram_total: u64,
 ) -> Result<(golem_plan::PlanReport, Option<u32>), EngineError> {
     let mach = golem_plan::Machine {
         vram_total: vram_free,
@@ -2430,14 +2434,19 @@ fn check_plan(
         rocm_overhead: golem_plan::ROCM_OVERHEAD,
     };
     let mut input = plan_input(config, m);
+    input.vram_reserve = config
+        .vram_reserve_bytes
+        .unwrap_or_else(|| golem_plan::default_vram_reserve(vram_total));
     let mut clamped = None;
     let k = u64::from(config.device_cache_experts);
     if matches!(input.experts, golem_plan::ExpertResidency::Pooled { .. }) {
         let max = golem_plan::clamp_device_cache_k(m, &mach, &input, k).map_err(|max| {
             EngineError::InvalidConfig(format!(
                 "device_cache_experts {k}: at most {max} fit in {:.1} GiB free VRAM \
-                 (below expert_used_count {}); lower --ctx or --parallel",
+                 less the {:.1} GiB vram_reserve (below expert_used_count {}); lower \
+                 --ctx or --parallel",
                 vram_free as f64 / f64::from(1u32 << 30),
+                input.vram_reserve as f64 / f64::from(1u32 << 30),
                 m.top_k
             ))
         })?;
@@ -2445,7 +2454,8 @@ fn check_plan(
             tracing::warn!(
                 requested = k,
                 clamped = max,
-                "device_cache_experts exceeds free VRAM; clamped"
+                vram_reserve = input.vram_reserve,
+                "device_cache_experts exceeds free VRAM less vram_reserve; clamped"
             );
             input.vram_experts = m.device_cache_bytes(max);
             // max < k ≤ u32::MAX.
@@ -2477,7 +2487,7 @@ fn load_plan(
     if config.ram_experts_gib == 0 && config.n_gpu_layers == 0 {
         return Ok(None);
     }
-    let Some((free, _)) = device_vram() else {
+    let Some((free, total)) = device_vram() else {
         return Ok(None);
     };
     let facts = match config.model_facts {
@@ -2489,7 +2499,7 @@ fn load_plan(
         )
         .map_err(|e| EngineError::InvalidModel(format!("plan: {e}")))?,
     };
-    check_plan(config, &facts, free).map(Some)
+    check_plan(config, &facts, free, total).map(Some)
 }
 
 /// Builds the snapshot cache (§7.1) per `config.snapshot_ram_bytes`.
@@ -2624,6 +2634,7 @@ mod tests {
         let mut cfg = EngineConfig {
             n_ctx: 100_000,
             ram_experts_gib: 57,
+            vram_reserve_bytes: Some(0),
             prefill_stream: true,
             // ubatch 512 keeps the fitted ws (810 MiB) from eating the
             // explicit K = 8 cache at this ctx.
@@ -2631,24 +2642,24 @@ mod tests {
             device_cache_experts: 8,
             ..EngineConfig::default()
         };
-        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap().0;
+        let r = check_plan(&cfg, &glm(), 24 << 30, 24 << 30).unwrap().0;
         assert_eq!(r.term("device_expert_cache"), 9 * 644_022_272);
         assert_eq!(r.term("stream_slabs"), 3_977_379_840);
         cfg.device_cache_experts = 12;
-        let (r, k) = check_plan(&cfg, &glm(), 24 << 30).unwrap();
+        let (r, k) = check_plan(&cfg, &glm(), 24 << 30, 24 << 30).unwrap();
         assert_eq!(k, Some(9));
         assert_eq!(r.term("device_expert_cache"), 10 * 644_022_272);
         assert!(r.vram_headroom >= 0);
         // Derived K: the cache term is whatever the other terms leave.
         cfg.device_cache_experts = 0;
-        let r = check_plan(&cfg, &glm(), 24 << 30).unwrap().0;
+        let r = check_plan(&cfg, &glm(), 24 << 30, 24 << 30).unwrap().0;
         assert_eq!(r.vram_headroom, 0);
         // ctx 100k at ubatch 512: fitted ws 0.79 GiB; 24 GiB − (8.35 t_ne +
         // 1.84 kv + 0.14 rs + 0.79 ws + 3.69 slabs + 2.64 ROCm) ≈ 6.55 GiB.
         assert!(r.term("device_expert_cache") > 5 << 30);
         // Half of that 6.55 GiB cache holds K = 4 < top_k 8.
         cfg.vram_experts_frac = 0.5;
-        let e = check_plan(&cfg, &glm(), 24 << 30).unwrap_err();
+        let e = check_plan(&cfg, &glm(), 24 << 30, 24 << 30).unwrap_err();
         assert!(e.to_string().contains("device_expert_cache "), "{e}");
     }
 
@@ -2667,22 +2678,57 @@ mod tests {
             n_ctx: 262_144,
             ram_experts_gib: 57,
             device_cache_experts: 512,
+            vram_reserve_bytes: Some(0),
             ..EngineConfig::default()
         };
-        let (r, k) = check_plan(&cfg, &glm(), (239 << 30) / 10).unwrap();
+        let (r, k) = check_plan(&cfg, &glm(), (239 << 30) / 10, 24 << 30).unwrap();
         assert_eq!(k, Some(9));
         assert_eq!(r.term("device_expert_cache"), 10 * 644_022_272);
         let at_top_k = 19_134_148_487 + 9 * 644_022_272;
-        assert_eq!(check_plan(&cfg, &glm(), at_top_k).unwrap().1, Some(8));
-        let e = check_plan(&cfg, &glm(), at_top_k - 1).unwrap_err();
+        assert_eq!(
+            check_plan(&cfg, &glm(), at_top_k, at_top_k).unwrap().1,
+            Some(8)
+        );
+        let e = check_plan(&cfg, &glm(), at_top_k - 1, at_top_k - 1).unwrap_err();
         assert!(e.to_string().contains("at most 7 fit"), "{e}");
-        let e = check_plan(&cfg, &glm(), 12 << 30).unwrap_err();
+        let e = check_plan(&cfg, &glm(), 12 << 30, 12 << 30).unwrap_err();
         let msg = e.to_string();
         assert!(matches!(e, EngineError::InvalidConfig(_)), "{msg}");
         assert!(
             msg.contains("device_cache_experts 512: at most 0 fit"),
             "{msg}"
         );
+    }
+
+    /// #168: an explicit K that fits free VRAM but eats into the default
+    /// reserve is clamped, or refused naming the max when that is below
+    /// top_k; never allowed into the reserve. Target, 23.98 GiB card, 24 GiB free
+    /// at ctx 100k / ubatch 512: ≈ 6.55 GiB left holds K = 9 with no
+    /// reserve; the 1.5 GiB reserve leaves ≈ 5.05 GiB → ⌊5.05 / 0.6⌋ − 1 =
+    /// K = 7 < top_k, so the request names the max instead; at ctx 65536
+    /// (KV −0.64 GiB) K = 9 is clamped to 8 and the reserve stays free.
+    #[test]
+    fn explicit_k_into_the_reserve_is_clamped() {
+        let total = 25_748_000_000;
+        let mut cfg = EngineConfig {
+            n_ctx: 100_000,
+            ram_experts_gib: 57,
+            prefill_stream: true,
+            prefill_ubatch: 512,
+            device_cache_experts: 9,
+            ..EngineConfig::default()
+        };
+        let e = check_plan(&cfg, &glm(), 24 << 30, total).unwrap_err();
+        assert!(matches!(e, EngineError::InvalidConfig(_)), "{e}");
+        assert!(e.to_string().contains("vram_reserve"), "{e}");
+        cfg.n_ctx = 65_536;
+        let (r, k) = check_plan(&cfg, &glm(), 24 << 30, total).unwrap();
+        assert_eq!(k, Some(8));
+        let reserve = golem_plan::default_vram_reserve(total);
+        assert_eq!(r.term("vram_reserve"), reserve);
+        assert!(r.vram_headroom >= 0);
+        cfg.vram_reserve_bytes = Some(0);
+        assert_eq!(check_plan(&cfg, &glm(), 24 << 30, total).unwrap().1, None);
     }
 
     /// Pool off, 4 layers × 1 GiB experts vs 4 GiB free: all offloaded
@@ -2707,15 +2753,16 @@ mod tests {
         let mut cfg = EngineConfig {
             n_ctx: 4096,
             n_gpu_layers: 99,
+            vram_reserve_bytes: Some(0),
             ..EngineConfig::default()
         };
-        let e = check_plan(&cfg, &m, 4 << 30).unwrap_err();
+        let e = check_plan(&cfg, &m, 4 << 30, 4 << 30).unwrap_err();
         assert!(
             matches!(&e, EngineError::PlanInfeasible(r) if r.term("resident_experts") == 4 << 30),
             "{e}"
         );
         cfg.cpu_moe_layers = Some(4);
-        let r = check_plan(&cfg, &m, 4 << 30).unwrap().0;
+        let r = check_plan(&cfg, &m, 4 << 30, 4 << 30).unwrap().0;
         assert_eq!(r.term("resident_experts"), 0);
         assert_eq!(r.term("ram_pool"), 0);
     }

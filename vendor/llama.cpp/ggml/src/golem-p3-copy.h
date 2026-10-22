@@ -11,11 +11,13 @@
 #ifndef GOLEM_P3_COPY_H
 #define GOLEM_P3_COPY_H
 
+#include "ggml.h"
+
 #include <cstddef>
 
 typedef void (*golem_set_copy_fn)(void *dst, const void *src, size_t dst_off, size_t len, void *ud);
 
-void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
+GGML_API void golem_copy_pooled_expert_run(void *dst, size_t expert_offset, size_t expert_size,
                                   size_t padding_len, const void *const *ptrs, size_t n,
                                   golem_set_copy_fn set_fn, void *ud);
 

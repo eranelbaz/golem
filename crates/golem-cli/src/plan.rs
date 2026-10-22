@@ -36,6 +36,10 @@ pub struct PlanArgs {
     /// as `run --vram-experts-frac`.
     #[arg(long, default_value_t = 1.0, value_parser = frac, conflicts_with = "vram_experts_gib")]
     pub vram_experts_frac: f32,
+    /// VRAM held back for other GPU clients (compositor, browsers); omitted =
+    /// max(1.5 GiB, 6 % of device VRAM), the `run` default.
+    #[arg(long, value_name = "GIB", value_parser = crate::run::parse_gib)]
+    pub vram_reserve_gib: Option<f64>,
     /// Host expert-pool cap; omitted = min(0.75 · free RAM, Σ expert bytes).
     #[arg(long, value_name = "GIB")]
     pub ram_experts_gib: Option<f64>,
@@ -162,6 +166,10 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
             ram_experts: bytes(args.ram_experts_gib),
         },
         snapshot_ram,
+        vram_reserve: args.vram_reserve_gib.map_or_else(
+            || golem_plan::default_vram_reserve(mach.vram_total),
+            |g| bytes(Some(g)),
+        ),
         ws: WS_MEASURED,
     };
     let r = golem_plan::plan_at_frac(&m, &mach, &input, args.vram_experts_frac);

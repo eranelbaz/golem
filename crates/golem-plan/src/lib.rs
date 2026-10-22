@@ -541,6 +541,14 @@ pub const ROCM_OVERHEAD: u64 = 2_834_678_415;
 pub const ROCM_SESSION_OVERHEAD: u64 = 544 << 20;
 const _: () = assert!(ROCM_SESSION_OVERHEAD < ROCM_OVERHEAD);
 
+/// Default [`PlanInput::vram_reserve`]: `max(1.5 GiB, 6 % of device total)`.
+/// Target, 23.98 GiB card: 6 % = 1.44 GiB, so 1.5 GiB. The 0.92-frac crash
+/// (#168) left 0.55 GiB for every other client.
+#[must_use]
+pub fn default_vram_reserve(device_total: u64) -> u64 {
+    (3u64 << 29).max(device_total / 100 * 6)
+}
+
 /// Per-layer device-slab experts `budget` bytes hold: `⌊budget / slab⌋ − 1`
 /// (ruling R3). Shared by the plan's feasibility and the engine's derived K.
 #[must_use]
@@ -631,6 +639,10 @@ pub struct PlanInput {
     pub experts: ExpertResidency,
     /// State-snapshot cache budget (§7.1).
     pub snapshot_ram: u64,
+    /// VRAM held back for other GPU clients (compositor, browsers) that grow
+    /// after load; subtracted before the derived cache, so neither
+    /// `vram_experts_frac` nor an explicit K can claim it.
+    pub vram_reserve: u64,
     /// Workspace model.
     pub ws: WsModel,
 }
@@ -771,6 +783,10 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
         Term {
             name: "rocm_overhead",
             bytes: mach.rocm_overhead,
+        },
+        Term {
+            name: "vram_reserve",
+            bytes: i.vram_reserve,
         },
     ];
     let after_ws = t
@@ -1146,6 +1162,70 @@ mod tests {
                 }
             )
             .feasible
+        );
+    }
+
+    /// #168: whatever the fraction or explicit K, the other VRAM clients
+    /// keep the reserve. Target, 23.98 GiB card at ctx 8192, ubatch 512:
+    /// 8.97 t_ne + 0.16 kv + 0.15 rs + 0.36 ws + 3.96 slabs + 2.83 ROCm +
+    /// 1.61 reserve = 18.04 GB → 7.71 GB cache → K = 10, so K ≥ 11 is
+    /// clamped to 10 by [`clamp_device_cache_k`].
+    #[test]
+    fn reserve_survives_every_frac_and_explicit_k() {
+        let m = ModelFacts {
+            t_ne: 8_966_188_280,
+            expert_bytes_total: 185_478_414_336,
+            ..glm()
+        };
+        let mach = Machine {
+            vram_total: 25_748_000_000,
+            ..box24()
+        };
+        let reserve = default_vram_reserve(mach.vram_total);
+        assert_eq!(reserve, 3 << 29);
+        assert_eq!(default_vram_reserve(100 << 30), (100 << 30) / 100 * 6);
+        let i = PlanInput {
+            ctx: 8192,
+            parallel: 1,
+            prefill_ubatch: 512,
+            prefill_stream: true,
+            vram_reserve: reserve,
+            ws: WS_MEASURED,
+            ..Default::default()
+        };
+        let others = |t: &[Term]| total(t) - get(t, "vram_reserve");
+        for frac in [0.05, 0.5, 0.8, 0.92, 0.999, 1.0] {
+            let r = plan_at_frac(&m, &mach, &i, frac);
+            assert_eq!(get(&r.vram, "vram_reserve"), reserve);
+            assert!(mach.vram_total - others(&r.vram) >= reserve, "frac {frac}");
+        }
+        let max = max_device_cache_k(&m, &mach, &i);
+        assert!(max >= u64::from(m.top_k) && max < 64, "max {max}");
+        for want in [8, 9, 12, 64, 512] {
+            let k = clamp_device_cache_k(&m, &mach, &i, want).unwrap();
+            assert_eq!(k, want.min(max));
+            let e = PlanInput {
+                vram_experts: m.device_cache_bytes(k),
+                ..i
+            };
+            for frac in [0.5, 1.0] {
+                let r = plan_at_frac(&m, &mach, &e, frac);
+                assert!(r.feasible, "k {k}: {:?}", r.violation());
+                assert!(mach.vram_total - others(&r.vram) >= reserve, "k {k}");
+            }
+        }
+        let none = plan(
+            &m,
+            &mach,
+            &PlanInput {
+                vram_reserve: 0,
+                ..i
+            },
+        );
+        let with = plan(&m, &mach, &i);
+        assert_eq!(
+            get(&none.vram, "device_expert_cache") - get(&with.vram, "device_expert_cache"),
+            reserve
         );
     }
 

@@ -45,8 +45,14 @@ fn cfg(model: &std::path::Path, ctx: u32, ub: u32) -> EngineConfig {
 /// `golem_plan::plan` at `free` VRAM. Feasibility uses
 /// `golem_plan::ROCM_OVERHEAD` like the engine's `check_plan`; the byte total
 /// keeps only its per-session part, since `hipMemGetInfo` before vs after
-/// does not see the one-time context.
-fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, bool, u64) {
+/// does not see the one-time context, and drops `vram_reserve`, which is
+/// held back, never allocated.
+fn predicted(
+    m: &golem_plan::ModelFacts,
+    c: &EngineConfig,
+    free: u64,
+    reserve: u64,
+) -> (i64, bool, u64) {
     let mach = golem_plan::Machine {
         vram_total: free,
         ram_total: u64::MAX,
@@ -63,6 +69,7 @@ fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, b
             ram_experts: c.ram_experts_gib << 30,
         },
         snapshot_ram: 0,
+        vram_reserve: reserve,
         ws: golem_plan::WS_MEASURED,
     };
     let r = golem_plan::plan(m, &mach, &i);
@@ -70,7 +77,8 @@ fn predicted(m: &golem_plan::ModelFacts, c: &EngineConfig, free: u64) -> (i64, b
     // is also bounded by free VRAM, so the caller adds the loaded K's bytes.
     let bytes = golem_plan::total(&r.vram) - r.term("rocm_overhead")
         + golem_plan::ROCM_SESSION_OVERHEAD
-        - r.term("device_expert_cache");
+        - r.term("device_expert_cache")
+        - r.term("vram_reserve");
     (bytes as i64, r.feasible, r.term("stream_slabs"))
 }
 
@@ -100,7 +108,8 @@ fn t8_plan_matches_hip_used_vram() {
     drop(Session::new(&cfg(&model, 4_096, 512)).expect("warm-up load"));
     #[cfg(golem_backend_hip)]
     golem_llama_sys::pinned::device_synchronize().expect("hipDeviceSynchronize");
-    let (free0, _) = device_vram().expect("HIP VRAM query");
+    let (free0, total) = device_vram().expect("HIP VRAM query");
+    let reserve = golem_plan::default_vram_reserve(total);
     // Points sit TOL inside the fit edge so normal drift between loads does
     // not fail them; drift past TOL still does. Target: 24 GiB VRAM, TOL
     // 256 MiB ≈ 1.0%; pre-warm-up drift 25671237632 → 25461522432 B =
@@ -115,7 +124,7 @@ fn t8_plan_matches_hip_used_vram() {
                 .filter(move |&u| u <= c)
                 .map(move |u| (c, u))
         })
-        .filter(|&(c, u)| predicted(&m, &cfg(&model, c, u), free_sel).1)
+        .filter(|&(c, u)| predicted(&m, &cfg(&model, c, u), free_sel, reserve).1)
         .take(cap.min(60))
         .collect();
     let min_points = cap.clamp(1, 20);
@@ -143,7 +152,7 @@ fn t8_plan_matches_hip_used_vram() {
         let prompt = sentence.repeat(((ctx as usize).saturating_sub(256) / 10).min(240));
         let c = cfg(&model, ctx, ub);
         let (free_before, _) = device_vram().unwrap();
-        let (pred, fits, stream_pred) = predicted(&m, &c, free_before);
+        let (pred, fits, stream_pred) = predicted(&m, &c, free_before, reserve);
         assert!(
             fits,
             "ctx {ctx} ubatch {ub} no longer fits: free VRAM drifted {free0} → {free_before} B"

@@ -133,6 +133,12 @@ pub struct EngineArgs {
     /// `--device-cache-experts` may use, in (0, 1] (default 1).
     #[arg(long, value_name = "FRAC")]
     pub vram_experts_frac: Option<f32>,
+    /// VRAM in GiB held back for other GPU clients (compositor, browsers)
+    /// that grow after load; neither `--vram-experts-frac` nor an explicit
+    /// `--device-cache-experts` can claim it. Omitted = max(1.5 GiB, 6 % of
+    /// device VRAM); 0 for a headless box.
+    #[arg(long, value_name = "GIB", value_parser = parse_gib)]
+    pub vram_reserve_gib: Option<f64>,
     /// Decode-only CPU/GPU hybrid expert math: multiply a share of each
     /// layer's RAM-resident slab misses on the CPU instead of copying them
     /// to the GPU (needs the RAM expert pool; refused on the CPU substrate).
@@ -295,6 +301,9 @@ impl EngineArgs {
                 "vram_experts_frac",
                 d.vram_experts_frac,
             )?,
+            vram_reserve_bytes: l
+                .opt(self.vram_reserve_gib.map(Gib), "vram_reserve_gib")?
+                .map(|Gib(g)| (g * (1u64 << 30) as f64) as u64),
             cpu_expert_math: l.get(flag(self.cpu_expert_math), "cpu_expert_math", false)?,
             cpu_expert_frac: l.get(self.cpu_expert_frac, "cpu_expert_frac", d.cpu_expert_frac)?,
             cpu_expert_threads: l.get(
@@ -502,8 +511,20 @@ fn fit_ram(
     )))
 }
 
+/// A [`parse_gib`]-checked GiB value, so env and `golem.toml` layers are
+/// held to the same rule as the flag.
+#[derive(Clone, Copy)]
+struct Gib(f64);
+
+impl std::str::FromStr for Gib {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        parse_gib(s).map(Gib)
+    }
+}
+
 /// Finite, non-negative GiB (clap parser).
-fn parse_gib(s: &str) -> Result<f64, String> {
+pub(crate) fn parse_gib(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(g) if g.is_finite() && g >= 0.0 => Ok(g),
         _ => Err(format!("expected a finite GiB value >= 0, got {s:?}")),
