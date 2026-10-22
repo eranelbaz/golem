@@ -29,6 +29,7 @@ if [ "$run_upstream" = 1 ]; then
   # leave its FIXTURES_REQUIRED dependents Not Run (ctest exits nonzero).
   # Exclusion list verified with `ctest -N` (regex excludes 7):
   #   - test-download-model: HF network download (FIXTURES_SETUP test-download-model)
+  #   - test-llama-context-model: FIXTURES_REQUIRED test-download-model (fails, not Not Run, on a missing model)
   #   - test-thread-safety, test-state-restore-fragmented: FIXTURES_REQUIRED
   #     test-download-model → Not Run if the fixture is excluded (ctest exits nonzero)
   #   - test-save-load-state: model-state save/load run (generate-models fixture);
@@ -39,7 +40,7 @@ if [ "$run_upstream" = 1 ]; then
   # FIXTURES_SETUP generate-models) + the 4 recurrent-state-rollback variants that
   # require it, tokenizer-0/-1 suites, sampling/grammar/gguf/alloc/backend tests.
   ctest --test-dir "$build" --output-on-failure \
-    -E 'test-(download-model|thread-safety|save-load-state|state-restore-fragmented|tokenizers-ggml-vocabs|jinja)'
+    -E 'test-(download-model|llama-context-model|thread-safety|save-load-state|state-restore-fragmented|tokenizers-ggml-vocabs|jinja)'
 fi
 "$bin" run --greedy "$model" --prompt "Hello" --n-predict 16 \
   --allow-overcommit --parity-dump "$out" >/dev/null

@@ -50,7 +50,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && alignof(std::atomic<
 
 // Detects unregister-from-inside-a-callback (deadlock by construction):
 // incremented around every hook invocation in ggml-backend.cpp.
-inline thread_local int golem_cb_depth = 0;
+GOLEM_API inline thread_local int golem_cb_depth = 0;
 struct golem_cb_guard {
     golem_cb_guard() { ++golem_cb_depth; }
     ~golem_cb_guard() { --golem_cb_depth; }
