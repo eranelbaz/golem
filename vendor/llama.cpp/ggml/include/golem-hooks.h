@@ -29,12 +29,12 @@
 extern "C" {
 #endif
 
-/* libllama (a separate shared object) calls these; ggml-base is built with
- * hidden visibility. */
+/* ggml-base is built with hidden visibility; libllama and the ctest TUs link
+ * these across the shared-object boundary. */
 #if defined(_WIN32) && !defined(__MINGW32__)
-#    define GOLEM_LIBLLAMA_API
+#    define GOLEM_API
 #else
-#    define GOLEM_LIBLLAMA_API __attribute__((visibility("default")))
+#    define GOLEM_API __attribute__((visibility("default")))
 #endif
 
 struct ggml_backend_sched;
@@ -50,7 +50,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
 #define GOLEM_HOOKS_ABI_VERSION 16
-int golem_hooks_abi_version(void);
+GOLEM_API int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
  * pool before the substrate reads them (blocks; called on the decode thread).
@@ -179,12 +179,12 @@ typedef void (*golem_predict_fn)(void *payload, int32_t src_blk, int32_t target_
  * order path); `n_experts` sizes the per-(blk,kind) triple buffers and the
  * slab scratch. Order buffers and scratch are preallocated here: a decode
  * step performs no heap allocation on the ctx path. */
-golem_ctx_t golem_ctx_create(int32_t n_layers, int32_t n_experts);
+GOLEM_API golem_ctx_t golem_ctx_create(int32_t n_layers, int32_t n_experts);
 
 /* Free a context. Aborts while a sched is attached (attach refcount != 0 —
  * the sched destructor or llama_golem_context_detach must run first) and
  * while hooks are still registered. */
-void golem_ctx_free(golem_ctx_t ctx);
+GOLEM_API void golem_ctx_free(golem_ctx_t ctx);
 
 /* Register the hooks on `ctx`. `payload` is passed back as the first
  * argument of every hook invocation. Not synchronized with a running step: call
@@ -193,7 +193,7 @@ void golem_ctx_free(golem_ctx_t ctx);
  * for a hook restores upstream behavior for that concern (unset hooks ==
  * byte-identical to upstream). Returns a handle that must be unregistered
  * with golem_unregister_hooks before golem_ctx_free. */
-golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
+GOLEM_API golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
                                          golem_ensure_host_resident_fn ensure,
                                          golem_routing_fn routing,
                                          golem_copy_done_fn copy_done,
@@ -207,18 +207,18 @@ golem_hook_handle_t golem_register_hooks(golem_ctx_t ctx,
  * count reaches 0, so no callback can touch the engine payload after this
  * returns. Aborts if called from inside a hook callback (deadlock by
  * construction — the join would wait for the calling step). */
-void golem_unregister_hooks(golem_hook_handle_t handle);
+GOLEM_API void golem_unregister_hooks(golem_hook_handle_t handle);
 
 /* Monotonic per-ctx counter, bumped on every register: the engine tags
  * scratch/pool state with it to reject addresses recycled across sessions. */
-uint64_t golem_ctx_generation(golem_ctx_t ctx);
+GOLEM_API uint64_t golem_ctx_generation(golem_ctx_t ctx);
 
 /* Process-global capability flag: number of hooked ctxs (> 0 = some model
  * has hooks). Consumed ONLY by golem_graphs_disabled(); per-sched decisions
  * (e.g. the cpy shrink) read the sched's OWN ctx, so a hookless sched under a
  * hooked process takes the upstream path verbatim. Documented deviation:
  * while ANY ctx is hooked, HIP graph capture is disabled process-wide. */
-int golem_any_ctx_hooked(void);
+GOLEM_API int golem_any_ctx_hooked(void);
 
 /* --- Eviction order (design §3.4). --- */
 
@@ -229,7 +229,7 @@ int golem_any_ctx_hooked(void);
  * acquired it (the publisher skips a buffer instead of overwriting one a
  * reader of the current epoch may hold). Flat per-ctx table indexed
  * blk × kind — no hash lookup. C never frees it and never blocks. */
-const int32_t *golem_policy_order(golem_ctx_t ctx, const void *tensor,
+GOLEM_API const int32_t *golem_policy_order(golem_ctx_t ctx, const void *tensor,
                                   int32_t n_experts);
 
 /* Publish a fresh eviction order for (blk, kind): copies `n` entries into a
@@ -237,14 +237,14 @@ const int32_t *golem_policy_order(golem_ctx_t ctx, const void *tensor,
  * without blocking when no buffer is free under the reader-epoch gate; the
  * publisher retries next step. `kind` is 1-based (1=gate 2=up 3=down).
  * Called off the decode thread — the only synchronized ctx entry point. */
-int golem_policy_order_push(golem_ctx_t ctx, int32_t blk, int32_t kind,
+GOLEM_API int golem_policy_order_push(golem_ctx_t ctx, int32_t blk, int32_t kind,
                             const int32_t *order, int32_t n);
 
 /* Advance the order epoch (one per decode step): releases the triple-buffer
  * slot the previous step's readers hold. The scheduler calls this at graph
  * compute entry; exposed so tests (and embedders driving steps by hand) can
  * match publisher progress without running a step. */
-void golem_policy_order_epoch_advance(golem_ctx_t ctx);
+GOLEM_API void golem_policy_order_epoch_advance(golem_ctx_t ctx);
 
 /* --- Device expert cache budget + stats (per ctx, design §3.4). --- */
 
@@ -254,40 +254,40 @@ void golem_policy_order_epoch_advance(golem_ctx_t ctx);
  * clamp to it; <= 0 is "unset" and aborts when the slab path first engages
  * (device allocations are budget-bounded, never proportional to the expert
  * count). Set once by the engine at pool enable. */
-void golem_set_device_cache_experts(golem_ctx_t ctx, int32_t k);
+GOLEM_API void golem_set_device_cache_experts(golem_ctx_t ctx, int32_t k);
 
 /* P5: enable next-layer prediction nodes (lookahead layers ahead, top
  * n_expert_used + margin each) delivered to `predict` with the registered
  * payload. lookahead <= 0 or predict == NULL disables (no graph nodes).
  * Init-only: set before the first graph build, never changed afterwards
  * (built graphs keep the node set they were built with). */
-void golem_set_predict(golem_ctx_t ctx, int32_t lookahead, int32_t margin, golem_predict_fn predict);
+GOLEM_API void golem_set_predict(golem_ctx_t ctx, int32_t lookahead, int32_t margin, golem_predict_fn predict);
 /* Graph-build query: prediction lookahead (0 = off, also for a NULL ctx). */
-GOLEM_LIBLLAMA_API int32_t golem_predict_lookahead(golem_ctx_t ctx);
+GOLEM_API int32_t golem_predict_lookahead(golem_ctx_t ctx);
 /* Graph-build query: prediction margin beyond n_expert_used. */
-GOLEM_LIBLLAMA_API int32_t golem_predict_margin(golem_ctx_t ctx);
+GOLEM_API int32_t golem_predict_margin(golem_ctx_t ctx);
 /* Current budget (<= 0 = unset). */
-int32_t golem_device_cache_experts(golem_ctx_t ctx);
+GOLEM_API int32_t golem_device_cache_experts(golem_ctx_t ctx);
 /* ABI v12: a device-slab allocation that fails (VRAM taken after load)
  * fails the compute with GGML_STATUS_ALLOC_FAILED (llama_decode -2) instead
  * of aborting; the engine resets the cache and lowers K. Count of such
  * failures since ctx creation (0 for a NULL ctx). */
-uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
+GOLEM_API uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
 #ifdef GOLEM_TEST_SUPPORT
 /* Test seam (ABI v15: declared only under GOLEM_TEST_SUPPORT): the next n
  * slab (re)allocations fail as if out of VRAM. */
-void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
+GOLEM_API void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
 #endif
 /* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
  * remapped-ids tensors (*slab_bytes) and prefill-stream slabs
  * (*stream_bytes). Slabs allocate lazily, so this is what is resident, not
  * the K + 1 reservation. Call between computes (stream slabs are mutated
  * outside dc_mutex). Zeros for a NULL ctx; either out pointer may be NULL. */
-void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t *slab_bytes, uint64_t *stream_bytes);
+GOLEM_API void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t *slab_bytes, uint64_t *stream_bytes);
 
 /* Clear the ctx's device cache maps — the invalidation seam (also the
  * cold-start lever). Also frees the prefill-stream slabs. */
-void golem_reset_device_cache(golem_ctx_t ctx);
+GOLEM_API void golem_reset_device_cache(golem_ctx_t ctx);
 
 /* Prefill-stream configuration (design section 7.6, ABI v10). `on != 0` arms
  * streaming for subsequent computes; the device slabs (two, each
@@ -297,7 +297,7 @@ void golem_reset_device_cache(golem_ctx_t ctx);
  * source the whole identity id range instead of the routed set. Requires the
  * stream hooks to be registered (else aborts). Init/config-time call --
  * not concurrent with a compute. */
-void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
+GOLEM_API void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
                               int32_t max_plane_stride, float routed_max);
 
 /* Dedicated H2D copy stream (ABI v15). `on != 0` issues the pooled and
@@ -311,12 +311,12 @@ void golem_set_prefill_stream(golem_ctx_t ctx, int32_t on, int32_t n_experts,
  * Config-time call. One device backend per ctx: a compute on a second device
  * backend is a documented FFI abort (the engine refuses multi-GPU async_h2d
  * up front). */
-int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
+GOLEM_API int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
 
 /* Copy-stream H2D time (sum of per-split event pairs) and bytes since the
  * last call; resets both. Returns 1 when measured, 0 when async_h2d is off
  * or the per-step ring overflowed. Call between computes. */
-int32_t golem_take_h2d_timing(golem_ctx_t ctx, double *ms, uint64_t *bytes);
+GOLEM_API int32_t golem_take_h2d_timing(golem_ctx_t ctx, double *ms, uint64_t *bytes);
 
 /* Hook (ABI v16, design §1 O1): among ids[0..n) of layer `blk`, count the
  * units RESIDENT in the host pool (no paging in, no scoring), and lease the
@@ -339,28 +339,28 @@ typedef int32_t (*golem_cpu_lease_fn)(void *payload, int32_t blk, const int32_t 
  * created lazily on the first eligible compute. Returns 0, or -1 when refused
  * (bad arguments, no routing hook, already armed); `on == 0` arms nothing
  * but still returns -1 for a NULL ctx, no routing hook or an armed ctx. */
-int32_t golem_set_cpu_expert_math(golem_ctx_t ctx, int32_t on, float frac, int32_t n_threads,
+GOLEM_API int32_t golem_set_cpu_expert_math(golem_ctx_t ctx, int32_t on, float frac, int32_t n_threads,
                                   golem_cpu_lease_fn lease);
 /* Graph-build query: 1 when armed, 0 otherwise (0 for a NULL ctx). */
-GOLEM_LIBLLAMA_API int32_t golem_cpu_expert_math_on(golem_ctx_t ctx);
+GOLEM_API int32_t golem_cpu_expert_math_on(golem_ctx_t ctx);
 /* Since the last call: experts computed on the CPU, their plane bytes, worker
  * busy ms, decode-thread join wait ms, and ids remapped to the padding slot K
  * (summed over planes); resets all five. Returns 1 when armed, 0 otherwise
  * (outputs untouched). Call between computes. */
-int32_t golem_take_cpu_expert_stats(golem_ctx_t ctx, uint64_t *experts, uint64_t *bytes, double *ms,
+GOLEM_API int32_t golem_take_cpu_expert_stats(golem_ctx_t ctx, uint64_t *experts, uint64_t *bytes, double *ms,
                                     double *join_wait_ms, uint64_t *padded);
 
 /* P4 counters. Opaque here (C++ side keeps the members atomic); each member
  * is a lock-free 8-byte counter read by Rust as u64. The pointer is stable
  * for the ctx's lifetime. */
 struct golem_device_cache_stats;
-const struct golem_device_cache_stats *golem_get_device_cache_stats(golem_ctx_t ctx);
+GOLEM_API const struct golem_device_cache_stats *golem_get_device_cache_stats(golem_ctx_t ctx);
 
 /* Placement stats stay PROCESS-GLOBAL by design: they count graph-build
  * placements per device across the process, are a windowed tripwire, and
  * outlive any ctx. */
 struct golem_expert_placement_stats;
-const struct golem_expert_placement_stats *golem_get_expert_placement_stats(void);
+GOLEM_API const struct golem_expert_placement_stats *golem_get_expert_placement_stats(void);
 
 /* I2 runtime proof (design §2.3): expert MUL_MAT_ID nodes counted at
  * scheduler graph split by the device type of their assigned backend
@@ -376,17 +376,17 @@ const struct golem_expert_placement_stats *golem_get_expert_placement_stats(void
  * during decode, so without this experts compute on the CPU. Values ≤ 0
  * restore the env/default behavior. Read once at device init — call before
  * backend init. Deliberate process-global setter. */
-void golem_set_expert_offload_min_batch(int n);
+GOLEM_API void golem_set_expert_offload_min_batch(int n);
 
 /* --- Internal seams (not part of the stable engine-facing ABI). --- */
 
 /* Attach/detach a ctx to a scheduler. set_ctx increments the ctx's attach
  * refcount; the sched destructor and detach decrement it. NULL ctx detaches.
  * libllama re-applies it after EVERY ggml_backend_sched_new. */
-GOLEM_LIBLLAMA_API void golem_sched_set_ctx(struct ggml_backend_sched *sched, golem_ctx_t ctx);
-GOLEM_LIBLLAMA_API void golem_sched_detach_ctx(struct ggml_backend_sched *sched);
+GOLEM_API void golem_sched_set_ctx(struct ggml_backend_sched *sched, golem_ctx_t ctx);
+GOLEM_API void golem_sched_detach_ctx(struct ggml_backend_sched *sched);
 /* The ctx attached to `sched` (ABI v16); NULL for a NULL or unattached sched. */
-GOLEM_LIBLLAMA_API golem_ctx_t golem_sched_get_ctx(struct ggml_backend_sched *sched);
+GOLEM_API golem_ctx_t golem_sched_get_ctx(struct ggml_backend_sched *sched);
 
 /* libllama seam: store `ctx` on the model before llama_init_from_model;
  * llama_context stores it and re-applies golem_sched_set_ctx to every sched
@@ -394,13 +394,13 @@ GOLEM_LIBLLAMA_API golem_ctx_t golem_sched_get_ctx(struct ggml_backend_sched *sc
  * null-guarded. */
 struct llama_model;
 struct llama_context;
-void llama_golem_model_attach(struct llama_model *model, golem_ctx_t ctx);
-void llama_golem_context_detach(struct llama_context *ctx);
+GOLEM_API void llama_golem_model_attach(struct llama_model *model, golem_ctx_t ctx);
+GOLEM_API void llama_golem_context_detach(struct llama_context *ctx);
 
 /* 0 when `t` is not an expert tensor; else expert count. */
-int32_t golem_tensor_expert_count(const void *tensor);
+GOLEM_API int32_t golem_tensor_expert_count(const void *tensor);
 /* 0 when count is 0; else bytes per expert (one ne[0]×ne[1] plane stride, nb[2]). */
-int32_t golem_tensor_expert_stride_bytes(const void *tensor);
+GOLEM_API int32_t golem_tensor_expert_stride_bytes(const void *tensor);
 
 #ifdef __cplusplus
 }
