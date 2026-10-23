@@ -16,17 +16,23 @@ use crate::sys::{self, DIRECT_ALIGN};
 /// real filesystems. Implemented for [`std::fs::File`]; tests inject fakes.
 pub trait FileRead: Send + Sync {
     /// Read exactly `buf.len()` bytes at `off`, retrying short reads.
-    fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()>;
+    fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.read_at_least(off, buf, buf.len())
+    }
+    /// Read at `off` until at least `min` bytes landed, retrying short reads;
+    /// no further read is issued once `min` is reached, so a covering read
+    /// ending past EOF stops at EOF (§5.4).
+    fn read_at_least(&self, off: u64, buf: &mut [u8], min: usize) -> std::io::Result<()>;
     /// Best-effort page-cache eviction of `[off, off + len)`; advisory, so a
     /// failure is reported and swallowed by the caller — never a read error.
     fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()>;
 }
 
 impl FileRead for std::fs::File {
-    fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    fn read_at_least(&self, off: u64, buf: &mut [u8], min: usize) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
         let mut filled = 0;
-        while filled < buf.len() {
+        while filled < min {
             match self.read_at(&mut buf[filled..], off + filled as u64) {
                 // `File::read_at` does not retry EINTR; a spurious interrupt
                 // must not surface as a device error.
@@ -54,8 +60,8 @@ impl FileRead for std::fs::File {
 }
 
 impl FileRead for Box<dyn FileRead> {
-    fn read_full(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        (**self).read_full(off, buf)
+    fn read_at_least(&self, off: u64, buf: &mut [u8], min: usize) -> std::io::Result<()> {
+        (**self).read_at_least(off, buf, min)
     }
     fn drop_cache(&self, off: u64, len: usize) -> std::io::Result<()> {
         (**self).drop_cache(off, len)
@@ -90,6 +96,9 @@ pub struct ShardReplicas {
 pub struct ReplicaSlot {
     /// Full path: replica dir joined with the shard file name.
     pub path: PathBuf,
+    /// Shard length verified at open; bounds the in-file part of a covering
+    /// read whose aligned end rounds past EOF (§5.4).
+    len: u64,
     /// `O_DIRECT` handle, `None` where the open-time probe failed.
     direct: Option<Box<dyn FileRead>>,
     /// Buffered handle, always present: the fallback needs it even when the
@@ -204,7 +213,7 @@ impl ReplicaSlot {
             && (only || self.direct_ok())
             && let Some(d) = &self.direct
         {
-            if let Err(e) = d.read_full(offset, buf) {
+            if let Err(e) = self.fill(&**d, offset, buf) {
                 if only {
                     return Err(e);
                 }
@@ -221,7 +230,7 @@ impl ReplicaSlot {
                 return Ok(());
             }
         }
-        self.buffered.read_full(offset, buf)?;
+        self.fill(&*self.buffered, offset, buf)?;
         self.served_chunks.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self.buffered.drop_cache(offset, buf.len())
             && self.warned_dontneed.swap(false, Ordering::Relaxed)
@@ -232,6 +241,27 @@ impl ReplicaSlot {
                 "POSIX_FADV_DONTNEED failed; page-cache pressure only"
             );
         }
+        Ok(())
+    }
+
+    /// Reads `buf` at `offset`; the part past EOF (only the last plane's
+    /// aligned covering tail, under one 4 KiB block, §5.4) is zero-filled,
+    /// never read. The §5.3 CRC window ends inside the file, so the tail never
+    /// enters a checksum; a longer tail is an out-of-range read and fails.
+    fn fill(&self, f: &dyn FileRead, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let in_file = usize::try_from(self.len.saturating_sub(offset))
+            .map_or(buf.len(), |n| n.min(buf.len()));
+        if in_file == buf.len() {
+            return f.read_full(offset, buf);
+        }
+        if in_file == 0 || (buf.len() - in_file) as u64 >= DIRECT_ALIGN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read extends past end of file",
+            ));
+        }
+        f.read_at_least(offset, buf, in_file)?;
+        buf[in_file..].fill(0);
         Ok(())
     }
 }
@@ -298,6 +328,7 @@ impl ReplicaRegistry {
                 };
                 replicas.push(Arc::new(ReplicaSlot {
                     path,
+                    len,
                     drive,
                     direct,
                     buffered: Box::new(file),
@@ -516,7 +547,7 @@ mod tests {
     }
 
     impl FileRead for FakeReads {
-        fn read_full(&self, _off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        fn read_at_least(&self, _off: u64, buf: &mut [u8], _min: usize) -> std::io::Result<()> {
             if self.direct_err {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
@@ -535,6 +566,7 @@ mod tests {
     fn direct_eio_falls_back_to_buffered_without_degrading() {
         let slot = ReplicaSlot {
             path: PathBuf::from("fake"),
+            len: u64::MAX,
             drive: "fake".into(),
             direct: Some(Box::new(FakeReads {
                 direct_err: true,
@@ -566,6 +598,7 @@ mod tests {
     fn fallback_reads_invoke_dontneed() {
         let slot = ReplicaSlot {
             path: PathBuf::from("fake"),
+            len: u64::MAX,
             drive: "fake".into(),
             direct: None,
             buffered: FakeReads::buffered().0,
@@ -584,6 +617,43 @@ mod tests {
         let buf = &mut v[skip..skip + 4096];
         slot.read_at(0, buf).unwrap();
         assert_eq!(*calls.lock().unwrap(), vec![(0, 4096)]);
+    }
+
+    #[test]
+    fn covering_read_past_eof_zero_fills_the_tail() {
+        let dir = std::env::temp_dir()
+            .join("golem-store-replica-test")
+            .join("eof-tail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8 + 1).collect();
+        std::fs::write(dir.join("a.gguf"), &body).unwrap();
+        let manifest = crate::manifest::ModelManifest {
+            name: "t".into(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: "a.gguf".into(),
+                bytes: body.len() as u64,
+                sha256: "0".repeat(64),
+                replicas: vec![dir],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let slot = &*reg.shards()[0].replicas[0];
+        let (mut v, skip) = aligned_storage(8192);
+        let buf = &mut v[skip..skip + 8192];
+        buf.fill(0xFF);
+        slot.read_at(0, buf).unwrap();
+        assert_eq!(&buf[..5000], &body[..]);
+        assert!(buf[5000..].iter().all(|&b| b == 0));
+        let buf = &mut v[skip..skip + 4096];
+        buf.fill(0xFF);
+        slot.read_at(4096, buf).unwrap();
+        assert_eq!(&buf[..904], &body[4096..]);
+        assert!(buf[904..].iter().all(|&b| b == 0));
+        let buf = &mut v[skip..skip + 4096];
+        assert!(slot.read_at(8192, buf).is_err(), "wholly past EOF fails");
+        assert_eq!(slot.health(), ReplicaHealth::Healthy);
     }
 
     #[test]
