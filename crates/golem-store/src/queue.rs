@@ -19,7 +19,7 @@ use crate::engine::{ChunkSource, ShardSources};
 use crate::replica::ReplicaHealth;
 use crate::stripe::plan_aligned;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// Everything a drain needs to settle one logical read.
@@ -131,6 +131,9 @@ pub struct ChunkQueue {
     /// read itself succeeded (failover-with-survivor), so health transitions
     /// surface on success paths, not only on read errors.
     degraded_reads: AtomicU64,
+    /// Home drive of the next drain's worker 0 (§5.2): rotates per drain so
+    /// single-chunk drains (one plane < `CHUNK`) alternate drives.
+    next_home: AtomicUsize,
 }
 
 impl ChunkQueue {
@@ -146,6 +149,7 @@ impl ChunkQueue {
             disk_ns: AtomicU64::new(0),
             disk_bytes: AtomicU64::new(0),
             degraded_reads: AtomicU64::new(0),
+            next_home: AtomicUsize::new(0),
         }
     }
 
@@ -702,15 +706,20 @@ fn drain_reads(
     })
     .min(list.len().max(1));
 
+    let first_home = queue.next_home.fetch_add(workers, Ordering::Relaxed);
     let shared = Arc::new((Mutex::new(Shared { list, remaining }), Condvar::new()));
     std::thread::scope(|s| {
         for w in 0..workers {
             let shared = Arc::clone(&shared);
             // Home drive for striping (§5.2): workers are pinned round-robin
-            // to drives; at pop time each worker self-selects the chunks its
-            // drive can serve, so the faster drive consumes proportionally
-            // more chunks.
-            let home = if drives == 0 { 0 } else { w % drives };
+            // to drives, starting at the drain's rotating first home; at pop
+            // time each worker self-selects the chunks its drive can serve,
+            // so the faster drive consumes proportionally more chunks.
+            let home = if drives == 0 {
+                0
+            } else {
+                first_home.wrapping_add(w) % drives
+            };
             s.spawn(move || {
                 if let Some(set) = &queue.io_cpuset
                     && let Err(e) = crate::sys::pin_current_thread(set)
@@ -1474,6 +1483,109 @@ mod tests {
             reads[0].0, reads[1].0,
             "chunks served by different replicas (striped across drives)"
         );
+    }
+
+    #[test]
+    fn single_chunk_drains_alternate_drives() {
+        let (_paths, reg) = fixture(2, "alternate");
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            drives: vec!["drv0".to_owned(), "drv1".to_owned()],
+            delay_ms: 0,
+            delays_ms: Vec::new(),
+            conc: None,
+            gates: Vec::new(),
+            wait_for_pair: None,
+        };
+        let queue = Arc::new(ChunkQueue::new(0, None));
+        for _ in 0..4 {
+            let mut dst = vec![0u8; SHARD_BYTES];
+            read_whole(&queue, &sources, &mut dst).wait().unwrap();
+        }
+        let replicas: Vec<usize> = sources.log.lock().unwrap().iter().map(|e| e.0).collect();
+        assert_eq!(replicas, [0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn last_plane_covering_read_past_eof_keeps_replicas_healthy() {
+        // /tmp is tmpfs (no O_DIRECT): the fixture lives under target/.
+        let bytes = crate::stripe::CHUNK + 5000;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/golem-store-queue-eof-{}",
+            std::process::id()
+        ));
+        let mut replicas = Vec::with_capacity(2);
+        for r in 0..2 {
+            let dir = root.join(format!("r{r}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SHARD_FILE), pattern(0, bytes)).unwrap();
+            replicas.push(dir);
+        }
+        let manifest = crate::manifest::ModelManifest {
+            name: "eof".to_owned(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: SHARD_FILE.to_owned(),
+                bytes: bytes as u64,
+                sha256: "0".repeat(64),
+                replicas,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let reg = ReplicaRegistry::open(&manifest).unwrap();
+        let sources = TestSources {
+            reg,
+            fail: Vec::new(),
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            drives: vec!["drv0".to_owned(), "drv1".to_owned()],
+            delay_ms: 0,
+            delays_ms: Vec::new(),
+            conc: None,
+            gates: Vec::new(),
+            wait_for_pair: None,
+        };
+        let queue = Arc::new(ChunkQueue::new(0, None));
+        let (offset, len) = (100usize, bytes - 100);
+        let plan = plan_aligned(offset as u64, len);
+        assert!(plan.len() > 1, "multi-chunk plane");
+        let covering: usize = plan.iter().map(|c| c.1).sum();
+        assert!(covering > bytes, "covering read ends past EOF");
+        // O_DIRECT needs a 4 KiB-aligned destination.
+        let mut storage = vec![0u8; covering + 4096];
+        let skip = (4096 - storage.as_ptr() as usize % 4096) % 4096;
+        let dst = &mut storage[skip..skip + covering];
+        queue
+            .enqueue(ReadJob {
+                shard_index: 0,
+                offset: offset as u64,
+                len,
+                expected_crc: crc32c::crc32c(&pattern(offset, len)),
+                verify_crc: true,
+                prefetch: false,
+                sources: &sources,
+                dst,
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(
+            &storage[skip + offset..skip + offset + len],
+            &pattern(offset, len)[..]
+        );
+        let mut direct = 0;
+        for r in 0..2 {
+            let slot = sources.slot(0, r);
+            assert_eq!(slot.health(), ReplicaHealth::Healthy, "replica {r}");
+            direct += slot.served_direct();
+        }
+        assert!(
+            direct > 0,
+            "O_DIRECT served the covering read (target/ must support O_DIRECT)"
+        );
+        assert_eq!(queue.degraded_reads(), 0);
+        drop(sources);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
