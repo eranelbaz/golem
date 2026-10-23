@@ -17,6 +17,11 @@ fn two_turns(cfg: &EngineConfig, snap_bytes: u64, corrupt: bool) -> (String, Ses
     let mut cfg = cfg.clone();
     cfg.snapshot_ram_bytes = Some(snap_bytes);
     cfg.n_predict = 16;
+    // Restore + delta and full reprefill split the prompt into different
+    // ubatches; with CPU-resident layers, ggml offloads only ops of batch
+    // >= GGML_OP_OFFLOAD_MIN_BATCH, so the device (and the numerics) would
+    // follow the chunk shape. Offload every layer, as the CLI infers on HIP.
+    cfg.n_gpu_layers = 99;
     let mut s = Session::new(&cfg).unwrap();
     let mut a1 = String::new();
     s.chat_turn(
