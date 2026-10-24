@@ -260,9 +260,10 @@ fn check_thinking(t: &Value) -> Result<(), ErrorEnvelope> {
 }
 
 /// `output_config.effort` → `reasoning_effort`; other keys are refused
-/// (design §8.6). `low`/`high`/`none` pass through verbatim; `max` maps to
-/// absent (the template's default); anything else is a 400, never a silent
-/// drop.
+/// (design §8.6). The value passes through verbatim under the chat-path
+/// `reasoning_effort` rule: `max` reaches the template, which
+/// renders 100 on DeepSeek-V4.1 and its default on GLM; anything else is a
+/// 400, never a silent drop.
 fn effort(c: &Value) -> Result<Option<Value>, ErrorEnvelope> {
     let o = c
         .as_object()
@@ -274,13 +275,9 @@ fn effort(c: &Value) -> Result<Option<Value>, ErrorEnvelope> {
     }
     match o.get("effort") {
         None | Some(Value::Null) => Ok(None),
-        Some(v) => match v.as_str() {
-            Some("low" | "high" | "none") => Ok(Some(v.clone())),
-            Some("max") => Ok(None),
-            _ => Err(invalid(
-                "`output_config.effort` must be `low`, `high`, `none` or `max`",
-            )),
-        },
+        Some(v) => crate::chat::parse_effort(v)
+            .map(|_| Some(v.clone()))
+            .map_err(|e| invalid(format!("`output_config.effort` {e}"))),
     }
 }
 
@@ -564,13 +561,16 @@ mod tests {
     }
 
     #[test]
-    fn output_config_effort_max_maps_to_absent() {
+    fn output_config_effort_max_and_integer_pass_through() {
         let mut b = base(json!([{"role": "user", "content": "q"}]));
         b["output_config"] = json!({"effort": "max"});
-        let c = ok(b.clone());
-        assert!(c.get("reasoning_effort").is_none());
-        b["output_config"] = json!({"effort": "medium"});
-        assert_eq!(code(b), ErrorCode::InvalidRequest);
+        assert_eq!(ok(b.clone())["reasoning_effort"], "max");
+        b["output_config"] = json!({"effort": 10});
+        assert_eq!(ok(b.clone())["reasoning_effort"], 10);
+        for bad in [json!("medium"), json!(0), json!(101), json!(10.5)] {
+            b["output_config"] = json!({"effort": bad});
+            assert_eq!(code(b.clone()), ErrorCode::InvalidRequest, "{bad}");
+        }
     }
 
     #[test]

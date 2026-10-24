@@ -664,3 +664,26 @@ async fn chat_reasoning_effort_medium_is_400() {
     assert_eq!(r.status(), 400);
     assert_eq!(json(r).await["error"]["code"], "golem_invalid_request");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_reasoning_effort_out_of_range_is_400() {
+    let app = router_for_test(golem_server::test_engine_config()).await;
+    for e in [0, 101] {
+        let mut body = hi(4);
+        body["reasoning_effort"] = e.into();
+        let r = app.clone().oneshot(chat(body)).await.unwrap();
+        assert_eq!(r.status(), 400, "{e}");
+        assert_eq!(json(r).await["error"]["code"], "golem_invalid_request");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_reasoning_effort_max_and_integer_are_accepted() {
+    let app = router_for_test(golem_server::test_engine_config()).await;
+    for e in [serde_json::json!("max"), serde_json::json!(10)] {
+        let mut body = hi(4);
+        body["reasoning_effort"] = e.clone();
+        let r = app.clone().oneshot(chat(body)).await.unwrap();
+        assert_eq!(r.status(), 200, "{e}");
+    }
+}

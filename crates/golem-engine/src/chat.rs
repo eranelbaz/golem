@@ -204,6 +204,7 @@ mod tests {
     use super::*;
 
     const GLM: &str = include_str!("../tests/fixtures/glm-5.3-flash.jinja");
+    const DS41: &str = include_str!("../tests/fixtures/deepseek-v4.1-flash-1017.jinja");
 
     fn tools() -> String {
         serde_json::json!([{"type":"function","function":{"name":"get_weather","parameters":{
@@ -329,6 +330,32 @@ mod tests {
         assert!(p(Some("medium")).contains("Reasoning Effort: Max"));
         assert!(p(Some("low")).contains("Reasoning Effort: Low"));
         assert!(p(Some("high")).contains("Reasoning Effort: High"));
+    }
+
+    /// DeepSeek-V4.1 renders effort as a 1-100 budget: integers verbatim,
+    /// `max` → 100, `low` → 50, absent → `high` (75).
+    #[test]
+    fn deepseek_v41_numeric_reasoning_effort_reaches_template() {
+        let t = ChatTemplates::from_source(DS41).unwrap();
+        let p = |e| {
+            t.render(&user(), None, None, false, e, false)
+                .unwrap()
+                .prompt
+        };
+        for (e, n) in [
+            (Some("10"), 10),
+            (Some("1"), 1),
+            (Some("100"), 100),
+            (Some("max"), 100),
+            (Some("low"), 50),
+            (None, 75),
+        ] {
+            let s = p(e);
+            assert!(
+                s.contains(&format!("Reasoning Effort: {n} (range 1-100")),
+                "{e:?}: {s}"
+            );
+        }
     }
 
     #[test]

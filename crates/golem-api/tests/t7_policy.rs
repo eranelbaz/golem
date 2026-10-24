@@ -181,29 +181,36 @@ fn max_completion_tokens_aliases_max_tokens() {
 }
 
 #[test]
-fn reasoning_effort_accepts_low_high_none_else_400() {
+fn reasoning_effort_accepts_low_high_max_none_or_1_to_100_else_400() {
     let with = |e: serde_json::Value| {
         let mut r = base();
         r["reasoning_effort"] = e;
         validate(&r, "tiny-moe")
     };
-    for ok in [json!("low"), json!("high"), json!("none")] {
+    for ok in [json!("low"), json!("high"), json!("max"), json!("none")] {
         assert_eq!(
             with(ok.clone()).unwrap().reasoning_effort,
             Some(ok.as_str().unwrap().to_string()),
             "{ok}"
         );
     }
+    for (n, s) in [(json!(1), "1"), (json!(10), "10"), (json!(100), "100")] {
+        assert_eq!(with(n).unwrap().reasoning_effort.as_deref(), Some(s));
+    }
     assert_eq!(with(json!(null)).unwrap().reasoning_effort, None);
     for bad in [
-        json!("max"),
         json!("medium"),
+        json!("10"),
+        json!(0),
+        json!(101),
+        json!(-5),
+        json!(10.5),
+        json!(10.0),
         json!("minimal"),
         json!(""),
         json!("LOW"),
         json!(" low"),
         json!("low\0"),
-        json!(5),
         json!(true),
         json!({"level": "low"}),
     ] {
