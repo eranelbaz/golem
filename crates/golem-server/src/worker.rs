@@ -186,7 +186,7 @@ impl HealthState {
     pub fn set(&self, s: ServeState) {
         let _ = self
             .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
                 (!matches!(
                     ServeState::from_u8(cur),
                     ServeState::Fatal | ServeState::FatalIo
@@ -206,7 +206,7 @@ impl HealthState {
     fn swap_state(&self, s: ServeState) {
         let _ = self
             .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
                 matches!(
                     ServeState::from_u8(cur),
                     ServeState::Healthy
