@@ -1,10 +1,21 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub fn usable_rocm_toolchain() -> bool {
+pub const ROCM_PATH_ENV: &str = "ROCM_PATH";
+
+pub fn rocm_root() -> PathBuf {
+    PathBuf::from(
+        std::env::var(ROCM_PATH_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/opt/rocm".into()),
+    )
+}
+
+/// ROCm toolchain files under `root` that auto-detect requires but cannot find.
+pub fn missing_rocm_paths(root: &Path) -> Vec<PathBuf> {
     #[cfg(unix)]
-    fn hipcc_executable() -> bool {
+    fn executable(path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
-        let path = Path::new("/opt/rocm/bin/hipcc");
         path.is_file()
             && path
                 .metadata()
@@ -12,8 +23,21 @@ pub fn usable_rocm_toolchain() -> bool {
                 .unwrap_or(false)
     }
     #[cfg(not(unix))]
-    fn hipcc_executable() -> bool {
-        Path::new("/opt/rocm/bin/hipcc").is_file()
+    fn executable(path: &Path) -> bool {
+        path.is_file()
     }
-    hipcc_executable() && Path::new("/opt/rocm/lib/libamdhip64.so").exists()
+    let mut missing: Vec<PathBuf> = ["bin/hipcc", "llvm/bin/clang++"]
+        .iter()
+        .map(|p| root.join(p))
+        .filter(|p| !executable(p))
+        .collect();
+    let libhip = root.join("lib/libamdhip64.so");
+    if !libhip.exists() {
+        missing.push(libhip);
+    }
+    missing
+}
+
+pub fn usable_rocm_toolchain() -> bool {
+    missing_rocm_paths(&rocm_root()).is_empty()
 }

@@ -1,4 +1,6 @@
 #![allow(missing_docs)]
+// usable_rocm_toolchain is consumed only through the library copy.
+#[allow(dead_code)]
 #[path = "backend_probe.rs"]
 mod backend_probe;
 #[path = "pin_gate.rs"]
@@ -11,20 +13,35 @@ use std::path::{Path, PathBuf};
 const BACKEND_ENV: &str = "GOLEM_LLAMA_SYS_BACKEND";
 const SKIP_GATE_ENV: &str = "GOLEM_LLAMA_SYS_SKIP_PIN_GATE";
 const AMDGPU_TARGET_ENV: &str = "GOLEM_LLAMA_SYS_AMDGPU_TARGET";
-const ROCM_PATH_ENV: &str = "ROCM_PATH";
 const DEFAULT_AMDGPU_TARGET: &str = "gfx1100";
 
-fn rocm_root() -> PathBuf {
-    PathBuf::from(env::var(ROCM_PATH_ENV).unwrap_or_else(|_| "/opt/rocm".into()))
-}
+use backend_probe::{ROCM_PATH_ENV, rocm_root};
 
 fn detect_backend() -> (&'static str, &'static str) {
     match env::var(BACKEND_ENV).as_deref() {
         Ok("cpu") => ("cpu", "cpu"),
         Ok("hip") => ("hip", "hip"),
         Ok("auto") | Err(env::VarError::NotPresent) => {
-            let hip = backend_probe::usable_rocm_toolchain();
-            ("auto", if hip { "hip" } else { "cpu" })
+            let root = rocm_root();
+            let missing = backend_probe::missing_rocm_paths(&root);
+            if missing.is_empty() {
+                return ("auto", "hip");
+            }
+            let missing: Vec<String> = missing.iter().map(|p| p.display().to_string()).collect();
+            println!(
+                "cargo:warning=golem-llama-sys: ROCm not found under {} ({}; {} missing); building a \
+                 CPU-only substrate (expert MUL_MAT_ID will not run on the GPU). Set \
+                 {ROCM_PATH_ENV} to your ROCm install, or {BACKEND_ENV}=hip to require it, \
+                 or {BACKEND_ENV}=cpu to silence this warning",
+                root.display(),
+                if env::var_os(ROCM_PATH_ENV).is_some_and(|v| !v.is_empty()) {
+                    "from ROCM_PATH"
+                } else {
+                    "default"
+                },
+                missing.join(", ")
+            );
+            ("auto", "cpu")
         }
         Ok(other) => panic!(
             "{BACKEND_ENV}: unknown value {other:?} (expected auto|cpu|hip); \
@@ -81,8 +98,9 @@ fn main() {
     fs::write(
         out_dir.join("backend_info.rs"),
         format!(
-            "const BACKEND: Backend = Backend::{};\nconst BACKEND_INPUT: &str = {raw:?};\n",
-            if resolved == "hip" { "Hip" } else { "Cpu" }
+            "const BACKEND: Backend = Backend::{};\nconst BACKEND_INPUT: &str = {raw:?};\nconst ROCM_ROOT: &str = {:?};\n",
+            if resolved == "hip" { "Hip" } else { "Cpu" },
+            rocm_root().display().to_string()
         ),
     )
     .expect("write backend_info.rs");
