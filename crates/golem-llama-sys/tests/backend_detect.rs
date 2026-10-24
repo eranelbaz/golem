@@ -1,7 +1,8 @@
 #![allow(unsafe_code, missing_docs)]
 
 fn auto_rule() -> golem_llama_sys::Backend {
-    if golem_llama_sys::backend_probe::usable_rocm_toolchain() {
+    let root = std::path::Path::new(golem_llama_sys::build_rocm_root());
+    if golem_llama_sys::backend_probe::missing_rocm_paths(root).is_empty() {
         golem_llama_sys::Backend::Hip
     } else {
         golem_llama_sys::Backend::Cpu

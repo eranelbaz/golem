@@ -30,6 +30,11 @@ pub fn backend_env_input() -> &'static str {
     BACKEND_INPUT
 }
 
+/// ROCm root the build script probed (`ROCM_PATH` or `/opt/rocm` at build time).
+pub fn build_rocm_root() -> &'static str {
+    ROCM_ROOT
+}
+
 pub fn pin_gate_skipped() -> bool {
     option_env!("GOLEM_LLAMA_PIN_GATE_SKIPPED") == Some("1")
 }

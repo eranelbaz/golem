@@ -44,6 +44,44 @@ row to [`BENCHMARKS.md`](BENCHMARKS.md).
 Community results from other machines live in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
+## Requirements
+
+| | |
+|---|---|
+| OS | Linux only (`golem-llama-sys` refuses to build elsewhere) |
+| GPU | AMD with ROCm/HIP, ROCm ≥ 7.2.4 (advisory pin in `engine/llama-cpp.lock`) |
+| Toolchain | Rust ≥ 1.99 (`rust-toolchain.toml` pins 1.99.1 under rustup), cmake, a C++ compiler, OpenMP (libgomp), libclang (bindgen) |
+| Tools | [`hf`](https://huggingface.co/docs/huggingface_hub/guides/cli) CLI for pulling models; `cargo-nextest` for the tests |
+| VRAM / RAM | Tested at 24 GiB VRAM / 93 GiB RAM; experts that fit neither stream from SSD |
+| Disk | Fast NVMe; GLM-5.3-Flash UD-IQ4_XS is 100+ GiB, DeepSeek-V4.1-Flash UD-IQ2_XXS ≈ 280 GiB |
+
+Sizing against the target (reference quant UD-Q4_K_XL, MB = 10⁶ bytes):
+GLM-5.3-Flash experts are 42 layers × 288 experts × (4.7 + 4.7 + 5.8) MB
+≈ 184 GB ≈ 171 GiB, more than 24 GiB VRAM + 93 GiB RAM = 117 GiB, so the cold
+set is read from SSD.
+After downloading, `golem plan` reports whether a given context fits.
+
+**Not supported yet:** NVIDIA/CUDA, macOS, Windows. Linux only for now: the
+substrate link table, `O_DIRECT`/`posix_fadvise` expert streaming and the ROCm
+probe have no macOS/Windows equivalents yet.
+
+### Environment variables
+
+| Variable | When | Default | Effect |
+|---|---|---|---|
+| `GOLEM_LLAMA_SYS_BACKEND` | build | `auto` | `auto` picks HIP when `$ROCM_PATH` has `bin/hipcc`, `llvm/bin/clang++` and `lib/libamdhip64.so`, else builds a CPU-only substrate with a `cargo:warning`; `hip` requires ROCm; `cpu` forces CPU |
+| `ROCM_PATH` | build | `/opt/rocm` | ROCm install root |
+| `GOLEM_LLAMA_SYS_AMDGPU_TARGET` | build | `gfx1100` | GPU arch; set it for any card other than RDNA3 Navi 31 |
+| `GOLEM_LLAMA_SYS_SKIP_PIN_GATE` | build | unset | `1` skips the vendor pin check (warns) |
+| `GOLEM_ALLOW_PARALLEL` | run | unset | `1` allows `serve --parallel > 1` |
+
+Example for an RX 6800 XT (gfx1030) with ROCm outside `/opt/rocm`:
+
+```sh
+ROCM_PATH=/opt/rocm-7.2.4 GOLEM_LLAMA_SYS_BACKEND=hip \
+GOLEM_LLAMA_SYS_AMDGPU_TARGET=gfx1030 scripts/build.sh build
+```
+
 ## Quick start
 
 ```sh
