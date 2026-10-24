@@ -93,7 +93,9 @@ int golem_chat_apply(golem_chat * chat, const char * messages_json, const char *
         in.messages         = common_chat_msgs_parse_oaicompat(common_json::parse(messages_json));
         in.reasoning_format = reasoning_inline ? COMMON_REASONING_FORMAT_NONE : COMMON_REASONING_FORMAT_DEEPSEEK;
         if (reasoning_effort && *reasoning_effort) {
-            in.chat_template_kwargs["reasoning_effort"] = common_json(std::string(reasoning_effort)).dump();
+            const std::string e(reasoning_effort);
+            const bool numeric = e.size() <= 3 && e[0] != '0' && e.find_first_not_of("0123456789") == std::string::npos;
+            in.chat_template_kwargs["reasoning_effort"] = numeric ? e : common_json(e).dump();
         } else if (no_think) {
             in.chat_template_kwargs["reasoning_effort"] = common_json(std::string("low")).dump();
         }

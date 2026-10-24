@@ -63,11 +63,14 @@ pub struct ChatCompletionRequest {
     /// Golem extension: top-k sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
-    /// `low`/`high`/`none`, passed to the chat template as `reasoning_effort`.
-    /// Absent → max (template default); `none` → no-think; anything else → 400.
+    /// `low`/`high`/`max`/`none` or an integer 1-100 (DeepSeek-V4.1 budget,
+    /// carried as its decimal string), passed to the chat template as
+    /// `reasoning_effort`; templates without a numeric budget (GLM) render
+    /// integers and `max` as their default. Absent → template default; `none` → no-think;
+    /// anything else → 400.
     #[serde(
         default,
-        deserialize_with = "glm_effort",
+        deserialize_with = "effort",
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_effort: Option<String>,
@@ -84,19 +87,26 @@ impl ChatCompletionRequest {
     }
 }
 
-/// GLM-5.3-Flash: absent → max (template default), `none` → no-think,
-/// `low`/`high` as-is; any other value is a deserialization error (400),
-/// never silently max.
-fn glm_effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    match serde_json::Value::deserialize(d)? {
+/// Absent → template default, `none` → no-think, `low`/`high`/`max` as-is,
+/// an integer 1-100 as its decimal string (the shim hands all-digit efforts
+/// to the template as an integer); any other value is an error (400), never
+/// a silent clamp or default.
+pub(crate) fn parse_effort(v: &serde_json::Value) -> Result<Option<String>, &'static str> {
+    match v {
         serde_json::Value::Null => Ok(None),
-        serde_json::Value::String(s) if matches!(s.as_str(), "low" | "high" | "none") => {
-            Ok(Some(s))
+        serde_json::Value::String(s) if matches!(s.as_str(), "low" | "high" | "max" | "none") => {
+            Ok(Some(s.clone()))
         }
-        _ => Err(serde::de::Error::custom(
-            "reasoning_effort must be `low`, `high` or `none`",
-        )),
+        serde_json::Value::Number(n) if n.as_u64().is_some_and(|n| (1..=100).contains(&n)) => {
+            Ok(Some(n.to_string()))
+        }
+        _ => Err("must be `low`, `high`, `max`, `none` or an integer 1-100"),
     }
+}
+
+fn effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    parse_effort(&serde_json::Value::deserialize(d)?)
+        .map_err(|e| serde::de::Error::custom(format!("reasoning_effort {e}")))
 }
 
 /// `stop` is a string or a list of strings.
