@@ -21,7 +21,7 @@ jobs:
       GOLEM_LLAMA_SYS_BACKEND: cpu
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -69,7 +69,7 @@ jobs:
       GOLEM_LLAMA_SYS_BACKEND: cpu
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - run: scripts/check-no-test-seams.sh
 
@@ -85,7 +85,7 @@ jobs:
       GOLEM_LLAMA_SYS_BACKEND: cpu
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - name: Upstream tests + unset-hooks byte-identity
         run: |
@@ -107,7 +107,7 @@ jobs:
       GOLEM_LLAMA_SYS_BACKEND: hip
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
