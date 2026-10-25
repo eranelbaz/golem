@@ -233,6 +233,12 @@ pub(crate) fn load_with_hooks(
     params.n_ctx = config.n_ctx.saturating_mul(config.parallel.max(1));
     params.n_seq_max = config.parallel.max(1);
     params.kv_unified = false;
+    // llama defaults to a ctx-sized SWA cache; the plan prices
+    // pad256(n_swa + ubatch) rows (dsv41_state_terms), and the engine only
+    // drops whole sequences, never rolls back inside the window. Target,
+    // DeepSeek-V4.1 q8_0 at ctx 262144: 40 × 262144 × 544 B = 5.3 GiB full
+    // vs 40 × 2304 × 544 B = 50 MB windowed.
+    params.swa_full = false;
     params.n_batch = n_batch.max(n_ubatch);
     params.n_ubatch = n_ubatch;
     params.n_threads = config.threads as i32;
