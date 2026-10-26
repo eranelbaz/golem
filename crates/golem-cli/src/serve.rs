@@ -132,10 +132,12 @@ fn listen(
 /// `[models.<name>]` tables of `golem.toml` (§8.1): each names a further
 /// served model. `path` is its GGUF; every other key overrides the file
 /// layer for that model only (`ctx`, `device_cache_experts`, …), and its own
-/// `golem optimize` profile applies. Returns `(name, path, layers)`.
+/// `golem optimize` profile applies when the model resolves the KV cache
+/// types the sweep measured under. Returns `(name, path, layers)`.
 fn served_models<'a>(
     layers: &crate::config::Layers<'a>,
     no_profile: bool,
+    cache_types: crate::config::CacheTypeFlags,
 ) -> Result<Vec<(String, PathBuf, crate::config::Layers<'a>)>, crate::config::ConfigError> {
     let Some(models) = layers.file.get("models") else {
         return Ok(Vec::new());
@@ -178,7 +180,7 @@ fn served_models<'a>(
                 path: layers.path.clone(),
                 env: layers.env,
             }
-            .with_profile(&path, no_profile);
+            .with_profile(&path, no_profile, cache_types)?;
             Ok((name.clone(), path, l))
         })
         .collect()
@@ -333,7 +335,11 @@ pub fn serve(
     ready: impl FnOnce(&str) + Send,
 ) -> Result<(), Box<dyn Error>> {
     let base = crate::config::Layers::from_process()?;
-    let mut extra = served_models(&base, args.engine.no_optimize_profile)?;
+    let mut extra = served_models(
+        &base,
+        args.engine.no_optimize_profile,
+        (args.engine.cache_type_k, args.engine.cache_type_v),
+    )?;
     // No `model` anywhere: the `[models.*]` entry named by `model_name`
     // loads at start, with its own keys.
     // No `model` and none named: start idle on the first entry.
@@ -347,7 +353,11 @@ pub fn serve(
                 path: base.path.clone(),
                 env: base.env,
             }
-            .with_profile(&m, args.engine.no_optimize_profile);
+            .with_profile(
+                &m,
+                args.engine.no_optimize_profile,
+                (args.engine.cache_type_k, args.engine.cache_type_v),
+            )?;
             (m, None, l)
         }
         Err(e) => {
@@ -668,7 +678,7 @@ mod tests {
             path: None,
             env: &env,
         };
-        let m = super::served_models(&l, true).unwrap();
+        let m = super::served_models(&l, true, (None, None)).unwrap();
         let (n, p, ml) = &m[0];
         assert_eq!((n.as_str(), p.to_str().unwrap()), ("ds", "/h/m/ds.gguf"));
         assert_eq!(ml.get(None, "ctx", 0u32).unwrap(), 4096);
@@ -679,7 +689,10 @@ mod tests {
                 file: toml::from_str(bad).unwrap(),
                 ..crate::config::Layers::none()
             };
-            assert!(super::served_models(&l, true).is_err(), "{bad}");
+            assert!(
+                super::served_models(&l, true, (None, None)).is_err(),
+                "{bad}"
+            );
         }
     }
 }

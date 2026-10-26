@@ -81,12 +81,15 @@ pub struct EngineArgs {
     #[arg(long)]
     pub flash_attn: bool,
     /// K cache element type (f16 default; f32, bf16, q8_0, q4_0, q4_1,
-    /// iq4_nl, q5_0, q5_1). The plan prices the KV term at this type.
+    /// iq4_nl, q5_0, q5_1). The plan prices the KV term at this type, and a
+    /// `golem optimize` profile applies only to the `k`/`v` pair it was
+    /// measured under.
     #[arg(long, value_name = "TYPE")]
     pub cache_type_k: Option<golem_plan::KvCacheType>,
     /// V cache element type (same set as `--cache-type-k`); llama.cpp turns
     /// Flash Attention on for a quantized V. MLA models need it equal to
-    /// `--cache-type-k`.
+    /// `--cache-type-k`. A `golem optimize` profile applies only to the
+    /// `k`/`v` pair it was measured under.
     #[arg(long, value_name = "TYPE")]
     pub cache_type_v: Option<golem_plan::KvCacheType>,
     /// Expert (MoE) FFN weights of the first N layers pinned to CPU buffers
@@ -275,6 +278,7 @@ impl EngineArgs {
                 .map_or((None, None), |(v, rest)| (Some(v), Some(rest))),
             Pin::Off => (None, None),
         };
+        let (cache_type_k, cache_type_v) = l.cache_types((self.cache_type_k, self.cache_type_v))?;
         Ok(EngineConfig {
             model_path: model,
             n_ctx: l.get(self.ctx, "ctx", d.n_ctx)?,
@@ -282,8 +286,8 @@ impl EngineArgs {
             threads: l.get(self.threads, "threads", d.threads)?,
             n_gpu_layers: l.get(self.n_gpu_layers, "n_gpu_layers", 0)?,
             flash_attn_on: l.get(flag(self.flash_attn), "flash_attn", false)?,
-            cache_type_k: l.get(self.cache_type_k, "cache_type_k", d.cache_type_k)?,
-            cache_type_v: l.get(self.cache_type_v, "cache_type_v", d.cache_type_v)?,
+            cache_type_k,
+            cache_type_v,
             cpu_moe_layers: l.opt(self.cpu_moe_layers, "cpu_moe_layers")?,
             // Fractional GiB floor to the engine's whole-GiB unit; a value in
             // (0, 1) therefore disables the pool — the help text says so.
@@ -539,7 +543,11 @@ pub(crate) fn parse_gib(s: &str) -> Result<f64, String> {
 pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     let layers = crate::config::Layers::from_process()?;
     let model = layers.model(args.model.clone())?;
-    let layers = layers.with_profile(&model, args.engine.no_optimize_profile);
+    let layers = layers.with_profile(
+        &model,
+        args.engine.no_optimize_profile,
+        (args.engine.cache_type_k, args.engine.cache_type_v),
+    )?;
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let ram_free = if args.allow_overcommit {

@@ -171,6 +171,12 @@ pub fn profile_table(knobs: Option<&crate::profile::Knobs>) -> toml::Table {
     t
 }
 
+/// The `--cache-type-k`/`--cache-type-v` flags, as the layers resolve them.
+pub type CacheTypeFlags = (
+    Option<golem_plan::KvCacheType>,
+    Option<golem_plan::KvCacheType>,
+);
+
 /// The non-flag layers for one invocation.
 pub struct Layers<'a> {
     /// `golem.toml` contents (empty when absent).
@@ -240,32 +246,44 @@ impl Layers<'_> {
     }
 
     /// Adds the saved `golem optimize` profile for `model` as the profile
-    /// layer, unless `disabled` (`--no-optimize-profile`), or the profile was
-    /// measured with more free VRAM/RAM than is free now.
-    #[must_use]
-    pub fn with_profile(mut self, model: &std::path::Path, disabled: bool) -> Self {
+    /// layer, unless `disabled` (`--no-optimize-profile`), or the profile does
+    /// not apply to this run: measured under other KV cache types
+    /// (`cache_types` flags) or with more free VRAM/RAM than is free now. Both
+    /// skips are logged with their reason.
+    pub fn with_profile(
+        mut self,
+        model: &std::path::Path,
+        disabled: bool,
+        cache_types: CacheTypeFlags,
+    ) -> Result<Self, ConfigError> {
         if disabled {
-            return self;
+            return Ok(self);
         }
         let Some(p) = crate::profile::fingerprint(model)
             .ok()
             .and_then(|fp| crate::profile::load_profile(&fp))
         else {
-            return self;
+            return Ok(self);
         };
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
+        let (k, v) = self.cache_types(cache_types)?;
+        let types = golem_plan::kv_cache_types(k, v);
         let vram = crate::profile::sysfs_vram().map(|(f, _)| f);
-        if crate::profile::applicable(&p, vram, sys.available_memory()) {
-            tracing::info!("golem: optimize profile {} applied", &p.fingerprint[..12]);
-            self.profile = profile_table(p.knobs.as_ref());
-        } else {
-            tracing::info!(
-                "golem: optimize profile {} ignored: measured with more free memory than now",
+        match crate::profile::applicable(&p, &types, vram, sys.available_memory()) {
+            Ok(()) => {
+                tracing::info!(
+                    "golem: optimize profile {} applied (KV cache {types})",
+                    &p.fingerprint[..12]
+                );
+                self.profile = profile_table(p.knobs.as_ref());
+            }
+            Err(why) => tracing::info!(
+                "golem: optimize profile {} ignored: {why}",
                 &p.fingerprint[..12]
-            );
+            ),
         }
-        self
+        Ok(self)
     }
 
     /// No env, file or profile: flags and defaults only.
@@ -313,6 +331,20 @@ impl Layers<'_> {
             key,
             self.env,
         )
+    }
+
+    /// The run's KV cache element types (flag > env > file > engine default).
+    /// No profile layer holds them, so this resolves the same before and after
+    /// [`Self::with_profile`].
+    pub fn cache_types(
+        &self,
+        flag: CacheTypeFlags,
+    ) -> Result<(golem_plan::KvCacheType, golem_plan::KvCacheType), ConfigError> {
+        let d = golem_engine::config::EngineConfig::default();
+        Ok((
+            self.get(flag.0, "cache_type_k", d.cache_type_k)?,
+            self.get(flag.1, "cache_type_v", d.cache_type_v)?,
+        ))
     }
 }
 
@@ -602,5 +634,27 @@ mod tests {
         assert_eq!(l.get(Some(Q8_0), "cache_type_k", F16).unwrap(), Q8_0);
         let e = l.get(None, "cache_type_v", F16).unwrap_err().to_string();
         assert!(e.contains("q8_0") && e.contains("\"q8\""), "{e}");
+    }
+
+    /// #161: one resolver, so the types a profile is compared against are the
+    /// types the engine loads (the file layer, the env var and the flag), and
+    /// the default is the engine's own.
+    #[test]
+    fn cache_types_resolver_matches_engine_defaults() {
+        use golem_plan::KvCacheType::{F16, Q8_0};
+        let d = golem_engine::config::EngineConfig::default();
+        let none = Layers::none();
+        assert_eq!(
+            none.cache_types((None, None)).unwrap(),
+            (d.cache_type_k, d.cache_type_v)
+        );
+        let l = Layers {
+            file: toml::from_str("cache_type_k = \"q8_0\"").unwrap(),
+            profile: toml::Table::new(),
+            path: None,
+            env: &|k| (k == "GOLEM_CACHE_TYPE_V").then(|| "q8_0".to_owned()),
+        };
+        assert_eq!(l.cache_types((None, None)).unwrap(), (Q8_0, Q8_0));
+        assert_eq!(l.cache_types((Some(F16), Some(F16))).unwrap(), (F16, F16));
     }
 }
