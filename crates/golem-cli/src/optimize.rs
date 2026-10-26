@@ -233,15 +233,16 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         baseline: baseline.clone(),
         candidates,
     };
-    // A no-winner run never replaces a saved winner for this fingerprint.
+    // A no-winner run never replaces a saved winner for this fingerprint and
+    // these KV cache types (a legacy `<fp>.json` may hold other types).
     let kept = if result.is_none() {
-        profile::load_profile(&profile::Fingerprint(p.fingerprint.clone()))
+        profile::stored_profile(&profile::Fingerprint(p.fingerprint.clone()), &p.cache_types)
+            .filter(|(k, _)| k.cache_types == p.cache_types)
     } else {
         None
     };
     let path = match &kept {
-        Some(_) => profile::profile_path(&profile::Fingerprint(p.fingerprint.clone()))
-            .ok_or("no config dir: set XDG_CONFIG_HOME or HOME")?,
+        Some((_, path)) => path.clone(),
         None => profile::save_profile(&p)?,
     };
     match result {
@@ -254,7 +255,7 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
             path.display()
         ),
         None => match &kept {
-            Some(k) => println!(
+            Some((k, _)) => println!(
                 "baseline {:.2} tok/s: no winner this run; existing profile kept (measured under \
                  KV cache {}): {}",
                 baseline.tok_s,

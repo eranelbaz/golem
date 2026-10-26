@@ -375,7 +375,7 @@ fn run_skips_a_profile_written_under_other_cache_types() {
         )),
         "f16 profile is refused by a q8_0 run"
     );
-    // Same record under q8_0: refused by an f16 run, applied by a q8_0 one.
+    // A q8_0 record in the legacy-named file: refused by an f16 run.
     p.cache_types = q8.clone();
     std::fs::write(&rec, serde_json::to_vec(&p).unwrap()).unwrap();
     assert!(
@@ -384,9 +384,42 @@ fn run_skips_a_profile_written_under_other_cache_types() {
         )),
         "q8_0 profile is refused by an f16 run"
     );
+    // Per-type files coexist: each run applies its own, and the typed file
+    // wins over the legacy name.
+    std::fs::remove_file(&rec).unwrap();
+    for t in [&f16, &q8] {
+        p.cache_types = t.clone();
+        let typed = dir.join(format!("{}-{}.json", p.fingerprint, t.replace('/', "-")));
+        std::fs::write(&typed, serde_json::to_vec(&p).unwrap()).unwrap();
+    }
+    // The legacy file holds the other run's types each time, so only the
+    // typed file can make the run apply.
+    for (k, t, legacy) in [("f16", &f16, &q8), ("q8_0", &q8, &f16)] {
+        p.cache_types = legacy.clone();
+        std::fs::write(&rec, serde_json::to_vec(&p).unwrap()).unwrap();
+        assert!(
+            run(k, k).contains(&format!("optimize profile {short} applied (KV cache {t})")),
+            "{t} profile applies to a {t} run"
+        );
+    }
+}
+
+/// Sweeps under different KV types keep separate files.
+#[test]
+fn profile_path_is_per_cache_types() {
+    let fp = profile::Fingerprint("ab".repeat(32));
+    let (f, q) = (
+        profile::profile_path(&fp, "f16/f16").unwrap(),
+        profile::profile_path(&fp, "q8_0/f16").unwrap(),
+    );
+    assert_ne!(f, q);
     assert!(
-        run("q8_0", "q8_0").contains(&format!("optimize profile {short} applied (KV cache {q8})")),
-        "q8_0 profile applies to a q8_0 run"
+        q.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("-q8_0-f16.json"),
+        "{q:?}"
     );
 }
 
@@ -541,7 +574,7 @@ fn optimize_on_fixture_with_budget_below_one_expert_tensor() {
         "no candidate refused (double count):\n{stdout}\n{stderr}"
     );
     let fp = profile::fingerprint(&model).unwrap().0;
-    let rec = rt.join(format!("config/golem/tuning/{fp}.json"));
+    let rec = rt.join(format!("config/golem/tuning/{fp}-q8_0-q8_0.json"));
     assert!(
         stdout.contains("profile saved") || stdout.contains("baseline recorded"),
         "{stdout}"

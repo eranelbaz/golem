@@ -259,16 +259,16 @@ impl Layers<'_> {
         if disabled {
             return Ok(self);
         }
+        let (k, v) = self.cache_types(cache_types)?;
+        let types = golem_plan::kv_cache_types(k, v);
         let Some(p) = crate::profile::fingerprint(model)
             .ok()
-            .and_then(|fp| crate::profile::load_profile(&fp))
+            .and_then(|fp| crate::profile::load_profile(&fp, &types))
         else {
             return Ok(self);
         };
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
-        let (k, v) = self.cache_types(cache_types)?;
-        let types = golem_plan::kv_cache_types(k, v);
         let vram = crate::profile::sysfs_vram().map(|(f, _)| f);
         match crate::profile::applicable(&p, &types, vram, sys.available_memory()) {
             Ok(()) => {

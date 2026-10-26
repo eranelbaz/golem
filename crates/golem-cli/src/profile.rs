@@ -1,7 +1,7 @@
 //! Per-machine scheduling profiles (#81): the hardware/model fingerprint,
 //! the KV cache types the sweep priced, the tunable knobs, the sweep that
 //! picks them, and the profile file
-//! (`$XDG_CONFIG_HOME/golem/tuning/<fingerprint>.json`). Quality knobs
+//! (`$XDG_CONFIG_HOME/golem/tuning/<fingerprint>-<k>-<v>.json`). Quality knobs
 //! (quant, top-k, sampling, draft, router caching) have no field in
 //! [`Knobs`], so no sweep can trade output quality for speed.
 
@@ -362,16 +362,35 @@ pub fn tuning_dir() -> Option<PathBuf> {
     crate::config::config_home(&|k| std::env::var(k).ok()).map(|d| d.join("tuning"))
 }
 
-/// The profile file for `fp`.
-pub fn profile_path(fp: &Fingerprint) -> Option<PathBuf> {
-    tuning_dir().map(|d| d.join(format!("{}.json", fp.0)))
+/// The profile file for `fp` measured under `cache_types` (`k/v`): one file
+/// per pair, so sweeps under different KV types do not replace each other.
+pub fn profile_path(fp: &Fingerprint, cache_types: &str) -> Option<PathBuf> {
+    tuning_dir().map(|d| d.join(format!("{}-{}.json", fp.0, cache_types.replace('/', "-"))))
 }
 
-/// The saved profile for `fp` when it carries a winner. An unreadable or
-/// corrupt file is warned about and ignored.
-pub fn load_profile(fp: &Fingerprint) -> Option<Profile> {
-    let path = profile_path(fp)?;
-    let bytes = match std::fs::read(&path) {
+/// The saved profile for `fp` under `cache_types` when it carries a winner,
+/// with the file it came from. Only when no typed file exists does it fall
+/// back to `<fp>.json`, the name used before files were per type; its record still goes through
+/// [`applicable`]'s type check. An unreadable or corrupt file is warned
+/// about and ignored.
+pub fn stored_profile(fp: &Fingerprint, cache_types: &str) -> Option<(Profile, PathBuf)> {
+    let typed = profile_path(fp, cache_types)?;
+    // An existing typed file is authoritative, even without a winner.
+    let path = if typed.exists() {
+        typed
+    } else {
+        typed.with_file_name(format!("{}.json", fp.0))
+    };
+    read_profile(fp, &path).map(|p| (p, path))
+}
+
+/// [`stored_profile`] without the path.
+pub fn load_profile(fp: &Fingerprint, cache_types: &str) -> Option<Profile> {
+    stored_profile(fp, cache_types).map(|(p, _)| p)
+}
+
+fn read_profile(fp: &Fingerprint, path: &Path) -> Option<Profile> {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -394,7 +413,7 @@ pub fn load_profile(fp: &Fingerprint) -> Option<Profile> {
 
 /// Writes `p` atomically (tmp + rename).
 pub fn save_profile(p: &Profile) -> Result<PathBuf, Box<dyn Error>> {
-    let path = profile_path(&Fingerprint(p.fingerprint.clone()))
+    let path = profile_path(&Fingerprint(p.fingerprint.clone()), &p.cache_types)
         .ok_or("no config dir: set XDG_CONFIG_HOME or HOME")?;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
