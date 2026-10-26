@@ -12,8 +12,8 @@ mod profile;
 mod common;
 
 use profile::{
-    Axis, FingerprintInput, Knobs, Metrics, Profile, StopSweep, applicable, fingerprint_of,
-    greedy_matches, sweep,
+    Axis, FingerprintInput, Inapplicable, Knobs, Metrics, Profile, StopSweep, applicable,
+    fingerprint_of, greedy_matches, sweep,
 };
 
 fn m(tok_s: f64) -> Metrics {
@@ -221,21 +221,206 @@ fn failing_candidate_is_skipped_not_fatal() {
 
 #[test]
 fn profile_ignored_when_less_free_memory_now() {
+    use golem_plan::KvCacheType::F16;
+    let f16 = golem_plan::kv_cache_types(F16, F16);
     let p = Profile {
         measured_free_vram: 20 << 30,
         measured_free_ram: 80 << 30,
         ..Profile::test_default()
     };
-    assert!(applicable(&p, Some(20 << 30), 80 << 30));
-    assert!(!applicable(&p, Some(18 << 30), 80 << 30));
-    assert!(!applicable(&p, Some(20 << 30), 78 << 30));
+    assert!(applicable(&p, &f16, Some(20 << 30), 80 << 30).is_ok());
+    assert!(applicable(&p, &f16, Some(18 << 30), 80 << 30).is_err());
+    assert!(applicable(&p, &f16, Some(20 << 30), 78 << 30).is_err());
     // Reading noise within the slack still applies.
     let noise = (20 << 30) - profile::SLACK;
-    assert!(applicable(&p, Some(noise), (80 << 30) - profile::SLACK));
-    assert!(!applicable(&p, Some(noise - 1), 80 << 30));
+    assert!(applicable(&p, &f16, Some(noise), (80 << 30) - profile::SLACK).is_ok());
+    assert!(applicable(&p, &f16, Some(noise - 1), 80 << 30).is_err());
     // Unknown VRAM (no sysfs) is not 0 free; RAM still decides.
-    assert!(applicable(&p, None, 80 << 30));
-    assert!(!applicable(&p, None, 78 << 30));
+    assert!(applicable(&p, &f16, None, 80 << 30).is_ok());
+    assert!(applicable(&p, &f16, None, 78 << 30).is_err());
+}
+
+/// #161: a profile tuned under one cache type must not be applied to a run
+/// using another — the types price `kv_per_token` (GLM-5.3-Flash at ctx
+/// 131,072: f16 19,712 B/token = 2.41 GiB vs q8_0 14,432 B = 1.76 GiB), so
+/// the knobs were tuned against another free-VRAM figure.
+#[test]
+fn profile_skipped_when_cache_types_differ() {
+    use golem_plan::KvCacheType::{F16, Q8_0};
+    let (f16, q8) = (
+        golem_plan::kv_cache_types(F16, F16),
+        golem_plan::kv_cache_types(Q8_0, Q8_0),
+    );
+    let (vram, ram) = (Some(20 << 30), 80 << 30);
+    let p = Profile {
+        cache_types: f16.clone(),
+        measured_free_vram: 20 << 30,
+        measured_free_ram: 80 << 30,
+        ..Profile::test_default()
+    };
+    // An f16 profile does not apply to a q8_0 run, and says so.
+    assert_eq!(
+        applicable(&p, &q8, vram, ram).unwrap_err(),
+        Inapplicable::CacheTypes {
+            measured: f16.clone(),
+            run: q8.clone(),
+        }
+    );
+    assert!(applicable(&p, &f16, vram, ram).is_ok());
+    // A q8_0 profile does not apply to an f16 run either.
+    let q = Profile {
+        cache_types: q8.clone(),
+        ..p.clone()
+    };
+    assert_eq!(
+        applicable(&q, &f16, vram, ram).unwrap_err(),
+        Inapplicable::CacheTypes {
+            measured: q8.clone(),
+            run: f16.clone(),
+        }
+    );
+    assert!(applicable(&q, &q8, vram, ram).is_ok());
+    // Memory is reported as itself, not as a type mismatch.
+    assert_eq!(
+        applicable(&p, &f16, Some(1 << 30), ram).unwrap_err(),
+        Inapplicable::Memory
+    );
+    let why = Inapplicable::CacheTypes {
+        measured: f16.clone(),
+        run: q8.clone(),
+    }
+    .to_string();
+    assert!(why.contains(&f16) && why.contains(&q8), "{why}");
+    assert!(Inapplicable::Memory.to_string().contains("free memory"));
+}
+
+/// #161 back-compat: profile files written before the field existed ran
+/// llama's f16 default, so they load as `f16/f16` and still apply to an f16
+/// run.
+#[test]
+fn old_profile_file_loads_as_f16() {
+    use golem_plan::KvCacheType::{F16, Q8_0};
+    let f16 = golem_plan::kv_cache_types(F16, F16);
+    let q8 = golem_plan::kv_cache_types(Q8_0, Q8_0);
+    let p = Profile {
+        cache_types: q8.clone(),
+        ..Profile::test_default()
+    };
+    let mut json = serde_json::to_value(&p).unwrap();
+    json.as_object_mut().unwrap().remove("cache_types");
+    let old: Profile = serde_json::from_value(json).unwrap();
+    assert_eq!(old.cache_types, f16);
+    assert!(applicable(&old, &f16, Some(20 << 30), 80 << 30).is_ok());
+    // An explicitly recorded pair survives the file round trip.
+    let stored: Profile = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(stored.cache_types, q8);
+    assert!(applicable(&stored, &f16, Some(20 << 30), 80 << 30).is_err());
+}
+
+/// #161 acceptance: a profile written under f16 is not applied to a q8_0
+/// `run` (nor the reverse), the info log names the reason, and the same
+/// profile applies to a run resolving the types it was measured under.
+#[test]
+fn run_skips_a_profile_written_under_other_cache_types() {
+    use golem_plan::KvCacheType::{F16, Q8_0};
+    let rt = common::tempdir_env();
+    let model = xtask::tiny_hybrid::cached_fixture();
+    let f16 = golem_plan::kv_cache_types(F16, F16);
+    let q8 = golem_plan::kv_cache_types(Q8_0, Q8_0);
+    let mut p = Profile {
+        fingerprint: profile::fingerprint(&model).unwrap().0,
+        cache_types: f16.clone(),
+        knobs: Some(Knobs {
+            threads: 1,
+            ..Knobs::default()
+        }),
+        ..Profile::test_default()
+    };
+    let dir = rt.join("config/golem/tuning");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rec = dir.join(format!("{}.json", p.fingerprint));
+    std::fs::write(&rec, serde_json::to_vec(&p).unwrap()).unwrap();
+    let short = p.fingerprint[..12].to_owned();
+    let run = |k: &str, v: &str| {
+        let out = common::golem_cmd(&rt)
+            .env("GOLEM_MODEL", &model)
+            .args([
+                "run",
+                "--prompt",
+                "hi",
+                "--n-predict",
+                "2",
+                "--ctx",
+                "256",
+                "--cache-type-k",
+                k,
+                "--cache-type-v",
+                v,
+            ])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{log}");
+        log
+    };
+    assert!(
+        run("f16", "f16").contains(&format!(
+            "optimize profile {short} applied (KV cache {f16})"
+        )),
+        "f16 profile applies to an f16 run"
+    );
+    assert!(
+        run("q8_0", "q8_0").contains(&format!(
+            "optimize profile {short} ignored: measured under KV cache {f16}, this run uses {q8}"
+        )),
+        "f16 profile is refused by a q8_0 run"
+    );
+    // A q8_0 record in the legacy-named file: refused by an f16 run.
+    p.cache_types = q8.clone();
+    std::fs::write(&rec, serde_json::to_vec(&p).unwrap()).unwrap();
+    assert!(
+        run("f16", "f16").contains(&format!(
+            "optimize profile {short} ignored: measured under KV cache {q8}, this run uses {f16}"
+        )),
+        "q8_0 profile is refused by an f16 run"
+    );
+    // Per-type files coexist: each run applies its own, and the typed file
+    // wins over the legacy name.
+    std::fs::remove_file(&rec).unwrap();
+    for t in [&f16, &q8] {
+        p.cache_types = t.clone();
+        let typed = dir.join(format!("{}-{}.json", p.fingerprint, t.replace('/', "-")));
+        std::fs::write(&typed, serde_json::to_vec(&p).unwrap()).unwrap();
+    }
+    // The legacy file holds the other run's types each time, so only the
+    // typed file can make the run apply.
+    for (k, t, legacy) in [("f16", &f16, &q8), ("q8_0", &q8, &f16)] {
+        p.cache_types = legacy.clone();
+        std::fs::write(&rec, serde_json::to_vec(&p).unwrap()).unwrap();
+        assert!(
+            run(k, k).contains(&format!("optimize profile {short} applied (KV cache {t})")),
+            "{t} profile applies to a {t} run"
+        );
+    }
+}
+
+/// Sweeps under different KV types keep separate files.
+#[test]
+fn profile_path_is_per_cache_types() {
+    let fp = profile::Fingerprint("ab".repeat(32));
+    let (f, q) = (
+        profile::profile_path(&fp, "f16/f16").unwrap(),
+        profile::profile_path(&fp, "q8_0/f16").unwrap(),
+    );
+    assert_ne!(f, q);
+    assert!(
+        q.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("-q8_0-f16.json"),
+        "{q:?}"
+    );
 }
 
 #[test]
@@ -363,6 +548,12 @@ fn optimize_on_fixture_with_budget_below_one_expert_tensor() {
             "--axes",
             "threads=1,2",
             "--test-tight-budget",
+            // #161: optimize measures under the requested types (the child
+            // inherits argv) and records them.
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0",
         ])
         .output()
         .unwrap();
@@ -383,13 +574,17 @@ fn optimize_on_fixture_with_budget_below_one_expert_tensor() {
         "no candidate refused (double count):\n{stdout}\n{stderr}"
     );
     let fp = profile::fingerprint(&model).unwrap().0;
-    let rec = rt.join(format!("config/golem/tuning/{fp}.json"));
+    let rec = rt.join(format!("config/golem/tuning/{fp}-q8_0-q8_0.json"));
     assert!(
         stdout.contains("profile saved") || stdout.contains("baseline recorded"),
         "{stdout}"
     );
     let p: Profile = serde_json::from_slice(&std::fs::read(&rec).unwrap()).unwrap();
     assert_eq!(p.fingerprint, fp);
+    // #161: the writer records the types the sweep ran under; serde's default
+    // would hide a missing field, so read the raw JSON.
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&rec).unwrap()).unwrap();
+    assert_eq!(raw["cache_types"], "q8_0/q8_0");
     assert_eq!(p.candidates.len(), measured);
     // Nothing left registered once optimize exits.
     let list = common::golem_cmd(&rt).arg("list").output().unwrap();

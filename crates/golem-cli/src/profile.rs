@@ -1,6 +1,7 @@
 //! Per-machine scheduling profiles (#81): the hardware/model fingerprint,
-//! the tunable knobs, the sweep that picks them, and the profile file
-//! (`$XDG_CONFIG_HOME/golem/tuning/<fingerprint>.json`). Quality knobs
+//! the KV cache types the sweep priced, the tunable knobs, the sweep that
+//! picks them, and the profile file
+//! (`$XDG_CONFIG_HOME/golem/tuning/<fingerprint>-<k>-<v>.json`). Quality knobs
 //! (quant, top-k, sampling, draft, router caching) have no field in
 //! [`Knobs`], so no sweep can trade output quality for speed.
 
@@ -233,6 +234,12 @@ pub fn greedy_matches(c: &Metrics, base: &Metrics) -> bool {
 pub struct Profile {
     /// [`Fingerprint`] hex.
     pub fingerprint: String,
+    /// KV cache element types the sweep measured under, `k/v` (e.g.
+    /// `q8_0/f16`). They price the KV term the knobs were tuned against, so a
+    /// run resolving other types must not use this profile. Entries written
+    /// before the field existed ran llama's f16 default.
+    #[serde(default = "default_cache_types")]
+    pub cache_types: String,
     /// Free VRAM when the sweep started.
     pub measured_free_vram: u64,
     /// Available RAM when the sweep started.
@@ -262,6 +269,7 @@ impl Profile {
         };
         Self {
             fingerprint: String::new(),
+            cache_types: default_cache_types(),
             measured_free_vram: 0,
             measured_free_ram: 0,
             knobs: None,
@@ -276,13 +284,63 @@ impl Profile {
 /// now (≈ 1% of the target's 24 GiB VRAM).
 pub const SLACK: u64 = 256 << 20;
 
-/// A profile measured with more free memory than exists now (beyond
-/// [`SLACK`]) would plan a pool or device cache that no longer fits.
-/// `free_vram` `None` (no sysfs reading) skips the VRAM comparison rather
-/// than counting as 0 free.
-pub fn applicable(p: &Profile, free_vram: Option<u64>, free_ram: u64) -> bool {
-    free_vram.is_none_or(|v| v + SLACK >= p.measured_free_vram)
-        && free_ram + SLACK >= p.measured_free_ram
+fn default_cache_types() -> String {
+    let d = golem_plan::KvCacheType::default();
+    golem_plan::kv_cache_types(d, d)
+}
+
+/// Why a saved profile cannot apply to this run.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Inapplicable {
+    /// Measured under other KV cache types: [`Profile::cache_types`] priced a
+    /// different `kv_per_token` (GLM-5.3-Flash at ctx 131,072: 19,712 B/token
+    /// at f16 = 2.41 GiB, 14,432 B/token at q8_0 = 1.76 GiB), so the knobs were
+    /// tuned against another amount of free VRAM.
+    CacheTypes {
+        /// Types the sweep measured under.
+        measured: String,
+        /// Types this run resolves.
+        run: String,
+    },
+    /// Measured with more free VRAM/RAM than exists now (beyond [`SLACK`]):
+    /// such a profile would plan a pool or device cache that no longer fits.
+    Memory,
+}
+
+impl std::fmt::Display for Inapplicable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CacheTypes { measured, run } => {
+                write!(f, "measured under KV cache {measured}, this run uses {run}")
+            }
+            Self::Memory => f.write_str("measured with more free memory than now"),
+        }
+    }
+}
+
+/// `Ok` when `p` applies to a run resolving `cache_types` (`k/v`, see
+/// [`golem_plan::kv_cache_types`]) with this free memory. `free_vram` `None`
+/// (no sysfs reading) skips the VRAM comparison rather than counting as 0
+/// free.
+pub fn applicable(
+    p: &Profile,
+    cache_types: &str,
+    free_vram: Option<u64>,
+    free_ram: u64,
+) -> Result<(), Inapplicable> {
+    if p.cache_types != cache_types {
+        return Err(Inapplicable::CacheTypes {
+            measured: p.cache_types.clone(),
+            run: cache_types.to_owned(),
+        });
+    }
+    let fits = free_vram.is_none_or(|v| v.saturating_add(SLACK) >= p.measured_free_vram)
+        && free_ram.saturating_add(SLACK) >= p.measured_free_ram;
+    if fits {
+        Ok(())
+    } else {
+        Err(Inapplicable::Memory)
+    }
 }
 
 /// `(free, total)` VRAM of the first amdgpu card from sysfs — no HIP
@@ -304,16 +362,35 @@ pub fn tuning_dir() -> Option<PathBuf> {
     crate::config::config_home(&|k| std::env::var(k).ok()).map(|d| d.join("tuning"))
 }
 
-/// The profile file for `fp`.
-pub fn profile_path(fp: &Fingerprint) -> Option<PathBuf> {
-    tuning_dir().map(|d| d.join(format!("{}.json", fp.0)))
+/// The profile file for `fp` measured under `cache_types` (`k/v`): one file
+/// per pair, so sweeps under different KV types do not replace each other.
+pub fn profile_path(fp: &Fingerprint, cache_types: &str) -> Option<PathBuf> {
+    tuning_dir().map(|d| d.join(format!("{}-{}.json", fp.0, cache_types.replace('/', "-"))))
 }
 
-/// The saved profile for `fp` when it carries a winner. An unreadable or
-/// corrupt file is warned about and ignored.
-pub fn load_profile(fp: &Fingerprint) -> Option<Profile> {
-    let path = profile_path(fp)?;
-    let bytes = match std::fs::read(&path) {
+/// The saved profile for `fp` under `cache_types` when it carries a winner,
+/// with the file it came from. Only when no typed file exists does it fall
+/// back to `<fp>.json`, the name used before files were per type; its record still goes through
+/// [`applicable`]'s type check. An unreadable or corrupt file is warned
+/// about and ignored.
+pub fn stored_profile(fp: &Fingerprint, cache_types: &str) -> Option<(Profile, PathBuf)> {
+    let typed = profile_path(fp, cache_types)?;
+    // An existing typed file is authoritative, even without a winner.
+    let path = if typed.exists() {
+        typed
+    } else {
+        typed.with_file_name(format!("{}.json", fp.0))
+    };
+    read_profile(fp, &path).map(|p| (p, path))
+}
+
+/// [`stored_profile`] without the path.
+pub fn load_profile(fp: &Fingerprint, cache_types: &str) -> Option<Profile> {
+    stored_profile(fp, cache_types).map(|(p, _)| p)
+}
+
+fn read_profile(fp: &Fingerprint, path: &Path) -> Option<Profile> {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -336,7 +413,7 @@ pub fn load_profile(fp: &Fingerprint) -> Option<Profile> {
 
 /// Writes `p` atomically (tmp + rename).
 pub fn save_profile(p: &Profile) -> Result<PathBuf, Box<dyn Error>> {
-    let path = profile_path(&Fingerprint(p.fingerprint.clone()))
+    let path = profile_path(&Fingerprint(p.fingerprint.clone()), &p.cache_types)
         .ok_or("no config dir: set XDG_CONFIG_HOME or HOME")?;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;

@@ -101,7 +101,8 @@ impl std::fmt::Display for KvCacheType {
     }
 }
 
-/// The `k/v` pair as logged and registered (e.g. `q8_0/f16`).
+/// The `k/v` pair as logged, registered and saved in a profile (e.g.
+/// `q8_0/f16`).
 #[must_use]
 pub fn kv_cache_types(type_k: KvCacheType, type_v: KvCacheType) -> String {
     format!("{type_k}/{type_v}")

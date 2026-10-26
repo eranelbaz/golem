@@ -225,6 +225,7 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         .ok_or("baseline measurement failed")?;
     let p = Profile {
         fingerprint: fp.0,
+        cache_types: golem_plan::kv_cache_types(config.cache_type_k, config.cache_type_v),
         measured_free_vram: measured_vram,
         measured_free_ram: free_ram,
         knobs: result.as_ref().map(|r| r.0),
@@ -232,15 +233,16 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         baseline: baseline.clone(),
         candidates,
     };
-    // A no-winner run never replaces a saved winner for this fingerprint.
+    // A no-winner run never replaces a saved winner for this fingerprint and
+    // these KV cache types (a legacy `<fp>.json` may hold other types).
     let kept = if result.is_none() {
-        profile::load_profile(&profile::Fingerprint(p.fingerprint.clone()))
-            .and_then(|_| profile::profile_path(&profile::Fingerprint(p.fingerprint.clone())))
+        profile::stored_profile(&profile::Fingerprint(p.fingerprint.clone()), &p.cache_types)
+            .filter(|(k, _)| k.cache_types == p.cache_types)
     } else {
         None
     };
-    let path = match kept.clone() {
-        Some(path) => path,
+    let path = match &kept {
+        Some((_, path)) => path.clone(),
         None => profile::save_profile(&p)?,
     };
     match result {
@@ -252,16 +254,20 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
             (m.tok_s / baseline.tok_s - 1.0) * 100.0,
             path.display()
         ),
-        None if kept.is_some() => println!(
-            "baseline {:.2} tok/s: no winner this run; existing profile kept: {}",
-            baseline.tok_s,
-            path.display()
-        ),
-        None => println!(
-            "baseline {:.2} tok/s: no winner; baseline recorded (not applied by run/serve): {}",
-            baseline.tok_s,
-            path.display()
-        ),
+        None => match &kept {
+            Some((k, _)) => println!(
+                "baseline {:.2} tok/s: no winner this run; existing profile kept (measured under \
+                 KV cache {}): {}",
+                baseline.tok_s,
+                k.cache_types,
+                path.display()
+            ),
+            None => println!(
+                "baseline {:.2} tok/s: no winner; baseline recorded (not applied by run/serve): {}",
+                baseline.tok_s,
+                path.display()
+            ),
+        },
     }
     drop(guard);
     Ok(())
