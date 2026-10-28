@@ -1,7 +1,7 @@
 //! `golem_store::import::scan_source` against the shape-realistic fixture:
 //! shard-set discovery, arch gate, live-only planes, and pinned geometry.
 use golem_store::import::{
-    ImportError, ImportRequest, hash_shards, import, scan_source, verify_replica,
+    ImportError, ImportRequest, hash_shards, import, publish, scan_source, verify_replica,
 };
 use std::path::{Path, PathBuf};
 
@@ -481,4 +481,120 @@ fn stale_tmp_is_swept_and_live_lock_refuses() {
         .unwrap_err()
         .to_string();
     assert!(e.contains(".golem-import.lock"), "{e}");
+}
+
+/// Re-import over an already-synced replica set: every shard matches the
+/// source by size, mtime and the R-8 windows, so no replica file is rewritten.
+#[test]
+fn reimport_keeps_matching_replica_shards() {
+    let src = tempdir("reimport-src");
+    copy_fixture_to(&src);
+    let r = tempdir("reimport");
+    import(&req(src.clone(), vec![r.clone()])).unwrap();
+    let scan = scan_source(&src).unwrap();
+    let d = hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024).unwrap();
+    assert_eq!(d.reused, vec![1, 1], "both replica shards kept");
+    assert!(no_tmp(&r), "a kept replica leaves no tmp");
+    for p in &scan.shards {
+        assert_eq!(
+            std::fs::read(p).unwrap(),
+            std::fs::read(r.join(p.file_name().unwrap())).unwrap()
+        );
+    }
+}
+
+/// Same bytes, newer mtime: the keep rule rejects it (mtime is part of the
+/// identity) and re-clones.
+#[test]
+fn stale_mtime_replica_is_recloned() {
+    let src = tempdir("stale-mtime-src");
+    copy_fixture_to(&src);
+    let r = tempdir("stale-mtime");
+    import(&req(src.clone(), vec![r.clone()])).unwrap();
+    let scan = scan_source(&src).unwrap();
+    let victim = r.join(scan.shards[1].file_name().unwrap());
+    std::fs::write(&victim, std::fs::read(&scan.shards[1]).unwrap()).unwrap();
+    assert_eq!(
+        hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024)
+            .unwrap()
+            .reused,
+        vec![1, 0],
+        "only the untouched shard is kept"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        std::fs::read(&scan.shards[1]).unwrap()
+    );
+}
+
+/// A flip inside an R-8 window with the source mtime restored is caught and
+/// re-cloned. Flipping outside every window is the documented R-8 residual —
+/// start-time verification trusts it, and so does the keep rule.
+#[test]
+fn flip_inside_sampled_window_is_recloned() {
+    use std::os::unix::fs::FileExt as _;
+    let src = tempdir("flip-src");
+    copy_fixture_to(&src);
+    let r = tempdir("flip");
+    import(&req(src.clone(), vec![r.clone()])).unwrap();
+    let scan = scan_source(&src).unwrap();
+    let victim = r.join(scan.shards[1].file_name().unwrap());
+    let mtime = std::fs::metadata(&scan.shards[1])
+        .unwrap()
+        .modified()
+        .unwrap();
+    {
+        let f = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&victim)
+            .unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact_at(&mut b, 0).unwrap();
+        f.write_all_at(&[b[0] ^ 0xff], 0).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+    assert_eq!(
+        hash_shards(&scan, std::slice::from_ref(&r), 64 * 1024)
+            .unwrap()
+            .reused,
+        vec![1, 0],
+        "sampled mismatch re-cloned"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        std::fs::read(&scan.shards[1]).unwrap()
+    );
+}
+
+#[test]
+fn publish_writes_loadable_manifest_everywhere() {
+    let out = import(&req(fixture_dir(), vec![])).unwrap();
+    let a = tempdir("publish-a");
+    let b = tempdir("publish-b");
+    let dirs = vec![a.clone(), b.clone()];
+    assert_eq!(
+        publish(&out.manifest, &dirs).unwrap(),
+        vec![a.join("manifest.json"), b.join("manifest.json")]
+    );
+    for d in &dirs {
+        let m = golem_store::load_manifest(&d.join("manifest.json")).unwrap();
+        assert_eq!((m.name.as_str(), m.shards.len()), ("shape-moe-v4", 2));
+    }
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+#[test]
+fn publish_leaves_no_tmp_on_failure() {
+    let out = import(&req(fixture_dir(), vec![])).unwrap();
+    let ok = tempdir("publish-ok");
+    let missing = tempdir("publish-missing").join("nope");
+    assert!(publish(&out.manifest, &[ok.clone(), missing]).is_err());
+    assert!(no_tmp(&ok));
+    assert!(
+        ok.join("manifest.json").is_file(),
+        "the reachable copy is durable"
+    );
+    let _ = std::fs::remove_dir_all(&ok);
 }

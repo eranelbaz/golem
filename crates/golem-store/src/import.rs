@@ -395,6 +395,12 @@ pub struct ShardDigests {
     pub bytes: Vec<u64>,
     /// Running crc32c per expert slice, per plane.
     pub crc: Vec<Vec<u32>>,
+    /// R-8 sampled-window digests per shard, index-aligned with
+    /// [`SourceScan::shards`]; the replica keep identity.
+    pub sampled: Vec<Vec<String>>,
+    /// Replica shards kept untouched per shard: their size, mtime and R-8
+    /// windows already matched the source (an idempotent re-import).
+    pub reused: Vec<usize>,
 }
 
 /// Warn once per process when a `POSIX_FADV_DONTNEED` advise fails (advisory:
@@ -671,37 +677,14 @@ impl Drop for TmpFile {
     }
 }
 
-/// One source shard into each unverified tmp: straight read → write with
-/// DONTNEED behind both cursors, no bounce buffer beyond the shared chunk.
-fn clone_shard(src_path: &Path, tmp: &mut TmpFile, buf: &mut [u8]) -> Result<u64, ImportError> {
-    let mut src = std::fs::File::open(src_path).map_err(|e| ImportError::Io {
-        path: src_path.to_path_buf(),
-        source: e,
-    })?;
-    let mut off = 0u64;
-    loop {
-        let n = read_span(&mut src, src_path, buf)?;
-        if n == 0 {
-            break;
-        }
-        tmp.file.write_all(&buf[..n]).map_err(|e| ImportError::Io {
-            path: tmp.path.clone(),
-            source: e,
-        })?;
-        tmp.pump(n as u64)?;
-        if !crate::sys::drop_page_cache(&src, off, n) {
-            warn_dontneed(src_path);
-        }
-        off += n as u64;
-    }
-    Ok(off)
-}
-
 /// One pass over the source shard set: computes per-shard sha256 + byte
-/// counts and per-plane expert crc32cs, while cloning every replica that is
-/// not already a byte-identical keep candidate. Replicas are verified
-/// *before* being kept; a same-size-but-wrong candidate is re-cloned.
-/// The source is re-stamped after each shard; any change mid-import aborts.
+/// counts, per-plane expert crc32cs and the R-8 sampled-window digests, while
+/// cloning every replica that is not already a byte-identical keep candidate.
+/// A replica shard is kept when its size, mtime and 16 sampled windows match
+/// the source — the same R-8 identity an instance checks at start, so a
+/// re-import does not re-read a replica it already has. Anything else is
+/// cloned and full-verified. The source is re-stamped after each shard; any
+/// change mid-import aborts.
 ///
 /// `chunk` is the I/O buffer size in bytes (see [`CHUNK_BYTES`]); digests
 /// and CRCs are chunk-size invariant. Callers running the full import use
@@ -711,7 +694,7 @@ fn clone_shard(src_path: &Path, tmp: &mut TmpFile, buf: &mut [u8]) -> Result<u64
 /// # Errors
 /// [`ImportError::Source`] on aliasing or a source that changed mid-read,
 /// [`ImportError::Io`] for filesystem failures, [`ImportError::ReplicaMismatch`]
-/// when a re-cloned replica still fails verification.
+/// when a freshly cloned replica still fails verification.
 pub fn hash_shards(
     scan: &SourceScan,
     replicas: &[PathBuf],
@@ -732,18 +715,31 @@ pub fn hash_shards(
         .iter()
         .map(|p| vec![0u32; p.experts as usize])
         .collect();
+    let mut sampled: Vec<Vec<String>> = Vec::with_capacity(scan.shards.len());
+    let mut reused: Vec<usize> = Vec::with_capacity(scan.shards.len());
     let mut buf = vec![0u8; chunk.max(1)];
 
     for (s, src_path) in scan.shards.iter().enumerate() {
         let name = src_path.file_name().unwrap();
-        let want_len = scan.stamps[s].0;
+        let (want_len, want_mtime) = scan.stamps[s];
+        // R-8 windows of the source: the cheap identity a kept replica must
+        // match. Sampled before the full read and re-stamped after it, so a
+        // source that moved mid-import still aborts below.
+        let src_samples = sampled_sha256(src_path)?;
         let mut tmps: Vec<TmpFile> = Vec::new();
-        let mut keeps: Vec<PathBuf> = Vec::new();
+        let mut kept = 0usize;
         for r in replicas {
             let cand = r.join(name);
-            match std::fs::metadata(&cand) {
-                Ok(md) if md.is_file() && md.len() == want_len => keeps.push(cand),
-                _ => tmps.push(TmpFile::create(&cand)?),
+            let keep = std::fs::metadata(&cand).ok().is_some_and(|md| {
+                md.is_file()
+                    && md.len() == want_len
+                    && md.modified().ok() == Some(want_mtime)
+                    && sampled_sha256(&cand).is_ok_and(|got| got == src_samples)
+            });
+            if keep {
+                kept += 1;
+            } else {
+                tmps.push(TmpFile::create(&cand)?);
             }
         }
 
@@ -820,34 +816,27 @@ pub fn hash_shards(
         bytes.push(md.len());
         sha256.push(digest.clone());
 
-        // Verify-then-commit every fresh clone; verify-then-keep every
-        // candidate, re-cloning the ones whose bytes went stale.
-        let mut stale: Vec<PathBuf> = Vec::new();
+        // Verify-then-commit every fresh clone; kept candidates already match
+        // the source's R-8 identity and keep their bytes untouched.
         for t in &mut tmps {
             t.settle()?;
             verify_replica(&t.path, &digest, chunk)?;
         }
-        for cand in &keeps {
-            match verify_replica(cand, &digest, chunk) {
-                Ok(()) => {}
-                Err(ImportError::ReplicaMismatch { .. }) => stale.push(cand.clone()),
-                Err(e) => return Err(e),
-            }
-        }
-        for cand in stale {
-            let mut t = TmpFile::create(&cand)?;
-            clone_shard(src_path, &mut t, &mut buf)?;
-            t.settle()?;
-            verify_replica(&t.path, &digest, chunk)?;
-            t.commit()?;
-        }
         for t in tmps {
             t.commit()?;
         }
+        sampled.push(src_samples);
+        reused.push(kept);
     }
 
     drop(locks);
-    Ok(ShardDigests { sha256, bytes, crc })
+    Ok(ShardDigests {
+        sha256,
+        bytes,
+        crc,
+        sampled,
+        reused,
+    })
 }
 
 /// Re-hashes `path` in `chunk`-sized reads and compares against `want_sha`,
@@ -944,6 +933,9 @@ pub struct ImportOutcome {
     /// One line per pair of roots (source included) sharing a physical
     /// device.
     pub warnings: Vec<String>,
+    /// Replica shards a re-import kept untouched (matching size, mtime and
+    /// the R-8 windows); 0 on a first import.
+    pub reused_shards: usize,
 }
 
 /// Manifest name: `--name`, else the source dir basename; must be exactly
@@ -1119,7 +1111,7 @@ pub fn import(req: &ImportRequest) -> Result<ImportOutcome, ImportError> {
             bytes: digests.bytes[i],
             sha256: digests.sha256[i].clone(),
             replicas: roots.clone(),
-            sampled_sha256: Some(sampled_sha256(s)?),
+            sampled_sha256: Some(digests.sampled[i].clone()),
             mtime: Some(
                 mtime
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -1152,7 +1144,42 @@ pub fn import(req: &ImportRequest) -> Result<ImportOutcome, ImportError> {
         chat_template_sha: Some(scan.chat_template_sha.clone()),
     };
     validate(&manifest, &src).map_err(|e| source(&src, e.to_string()))?;
-    Ok(ImportOutcome { manifest, warnings })
+    let reused_shards = digests.reused.iter().sum();
+    Ok(ImportOutcome {
+        manifest,
+        warnings,
+        reused_shards,
+    })
+}
+
+/// Publishes `manifest` as `<dir>/manifest.json` in every `dir`, atomically
+/// ([`TmpFile`]: fsync file, rename, fsync parent). Returns the written paths
+/// in `dirs` order. The source dir and every replica get the same copy, so any
+/// replica is self-describing and `run`/`serve` find the manifest next to the
+/// model they were pointed at.
+///
+/// # Errors
+/// [`ImportError::Io`] naming the dir when one copy cannot be written;
+/// [`ImportError::Source`] when the manifest cannot be serialized.
+pub fn publish(manifest: &ModelManifest, dirs: &[PathBuf]) -> Result<Vec<PathBuf>, ImportError> {
+    let json = serde_json::to_string_pretty(manifest).map_err(|e| ImportError::Source {
+        path: dirs.first().cloned().unwrap_or_default(),
+        msg: format!("manifest serialize: {e}"),
+    })?;
+    let mut written = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let dst = dir.join("manifest.json");
+        let mut tmp = TmpFile::create(&dst)?;
+        tmp.file
+            .write_all(json.as_bytes())
+            .map_err(|e| ImportError::Io {
+                path: dst.clone(),
+                source: e,
+            })?;
+        tmp.commit()?;
+        written.push(dst);
+    }
+    Ok(written)
 }
 
 #[cfg(test)]

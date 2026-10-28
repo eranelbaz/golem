@@ -372,9 +372,28 @@ pub fn engine_config(
     let mut config = engine.to_config(model.to_path_buf(), layers)?;
     let requested_snapshot = config.snapshot_ram_bytes;
     config.parallel = parallel;
+    // §5.1/§5.5: configured replicas are synced through the one verified
+    // clone *before* the manifest is inferred, so the pool opens the store
+    // the user asked for and a stale copy never serves silently.
+    let configured = layers.replicas()?;
+    if !configured.is_empty() {
+        if config.manifest_path.is_some() {
+            return Err("`replicas` and `manifest` both name the replica set; keep one".into());
+        }
+        if let Some(out) = crate::import::sync_model(model, &configured)? {
+            for w in &out.warnings {
+                eprintln!("warning: {w}");
+            }
+            eprintln!(
+                "golem: synced {} replica(s) for {}",
+                configured.len(),
+                model.display()
+            );
+        }
+    }
     // §9 inference: explicit flags already won in `to_config`; fill the rest
     // from the model folder and the compiled backend.
-    let inferred = infer_defaults(&mut config, engine.n_gpu_layers);
+    let inferred = infer_defaults(&mut config, engine.n_gpu_layers)?;
     if !inferred.is_empty() {
         eprintln!(
             "golem: inferred {}",
@@ -674,7 +693,7 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
 fn infer_defaults(
     config: &mut EngineConfig,
     explicit_gpu_layers: Option<u32>,
-) -> Vec<&'static str> {
+) -> Result<Vec<&'static str>, Box<dyn Error>> {
     let mut inferred = Vec::new();
     if config.manifest_path.is_none()
         && let Some(dir) = config.model_path.parent()
@@ -684,6 +703,14 @@ fn infer_defaults(
             config.manifest_path = Some(m);
             inferred.push("manifest");
         }
+    }
+    // §5.1: a manifest whose replicas are gone refuses to serve rather than
+    // silently fall back to one disk. A junk manifest does not load and keeps
+    // the single-file fallback below (it declares no replica set).
+    if let Some(m) = &config.manifest_path
+        && let Ok(manifest) = golem_store::load_manifest(m)
+    {
+        crate::import::require_replicas(&manifest)?;
     }
     if explicit_gpu_layers.is_none()
         && config.n_gpu_layers == 0
@@ -700,14 +727,28 @@ fn infer_defaults(
             }
             // No workable pool size → the manifest would hard-error against
             // the pool requirement while the plain GGUF path would have
-            // worked: drop the inferred manifest, keep the run going.
+            // worked: drop the inferred manifest, keep the run going. A
+            // multi-replica manifest is refused instead — dropping it would
+            // silently serve off one disk.
             None => {
+                if let Some(m) = &config.manifest_path
+                    && let Ok(manifest) = golem_store::load_manifest(m)
+                    && manifest.shards.iter().any(|s| s.replicas.len() > 1)
+                {
+                    return Err(format!(
+                        "manifest {}: replaying its replicas needs the RAM expert pool, \
+                         but no workable pool fits here; refusing to fall back to one disk \
+                         (free RAM, size --ram-experts-gib down, or drop the manifest)",
+                        m.display()
+                    )
+                    .into());
+                }
                 config.manifest_path = None;
                 inferred.retain(|&name| name != "manifest");
             }
         }
     }
-    inferred
+    Ok(inferred)
 }
 
 /// Workable pool size for a manifest-bearing run: the preflight's own cap,
@@ -1687,7 +1728,7 @@ mod tests {
             .to_config("model.gguf".into(), &crate::config::Layers::none())
             .unwrap();
         config.model_path = model.clone();
-        let inferred = infer_defaults(&mut config, None);
+        let inferred = infer_defaults(&mut config, None).unwrap();
         assert_eq!(
             config.manifest_path, None,
             "unusable manifest → plain GGUF path, no hard error"
@@ -1714,7 +1755,7 @@ mod tests {
             .to_config("model.gguf".into(), &crate::config::Layers::none())
             .unwrap();
         config.model_path = model.clone();
-        infer_defaults(&mut config, Some(0));
+        infer_defaults(&mut config, Some(0)).unwrap();
         assert_eq!(config.n_gpu_layers, 0, "explicit 0 must not be re-inferred");
 
         // Explicit flags win: no manifest file in the folder, no inference.
@@ -1732,7 +1773,7 @@ mod tests {
         .to_config("model.gguf".into(), &crate::config::Layers::none())
         .unwrap();
         config.model_path = model;
-        infer_defaults(&mut config, Some(7));
+        infer_defaults(&mut config, Some(7)).unwrap();
         assert_eq!(config.n_gpu_layers, 7);
         assert_eq!(config.ram_experts_gib, 3);
         assert_eq!(
@@ -1937,5 +1978,130 @@ mod tests {
             .try_get_matches_from(["run", "m.gguf", "--threads", "0"])
             .expect_err("threads must be >= 1");
         assert!(err.kind() == clap::error::ErrorKind::ValueValidation);
+    }
+    /// Fixture shard names, in split order.
+    fn shape_names() -> Vec<String> {
+        xtask::shape_moe::cached_fixture()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A temp source dir holding a copy of the shape fixture, plus its first
+    /// shard path.
+    fn shape_source(dir: &std::path::Path) -> PathBuf {
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for s in xtask::shape_moe::cached_fixture() {
+            std::fs::copy(&s, src.join(s.file_name().unwrap())).unwrap();
+        }
+        src.join(&shape_names()[0])
+    }
+
+    fn config_for(model: &std::path::Path, layers: &crate::config::Layers<'_>) -> EngineConfig {
+        parse_run_args(&["run", model.to_str().unwrap()])
+            .engine
+            .to_config(model.to_path_buf(), layers)
+            .unwrap()
+    }
+
+    #[test]
+    fn infer_defaults_refuses_a_manifest_with_a_missing_replica() {
+        let dir = scratch_dir("missing-replica");
+        let model = shape_source(&dir);
+        let src = model.parent().unwrap().to_path_buf();
+        let r1 = dir.join("r1");
+        std::fs::create_dir_all(&r1).unwrap();
+        let out = golem_store::import::import(&golem_store::import::ImportRequest {
+            source: src.clone(),
+            replicas: vec![r1.clone()],
+            name: None,
+            quant: None,
+            revision_label: None,
+        })
+        .unwrap();
+        golem_store::import::publish(&out.manifest, std::slice::from_ref(&src)).unwrap();
+        let gone = r1.join(&shape_names()[1]);
+        std::fs::remove_file(&gone).unwrap();
+
+        let mut config = config_for(&model, &crate::config::Layers::none());
+        let e = infer_defaults(&mut config, Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(gone.to_str().unwrap()), "{e}");
+        assert!(e.contains("--sync"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn infer_defaults_refuses_a_multi_replica_fallback() {
+        // The fixture's expert bytes round to a 0 GiB pool, so `infer_defaults`
+        // cannot size one; a multi-replica manifest must not be dropped into a
+        // single-disk run.
+        let dir = scratch_dir("multi-fallback");
+        let model = shape_source(&dir);
+        let src = model.parent().unwrap().to_path_buf();
+        let r1 = dir.join("r1");
+        std::fs::create_dir_all(&r1).unwrap();
+        let out = golem_store::import::import(&golem_store::import::ImportRequest {
+            source: src.clone(),
+            replicas: vec![r1.clone()],
+            name: None,
+            quant: None,
+            revision_label: None,
+        })
+        .unwrap();
+        golem_store::import::publish(&out.manifest, std::slice::from_ref(&src)).unwrap();
+
+        let mut config = config_for(&model, &crate::config::Layers::none());
+        let e = infer_defaults(&mut config, Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("one disk"), "{e}");
+
+        // One root: the existing single-file fallback still applies.
+        let out = golem_store::import::import(&golem_store::import::ImportRequest {
+            source: src.clone(),
+            replicas: Vec::new(),
+            name: None,
+            quant: None,
+            revision_label: None,
+        })
+        .unwrap();
+        golem_store::import::publish(&out.manifest, std::slice::from_ref(&src)).unwrap();
+        let mut config = config_for(&model, &crate::config::Layers::none());
+        infer_defaults(&mut config, Some(0)).unwrap();
+        assert_eq!(config.manifest_path, None, "single replica falls back");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn engine_config_syncs_configured_replicas_before_inference() {
+        let dir = scratch_dir("startup-sync");
+        let model = shape_source(&dir);
+        let r1 = dir.join("r1");
+        let layers = crate::config::Layers {
+            file: toml::from_str(&format!("replicas = [{:?}]", r1)).unwrap(),
+            profile: toml::Table::new(),
+            path: None,
+            env: &|_| None,
+        };
+        let args = parse_run_args(&[
+            "run",
+            "--n-gpu-layers",
+            "0",
+            "--ram-experts-gib",
+            "2",
+            model.to_str().unwrap(),
+        ]);
+        // Later steps (facts, memlock) may refuse this fixture; the sync must
+        // already have happened by then.
+        let _ = engine_config(&args.engine, &model, 1, &layers, u64::MAX);
+        assert_eq!(
+            std::fs::read(r1.join(&shape_names()[1])).unwrap(),
+            std::fs::read(model.parent().unwrap().join(&shape_names()[1])).unwrap()
+        );
+        assert!(model.parent().unwrap().join("manifest.json").is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

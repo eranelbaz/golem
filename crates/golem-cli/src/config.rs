@@ -77,6 +77,54 @@ fn toml_raw(v: &toml::Value) -> String {
     }
 }
 
+/// The `[models.*]` table of a file layer, the one reader of that key;
+/// `None` when absent.
+///
+/// # Errors
+/// [`ConfigError::Invalid`] when `models` is present but not a table.
+pub fn models(file: &toml::Table) -> Result<Option<&toml::Table>, ConfigError> {
+    let Some(v) = file.get("models") else {
+        return Ok(None);
+    };
+    v.as_table().map(Some).ok_or_else(|| ConfigError::Invalid {
+        layer: "file",
+        key: "models".into(),
+        value: v.to_string(),
+        msg: "must be a table of tables".into(),
+    })
+}
+
+/// `replicas` of a model-layout table (the file layer or one `[models.*]`
+/// entry): an array of paths, `~` expanded. A layout key, not an engine flag,
+/// so it has no env/flag layer (§9.4 leaves it file-only).
+///
+/// # Errors
+/// [`ConfigError::Invalid`] naming `key` when it is not an array of strings.
+pub fn replicas_of(
+    table: &toml::Table,
+    key: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<std::path::PathBuf>, ConfigError> {
+    let Some(v) = table.get("replicas") else {
+        return Ok(Vec::new());
+    };
+    let invalid = |value: String, msg: &str| ConfigError::Invalid {
+        layer: "file",
+        key: key.to_owned(),
+        value,
+        msg: msg.into(),
+    };
+    let arr = v
+        .as_array()
+        .ok_or_else(|| invalid(v.to_string(), "must be an array of paths"))?;
+    arr.iter()
+        .map(|e| match e.as_str() {
+            Some(s) => Ok(expand_tilde(std::path::PathBuf::from(s), env)),
+            None => Err(invalid(e.to_string(), "must be a string path")),
+        })
+        .collect()
+}
+
 fn parse<T: FromStr>(layer: &'static str, key: &str, raw: String) -> Result<T, ConfigError>
 where
     T::Err: std::fmt::Display,
@@ -243,6 +291,15 @@ impl Layers<'_> {
             Some(m) => Ok(expand_tilde(m, self.env)),
             None => Err(NoModel(self.path.clone()).into()),
         }
+    }
+
+    /// This layer's `replicas` (§5.1/§5.5): the file layer's array, `~`
+    /// expanded. Empty when unset.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`] when the key is not an array of strings.
+    pub fn replicas(&self) -> Result<Vec<std::path::PathBuf>, ConfigError> {
+        replicas_of(&self.file, "replicas", self.env)
     }
 
     /// Adds the saved `golem optimize` profile for `model` as the profile
@@ -656,5 +713,50 @@ mod tests {
         };
         assert_eq!(l.cache_types((None, None)).unwrap(), (Q8_0, Q8_0));
         assert_eq!(l.cache_types((Some(F16), Some(F16))).unwrap(), (F16, F16));
+    }
+    #[test]
+    fn replicas_reads_file_array_and_expands_tilde() {
+        let env = |k: &str| (k == "HOME").then(|| "/h".to_owned());
+        let file: toml::Table = toml::from_str(r#"replicas = ["~/r1", "/r2"]"#).unwrap();
+        assert_eq!(
+            replicas_of(&file, "replicas", &env).unwrap(),
+            vec![
+                std::path::PathBuf::from("/h/r1"),
+                std::path::PathBuf::from("/r2")
+            ]
+        );
+        let l = Layers {
+            file,
+            profile: toml::Table::new(),
+            path: None,
+            env: &|k| (k == "HOME").then(|| "/h".to_owned()),
+        };
+        assert_eq!(l.replicas().unwrap().len(), 2);
+        assert!(Layers::none().replicas().unwrap().is_empty(), "absent");
+    }
+
+    #[test]
+    fn replicas_rejects_non_array_and_non_string() {
+        let env = |_: &str| None;
+        for (body, want) in [
+            (r#"replicas = "/r1""#, "array"),
+            (r#"replicas = [1, 2]"#, "string path"),
+        ] {
+            let file: toml::Table = toml::from_str(body).unwrap();
+            let e = replicas_of(&file, "replicas", &env)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("replicas") && e.contains(want), "{e}");
+        }
+    }
+
+    #[test]
+    fn models_absent_is_none_and_non_table_errors() {
+        assert!(models(&toml::Table::new()).unwrap().is_none());
+        let file: toml::Table = toml::from_str(r#"models = 1"#).unwrap();
+        let e = models(&file).unwrap_err().to_string();
+        assert!(e.contains("models") && e.contains("table"), "{e}");
+        let file: toml::Table = toml::from_str("[models.a]\npath = \"/m\"").unwrap();
+        assert!(models(&file).unwrap().unwrap().contains_key("a"));
     }
 }

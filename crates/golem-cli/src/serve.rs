@@ -139,7 +139,7 @@ fn served_models<'a>(
     no_profile: bool,
     cache_types: crate::config::CacheTypeFlags,
 ) -> Result<Vec<(String, PathBuf, crate::config::Layers<'a>)>, crate::config::ConfigError> {
-    let Some(models) = layers.file.get("models") else {
+    let Some(models) = crate::config::models(&layers.file)? else {
         return Ok(Vec::new());
     };
     let invalid = |key: String, value: String, msg: &str| crate::config::ConfigError::Invalid {
@@ -148,13 +148,6 @@ fn served_models<'a>(
         value,
         msg: msg.into(),
     };
-    let models = models.as_table().ok_or_else(|| {
-        invalid(
-            "models".into(),
-            models.to_string(),
-            "must be a table of tables",
-        )
-    })?;
     models
         .iter()
         .map(|(name, t)| {
@@ -169,6 +162,10 @@ fn served_models<'a>(
             let mut file = layers.file.clone();
             file.remove("models");
             file.remove("model");
+            // `replicas` describes *this* model's shard layout; inheriting the
+            // top-level set would clone one model's shards into another's
+            // replica dir and overwrite its manifest there.
+            file.remove("replicas");
             file.extend(
                 t.iter()
                     .filter(|(k, _)| *k != "path")
@@ -668,7 +665,7 @@ mod tests {
     #[test]
     fn models_tables_name_paths_and_override_knobs() {
         let file: toml::Table = toml::from_str(
-            "ctx = 8192\n[models.ds]\npath = \"~/m/ds.gguf\"\nctx = 4096\n[models.glm]\npath = \"/m/glm.gguf\"\n",
+            "ctx = 8192\nreplicas = [\"/top\"]\n[models.ds]\npath = \"~/m/ds.gguf\"\nctx = 4096\n[models.glm]\npath = \"/m/glm.gguf\"\nreplicas = [\"/glm\"]\n",
         )
         .unwrap();
         let env = |k: &str| (k == "HOME").then(|| "/h".to_string());
@@ -684,6 +681,13 @@ mod tests {
         assert_eq!(ml.get(None, "ctx", 0u32).unwrap(), 4096);
         assert!(ml.file.get("models").is_none() && ml.file.get("path").is_none());
         assert_eq!(m[1].2.get(None, "ctx", 0u32).unwrap(), 8192);
+        // The top-level `replicas` belongs to the top-level model only; a
+        // per-model entry opts in with its own array.
+        assert!(ml.replicas().unwrap().is_empty(), "no inherited replicas");
+        assert_eq!(
+            m[1].2.replicas().unwrap(),
+            vec![std::path::PathBuf::from("/glm")]
+        );
         for bad in ["models = 3", "[models.x]\nctx = 1"] {
             let l = crate::config::Layers {
                 file: toml::from_str(bad).unwrap(),

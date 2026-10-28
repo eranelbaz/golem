@@ -1,12 +1,11 @@
 //! `golem` CLI entry point (tech design §9): run, serve, plan, list, stop,
-//! optimize.
+//! optimize, import.
 //! Bare `golem` (no subcommand) prints the version.
-//! Future: `golem import` (§5.5 store intake: hash + CRC + mirror a shard
-//! set into `$GOLEM_DATA_DIR`; `golem_store::import` already implements it).
 
 use clap::{Parser, Subcommand};
 
 mod config;
+mod import;
 mod list;
 mod optimize;
 mod plan;
@@ -25,7 +24,7 @@ use golem_api::{ErrorCode, ErrorEnvelope};
 #[command(
     name = "golem",
     version,
-    about = "golem CLI: run, serve, plan, list, stop, optimize"
+    about = "golem CLI: run, serve, plan, list, stop, optimize, import"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -81,6 +80,13 @@ enum Command {
     Optimize {
         #[command(flatten)]
         args: optimize::OptimizeArgs,
+    },
+    /// Import a local GGUF shard dir (§5.5): verified mirror into every
+    /// replica, then `manifest.json` into the source dir and every replica.
+    /// `--sync [NAME]` runs the same clone for a `golem.toml` model.
+    Import {
+        #[command(flatten)]
+        args: import::ImportArgs,
     },
 }
 
@@ -156,6 +162,7 @@ fn main() {
         Some(Command::List { args }) => list::list(&args),
         Some(Command::Stop { args }) => stop::stop(&args),
         Some(Command::Optimize { args }) => optimize::optimize(&args),
+        Some(Command::Import { args }) => import::run(&args),
     };
     if let Err(e) = status {
         // A signal is the user's choice, not a failure: no envelope, the

@@ -91,18 +91,25 @@ scripts/build.sh build                       # release build → target/release/
 hf download unsloth/GLM-5.3-Flash-GGUF \
   --include "UD-IQ4_XS/*" --local-dir ~/models/glm-5.3-flash-ud-iq4-xs
 
-# 2. Plan memory (exit 2 = does not fit)
+# 2. Mirror it onto the second disk and write manifest.json next to the shards
+#    (re-runnable: shards that already match are kept, not re-copied)
+golem import ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS /mnt/ssd1/golem/models/glm-5.3-flash-ud-iq4-xs
+
+# 3. Plan memory (exit 2 = does not fit)
 scripts/build.sh run plan ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf --ctx 32768
 
-# 3. Serve
+# 4. Serve
 scripts/build.sh run serve ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf \
   --port 8080 --ctx 32768 --n-predict 4096 --prefill-stream
 ```
 
 `golem plan` prints the memory plan; `golem optimize` sweeps scheduling knobs on your
 machine and saves a winner that `serve`/`run` apply automatically; `--detach`
-runs in the background (`golem list`, `golem stop <id>`). (`golem import` —
-ingesting an HF cache layout into the store — is planned but not implemented.)
+runs in the background (`golem list`, `golem stop <id>`). `golem import` mirrors a
+local shard dir onto the other disks and publishes `manifest.json` into the source
+dir and every replica; point `run`/`serve` at any of them and the expert pool
+(sized from the manifest, or with `--ram-experts-gib`) reads across the replicas.
+A manifest whose replica shards are gone is refused, never served off one disk.
 
 DeepSeek-V4.1-Flash: pull a quant the same way (UD-IQ2_XXS ≈ 280 GiB) and
 serve its first shard. Until the hybrid snapshot restore is fixed, serve with
@@ -125,7 +132,14 @@ idle_unload_min = 30   # unload after 30 min without a request; 0/unset keeps it
 [models."deepseek-v4.1-flash"]
 path = "~/models/ds/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf"
 snapshot_ram_gib = 0   # any engine key here overrides golem.toml for this model
+replicas = ["/mnt/ssd1/golem/models/deepseek-v4.1-flash"]   # synced at startup
 ```
+
+`replicas` names the model's other full mirrors (`golem import <dir> <replica>…`
+creates them). At startup `run`/`serve` clone any missing or stale copy through
+the same verified clone before the model loads, and refuse to run a manifest whose
+replica shards are gone — never a silent fall back to one disk. `golem import
+--sync` (top-level model) or `golem import --sync <name>` re-runs that sync by hand.
 
 With `idle_unload_min` set, `serve` starts with nothing loaded
 (`/health` → `idle`), the first request loads its model, and the model is
