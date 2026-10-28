@@ -101,8 +101,8 @@ scripts/build.sh run serve ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Fl
 
 `golem plan` prints the memory plan; `golem optimize` sweeps scheduling knobs on your
 machine and saves a winner that `serve`/`run` apply automatically; `--detach`
-runs in the background (`golem list`, `golem stop <id>`). (`golem import` —
-ingesting an HF cache layout into the store — is planned but not implemented.)
+runs in the background (`golem list`, `golem stop <id>`). Golem reads the GGUF
+shards in place; there is no import step.
 
 DeepSeek-V4.1-Flash: pull a quant the same way (UD-IQ2_XXS ≈ 280 GiB) and
 serve its first shard. Until the hybrid snapshot restore is fixed, serve with

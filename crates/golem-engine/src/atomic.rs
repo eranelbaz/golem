@@ -1,6 +1,5 @@
-//! Atomic file write shared by every harness leg that emits a dump, and by
-//! `golem import`'s manifest publication. Durability: fsync the temp file
-//! before rename, fsync the parent directory after — a crash leaves the old
+//! Atomic file write shared by every harness leg that emits a dump.
+//! Durability: fsync the temp file before rename, fsync the parent directory after — a crash leaves the old
 //! or the new file, never a truncated one or an unlinked rename.
 
 use std::io::Write;

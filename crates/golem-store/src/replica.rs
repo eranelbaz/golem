@@ -382,9 +382,7 @@ impl ReplicaRegistry {
 }
 
 /// One warning per physical device hosting two or more of `roots`
-/// (insertion-ordered grouping; undeterminable devices never warn). Shared
-/// by [`ReplicaRegistry::shared_device_warnings`] and the §5.5 import
-/// same-disk warnings — one implementation of the device-pair rule.
+/// (insertion-ordered grouping; undeterminable devices never warn).
 pub(crate) fn shared_device_pairs(roots: &[PathBuf]) -> Vec<String> {
     let mut by_device: Vec<(String, Vec<PathBuf>)> = Vec::new();
     for root in roots {

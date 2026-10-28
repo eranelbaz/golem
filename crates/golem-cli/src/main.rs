@@ -1,8 +1,6 @@
 //! `golem` CLI entry point (tech design §9): run, serve, plan, list, stop,
 //! optimize.
 //! Bare `golem` (no subcommand) prints the version.
-//! Future: `golem import` (§5.5 store intake: hash + CRC + mirror a shard
-//! set into `$GOLEM_DATA_DIR`; `golem_store::import` already implements it).
 
 use clap::{Parser, Subcommand};
 

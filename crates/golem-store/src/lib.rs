@@ -17,12 +17,12 @@
 //! Scope: [`StoreError`], manifest types + validating loader ([`manifest`]),
 //! replica I/O, striping, and the pread engine ([`engine`]).
 
+/// §4.3 R-8 shard digests: full and sampled SHA-256.
+pub mod digest;
 mod engine;
 /// Instance-level health state machine (§5.2, §11): per-replica health +
 /// checksum degradation → one classification, with transition surfacing.
 pub mod health;
-/// `golem import` (§5.5): local source discovery + expert-plane geometry.
-pub mod import;
 mod manifest;
 /// §5.2 shared chunk queue: demand-first drain scheduling with per-drive
 /// scoped reader threads.
