@@ -1,11 +1,11 @@
 //! Start-time model check (§4.3 R-8): per shard size + mtime against the
 //! manifest plus 16 sampled 1 MiB SHA-256 windows; `full` re-hashes every
-//! byte. Full verification belongs to import; this catches a swapped,
-//! truncated or rewritten shard before weights load.
+//! byte. Catches a swapped, truncated or rewritten shard before weights
+//! load.
 
 use std::path::Path;
 
-use golem_store::import::{sampled_sha256, verify_replica};
+use golem_store::digest::{CHUNK_BYTES, sampled_sha256, verify_sha256};
 use golem_store::{ModelManifest, load_manifest};
 
 use crate::error::EngineError;
@@ -49,8 +49,7 @@ pub fn verify_shards(
             }
         }
         if full {
-            verify_replica(&p, &s.sha256, golem_store::import::CHUNK_BYTES)
-                .map_err(|e| bad(&s.file, e.to_string()))?;
+            verify_sha256(&p, &s.sha256, CHUNK_BYTES).map_err(|e| bad(&s.file, e.to_string()))?;
             continue;
         }
         match &s.sampled_sha256 {
@@ -62,7 +61,7 @@ pub fn verify_shards(
                 }
             }
             None => warnings.push(format!(
-                "shard {}: manifest has no sampled_sha256 (pre-R-8 import); size + mtime only",
+                "shard {}: manifest has no sampled_sha256 (pre-R-8); size + mtime only",
                 s.file
             )),
         }
@@ -74,6 +73,7 @@ pub fn verify_shards(
 mod tests {
     use super::*;
     use golem_store::ShardEntry;
+    use golem_store::digest::sha256_hex;
     use std::os::unix::fs::FileExt;
 
     /// `len`-byte shard + manifest stamped from it; returns (dir, manifest).
@@ -95,7 +95,7 @@ mod tests {
             shards: vec![ShardEntry {
                 file: "m-00001-of-00001.gguf".into(),
                 bytes: md.len(),
-                sha256: golem_store::import::sha256_hex(&bytes),
+                sha256: sha256_hex(&bytes),
                 replicas: vec![dir.clone()],
                 sampled_sha256: Some(sampled_sha256(&p).unwrap()),
                 mtime: Some(mtime.as_secs()),

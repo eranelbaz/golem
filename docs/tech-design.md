@@ -282,11 +282,11 @@ Every downloaded model gets `$GOLEM_DATA_DIR/models/<name>/manifest.json`:
 }
 ```
 
-`expert_index` is produced once at download/import time by walking the GGUF tensor table (expert tensors are identified by the upstream MoE regex `ffn_(up|down|gate|gate_up)_(ch|)exps`); it is the index the store and placement manager share. Vision-tower (`mmproj*`) tensors and files are refused at import with a clear message ("text path only in v1") rather than silently skipped — the spec bans silent anything.
+`expert_index` is produced by walking the GGUF tensor table (expert tensors are identified by the upstream MoE regex `ffn_(up|down|gate|gate_up)_(ch|)exps`); it is the index the store and placement manager share. Vision-tower (`mmproj*`) tensors and files must not appear in a manifest (text path only in v1); the refusal lived in `golem import` and is not enforced since #187 — the spec bans silent anything.
 
 ### 4.3 Load-time checks (fail fast, fail loud)
 
-1. ~~Manifest SHA-256 over every shard (streamed, ~1–2 min for ~170 GB on NVMe; `--skip-verify` available and reported loudly in logs).~~ *Amended 2026-09-29 (review R-8):* the full hash is ≈32 s of pure read at 5.8 GiB/s plus ≈90 s single-core SHA, reads 186 GiB off the SSD and flushes the page cache at every start. Full verify happens **at import**. At instance start, check size + mtime + a sampled per-shard hash (e.g. 64 × 1 MiB at deterministic offsets), with `--full-verify` opt-in. Also check the expert layer set against `block_count − nextn_predict_layers`, so the MTP block is never counted as a trunk layer.
+1. ~~Manifest SHA-256 over every shard (streamed, ~1–2 min for ~170 GB on NVMe; `--skip-verify` available and reported loudly in logs).~~ *Amended 2026-09-29 (review R-8):* the full hash is ≈32 s of pure read at 5.8 GiB/s plus ≈90 s single-core SHA, reads 186 GiB off the SSD and flushes the page cache at every start. Full verify happens only with `--full-verify`. At instance start, check size + mtime + a sampled per-shard hash (e.g. 64 × 1 MiB at deterministic offsets). Also check the expert layer set against `block_count − nextn_predict_layers`, so the MTP block is never counted as a trunk layer.
 2. Expert count and bytes-per-expert uniformity per layer (GGUF guarantee; a violation means a corrupted/mismatched mirror — refuse to start).
 3. VRAM budget feasibility: non-expert bytes (incl. shared experts) + KV (11 attention layers) + recurrent state × parallel + workspace + VRAM expert-cache budget ≤ free VRAM minus measured ROCm overhead (M0 number). Failure → `golem_plan_infeasible` error with the exact over-budget line items (§10), never a degraded start.
 4. Backend probe: `hipGetDeviceProperties` on gfx1100, kernel self-test (one expert matmul GPU vs known-good CPU result within tolerance). Failure → `golem_backend_unavailable` with install instructions (ROCm version, env vars) in the error body.
@@ -311,8 +311,8 @@ v1 supports **N ≥ 1 full copies** of the model on separate paths (the model by
 
 ### 5.3 Validation
 
-- Full SHA-256 verify at import and at instance start (§4.3). Sizes re-checked on open.
-- Continuous in-flight hashing would tax the read path; instead each pool page-in is covered by a cheap **CRC32C** appended into the page table entry, verified **at page-in** (*amended 2026-09-29, review R-8, D-4:* "on use" would mean hashing ≈5 GB per token on the decode thread. CRCs are per fixed unit, i.e. per expert plane, computed at import and stored in the manifest `expert_index`, never per striped chunk). Mismatch → treat as corrupted replica (same path as EIO) and log the offending shard+range. This catches silent rot between full verifies at ~3 GB/s/core cost, negligible against disk reads.
+- Full SHA-256 verify at instance start when `--full-verify` is set (§4.3). Sizes re-checked on open.
+- Continuous in-flight hashing would tax the read path; instead each pool page-in is covered by a cheap **CRC32C** appended into the page table entry, verified **at page-in** (*amended 2026-09-29, review R-8, D-4:* "on use" would mean hashing ≈5 GB per token on the decode thread. CRCs are per fixed unit, i.e. per expert plane, stored in the manifest `expert_index`; no tool generates them since #187, and a manifest without them skips page-in CRC, never per striped chunk). Mismatch → treat as corrupted replica (same path as EIO) and log the offending shard+range. This catches silent rot between full verifies at ~3 GB/s/core cost, negligible against disk reads.
 - On any detected mismatch, `golem list` shows the instance as `degraded`, naming the shard and replica — actionable, not silent.
 
 ### 5.4 I/O engine (D10)
@@ -324,15 +324,9 @@ v1 supports **N ≥ 1 full copies** of the model on separate paths (the model by
 - *Amended 2026-09-29 (review D-2, D-3, D-11):* slots are **not** one uniform size. Use one slab per plane-stride class, because max-stride slots waste ≈12%. There is no static per-layer quota: one global pool with a global CLOCK, and per-layer locks for residency bits only. The **unit of residency is (layer, expert)**: its gate, up and down planes are claimed, filled, leased and evicted together, in RAM and in VRAM.
 - *Amended 2026-10-01 (review D-2, D-11, implemented):* the arena is **one mlock'd mapping carved into per-class regions** (class = distinct unit byte size), one free list and one CLOCK hand per class under the existing two locks. Per-class budget ∝ the class's byte share, computed as `⌊pool × layers_c / Σ unit bytes⌋`. Target arithmetic (GLM-5.3-Flash UD-Q4_K_XL, blk 3–44 live, blk 45 MTP skipped): std 39 layers @ 15,204,352 B/unit, q6d 2 @ 16,318,464, q5q6 1 @ 18,415,616; Σ = 644,022,272 B. 65 GiB → std 4,226, q6d 216, q5q6 108 = **4,550 units (+34.6% vs max-stride HEAD's 3,380)**. Per-class floor: one cold step leases `layers_c × top-k` units (std 312, q6d 16, q5q6 8 — all fit). Derived K (C-3) is priced by Σ unit bytes → K = 9.
 
-### 5.5 Import (amended 2026-09-20, supersedes the original HF-download design)
+### 5.5 Import (dropped 2026-10-27, #187)
 
-`golem import <source-path> [<replica-path> ...] [--quant ...] [--name ...] [--revision-label ...]` — Golem never talks to Hugging Face. The customer supplies local paths to weights already on their machine (obtained however they like — `hf download`, another machine, purchased copy).
-
-- **`source-path` (first path)** = source of truth: a directory containing the model's shard files. Golem walks the GGUF headers (arch gate, tensor table, expert regex — §4.2), streams per-shard SHA-256, and writes `manifest.json` into `$GOLEM_DATA_DIR/models/<name>/`.
-- **`replica-path`s (additional paths)** = full-mirror targets, one per disk. Golem *creates* the mirrors itself: streamed verified clone of the source shard set into each target, re-hashed against the source's hashes (no trust in pre-existing copies). Full mirrors only (D6) — every replica path must end with the complete shard set; partial/sharded placement stays out of v1.
-- **Same-disk detection** (§5.1) runs on the supplied paths: two paths resolving to one physical device → warn, no aggregate bandwidth claimed.
-- **Revision metadata is best-effort**: no HF authority exists in this flow. The manifest takes an optional user-supplied `--revision-label` (or reads the revision when the directory carries `hf download` cache metadata); `revision_source` records which of {user, hf-cache, unknown} applied.
-- HF download remains out of product scope; the README quickstart documents `hf download <repo>` + `golem import <dir>` as the recipe. (The original `golem pull <repo>` download design is retired; spec §CLI never listed `pull` — the verb is now `import`.)
+There is no `golem import`. Golem reads the customer's GGUF shards in place (obtained however they like — `hf download`, another machine, purchased copy) and never talks to Hugging Face. A manifest (§4.2) is optional: without `manifest.json` next to the model, the engine reads the GGUF directly; with one, it is written by hand (`sampled_sha256`, `mtime` and per-plane CRCs are optional; absent ones are not checked) and §5.1–§5.4 apply to its replica set. Dropped because the real-target A/B (GLM-5.3-Flash UD-IQ3_XXS, 120.4 GB, PR #186) measured striping nvme1n1 + 990 PRO at 5.4–6.6 GB/s vs 7.2–8.0 GB/s for nvme1n1 alone: static round-robin homing caps the pair at the harmonic mean 2 / (1/7.85 + 1/5.97) = 6.78 GB/s, so a second mirror buys failover only, not bandwidth.
 
 ---
 
@@ -575,7 +569,7 @@ Binds `127.0.0.1` by default (port: auto-select, recorded in the registry; `--ho
 | `golem list` | Default: running instances (id, model, health, tier fill %, req/s, tok/s, degraded flags) from the registry. `--models`: downloaded models from the data dir with manifest summary (quant, size, replicas, last-used). Both, never conflated |
 | `golem stop <id\|name>` | Graceful: stop accepting, drain in-flight requests (grace period 30 s), unload, exit. `--force`: SIGKILL. `--now`: skip drain. Stopping a nonexistent/dead instance is a typed error, not a shrug. *Amended 2026-10-13:* socketless kinds get SIGTERM then SIGKILL after a per-kind grace — `run` 60 s (teardown; the SIGKILL may land mid-load), others 5 s |
 | `golem plan [model] --ctx N --vram-experts-gib N --ram-experts-gib N ...` | §10. No GPU required; reads manifest + flags, prints per-tier byte table and a fit verdict with exact overages |
-| `golem import` | §5.5 |
+| ~~`golem import`~~ | Dropped (§5.5) |
 
 ### 9.2 Instance registry (D11)
 
@@ -687,7 +681,7 @@ golem/
 │   ├── golem-engine/              # llama.h glue: load config, sampler chain, batch building, KV mgmt
 │   ├── golem-llama-sys/           # bindgen over llama.h + golem-hooks.h; cmake build of the fork
 │   ├── golem-placement/           # scores, tiers, caps, prefetch; policy consumed by P2/P3
-│   ├── golem-store/               # replicas, striping, checksums, pool, import
+│   ├── golem-store/               # replicas, striping, checksums, pool
 │   ├── golem-plan/                # §10 arithmetic (shared by CLI and runtime feasibility check)
 │   ├── golem-api/                 # OpenAI types, SSE, error envelope, field-policy table
 │   └── golem-registry/            # instance registry, UDS control, heartbeat
@@ -709,7 +703,7 @@ Select and lock the fork commit (GLM-5.3-Flash text support present); build HIP 
 
 **M2 — Placement engine.** P1–P4 patches (P5 + rework per §3.4 amendment) + `golem-placement` (scores, swap margin, caps, VRAM resident-set). Exit: T3, T4, T6 green; P2 skip-ratio and P3 slow-path metrics demonstrably better than naive per-step copies on the same trace.
 
-**M3 — Storage tier.** `golem-store` (replicas, striping, checksums, pool, import) wired into P3/prefetch; two-drive mode. Exit: T5 green; cold-start TTFP and cold tok/s measured on 1 vs 2 replicas; degraded-replica failover demonstrated by yanking a drive (literal test procedure in the local M3 doc).
+**M3 — Storage tier.** `golem-store` (replicas, striping, checksums, pool) wired into P3/prefetch; two-drive mode. Exit: T5 green; cold-start TTFP and cold tok/s measured on 1 vs 2 replicas; degraded-replica failover demonstrated by yanking a drive (literal test procedure in the local M3 doc).
 
 **M3.5 — Throughput decision gate (amended 2026-09-29, blocks M4).** Prerequisite: the Critical/High review fixes (all landed by PR #48; the remaining open findings are in §17), which stopped the pooled GPU path from running on the real model. In suggested order:
 1. Test skips must fail (H-7); unsafe pool-slot API replaced by lease tokens (H-1).
@@ -742,7 +736,7 @@ Exit: the numbers are in `docs/baselines/`, compared against the §2.4 ceilings,
 6. **M3.9 cpu-expert-math (O8, §2.4).** The CPU+DMA split, gated on the measured d.
 7. **M3.6 prefill-stream and M4.8 state-snapshots.** Unchanged.
 
-**M4 — Product surface.** `golem-api` + `golem-server` HTTP, slots/batching, reasoning content; `golem` CLI (run/serve/list/stop/plan/import), registry; `golem-plan` with T8 calibration. Exit: T7, T8 green; the spec's five commands behave as §9 pins them.
+**M4 — Product surface.** `golem-api` + `golem-server` HTTP, slots/batching, reasoning content; `golem` CLI (run/serve/list/stop/plan; import dropped, §5.5), registry; `golem-plan` with T8 calibration. Exit: T7, T8 green; the spec's five commands behave as §9 pins them.
 
 **M5 — Validation hardening.** Full T2 suite vs reference runtime, 24 h soak (T6), baselines for cold/warm across the §12.3 matrix, README quickstart, baseline doc per spec §Acceptance. Exit: acceptance criteria of the product spec demonstrably met on the author's machine, with numbers committed under `docs/baselines/`.
 
@@ -761,7 +755,7 @@ Exit: the numbers are in `docs/baselines/`, compared against the §2.4 ceilings,
 | Multi-instance VRAM oversubscription crashes the driver | medium | medium | blocked by default when planned VRAM or locked RAM exceeds physical (§9.3, O5), with `--allow-overcommit` as a loud override; per-instance budgets |
 | RAM pool + page cache pressure on smaller-RAM machines | medium | low | pool default ≤75% free RAM, mlock'd; `--ram-experts-gib`; plan reports RAM fit explicitly |
 | Hybrid recurrent architecture breaks KV-rewind assumptions (slot cancel, prefix reuse) | certain (amended 2026-09-29, R-1) | high | state snapshot/restore (§7.1); no partial rewind anywhere |
-| Checksum verify slows startup (~186 GiB) | certain | low | amended 2026-09-29 (R-8): full verify at import only; start-time size + mtime + sampled hash; `--full-verify` opt-in; CRC32C at page-in |
+| Checksum verify slows startup (~186 GiB) | certain | low | amended 2026-09-29 (R-8): full verify opt-in; start-time size + mtime + sampled hash; `--full-verify` opt-in; CRC32C at page-in |
 
 ---
 
@@ -784,7 +778,7 @@ Every finding from the design/code reviews (2026-09-29 onward) is either fixed i
 
 **Closed since the last review pass:**
 - H-8: M3.3 shared-queue striping (§5.2).
-- D-4: per-plane CRC32C computed at import and carried in the manifest `expert_index` (§5.3).
+- D-4: per-plane CRC32C carried in the manifest `expert_index` (§5.3).
 - D-5: O7.
 - D-6: §2.4.
 - H-6: design side done (§6.5); the code landed in M3.7.
@@ -802,7 +796,7 @@ residency accounting), tracked in that baseline.
 - **R-4 (§7.1):** every `chat_turn` re-prefills the whole transcript (`session.rs`, `llama_memory_clear` per turn). The fix is state snapshot/restore. *Status (M4, #54):* implemented — prompt-prefill snapshots in a pinned arena, restore + delta prefill (`snapshot.rs`); byte-identical on tiny-moe and tiny-hybrid. Real model (`docs/baselines/m4.8-snapshots.md`): turn-5 TTFT 49.6–52.6 s → 9.9–10.1 s cold, 49.4–54.7 s → 9.8 s warm; greedy output not byte-identical on vs off (resolved, see below). *Amended 2026-10-23 (#169):* tiny-hybrid restore diverged at `n_gpu_layers` 0 because ggml places an op on the GPU only when its batch ≥ `GGML_OP_OFFLOAD_MIN_BATCH` (32), so restore + delta and full reprefill ran some ops on different devices; the test now offloads every layer, as the CLI does on HIP. Re-measured on GLM-5.3-Flash UD-IQ3_XXS (`hw_snapshot_turn_ttft`, both A/B orders): cold-pass greedy output byte-identical on vs off; turn-5 TTFT 21.0–21.1 s → 4.9–5.0 s cold, 20.9 s → 4.1–4.2 s warm.
 - **R-5 / H-10 (§3.4 P1):** hooks, device-cache map, budget and stats are process-global. The fix is a per-model `golem_ctx*` and an unregister that waits for in-flight callbacks. Mitigated today by refusing a second session or a re-enable.
 - **R-6 (§2.3 step 4):** the per-tensor `policy_query` and per-expert `notify_access` callbacks should become one ids-tensor read per MoE layer per step, with the eviction order pushed to C as context-owned data. The per-call cost is already allocation- and lock-free (M-1).
-- **R-8 (§4.3):** start-time verify should be size + mtime + sampled hash, with `--full-verify` opt-in. *Status (M4, #33):* implemented — `golem-engine/src/verify.rs` checks size + mtime + 16 × 1 MiB sampled SHA-256 (`i·len/16`) against manifest fields written by `golem import` (manifests without them: size + mtime + a warning); `--full-verify` re-hashes every byte. Real-model start times (cold, sampled vs full) pending the HW leg in `docs/baselines/m4.7-start-verify.md`. The expert-layer-set check against `block_count − nextn_predict_layers` is not part of it.
+- **R-8 (§4.3):** start-time verify should be size + mtime + sampled hash, with `--full-verify` opt-in. *Status (M4, #33):* implemented — `golem-engine/src/verify.rs` checks size + mtime + 16 × 1 MiB sampled SHA-256 (`i·(len−1 MiB)/15`, last window ends at EOF) against the manifest's `sampled_sha256` / `mtime` fields (manifests without them: size + mtime + a warning); `--full-verify` re-hashes every byte. Real-model start times (cold, sampled vs full) pending the HW leg in `docs/baselines/m4.7-start-verify.md`. The expert-layer-set check against `block_count − nextn_predict_layers` is not part of it.
 - **D-14 (§3.2):** the scheduler patch-size trigger (≈1.5k lines, or two conflicting rebases) re-opens D2 option B. Re-estimate at every vendor rebase.
 - **R-15:** CCD pinning, with decode on the V-cache CCD and I/O threads elsewhere. *Status (M4, #33):* implemented — `--pin auto` (default) detects the V-cache CCD from `cache/index3/size`, the decode worker pins itself before `Session::new` (ggml's threadpool inherits), store readers and the prefetch thread pin to the other CCD at spawn; no-op with one CCD. CPU threadpool default is physical cores / 2. Throughput effect unmeasured.
 

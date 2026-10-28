@@ -15,7 +15,7 @@ concurrency:
 jobs:
   test:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       GOLEM_LLAMA_SYS_BACKEND: cpu
@@ -63,7 +63,7 @@ jobs:
   # engine; own job so its two release builds stay out of `test`'s budget.
   test-seams:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       GOLEM_LLAMA_SYS_BACKEND: cpu
@@ -79,7 +79,7 @@ jobs:
   # cmake build is its own upstream-test tree (one substrate each).
   fork-parity-patch-p1:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       GOLEM_LLAMA_SYS_BACKEND: cpu
