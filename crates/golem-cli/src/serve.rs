@@ -469,6 +469,10 @@ pub fn serve(
         .filter(|m| *m > 0)
         .map(|m| std::time::Duration::from_secs(m * 60));
     let worker = spawn_worker_models(models, idle_unload, sinks)?;
+    tracing::info!(
+        device_cache_experts = worker.device_cache_experts,
+        "resolved device expert cache K"
+    );
     if let Some(f) = timing.as_mut() {
         TimingRecorder::header(
             f,
