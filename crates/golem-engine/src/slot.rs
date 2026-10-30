@@ -256,11 +256,13 @@ enum Phase {
 
 /// Decode steps a generating slot runs between two streamed prefill chunks
 /// of a joiner (§7.6). A streamed chunk stalls every generating slot for its
-/// whole duration: measured ≈ 91 s cold for one 512-token chunk on the
-/// target (`docs/baselines/m3.6-prefill-stream.md`, on512 mean 104 s wall
-/// incl. ≈ 10 s load → ≈ 5.6 prompt tok/s). 32 steps bounds that stall to
-/// at most 1 in 33 inter-token gaps; the `parallel ∈ {1,2,4}` HW leg
-/// (`docs/baselines/m4.4-batching.md`) re-derives it from measured ITL p99.
+/// whole duration: measured 12.7–15.7 s (mean 14.3 s) on the real model
+/// target for one streamed `prefill_ubatch` 1024 chunk, stall-free ITL
+/// p50/p99 147/258 ms vs. 14 777/15 669 ms with it. 32 steps bounds that
+/// stall to at most 1 in 33 inter-token gaps (confirmed: it landed at
+/// exactly steps 31, 63, 95, …, every 32); unchanged pending a product call
+/// on tail latency vs. joiner TTFT (raising it thins the stall out further,
+/// at the cost of a longer wait for the joiner itself).
 pub(crate) const STREAM_EVERY: u32 = 32;
 
 /// Initial detokenize buffer; longer pieces regrow it once.

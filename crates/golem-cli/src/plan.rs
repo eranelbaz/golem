@@ -194,12 +194,12 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
             g.cold_expert_ms
         );
         println!(
-            "ws: fitted on gfx1100 ({} MiB base, {} B/ctx token, {} B/ubatch token, \
-             {} B/ubatch×ctx token; {} below ctx {})",
+            "ws: fitted on gfx1100 ({} MiB floor, {} + {}·ctx B/ubatch token, \
+             ≥ {}·ctx; {} below ctx {})",
             WS_MEASURED.base >> 20,
-            WS_MEASURED.per_ctx_token,
             WS_MEASURED.per_ubatch_token,
             WS_MEASURED.per_ubatch_ctx_token,
+            WS_MEASURED.score_per_ubatch_ctx_token,
             WS_MEASURED.dense_per_ubatch_token,
             m.dense_below_ctx
         );

@@ -2631,10 +2631,10 @@ mod tests {
         }
     }
 
-    /// Target, 24 GiB free: 100k ctx + streamed 512 ubatch (fitted ws 0.79
+    /// Target, 24 GiB free: 100k ctx + streamed 512 ubatch (fitted ws 0.48
     /// GiB) + explicit K = 8 (9 × 644 MB = 5.4 GiB) is 8.35 + 1.84 + 0.14 +
-    /// 0.79 + 5.4 + 3.69 + 2.64 ≈ 22.9 GiB → fits; K = 12 (7.8 GiB) →
-    /// 25.3 GiB, clamped to the ≈ 6.55 GiB left: ⌊6.55 / 0.6⌋ − 1 = 9.
+    /// 0.48 + 5.4 + 3.69 + 2.64 ≈ 22.5 GiB → fits; K = 12 (7.8 GiB) →
+    /// 24.9 GiB, clamped to the ≈ 6.86 GiB left: ⌊7.37 / 0.644⌋ − 1 = 10.
     #[test]
     fn load_check_clamps_an_overcommitted_k() {
         let mut cfg = EngineConfig {
@@ -2642,7 +2642,7 @@ mod tests {
             ram_experts_gib: 57,
             vram_reserve_bytes: Some(0),
             prefill_stream: true,
-            // ubatch 512 keeps the fitted ws (810 MiB) from eating the
+            // ubatch 512 keeps the fitted ws (488 MiB) from eating the
             // explicit K = 8 cache at this ctx.
             prefill_ubatch: 512,
             device_cache_experts: 8,
@@ -2653,17 +2653,17 @@ mod tests {
         assert_eq!(r.term("stream_slabs"), 3_977_379_840);
         cfg.device_cache_experts = 12;
         let (r, k) = check_plan(&cfg, &glm(), 24 << 30, 24 << 30).unwrap();
-        assert_eq!(k, Some(9));
-        assert_eq!(r.term("device_expert_cache"), 10 * 644_022_272);
+        assert_eq!(k, Some(10));
+        assert_eq!(r.term("device_expert_cache"), 11 * 644_022_272);
         assert!(r.vram_headroom >= 0);
         // Derived K: the cache term is whatever the other terms leave.
         cfg.device_cache_experts = 0;
         let r = check_plan(&cfg, &glm(), 24 << 30, 24 << 30).unwrap().0;
         assert_eq!(r.vram_headroom, 0);
-        // ctx 100k at ubatch 512: fitted ws 0.79 GiB; 24 GiB − (8.35 t_ne +
-        // 1.84 kv + 0.14 rs + 0.79 ws + 3.69 slabs + 2.64 ROCm) ≈ 6.55 GiB.
+        // ctx 100k at ubatch 512: fitted ws 0.48 GiB; 24 GiB − (8.35 t_ne +
+        // 1.84 kv + 0.14 rs + 0.48 ws + 3.69 slabs + 2.64 ROCm) ≈ 6.86 GiB.
         assert!(r.term("device_expert_cache") > 5 << 30);
-        // Half of that 6.55 GiB cache holds K = 4 < top_k 8.
+        // Half of that 6.86 GiB cache holds K = 4 < top_k 8.
         cfg.vram_experts_frac = 0.5;
         let e = check_plan(&cfg, &glm(), 24 << 30, 24 << 30).unwrap_err();
         assert!(e.to_string().contains("device_expert_cache "), "{e}");
@@ -2671,9 +2671,9 @@ mod tests {
 
     /// Issue #102, real target: `--device-cache-experts 512` at ctx 262,144
     /// on 23.9 GiB free priced 513 × 644 MB ≈ 307 GiB + 4.8 GiB KV. Now the
-    /// other terms are 8.35 t_ne + 4.81 kv + 0.14 rs + 1.88 ws (512 × 15 ×
-    /// 262,144) + 2.64 ROCm = 19,134,148,487 B (17.8 GiB), leaving 6.1 GiB →
-    /// ⌊6.53 / 0.644⌋ − 1 = K = 9. The top-k boundary: others + 9
+    /// other terms are 8.35 t_ne + 4.81 kv + 0.14 rs + 1.13 ws (512 × 9 ×
+    /// 262,144) + 2.64 ROCm = 18,328,842,119 B (17.1 GiB), leaving 6.8 GiB →
+    /// ⌊7.33 / 0.644⌋ − 1 = K = 10. The top-k boundary: others + 9
     /// slots fits K = 8 exactly; one
     /// byte less leaves K = 7 < 8, refused naming the max. At 12 GiB free
     /// less than one slab slot (644 MB) is left: max 0. Never the raw
@@ -2688,9 +2688,9 @@ mod tests {
             ..EngineConfig::default()
         };
         let (r, k) = check_plan(&cfg, &glm(), (239 << 30) / 10, 24 << 30).unwrap();
-        assert_eq!(k, Some(9));
-        assert_eq!(r.term("device_expert_cache"), 10 * 644_022_272);
-        let at_top_k = 19_134_148_487 + 9 * 644_022_272;
+        assert_eq!(k, Some(10));
+        assert_eq!(r.term("device_expert_cache"), 11 * 644_022_272);
+        let at_top_k = 18_328_842_119 + 9 * 644_022_272;
         assert_eq!(
             check_plan(&cfg, &glm(), at_top_k, at_top_k).unwrap().1,
             Some(8)
@@ -2709,10 +2709,11 @@ mod tests {
     /// #168: an explicit K that fits free VRAM but eats into the default
     /// reserve is clamped, or refused naming the max when that is below
     /// top_k; never allowed into the reserve. Target, 23.98 GiB card, 24 GiB free
-    /// at ctx 100k / ubatch 512: ≈ 6.55 GiB left holds K = 9 with no
-    /// reserve; the 1.5 GiB reserve leaves ≈ 5.05 GiB → ⌊5.05 / 0.6⌋ − 1 =
-    /// K = 7 < top_k, so the request names the max instead; at ctx 65536
-    /// (KV −0.64 GiB) K = 9 is clamped to 8 and the reserve stays free.
+    /// at ctx 100k / ubatch 512: ≈ 6.86 GiB left holds K = 10 with no
+    /// reserve; the 1.5 GiB reserve leaves ≈ 5.36 GiB → ⌊5.75 / 0.644⌋ − 1 =
+    /// K = 7 < top_k, so the request names the max instead; at ctx 80000
+    /// (KV −0.37 GiB, ws −0.03 GiB) K = 9 is clamped to 8 and the reserve
+    /// stays free.
     #[test]
     fn explicit_k_into_the_reserve_is_clamped() {
         let total = 25_748_000_000;
@@ -2727,7 +2728,7 @@ mod tests {
         let e = check_plan(&cfg, &glm(), 24 << 30, total).unwrap_err();
         assert!(matches!(e, EngineError::InvalidConfig(_)), "{e}");
         assert!(e.to_string().contains("vram_reserve"), "{e}");
-        cfg.n_ctx = 65_536;
+        cfg.n_ctx = 80_000;
         let (r, k) = check_plan(&cfg, &glm(), 24 << 30, total).unwrap();
         assert_eq!(k, Some(8));
         let reserve = golem_plan::default_vram_reserve(total);

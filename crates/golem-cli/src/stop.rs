@@ -21,9 +21,11 @@ pub struct StopArgs {
 
 /// Grace between SIGTERM and SIGKILL for instances without a socket.
 const TERM_GRACE: Duration = Duration::from_secs(5);
-/// Teardown allowance (munlock + unregister of the ≈ 63 GiB pool, snapshot
-/// arena, staging ring). Unmeasured on the target until the
-/// `m4.7-start-verify.md` HW leg records it; 60 s is a placeholder bound.
+/// `run` grace after SIGTERM: teardown (munlock + unregister of the pool,
+/// snapshot arena, staging ring) measured ≤ 0.42 s on the real model target
+/// with a 52 GiB pool, but a SIGTERM during model load is honoured only
+/// after it (13 s warm, longer cold), so the bound covers the load, not
+/// the teardown.
 const TEARDOWN: Duration = Duration::from_secs(60);
 /// Exit wait after a socket stop: 30 s drain + 60 s worker join + teardown
 /// + 30 s margin.

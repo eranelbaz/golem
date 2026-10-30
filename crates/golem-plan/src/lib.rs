@@ -444,85 +444,96 @@ pub struct Machine {
 }
 
 /// Prefill workspace model, fitted from the measured T8 sweep on gfx1100
-/// (docs/baselines/m4.6-plan-t8.md). The compute buffer is the larger of a
-/// ctx-dominated and a ubatch-dominated regime, hence max.
+/// (docs/baselines/m4.6-plan-t8.md). The compute buffer is a floor or a
+/// per-ubatch-token slope that grows with ctx, hence max.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WsModel {
-    /// Fixed part of the ctx-dominated regime.
+    /// Floor (small ubatch).
     pub base: u64,
-    /// Bytes per ctx token in the ctx-dominated regime.
-    pub per_ctx_token: u64,
-    /// Bytes per ubatch token in the ubatch-dominated regime.
+    /// Bytes per ubatch token at ctx 0.
     pub per_ubatch_token: u64,
-    /// Bytes per ubatch token below [`ModelFacts::dense_below_ctx`].
+    /// Bytes per ubatch token at ctx 0 below [`ModelFacts::dense_below_ctx`].
     pub dense_per_ubatch_token: u64,
-    /// Bytes per ubatch × ctx token; overtakes `per_ubatch_token` at large
-    /// ctx (the ubatch × ctx score buffers).
+    /// Bytes per ubatch × ctx token added to the per-ubatch-token slope.
     pub per_ubatch_ctx_token: u64,
+    /// Bytes per ubatch × ctx token of the score buffers; overtakes the
+    /// linear slope at large ctx.
+    pub score_per_ubatch_ctx_token: u64,
 }
 
 impl WsModel {
-    /// Workspace bytes at this ctx × ubatch: `max(base + a·ctx,
-    /// ubatch·max(b, c·ctx))`, with the dense slope for `b` when
+    /// Workspace bytes at this ctx × ubatch: `max(base, ubatch·max(b +
+    /// a·ctx, c·ctx))`, with the dense slope for `b` when
     /// `ctx < dense_below_ctx`.
     #[must_use]
     pub fn bytes(&self, ctx: u32, ubatch: u32, dense_below_ctx: u32) -> u64 {
-        let b = if ctx < dense_below_ctx {
+        let ctx = u64::from(ctx);
+        let b = if ctx < u64::from(dense_below_ctx) {
             self.dense_per_ubatch_token
         } else {
             self.per_ubatch_token
         };
-        let b = b.max(self.per_ubatch_ctx_token.saturating_mul(u64::from(ctx)));
-        self.base
-            .saturating_add(self.per_ctx_token.saturating_mul(u64::from(ctx)))
-            .max(b.saturating_mul(u64::from(ubatch)))
+        let b = b
+            .saturating_add(self.per_ubatch_ctx_token.saturating_mul(ctx))
+            .max(self.score_per_ubatch_ctx_token.saturating_mul(ctx));
+        self.base.max(b.saturating_mul(u64::from(ubatch)))
     }
 }
 
-/// Fitted on RX 7900 XTX, GLM-5.3-Flash UD-Q4_K_XL (§12, T8): base 320 MiB,
-/// fitted ctx slope 5 138 B/token (ubatch-512 row), ubatch slope 1 105 975
-/// B/token (ctx 65536 row, linear through zero at 1.0547 MiB/token). All
-/// eight measured points within 256 MiB of the model; worst +198 MiB at ctx
-/// 4096 / ubatch 512, where the ubatch branch over-predicts the flat
-/// small-ctx compute buffer. Fit domain: ubatch ≥ 512. Dense slope: below
-/// ctx 2052 (indexer top_k 2048 + kpool 4) llama skips indexer scoring;
-/// ctx 2048 logged 685.00 / 1370.00 MiB at ubatch 1024 / 2048 = 701 445
-/// B/token, where the sparse slope over-predicted 2048 by +790 MiB. Dense
-/// fit domain: those two points. ubatch × ctx slope: 15 B, from ctx 131072
-/// at ubatch 512 / 1024 (956.64 / 1944.66 MiB ≈ 1.96 MB per ubatch token =
-/// 15 × 131072). Below ctx 73 732 (1 105 975 / 15) the flat slope wins, so
-/// the ctx-65536 rows are unchanged. ws is quant-independent:
-/// UD-IQ3_XXS logged the UD-Q4_K_XL bytes at 131072/512 and 65536/2048.
+/// Fitted on RX 7900 XTX, GLM-5.3-Flash UD-IQ3_XXS, flash attention on, KV
+/// q8_0 (§12, T8, 26 points, ctx 2048–131072 × ubatch 512–4096): llama's
+/// buffer is ubatch-linear at every ctx, ≈ 704 KB per ubatch token at ctx
+/// 2048 rising ≈ 2.6 B per ctx token to 864 KB at ctx 65536; at 131072 the
+/// ubatch × ctx score buffers take over (1.20 MB = 9.2 × 131072). Fit:
+/// b 699 500 + 3·ctx, c 9 → every point within −40 / +127 MiB. Dense slope
+/// unchanged (indexer skipped below ctx 2052; 701 445 B/token at ctx 2048).
+/// Floor 320 MiB is under every measured point (≥ 344 MiB at ubatch 512).
 pub const WS_MEASURED: WsModel = WsModel {
     base: 320 << 20,
-    per_ctx_token: 5_138,
-    per_ubatch_token: 1_105_975,
+    per_ubatch_token: 699_500,
     dense_per_ubatch_token: 701_445,
-    per_ubatch_ctx_token: 15,
+    per_ubatch_ctx_token: 3,
+    score_per_ubatch_ctx_token: 9,
 };
 
 /// The T8 measured compute-buffer points (ctx, ubatch, bytes).
 #[cfg(test)]
-const T8_MEASURED: [(u32, u32, u64); 10] = [
-    (2_048, 1_024, 718_274_560),
-    (2_048, 2_048, 1_436_549_120),
-    (4_096, 512, 359_137_280),
-    (4_096, 1_024, 1_062_228_460),
-    (65_536, 512, 633_685_934),
-    (65_536, 1_024, 1_132_818_596),
-    (65_536, 2_048, 2_265_312_133),
-    (65_536, 4_096, 4_530_299_208),
-    (131_072, 512, 1_003_109_745),
-    (131_072, 1_024, 2_039_123_804),
+const T8_MEASURED: [(u32, u32, u64); 26] = [
+    (131_072, 512, 617_663_693),
+    (131_072, 1_024, 1_230_912_881),
+    (131_072, 2_048, 2_457_411_256),
+    (65_536, 512, 444_061_450),
+    (65_536, 1_024, 885_857_976),
+    (65_536, 2_048, 1_769_472_000),
+    (65_536, 4_096, 3_536_679_076),
+    (32_768, 512, 401_038_377),
+    (32_768, 1_024, 800_891_863),
+    (32_768, 2_048, 1_600_609_321),
+    (32_768, 4_096, 3_200_054_723),
+    (16_384, 512, 379_521_597),
+    (16_384, 1_024, 758_414_049),
+    (16_384, 2_048, 1_516_188_467),
+    (16_384, 4_096, 3_031_737_303),
+    (8_192, 512, 368_763_208),
+    (8_192, 1_024, 737_169_900),
+    (8_192, 2_048, 1_473_972_797),
+    (8_192, 4_096, 2_947_589_079),
+    (4_096, 512, 363_384_013),
+    (4_096, 1_024, 726_547_825),
+    (4_096, 2_048, 1_452_864_963),
+    (4_096, 4_096, 2_905_509_724),
+    (2_048, 512, 360_699_658),
+    (2_048, 1_024, 721_242_030),
+    (2_048, 2_048, 1_442_316_288),
 ];
 
-/// Fit regression: `WS_MEASURED` reproduces every T8 point within 256 MiB.
+/// Fit regression: `WS_MEASURED` reproduces every T8 point within 128 MiB.
 #[test]
 fn ws_fitted_model_matches_t8_points() {
     for (ctx, ub, actual) in T8_MEASURED {
         let pred = WS_MEASURED.bytes(ctx, ub, 2_052);
         assert!(
-            pred.abs_diff(actual) <= 256 << 20,
+            pred.abs_diff(actual) <= 128 << 20,
             "ctx {ctx} ubatch {ub}: predicted {pred}, actual {actual}"
         );
     }
@@ -1053,10 +1064,10 @@ mod tests {
     fn oversized_ubatch_refused_with_largest_fitting_suggestion() {
         let ws = WsModel {
             base: 512 << 20,
-            per_ctx_token: 0,
             per_ubatch_token: 1 << 20,
             dense_per_ubatch_token: 1 << 20,
             per_ubatch_ctx_token: 0,
+            score_per_ubatch_ctx_token: 0,
         };
         let r = plan(
             &glm(),
@@ -1317,10 +1328,10 @@ mod tests {
         assert!(!plan(&m, &box24(), &explicit).feasible);
     }
 
-    /// Target at ctx 32768, parallel 1: 25.77 − (8.97 + 0.65 + 0.15 + 2.27 +
-    /// 3.96 + 2.83) = 6.94 GB derived cache with the fitted ws of 2.27 GB at
-    /// ubatch 2048. Fraction × 0.7 gives 4.86 GB < 9 × 644 MB = 5.80 GB →
-    /// refused; × 0.95 gives 6.59 GB, which fits.
+    /// Target at ctx 32768, parallel 1: 25.77 − (8.97 + 0.65 + 0.15 + 1.63 +
+    /// 3.96 + 2.83) = 7.58 GB derived cache with the fitted ws of 1.63 GB at
+    /// ubatch 2048. Fraction × 0.7 gives 5.31 GB < 9 × 644 MB = 5.80 GB →
+    /// refused; × 0.95 gives 7.20 GB, which fits.
     #[test]
     fn frac_caps_the_derived_cache_against_its_minimum() {
         let m = ModelFacts {
