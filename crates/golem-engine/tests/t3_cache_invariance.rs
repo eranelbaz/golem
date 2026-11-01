@@ -145,6 +145,8 @@ fn register_p2_hooks() {
         miss_ids: *const i32,
         n_miss: i32,
         ptrs: *mut *const libc::c_void,
+        _hits_ready: golem_llama_sys::raw::golem_hits_ready_fn,
+        _hits_ud: *mut libc::c_void,
     ) -> i32 {
         // ABI v2: the substrate copies from the returned pointers, so serve
         // the tensor's REAL per-expert planes — the same bytes the unpooled

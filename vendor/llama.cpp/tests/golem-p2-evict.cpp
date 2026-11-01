@@ -72,10 +72,13 @@ static void ev_abandon(void *, int32_t blk, const int32_t * experts, int32_t n) 
 }
 
 static int32_t ev_ensure(void *, const void *, const int32_t * mk, const int32_t * mi,
-                      int32_t n, const void ** out) {
+                      int32_t n, const void ** out, golem_hits_ready_fn hits_ready, void * hits_ud) {
     for (int32_t i = 0; i < n; ++i) {
         T_REQUIRE(mi[i] >= 0 && mi[i] < N_EXPERTS, "miss id out of range");
         out[i] = pool_plane(mk[i] - 1, mi[i]).data();
+    }
+    if (hits_ready != nullptr) {
+        hits_ready(hits_ud, out);
     }
     return 0;
 }

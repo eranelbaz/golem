@@ -9,7 +9,17 @@
 //   6. allocation-free steady state: repeated ggml_backend_sched_graph_compute
 //      over a synthetic MUL_MAT_ID slab graph with an overriding operator new
 //      allocates nothing after the first step.
+//   7. ABI v17 hits_ready, pooled (mode 1): hits are H2D-queued inside the
+//      callback, before the stub fills the misses; a run split by a miss is
+//      not issued early (MMQ padding); output equals the hookless reference.
+//   8. hits_ready, slab (mode 2) with a parked eviction D2H: the eviction
+//      destination holds the old bytes, the slab the new ones.
+//   9. ensure failing after hits_ready ran: compute FAILED, then recovers.
+//  10. hits_ready under async_h2d (copy stream): needs a GPU device; a
+//      CPU-only build skips it only with GOLEM_CTEST_CPU_ONLY=1 (reported).
 #include <atomic>
+#include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -147,7 +157,7 @@ static void pool_init() {
 }
 
 static int32_t h_ensure(void * p, const void * tensor, const int32_t * mk, const int32_t * mi,
-                     int32_t n, const void ** out) {
+                     int32_t n, const void ** out, golem_hits_ready_fn hits_ready, void * hits_ud) {
     auto * s = (HState *) p;
     s->ensure_calls.fetch_add(1);
     s->miss_kinds.assign(mk, mk + n);
@@ -159,6 +169,9 @@ static int32_t h_ensure(void * p, const void * tensor, const int32_t * mk, const
         out[i] = g_pool.data() + plane * ((size_t) (kind - 1) * N_EXP + mi[i]);
     }
     (void) tensor;
+    if (hits_ready != nullptr) {
+        hits_ready(hits_ud, out);
+    }
     g_cb_entered.store(true);
     std::this_thread::sleep_for(std::chrono::milliseconds(g_join_sleep_ms.load()));
     s->cb_returned.store(true);
@@ -166,7 +179,7 @@ static int32_t h_ensure(void * p, const void * tensor, const int32_t * mk, const
 }
 
 static int32_t h_abort_ensure(void *, const void *, const int32_t *, const int32_t *,
-                           int32_t, const void **) {
+                           int32_t, const void **, golem_hits_ready_fn, void *) {
     golem_unregister_hooks(g_h_abort); // must GGML_ABORT (join waits for the calling step)
     return 0;
 }
@@ -183,6 +196,234 @@ static void h_routing(void * p, int32_t blk, const void * tensor, const int32_t 
 }
 
 static void h_copy_done(void * p) { ((HState *) p)->copy_done_calls.fetch_add(1); }
+
+// --- ABI v17 hits_ready legs (7-10) ---
+static const int32_t HX = 8; // experts per plane
+static const size_t HX_PLANE = (size_t) NE0 * NE1 * sizeof(float);
+
+static float hx_weight(size_t i) { return (float) (i % 7) * 0.25f + 0.125f * (float) (i / (NE0 * NE1)); }
+
+// Pool stand-in: plane (kind, e) holds the bytes of the weights' expert e, so
+// the hookless upstream copy is the reference.
+static std::vector<float> & hx_pool() {
+    static std::vector<float> p;
+    if (p.empty()) {
+        p.resize((size_t) 3 * HX * NE0 * NE1);
+        for (int k = 0; k < 3; ++k) {
+            for (size_t i = 0; i < (size_t) HX * NE0 * NE1; ++i) {
+                p[(size_t) k * HX * NE0 * NE1 + i] = hx_weight(i);
+            }
+        }
+    }
+    return p;
+}
+static const void * hx_plane(int kind, int32_t e) {
+    return (const char *) hx_pool().data() + HX_PLANE * ((size_t) (kind - 1) * HX + e);
+}
+
+struct HitState {
+    golem_ctx_t c = nullptr;
+    std::vector<int32_t> miss;  // ids pending (disk read) at hits_ready time
+    int32_t rc = 0;             // ensure return code
+    int ensure_calls = 0;
+    std::vector<char> order;    // 'c' = hits_ready, 'f' = miss fill
+    uint64_t early_at_cb = 0;   // early_h2d_units right after hits_ready returned
+    std::vector<int32_t> nulls_at_cb;
+};
+static HitState g_hit;
+
+static uint64_t hx_early(golem_ctx_t c) {
+    const auto * st = reinterpret_cast<const std::atomic<uint64_t> *>(golem_get_device_cache_stats(c));
+    return st[5].load(std::memory_order_relaxed);
+}
+
+static int32_t hx_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi, int32_t n,
+                         const void ** out, golem_hits_ready_fn hits_ready, void * hits_ud) {
+    auto * s = (HitState *) p;
+    s->ensure_calls++;
+    auto is_miss = [&](int32_t id) {
+        return std::find(s->miss.begin(), s->miss.end(), id) != s->miss.end();
+    };
+    for (int32_t i = 0; i < n; ++i) {
+        out[i] = is_miss(mi[i]) ? nullptr : hx_plane(mk[i], mi[i]);
+    }
+    if (hits_ready != nullptr) {
+        s->order.push_back('c');
+        for (int32_t i = 0; i < n; ++i) {
+            if (out[i] == nullptr) {
+                s->nulls_at_cb.push_back(mi[i]);
+            }
+        }
+        hits_ready(hits_ud, out);
+        s->early_at_cb = hx_early(s->c);
+    }
+    s->order.push_back('f');
+    for (int32_t i = 0; i < n; ++i) {
+        out[i] = hx_plane(mk[i], mi[i]);
+    }
+    return s->rc;
+}
+
+static void hx_routing(void *, int32_t, const void *, const int32_t *, int64_t, int32_t) {}
+static void hx_copy_done(void *) {}
+
+struct HitEvict {
+    std::vector<int32_t> evicted;
+    std::vector<std::vector<char>> dst = std::vector<std::vector<char>>(3 * HX);
+};
+static HitEvict g_hev;
+static void hx_evict(void *, const void *, const int32_t * experts, int32_t n, void * const * out, int32_t * keep) {
+    for (int32_t i = 0; i < n; ++i) {
+        g_hev.evicted.push_back(experts[i]);
+        keep[i] = 1;
+        for (int k = 0; k < 3; ++k) {
+            auto & d = g_hev.dst[(size_t) k * HX + experts[i]];
+            d.assign(HX_PLANE, 0);
+            const_cast<void **>(out)[3 * i + k] = d.data();
+        }
+    }
+}
+
+// One layer, `planes` expert tensors (gate/up/down), top-`k` routing of one
+// token, each MUL_MAT_ID forced onto `gpu`; weights in a host WEIGHTS buffer.
+struct HitSched {
+    ggml_backend_t cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t wbuf = nullptr;
+    std::vector<ggml_tensor *> outs;
+    ggml_tensor * ids = nullptr;
+    ggml_cgraph * gf = nullptr;
+    int k = 0;
+
+    void build(ggml_backend_t gpu, int planes, int k_) {
+        static const char * names[3] = {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                        "blk.0.ffn_down_exps.weight"};
+        k = k_;
+        ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
+        ctx = ggml_init(ip);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NE0, k);
+        ggml_set_name(b, "blk.0.cur_ffn_inp");
+        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, 1);
+        ggml_set_name(ids, "blk.0.ffn_router");
+        std::vector<ggml_tensor *> w;
+        for (int p = 0; p < planes; ++p) {
+            ggml_tensor * wk = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, NE0, NE1, HX);
+            ggml_set_name(wk, names[p]);
+            w.push_back(wk);
+            outs.push_back(ggml_mul_mat_id(ctx, wk, b, ids));
+        }
+        gf = ggml_new_graph(ctx);
+        for (auto * o : outs) {
+            ggml_build_forward_expand(gf, o);
+        }
+        cpu = ggml_backend_cpu_init();
+        ggml_backend_t backs[2] = {gpu, cpu};
+        sched = ggml_backend_sched_new(backs, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        for (auto * o : outs) {
+            ggml_backend_sched_set_tensor_backend(sched, o, gpu);
+        }
+        wbuf = ggml_backend_alloc_buffer(cpu, (size_t) planes * HX * HX_PLANE + 4096);
+        char * base = (char *) ggml_backend_buffer_get_base(wbuf);
+        for (int p = 0; p < planes; ++p) {
+            ggml_backend_tensor_alloc(wbuf, w[p], base + (size_t) p * HX * HX_PLANE);
+            ggml_backend_tensor_set(w[p], hx_pool().data(), 0, ggml_nbytes(w[p]));
+        }
+        ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        REQUIRE(ggml_backend_sched_alloc_graph(sched, gf), "hit sched alloc_graph");
+        std::vector<float> hb((size_t) NE0 * k);
+        for (size_t i = 0; i < hb.size(); ++i) hb[i] = 0.5f + 0.25f * (float) (i % 5);
+        ggml_backend_tensor_set(b, hb.data(), 0, ggml_nbytes(b));
+    }
+    enum ggml_status run(const std::vector<int32_t> & route, std::vector<float> & res) {
+        ggml_backend_tensor_set(ids, route.data(), 0, ggml_nbytes(ids));
+        const enum ggml_status st = ggml_backend_sched_graph_compute(sched, gf);
+        res.clear();
+        if (st == GGML_STATUS_SUCCESS) {
+            for (auto * o : outs) {
+                std::vector<float> v(ggml_nelements(o));
+                ggml_backend_tensor_get(o, v.data(), 0, ggml_nbytes(o));
+                res.insert(res.end(), v.begin(), v.end());
+            }
+        }
+        return st;
+    }
+    ~HitSched() {
+        golem_sched_detach_ctx(sched);
+        ggml_backend_sched_free(sched);
+        ggml_backend_buffer_free(wbuf);
+        ggml_backend_free(cpu);
+        ggml_free(ctx);
+    }
+};
+
+// Hookless upstream reference on the same backend + route.
+static std::vector<float> hx_reference(ggml_backend_t gpu, int planes, const std::vector<int32_t> & route) {
+    HitSched hs;
+    hs.build(gpu, planes, (int) route.size());
+    std::vector<float> res;
+    REQUIRE(hs.run(route, res) == GGML_STATUS_SUCCESS, "reference compute");
+    return res;
+}
+
+static bool hx_same(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size() || a.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::fabs(a[i] - b[i]) > 1e-4f * (1.0f + std::fabs(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static golem_hook_handle_t g_hx_handle = nullptr;
+static golem_ctx_t hx_ctx(bool slab, bool evict) {
+    golem_ctx_t c = golem_ctx_create(N_LAYERS, HX);
+    golem_set_device_cache_experts(c, 2);
+    g_hx_handle = golem_register_hooks(c, hx_ensure, slab ? hx_routing : nullptr, hx_copy_done, evict ? hx_evict : nullptr,
+                         nullptr, nullptr, nullptr, &g_hit);
+    g_hit = HitState{};
+    g_hit.c = c;
+    return c;
+}
+static void hx_free(golem_ctx_t c) {
+    golem_unregister_hooks(g_hx_handle);
+    golem_reset_device_cache(c);
+    golem_ctx_free(c);
+}
+
+// Pooled (mode 1) hits_ready checks on `gpu`; returns nothing, REQUIREs.
+static void hx_pooled_legs(ggml_backend_t gpu, const char * tag) {
+    const std::vector<int32_t> route = {0, 1, 3, 4, 5}; // runs {0,1} and {3,4,5}
+    const std::vector<float> ref = hx_reference(gpu, 1, route);
+    struct Case { std::vector<int32_t> miss; uint64_t early; };
+    // {4} splits run {3,4,5}: only {0,1} goes early. No miss: all 5. All
+    // misses: no hits, no callback work.
+    const Case cases[3] = {{{4}, 2}, {{}, 5}, {{0, 1, 3, 4, 5}, 0}};
+    for (const Case & cs : cases) {
+        golem_ctx_t c = hx_ctx(false, false);
+        g_hit.miss = cs.miss;
+        {
+            HitSched hs;
+            hs.build(gpu, 1, (int) route.size());
+            golem_sched_set_ctx(hs.sched, c);
+            const uint64_t e0 = hx_early(c);
+            std::vector<float> res;
+            REQUIRE(hs.run(route, res) == GGML_STATUS_SUCCESS, "%s: pooled compute", tag);
+            REQUIRE(g_hit.ensure_calls == 1, "%s: one ensure, got %d", tag, g_hit.ensure_calls);
+            REQUIRE((g_hit.order == std::vector<char>{'c', 'f'}), "%s: hits_ready before the miss fill", tag);
+            REQUIRE(g_hit.nulls_at_cb == cs.miss, "%s: pending ids at hits_ready", tag);
+            REQUIRE(g_hit.early_at_cb - e0 == cs.early, "%s: %llu units queued inside hits_ready (want %llu)",
+                    tag, (unsigned long long) (g_hit.early_at_cb - e0), (unsigned long long) cs.early);
+            REQUIRE(hx_early(c) - e0 == cs.early, "%s: early units total", tag);
+            REQUIRE(hx_same(res, ref), "%s: pooled output == hookless reference (miss set size %zu)", tag,
+                    cs.miss.size());
+        }
+        hx_free(c);
+    }
+}
 
 int main() {
     if (golem_hooks_abi_version() != GOLEM_HOOKS_ABI_VERSION) {
@@ -321,6 +562,108 @@ int main() {
         golem_ctx_free(c);
     }
 
+    {   // --- leg 7: hits_ready, pooled (mode 1), fake GPU ---
+        hx_pooled_legs(golem_test::fake_backend(), "leg 7");
+    }
+
+    {   // --- leg 8: hits_ready, slab (mode 2) + parked eviction D2H ---
+        golem_ctx_t c = hx_ctx(true, true);
+        g_hev = HitEvict{};
+        {
+            HitSched hs;
+            hs.build(golem_test::fake_backend(), 3, 2);
+            golem_sched_set_ctx(hs.sched, c);
+            std::vector<float> res;
+            REQUIRE(hs.run({0, 1}, res) == GGML_STATUS_SUCCESS, "leg 8: step 1");
+            REQUIRE(hx_same(res, hx_reference(golem_test::fake_backend(), 3, {0, 1})), "leg 8: step 1 output");
+            REQUIRE(g_hev.evicted.empty(), "leg 8: no eviction before the slots fill");
+            // Step 2: slots of 0,1 are stolen by 2,3; 3 is a disk miss.
+            g_hit.miss = {3};
+            g_hit.order.clear();
+            g_hit.nulls_at_cb.clear();
+            const uint64_t e0 = hx_early(c);
+            REQUIRE(hs.run({2, 3}, res) == GGML_STATUS_SUCCESS, "leg 8: step 2");
+            REQUIRE(hx_early(c) - e0 == 3, "leg 8: expert 2 early in all 3 planes, got %llu",
+                    (unsigned long long) (hx_early(c) - e0));
+            REQUIRE(g_hev.evicted.size() == 2, "leg 8: both owners evicted, got %zu", g_hev.evicted.size());
+            for (int32_t e : g_hev.evicted) {
+                for (int k = 0; k < 3; ++k) {
+                    const auto & d = g_hev.dst[(size_t) k * HX + e];
+                    REQUIRE(d.size() == HX_PLANE && memcmp(d.data(), hx_plane(k + 1, e), HX_PLANE) == 0,
+                            "leg 8: evicted expert %d plane %d holds the OLD bytes (D2H before refill)", e, k);
+                }
+            }
+            REQUIRE(hx_same(res, hx_reference(golem_test::fake_backend(), 3, {2, 3})), "leg 8: slab holds the NEW bytes");
+        }
+        hx_free(c);
+    }
+
+    {   // --- leg 9: ensure fails after hits_ready ran ---
+        golem_ctx_t c = hx_ctx(false, false);
+        g_hit.miss = {4};
+        g_hit.rc = 1;
+        {
+            HitSched hs;
+            hs.build(golem_test::fake_backend(), 1, 5);
+            golem_sched_set_ctx(hs.sched, c);
+            std::vector<float> res;
+            REQUIRE(hs.run({0, 1, 3, 4, 5}, res) == GGML_STATUS_FAILED, "leg 9: compute FAILED");
+            REQUIRE((g_hit.order == std::vector<char>{'c', 'f'}), "leg 9: hits_ready ran before the failure");
+            g_hit.rc = 0;
+            REQUIRE(hs.run({0, 1, 3, 4, 5}, res) == GGML_STATUS_SUCCESS, "leg 9: recovery compute");
+            REQUIRE(hx_same(res, hx_reference(golem_test::fake_backend(), 1, {0, 1, 3, 4, 5})), "leg 9: recovery output");
+        }
+        hx_free(c);
+    }
+
+    {   // --- leg 10: hits_ready under async_h2d (copy stream, GPU only) ---
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (dev == nullptr) {
+            const char * cpu_only = getenv("GOLEM_CTEST_CPU_ONLY");
+            if (cpu_only != nullptr && strcmp(cpu_only, "1") == 0) {
+                printf("SKIPPED: leg 10 async_h2d (no GPU device, GOLEM_CTEST_CPU_ONLY=1)\n");
+                fflush(stdout);
+            } else {
+                REQUIRE(false, "leg 10: no GPU device for async_h2d (set GOLEM_CTEST_CPU_ONLY=1 on a CPU-only build)");
+            }
+        } else {
+            ggml_backend_t gpu = ggml_backend_dev_init(dev, nullptr);
+            REQUIRE(gpu != nullptr, "leg 10: GPU backend init");
+            const std::vector<int32_t> route = {0, 1, 3, 4, 5};
+            for (int slab = 0; slab < 2; ++slab) {
+                const std::vector<float> ref = hx_reference(gpu, 1, route);
+                golem_ctx_t c = hx_ctx(slab != 0, false);
+                if (slab) {
+                    golem_set_device_cache_experts(c, 5);
+                }
+                REQUIRE(golem_set_async_h2d(c, 1) == 0, "leg 10: async_h2d on");
+                g_hit.miss = {4};
+                {
+                    HitSched hs;
+                    hs.build(gpu, 1, (int) route.size());
+                    golem_sched_set_ctx(hs.sched, c);
+                    const uint64_t e0 = hx_early(c);
+                    std::vector<float> res;
+                    REQUIRE(hs.run(route, res) == GGML_STATUS_SUCCESS, "leg 10 (%s): compute", slab ? "slab" : "pooled");
+                    // pooled: run {0,1} (2); slab: every pending hit (4).
+                    const uint64_t want = slab ? 4 : 2;
+                    REQUIRE(hx_early(c) - e0 == want, "leg 10 (%s): early units %llu (want %llu)",
+                            slab ? "slab" : "pooled", (unsigned long long) (hx_early(c) - e0),
+                            (unsigned long long) want);
+                    REQUIRE(hx_same(res, ref), "leg 10 (%s): output == hookless reference", slab ? "slab" : "pooled");
+                    double ms = -1.0;
+                    uint64_t bytes = 0;
+                    REQUIRE(golem_take_h2d_timing(c, &ms, &bytes) == 1, "leg 10: timing pairs closed, no overflow");
+                    REQUIRE(ms >= 0.0 && bytes >= 5 * HX_PLANE, "leg 10: timed bytes %llu",
+                            (unsigned long long) bytes);
+                }
+                hx_free(c);
+            }
+            ggml_backend_free(gpu);
+        }
+    }
+
+    fflush(stdout); // forked legs below must not re-emit buffered output
     {   // --- leg 5: unregister inside a callback aborts ---
         if (fork() == 0) {
             HState s;
@@ -332,7 +675,7 @@ int main() {
             static int32_t mk[1] = {1}, mi[1] = {0};
             const void * optr[1] = {nullptr};
             golem_cb_guard cb;
-            h_abort_ensure(&s, nullptr, mk, mi, 1, optr);
+            h_abort_ensure(&s, nullptr, mk, mi, 1, optr, nullptr, nullptr);
             _exit(0); // must not survive
         }
         int st = 0; wait(&st);

@@ -97,13 +97,16 @@ void s_release(void * p, uint64_t seq) {
 }
 
 int32_t s_ensure(void * p, const void *, const int32_t * mk, const int32_t * mi,
-              int32_t n, const void ** out) {
+              int32_t n, const void ** out, golem_hits_ready_fn hits_ready, void * hits_ud) {
     auto * s = (SState *) p;
     s->ensure_calls.fetch_add(1);
     // Pooled stand-in: serve the pool pattern too, so a disarmed step still
     // computes the same bytes.
     for (int32_t i = 0; i < n; ++i) {
         out[i] = s->plane_ptr(mk[i], mi[i]);
+    }
+    if (hits_ready != nullptr) {
+        hits_ready(hits_ud, out);
     }
     return 0;
 }

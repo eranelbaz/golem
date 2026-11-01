@@ -236,6 +236,10 @@ async fn metrics_export_expert_h2d_copies() {
         "{body}"
     );
     assert!(
+        body.contains("golem_expert_early_h2d_units_total "),
+        "{body}"
+    );
+    assert!(
         body.contains("golem_expert_mul_mat_id_total{device=\"cpu\"} 0"),
         "{body}"
     );

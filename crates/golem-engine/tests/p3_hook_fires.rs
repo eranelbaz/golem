@@ -51,6 +51,8 @@ fn drive_step(payload: *mut libc::c_void, gate: *mut raw::ggml_tensor) -> [*cons
         miss_ids.as_ptr(),
         3,
         out.as_mut_ptr().cast(),
+        None,
+        std::ptr::null_mut(),
     );
     assert_eq!(rc, 0, "ensure paged in");
     p3_glue::copy_done(payload);

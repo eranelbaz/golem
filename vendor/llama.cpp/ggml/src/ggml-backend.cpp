@@ -201,16 +201,51 @@ static void golem_cs_set(golem_ctx_t ctx, ggml_tensor * t, const void * src, siz
     ctx->cs_bytes += len;
 }
 
-// Closes a copying split: the compute stream waits for every H2D the split
-// queued on the copy stream before the split's graph reads it.
-static void golem_cs_join(golem_ctx_t ctx) {
-    ggml_backend_t be = ctx->cs_backend;
+// Closes the split's open timing pair (golem_cs_begin with first = true):
+// records t1 and counts the pair, or flags the ring overflow.
+static void golem_cs_close_pair(golem_ctx_t ctx) {
     if (ctx->cs_t_n < golem_ctx::GOLEM_CS_RING) {
-        ctx->cs->record_copy(be, ctx->cs_t1[ctx->cs_t_n]);
+        ctx->cs->record_copy(ctx->cs_backend, ctx->cs_t1[ctx->cs_t_n]);
         ctx->cs_t_n++;
+    } else {
+        ctx->cs_t_overflow = true;
+    }
+}
+
+// Closes a copying split: the compute stream waits for every H2D the split
+// queued on the copy stream before the split's graph reads it. `pair_open`:
+// a timing pair is still open (the ensure hits_ready callback closes its own).
+static void golem_cs_join(golem_ctx_t ctx, bool pair_open) {
+    ggml_backend_t be = ctx->cs_backend;
+    if (pair_open) {
+        golem_cs_close_pair(ctx);
     }
     ctx->cs->record_copy(be, ctx->cs_ev_done);
     ctx->cs->compute_wait(be, ctx->cs_ev_done);
+}
+
+// One run of consecutive routed experts of a pooled (mode 1) plane: a copy
+// per expert from its pool slot plus the 512 B MMQ tail (golem-p3-copy.h),
+// on the copy stream (golem_cs_begin already ran) or the split stream.
+static void golem_issue_pooled_run(golem_ctx_t ctx, ggml_backend_t be, ggml_tensor * dst, int32_t first_id,
+                                   int32_t last_id, int64_t n_expert, size_t expert_size,
+                                   const void * const * ptrs) {
+    const size_t expert_offset = first_id * expert_size;
+    const size_t padding = std::min<size_t>(expert_size, 512);
+    const size_t padding_len = last_id < n_expert - 1 ? padding : 0;
+    if (ctx->async_h2d) {
+        golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
+            ptrs, last_id - first_id + 1,
+            [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
+                golem_cs_set((golem_ctx_t) ud, (ggml_tensor *) dst, src, dst_off, len);
+            }, ctx);
+        return;
+    }
+    golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
+        ptrs, last_id - first_id + 1,
+        [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
+            ggml_backend_tensor_set_async((ggml_backend_t) ud, (ggml_tensor *) dst, src, dst_off, len);
+        }, be);
 }
 
 int32_t golem_take_h2d_timing(golem_ctx_t ctx, double * ms, uint64_t * bytes) {
@@ -2342,6 +2377,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         golem::GolemSlabEntry * st = nullptr;             // slab entry (map stable within the step)
         golem::GolemSlabCounters dc = {};
         size_t out_off = 0;                               // slice of the batched out_ptrs
+        std::vector<uint8_t> issued;                      // per ptrs index: H2D queued by hits_ready (ABI v17)
     };
     static thread_local std::vector<golem_plane_plan> golem_planes;
     static thread_local std::vector<int32_t> golem_dense;    // dense ids (routing readback + remap)
@@ -2564,6 +2600,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // Copy stream already ordered after every compute-stream op queued
         // so far in this split (cleared by eviction D2H).
         bool golem_cs_fenced = false;
+        // A timing pair (t0 recorded by golem_cs_begin) is open on the copy
+        // stream. Closed by the hits_ready callback and by golem_cs_join, so
+        // a split has at most 2 pairs per ensure segment: 42 x 2 = 84 per
+        // GLM-5.3-Flash step (168 with 2-segment layers) < GOLEM_CS_RING.
+        bool golem_cs_pair_open = false;
+        auto golem_cs_open = [&]() {
+            golem_cs_begin(gctx, split_backend, !golem_cs_pair_open, !golem_cs_fenced);
+            golem_cs_used = true;
+            golem_cs_pair_open = true;
+            golem_cs_fenced = true;
+        };
+        // Exclusive D2H drain (see golem_evict_d2h): issue plane `inp`'s share
+        // of its layer's parked evictions on the split stream. Must precede
+        // the plane's staged H2D refills (stream order lands the D2H read of
+        // a stolen slot before the refill overwrites it); idempotent through
+        // the per-kind done bits, so the hits_ready callback and the copy
+        // loop may both call it.
+        auto golem_d2h_drain = [&](const ggml_tensor * inp, golem::GolemSlabEntry & st) {
+            const int blk_d = golem_tensor_blk(inp->name);
+            const int kind_d = golem_expert_stem_kind(inp->name) - 1;
+            if (blk_d < 0 || kind_d < 0 || kind_d >= 3) {
+                return;
+            }
+            const uint32_t bit = 1u << kind_d;
+            size_t w = 0;
+            for (size_t r = 0; r < golem_evict_d2h.size(); ++r) {
+                golem_evict_d2h_entry & e = golem_evict_d2h[r];
+                if (e.blk != blk_d) {
+                    golem_evict_d2h[w++] = e;
+                    continue;
+                }
+                if (!(e.done & bit)) {
+                    ggml_backend_tensor_get_async(split_backend, st.slab,
+                        e.dst[kind_d], (size_t) e.slot * st.expert_size,
+                        st.expert_size);
+                    e.done |= bit;
+                    golem_cs_fenced = false;
+                }
+                if (e.done != 7u) {
+                    golem_evict_d2h[w++] = e;
+                }
+            }
+            golem_evict_d2h.resize(w);
+        };
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2923,6 +3003,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         plan.routed.clear();
                         plan.pending.clear();
                         plan.ptrs.clear();
+                        plan.issued.clear();
                         plan.out_off = 0;
                         for (int64_t id3 = 0; id3 < n_expert_j; ++id3) {
                             if (ggml_bitset_get(used_ids.data(), id3)) {
@@ -2938,6 +3019,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     plan.routed.clear();
                     plan.pending.clear();
                     plan.ptrs.clear();
+                    plan.issued.clear();
                     plan.out_off = golem_miss_ids.size();
                     for (int64_t id3 = 0; id3 < n_expert_j; ++id3) {
                         if (ggml_bitset_get(used_ids.data(), id3) &&
@@ -3179,11 +3261,97 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (!golem_miss_ids.empty()) {
                     golem_miss_out.resize(golem_miss_ids.size());
                     std::fill(golem_miss_out.begin(), golem_miss_out.end(), nullptr);
+                    // ABI v17 hits_ready: queue the H2D of every RAM-resident
+                    // hit of this blk's planes ([input_id, n_inputs)) before
+                    // the pool blocks on the disk read of the misses. Hits are
+                    // read ONLY through `hits` (slice plan.out_off of each
+                    // plane; plan.ptrs is still empty). Async copies only: the
+                    // callback runs under the pool's claim lock.
+                    auto golem_hits_ready = [&](const void * const * hits) {
+                        for (int j = input_id; j < split->n_inputs; ++j) {
+                            golem_plane_plan & plan = golem_planes[j];
+                            if ((plan.mode != 1 && plan.mode != 2) ||
+                                golem_tensor_blk(split->inputs[j]->name) != blk) {
+                                continue;
+                            }
+                            const size_t n_plane = plan.mode == 1 ? plan.routed.size() : plan.pending.size();
+                            const void * const * hp = hits + plan.out_off;
+                            bool any_hit = false;
+                            for (size_t k = 0; k < n_plane && !any_hit; ++k) {
+                                any_hit = hp[k] != nullptr;
+                            }
+                            if (!any_hit) {
+                                continue;
+                            }
+                            plan.issued.assign(n_plane, 0);
+                            struct ggml_tensor * inp = split->inputs[j];
+                            const size_t expert_size_j = inp->nb[2];
+                            uint64_t n_early = 0;
+                            if (plan.mode == 1) {
+                                // MMQ padding: a run's 512 B tail lands in the
+                                // next (unrouted) expert's region, so only
+                                // all-hit runs are issued early.
+                                struct ggml_tensor * dst = tensor_copy(inp, split_backend_id, sched->cur_copy);
+                                bool opened = false;
+                                size_t i = 0;
+                                while (i < n_plane) {
+                                    const size_t run0 = i;
+                                    bool all_hit = hp[i] != nullptr;
+                                    while (i + 1 < n_plane && plan.routed[i + 1] == plan.routed[i] + 1) {
+                                        ++i;
+                                        all_hit = all_hit && hp[i] != nullptr;
+                                    }
+                                    ++i;
+                                    if (!all_hit) {
+                                        continue;
+                                    }
+                                    if (gctx->async_h2d && !opened) {
+                                        golem_cs_open();
+                                        opened = true;
+                                    }
+                                    golem_issue_pooled_run(gctx, split_backend, dst, plan.routed[run0],
+                                        plan.routed[i - 1], inp->ne[2], expert_size_j, &hp[run0]);
+                                    for (size_t k = run0; k < i; ++k) {
+                                        plan.issued[k] = 1;
+                                    }
+                                    n_early += i - run0;
+                                }
+                            } else {
+                                golem_d2h_drain(inp, *plan.st);
+                                if (gctx->async_h2d) {
+                                    golem_cs_open();
+                                }
+                                for (size_t k = 0; k < n_plane; ++k) {
+                                    if (hp[k] == nullptr) {
+                                        continue;
+                                    }
+                                    const size_t off = (size_t) plan.pending[k].first * expert_size_j;
+                                    if (gctx->async_h2d) {
+                                        golem_cs_set(gctx, plan.slab, hp[k], off, expert_size_j);
+                                    } else {
+                                        ggml_backend_tensor_set_async(split_backend, plan.slab, hp[k], off, expert_size_j);
+                                    }
+                                    plan.issued[k] = 1;
+                                    ++n_early;
+                                }
+                            }
+                            gctx->dc_stats.early_h2d_units.fetch_add(n_early, std::memory_order_relaxed);
+                        }
+                        if (golem_cs_pair_open) {
+                            golem_cs_close_pair(gctx);
+                            golem_cs_pair_open = false;
+                        }
+                    };
+                    using golem_hits_ready_t = decltype(golem_hits_ready);
                     int32_t ensure_rc = 0;
                     {
                         golem_cb_guard cb;
                         ensure_rc = gctx->ensure(gctx->payload, input, golem_miss_kinds.data(), golem_miss_ids.data(),
-                                                 (int32_t) golem_miss_ids.size(), golem_miss_out.data());
+                                                 (int32_t) golem_miss_ids.size(), golem_miss_out.data(),
+                                                 [](void * ud, const void * const * hits) {
+                                                     (*(golem_hits_ready_t *) ud)(hits);
+                                                 },
+                                                 &golem_hits_ready);
                     }
                     if (ensure_rc != 0) {
                         // ABI v13: the misses could not be paged in; drain
@@ -3320,20 +3488,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // bytes). A slot is exactly expert_size whenever
                             // expert_size is the pool's max stride, so reading
                             // past it could leave the arena mapping entirely.
-                            if (gctx->async_h2d) {
-                                // golem_cs_begin ran once for the plane (mode 1).
-                                golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
-                                    ptrs, last_id - first_id + 1,
-                                    [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
-                                        golem_cs_set((golem_ctx_t) ud, (ggml_tensor *) dst, src, dst_off, len);
-                                    }, gctx);
-                                return;
-                            }
-                            golem_copy_pooled_expert_run(dst, expert_offset, expert_size, padding_len,
-                                ptrs, last_id - first_id + 1,
-                                [](void *dst, const void *src, size_t dst_off, size_t len, void *ud) {
-                                    ggml_backend_tensor_set_async((ggml_backend_t) ud, (ggml_tensor *) dst, src, dst_off, len);
-                                }, split_backend);
+                            // async_h2d: golem_cs_begin ran once for the plane.
+                            golem_issue_pooled_run(gctx, split_backend, dst, first_id, last_id, n_expert,
+                                expert_size, ptrs);
                             return;
                         }
 
@@ -3499,10 +3656,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // consecutive routed experts map onto contiguous
                         // slices of the returned pointer array (plan.routed
                         // is sorted — no dependency on the mutable used_ids).
-                        if (gctx->async_h2d && !plan.routed.empty()) {
-                            golem_cs_begin(gctx, split_backend, !golem_cs_used, !golem_cs_fenced);
-                            golem_cs_used = true;
-                            golem_cs_fenced = true;
+                        // Runs already queued by the hits_ready callback are
+                        // skipped (a run is issued whole or not at all).
+                        bool left = false;
+                        for (size_t k = 0; k < plan.routed.size() && !left; ++k) {
+                            left = k >= plan.issued.size() || !plan.issued[k];
+                        }
+                        if (gctx->async_h2d && left) {
+                            golem_cs_open();
                         }
                         size_t i = 0;
                         while (i < plan.routed.size()) {
@@ -3513,6 +3674,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 last_id = plan.routed[i];
                             }
                             ++i;
+                            if (run0 < plan.issued.size() && plan.issued[run0]) {
+                                continue;
+                            }
                             copy_experts(first_id, last_id, &plan.ptrs[run0]);
                         }
                     } else if (golem_planned && plan.mode == 2) {
@@ -3522,37 +3686,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // one async copy per staged slot from the batched
                         // ensure pointers (no extra copy).
                         golem::GolemSlabEntry & st = *plan.st;
-                        // Exclusive D2H drain (see golem_evict_d2h): issue
-                        // this plane's share of the layer's pending evictions
-                        // BEFORE the staged H2D refills below — stream order
-                        // must land the D2H read of a stolen slot ahead of
-                        // the refill that overwrites it.
-                        {
-                            const int blk_d = golem_tensor_blk(input->name);
-                            const int kind_d = golem_expert_stem_kind(input->name) - 1;
-                            if (blk_d >= 0 && kind_d >= 0 && kind_d < 3) {
-                                const uint32_t bit = 1u << kind_d;
-                                size_t w = 0;
-                                for (size_t r = 0; r < golem_evict_d2h.size(); ++r) {
-                                    golem_evict_d2h_entry & e = golem_evict_d2h[r];
-                                    if (e.blk != blk_d) {
-                                        golem_evict_d2h[w++] = e;
-                                        continue;
-                                    }
-                                    if (!(e.done & bit)) {
-                                        ggml_backend_tensor_get_async(split_backend, st.slab,
-                                            e.dst[kind_d], (size_t) e.slot * st.expert_size,
-                                            st.expert_size);
-                                        e.done |= bit;
-                                        golem_cs_fenced = false;
-                                    }
-                                    if (e.done != 7u) {
-                                        golem_evict_d2h[w++] = e;
-                                    }
-                                }
-                                golem_evict_d2h.resize(w);
-                            }
-                        }
+                        // Exclusive D2H drain BEFORE the staged H2D refills
+                        // below (no-op for kinds hits_ready already drained).
+                        golem_d2h_drain(input, st);
                         // SAFETY (ordering invariant): the step-(N+1) memcpy
                         // below into ids_pin must never overlap the step-N DMA
                         // reading it. This holds because compute_splits drains
@@ -3578,21 +3714,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 n2->src[2] = st.ids_dev;
                             }
                         }
-                        if (gctx->async_h2d && !plan.pending.empty()) {
+                        // Slots the hits_ready callback queued are skipped.
+                        auto golem_slot_left = [&](size_t k4) {
+                            return k4 >= plan.issued.size() || !plan.issued[k4];
+                        };
+                        bool left = false;
+                        for (size_t k4 = 0; k4 < plan.pending.size() && !left; ++k4) {
+                            left = golem_slot_left(k4);
+                        }
+                        if (gctx->async_h2d && left) {
                             // After this plane's D2H issue above: the copy
                             // stream waits on the compute stream, so the
                             // eviction read of a stolen slot lands first.
-                            golem_cs_begin(gctx, split_backend, !golem_cs_used, !golem_cs_fenced);
-                            golem_cs_used = true;
-                            golem_cs_fenced = true;
+                            golem_cs_open();
                             for (size_t k4 = 0; k4 < plan.pending.size(); ++k4) {
-                                golem_cs_set(gctx, plan.slab, plan.ptrs[k4],
-                                    (size_t) plan.pending[k4].first * expert_size, expert_size);
+                                if (golem_slot_left(k4)) {
+                                    golem_cs_set(gctx, plan.slab, plan.ptrs[k4],
+                                        (size_t) plan.pending[k4].first * expert_size, expert_size);
+                                }
                             }
-                        } else {
+                        } else if (!gctx->async_h2d) {
                             for (size_t k4 = 0; k4 < plan.pending.size(); ++k4) {
-                                ggml_backend_tensor_set_async(split_backend, plan.slab, plan.ptrs[k4],
-                                    (size_t) plan.pending[k4].first * expert_size, expert_size);
+                                if (golem_slot_left(k4)) {
+                                    ggml_backend_tensor_set_async(split_backend, plan.slab, plan.ptrs[k4],
+                                        (size_t) plan.pending[k4].first * expert_size, expert_size);
+                                }
                             }
                         }
                         gctx->dc_stats.bytes_copied.fetch_add(plan.dc.copied * expert_size, std::memory_order_relaxed);
@@ -3655,7 +3801,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (golem_cs_used) {
-            golem_cs_join(gctx);
+            golem_cs_join(gctx, golem_cs_pair_open);
         }
 
         if (!sched->callback_eval) {

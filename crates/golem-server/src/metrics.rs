@@ -26,6 +26,9 @@ pub struct MetricsSnapshot {
     pub device_cache: Option<(u64, u64, u64)>,
     /// Expert planes copied host→device: device-cache fills, streamed prefill.
     pub h2d_copies: Option<(u64, u64)>,
+    /// Expert units whose H2D was issued at the RAM-hit hand-off, ahead of
+    /// the ensure's blocking disk reads.
+    pub early_h2d_units: Option<u64>,
     /// P3: demand page-ins, fast hits, evictions, bytes paged, source errors.
     pub p3: Option<[u64; 5]>,
     /// §6.5: prefetch page-ins, hits, wasted bytes, demand stand-downs.
@@ -59,6 +62,7 @@ impl MetricsSnapshot {
         self.device_cache = dc
             .as_ref()
             .map(|d| (d.bytes_copied, d.bytes_skipped, d.evictions));
+        self.early_h2d_units = dc.as_ref().map(|d| d.early_h2d_units);
         self.h2d_copies = dc.map(|d| (d.cache_copies, d.stream_copies));
         self.p3 = s.p3_stats().map(|p| {
             [
@@ -153,6 +157,14 @@ pub(crate) fn render(h: &HealthState) -> String {
             "# HELP golem_expert_h2d_copies_total expert planes copied host→device, by device-cache fill or streamed prefill (stream counts whole-tensor fills, which can exceed routed demand)\n# TYPE golem_expert_h2d_copies_total counter\n\
              golem_expert_h2d_copies_total{{path=\"cache\"}} {cache}\n\
              golem_expert_h2d_copies_total{{path=\"stream\"}} {stream}"
+        );
+    }
+    if let Some(early) = m.early_h2d_units {
+        g(
+            "golem_expert_early_h2d_units_total",
+            "counter",
+            "expert planes whose H2D was issued before the ensure's blocking disk reads",
+            early as f64,
         );
     }
     if let Some([demand, fast, ev, paged, errs]) = m.p3 {

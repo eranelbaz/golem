@@ -40,6 +40,7 @@ fn cpu_expert_columns_measured_and_not_subtracted_from_compute() {
         tokens: 1,
         wall_ms: 100.0,
         p3_wait_ms: 60.0,
+        disk_wait_ms: f64::NAN,
         disk_worker_ms: f64::NAN,
         disk_bytes: 0,
         h2d_ms: f64::NAN,
@@ -67,6 +68,7 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
         tokens: 1,
         wall_ms: 100.0,
         p3_wait_ms: 60.0,
+        disk_wait_ms: f64::NAN,
         disk_worker_ms: 55.0,
         disk_bytes: 121_634_816,
         h2d_ms: f64::NAN,
@@ -101,6 +103,7 @@ fn compute_is_wall_minus_p3_h2d_policy_not_disk_worker() {
         tokens: 1,
         wall_ms: 100.0,
         p3_wait_ms: 60.0,
+        disk_wait_ms: f64::NAN,
         disk_worker_ms: f64::NAN,
         disk_bytes: 0,
         h2d_ms: f64::NAN,
@@ -146,7 +149,7 @@ fn h2d_columns_measured_only_with_async_h2d() {
         s.write_timing(&mut out).unwrap();
         String::from_utf8(out).unwrap()
     };
-    // columns: step,tokens,wall_ms,p3_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,...
+    // columns: step,tokens,wall_ms,p3_wait_ms,disk_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,...
     let col = |csv: &str, i: usize| -> Vec<String> {
         csv.lines()
             .filter(|l| !l.starts_with('#') && !l.starts_with("step"))
@@ -154,16 +157,16 @@ fn h2d_columns_measured_only_with_async_h2d() {
             .collect()
     };
     let csv_on = rows(true);
-    let on = col(&csv_on, 6);
+    let on = col(&csv_on, 7);
     assert!(!on.is_empty());
     assert!(on.iter().all(|v| v.parse::<f64>().is_ok()), "{on:?}");
     // The copy stream actually carried bytes (not just a zero reading).
-    let bytes: u64 = col(&csv_on, 7)
+    let bytes: u64 = col(&csv_on, 8)
         .iter()
         .map(|v| v.parse::<u64>().unwrap())
         .sum();
     assert!(bytes > 0, "{csv_on}");
-    let off = col(&rows(false), 6);
+    let off = col(&rows(false), 7);
     assert!(!off.is_empty());
     assert!(off.iter().all(|v| v == "unmeasured"), "{off:?}");
 }

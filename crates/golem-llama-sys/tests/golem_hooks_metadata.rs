@@ -98,6 +98,8 @@ fn hooked_guard_unregisters_and_recovers_payload() {
         _c: *const i32,
         _n: i32,
         _o: *mut *const std::ffi::c_void,
+        _hits_ready: golem_llama_sys::raw::golem_hits_ready_fn,
+        _hits_ud: *mut std::ffi::c_void,
     ) -> i32 {
         0
     }

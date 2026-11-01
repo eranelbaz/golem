@@ -39,7 +39,8 @@ if [ "$run_upstream" = 1 ]; then
   # Still running (56): test-generate-models (offline synthetic dummy models,
   # FIXTURES_SETUP generate-models) + the 4 recurrent-state-rollback variants that
   # require it, tokenizer-0/-1 suites, sampling/grammar/gguf/alloc/backend tests.
-  ctest --test-dir "$build" --output-on-failure \
+  # GGML_HIP=OFF above: no GPU, so golem ctest legs that need one must be told.
+  GOLEM_CTEST_CPU_ONLY=1 ctest --test-dir "$build" --output-on-failure \
     -E 'test-(download-model|llama-context-model|thread-safety|save-load-state|state-restore-fragmented|tokenizers-ggml-vocabs|jinja)'
 fi
 "$bin" run --greedy "$model" --prompt "Hello" --n-predict 16 \

@@ -33,6 +33,8 @@ fn cpu_lease_takes_resident_units_and_copy_done_releases_them() {
         miss_ids.as_ptr(),
         3,
         planes.as_mut_ptr().cast(),
+        None,
+        std::ptr::null_mut(),
     );
     assert_eq!(rc, 0, "ensure paged in");
     p3_glue::copy_done(payload);
