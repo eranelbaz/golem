@@ -88,14 +88,16 @@ fn assert_default_unchanged(set: impl Fn(&mut EngineConfig)) -> (EngineConfig, S
 }
 
 #[test]
-fn io_depth_default_and_two_keep_greedy_output() {
+fn io_depth_default_one_and_two_keep_greedy_output() {
     let d = EngineConfig::default().io_depth;
     let (base, want) = assert_default_unchanged(|c| c.io_depth = d);
-    let two = EngineConfig {
-        io_depth: 2,
-        ..base
-    };
-    assert_eq!(greedy(&two).unwrap(), want);
+    for io_depth in [1, 2] {
+        let c = EngineConfig {
+            io_depth,
+            ..base.clone()
+        };
+        assert_eq!(greedy(&c).unwrap(), want, "io_depth {io_depth}");
+    }
 }
 
 #[test]
