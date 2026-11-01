@@ -163,7 +163,7 @@ pub(crate) fn render(h: &HealthState) -> String {
         g(
             "golem_expert_early_h2d_units_total",
             "counter",
-            "expert units whose H2D was issued before the ensure's blocking disk reads",
+            "expert planes whose H2D was issued before the ensure's blocking disk reads",
             early as f64,
         );
     }

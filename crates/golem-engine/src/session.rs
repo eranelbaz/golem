@@ -2358,8 +2358,8 @@ pub struct DeviceCacheStats {
     pub cache_copies: u64,
     /// Expert planes copied host→device by streamed prefill.
     pub stream_copies: u64,
-    /// Expert units whose H2D was issued at the RAM-hit hand-off, before the
-    /// ensure's blocking disk reads.
+    /// Expert planes whose H2D was issued at the RAM-hit hand-off, before the
+    /// ensure's blocking disk reads (counted per plane, like `cache_copies`).
     pub early_h2d_units: u64,
     /// `bytes_skipped / (bytes_skipped + bytes_copied)`; 0.0 with no traffic.
     pub skip_ratio: f64,

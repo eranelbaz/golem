@@ -28,6 +28,7 @@ pub struct StepTiming {
     pub p3_wait_ms: f64,
     /// Ensure time blocked on disk misses after the RAM hits were handed off
     /// (a component of `p3_wait_ms`), summed over layers; NaN with no hooks.
+    /// An all-miss ensure has no hand-off, so its whole ensure counts.
     pub disk_wait_ms: f64,
     /// Time spent in store shard reads on the parallel drain worker
     /// (a component of `p3_wait_ms`, not part of the compute remainder).

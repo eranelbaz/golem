@@ -3656,8 +3656,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // consecutive routed experts map onto contiguous
                         // slices of the returned pointer array (plan.routed
                         // is sorted — no dependency on the mutable used_ids).
-                        // Runs the hits_ready callback queued are skipped (a run
-                        // is issued whole or not at all).
+                        // Runs already queued by the hits_ready callback are
+                        // skipped (a run is issued whole or not at all).
                         bool left = false;
                         for (size_t k = 0; k < plan.routed.size() && !left; ++k) {
                             left = k >= plan.issued.size() || !plan.issued[k];

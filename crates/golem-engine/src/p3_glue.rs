@@ -2677,12 +2677,11 @@ pub extern "C" fn ensure_host_resident(
             h.fail_storage();
         }
         let t0 = std::time::Instant::now();
-        // Disk span start: the hits hand-off, else the ensure start.
+        // Disk span start: after the hits hand-off, else the ensure start.
         let mut t_disk = t0;
         let paged = h
             .pool
             .ensure_batch_with(entry.layer, &scratch, out, |hits| {
-                t_disk = std::time::Instant::now();
                 if let Some(f) = hits_ready {
                     // SAFETY: C passes `hits_ud` with `hits_ready` and keeps it
                     // alive for this call (golem-hooks.h v17); `hits` is the
@@ -2693,6 +2692,7 @@ pub extern "C" fn ensure_host_resident(
                     // the live `&mut` during the call.
                     unsafe { f(hits_ud, hits.as_ptr().cast()) }
                 }
+                t_disk = std::time::Instant::now();
             });
         drop(scratch);
         let t_end = std::time::Instant::now();

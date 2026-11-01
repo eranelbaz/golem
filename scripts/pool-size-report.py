@@ -15,11 +15,11 @@ EXPERT_BYTES = 15.2e6             # bytes per expert unit
 H2D_GBPS = 27.0                   # GB/s pinned H2D
 DISK_GBPS = 4.73                  # GB/s disk
 
-COLS = ["step", "tokens", "wall_ms", "p3_wait_ms", "disk_worker_ms", "disk_bytes",
+COLS = ["step", "tokens", "wall_ms", "p3_wait_ms", "disk_wait_ms", "disk_worker_ms", "disk_bytes",
         "h2d_ms", "h2d_bytes", "policy_ms", "compute_ms",
         "cpu_expert_math_experts", "cpu_expert_math_bytes", "cpu_expert_math_ms",
         "cpu_expert_join_wait_ms"]
-UNMEASURED = {"h2d_ms", "h2d_bytes", "policy_ms", "cpu_expert_math_experts",
+UNMEASURED = {"disk_wait_ms", "h2d_ms", "h2d_bytes", "policy_ms", "cpu_expert_math_experts",
               "cpu_expert_math_bytes", "cpu_expert_math_ms", "cpu_expert_join_wait_ms"}
 
 
@@ -43,6 +43,8 @@ def load_leg(path):
         if header != COLS:
             raise ValueError(f"bad header: {header}")
         for i, row in enumerate(rdr):
+            if row and row[0].startswith("#"):
+                continue
             if len(row) != len(COLS):
                 raise ValueError(f"data row {i+1}: expected {len(COLS)} columns, got {len(row)}")
             rows.append({c: parse_num(c, v) for c, v in zip(COLS, row)})
