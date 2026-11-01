@@ -1076,9 +1076,10 @@ impl SessionHooks {
     }
 
     /// Derived-K fit (ruling R3), once the model, KV and compute buffer are
-    /// resident: frees the load's top-k slab, then K = (free − stream slabs
-    /// − headroom) / per-expert slab bytes − 1, capped at the pre-load
-    /// bound. With streaming on and that K below top-k, streaming
+    /// resident: frees the load's top-k slab, then `k_stream` = (free −
+    /// stream slabs − headroom) / per-expert slab bytes − 1, capped at the
+    /// pre-load bound, and `k_decode` the same without the slabs. The cache
+    /// starts at `k_decode`; the first streamed chunk shrinks it. With streaming on and that K below top-k, streaming
     /// auto-disables with a warning and K is refit without the slabs.
     /// No-op for an explicit K or after the first call.
     pub(crate) fn fit_device_cache(&mut self) -> Result<(), EngineError> {
@@ -1141,15 +1142,21 @@ impl SessionHooks {
             }
             Err(e) => return Err(e),
         };
+        // Start decode-sized (§7.6 slabs allocate lazily): a session whose
+        // prompts never stream never holds the slab reservation; the first
+        // streamed chunk shrinks to `k_stream` through `set_vram_mode`.
+        // Target UD-Q4_K_XL: 3,963,617,280 B / 644,022,272 B ≈ +6 K idle.
+        self.k_stream = k;
+        self.vram_stream = false;
+        let k = self.k_decode;
         // SAFETY: FFI setter on the live ctx between computes.
         unsafe { raw::golem_set_device_cache_experts(ctx, k as i32) };
         self.device_cache_experts = k;
-        self.k_stream = k;
-        self.vram_stream = true;
         tracing::info!(
-            k_stream = k,
-            k_decode = self.k_decode,
-            "device cache fitted"
+            k_stream = self.k_stream,
+            k_decode = k,
+            stream_slab_vram = self.stream_slab_vram,
+            "device cache fitted decode-sized; shrinks to k_stream while a prompt streams"
         );
         Ok(())
     }
@@ -1233,21 +1240,21 @@ impl SessionHooks {
     }
 
     /// Test seam, between turns only: overrides both Ks (an explicit-K
-    /// session never splits them) and puts the cache in stream mode at
-    /// `k_stream`.
+    /// session never splits them) and leaves the cache decode-sized at
+    /// `k_decode`, as [`Self::fit_device_cache`] does.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn test_set_ks(&mut self, k_stream: u32, k_decode: u32) {
         self.k_stream = k_stream;
         self.k_decode = k_decode;
-        self.vram_stream = true;
+        self.vram_stream = false;
         let ctx = self.ctx_ptr();
         // SAFETY: FFI on the live ctx between computes.
         unsafe { raw::golem_reset_device_cache(ctx) };
         self.device_cache_reset();
         // SAFETY: FFI setter on the live ctx between computes.
-        unsafe { raw::golem_set_device_cache_experts(ctx, k_stream as i32) };
-        self.device_cache_experts = k_stream;
+        unsafe { raw::golem_set_device_cache_experts(ctx, k_decode as i32) };
+        self.device_cache_experts = k_decode;
     }
 
     /// Caps the pending derived-K fit at the §10 plan's `device_expert_cache`

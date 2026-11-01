@@ -117,9 +117,10 @@ fn streamed_prefill_matches_per_token_and_spares_the_pool() {
     assert_eq!(out, out_token, "gated output must match");
 }
 
-/// #135: after a streamed prefill, decode runs at `k_decode` with the
-/// stream slabs freed; the next turn re-shrinks to `k_stream` and streams
-/// again. Greedy output matches the per-token path on both turns.
+/// #135/#119: the session idles at `k_decode` with no stream slabs; each
+/// streamed turn, the first included, shrinks to `k_stream`, and decode
+/// runs at `k_decode` with the slabs freed again. Greedy output matches the
+/// per-token path on both turns.
 #[test]
 fn decode_reclaims_the_stream_slabs_and_the_next_turn_streams_again() {
     let resident = |session: &Session| {
@@ -150,6 +151,12 @@ fn decode_reclaims_the_stream_slabs_and_the_next_turn_streams_again() {
     .expect("session");
     // tiny-moe top_k 2: stream K 2, decode K 4.
     session.p3_hooks_mut().expect("pooled").test_set_ks(2, 4);
+    assert_eq!(session.device_cache_experts(), Some(4), "idle K");
+    assert_eq!(
+        resident(&session).1,
+        0,
+        "stream slabs live before any stream"
+    );
     for turn in 0..2 {
         let planes_before = session
             .p3_hooks()
