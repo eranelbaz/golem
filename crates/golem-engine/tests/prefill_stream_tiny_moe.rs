@@ -45,9 +45,9 @@ fn stream_copies(session: &Session) -> u64 {
         golem_llama_sys::raw::golem_get_device_cache_stats(session.p3_ctx_ptr().expect("pooled"))
     };
     assert!(!block.is_null());
-    // SAFETY: layout documented on `Session::device_cache_stats`: 5
-    // contiguous AtomicU64, stream_experts_copied last.
-    let c = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 5]>() };
+    // SAFETY: layout documented on `Session::device_cache_stats`: 6
+    // contiguous AtomicU64, stream_experts_copied fifth.
+    let c = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 6]>() };
     c[4].load(Ordering::Relaxed)
 }
 

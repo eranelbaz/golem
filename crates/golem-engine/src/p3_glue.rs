@@ -283,6 +283,10 @@ struct HookState {
     /// Cumulative ns spent inside the ensure trampoline's page-in section
     /// (§11 per-step timing; taken (swap-to-zero) per decode step).
     p3_wait_ns: AtomicU64,
+    /// Per-layer cumulative ns from the `hits_ready` hand-off (or the ensure
+    /// start without one) to the ensure return: the blocking disk span the
+    /// early hit H2D overlaps. Preallocated `n_layers` long; taken per step.
+    ensure_disk_wait_ns: Box<[AtomicU64]>,
     /// Test/counters observability: trampoline call counts (the ABI v5 call
     /// arithmetic: routing == n_offloaded_expert_layers, ensure ≤ that).
     routing_calls: AtomicUsize,
@@ -793,6 +797,9 @@ pub(crate) fn advance_decode_step() {
 #[derive(Default)]
 pub(crate) struct StepIoStats {
     pub p3_wait_ns: u64,
+    /// Ensure disk span (ns) summed over layers; `None` while hooks are
+    /// unregistered.
+    pub ensure_disk_wait_ns: Option<u64>,
     pub disk_ns: Option<u64>,
     pub disk_bytes: Option<u64>,
     /// Copy-stream H2D (ms, bytes); `None` unless async_h2d measured it.
@@ -811,6 +818,12 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
     let mut out = StepIoStats::default();
     for h in current_states() {
         out.p3_wait_ns += h.p3_wait_ns.swap(0, Ordering::Relaxed);
+        let disk_wait: u64 = h
+            .ensure_disk_wait_ns
+            .iter()
+            .map(|a| a.swap(0, Ordering::Relaxed))
+            .sum();
+        out.ensure_disk_wait_ns = Some(out.ensure_disk_wait_ns.unwrap_or(0) + disk_wait);
         if let Some(s) = &h.store {
             let (ns, bytes) = s.take_disk_stats();
             out.disk_ns = Some(out.disk_ns.unwrap_or(0) + ns);
@@ -1032,6 +1045,15 @@ impl SessionHooks {
     /// Batched ensure calls so far.
     pub fn ensure_calls(&self) -> usize {
         self.state.ensure_calls.load(Ordering::Relaxed)
+    }
+    /// Cumulative ensure disk span (ns) for pool `layer` since the last step
+    /// take (a decode step boundary zeroes it, so compare two reads only
+    /// with no decode between them); 0 for an out-of-range layer.
+    pub fn ensure_disk_wait_ns(&self, layer: u32) -> u64 {
+        self.state
+            .ensure_disk_wait_ns
+            .get(layer as usize)
+            .map_or(0, |a| a.load(Ordering::Relaxed))
     }
     /// copy_done calls so far.
     pub fn copy_done_calls(&self) -> usize {
@@ -2024,6 +2046,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     });
     let state = Arc::new(HookState {
         p3_wait_ns: AtomicU64::new(0),
+        ensure_disk_wait_ns: (0..n_layers).map(|_| AtomicU64::new(0)).collect(),
         slow_calls: AtomicUsize::new(0),
         routing_calls: AtomicUsize::new(0),
         ensure_calls: AtomicUsize::new(0),
@@ -2595,6 +2618,8 @@ pub extern "C" fn ensure_host_resident(
     miss_ids: *const i32,
     n_miss: i32,
     out_ptrs: *mut *const c_void,
+    hits_ready: raw::golem_hits_ready_fn,
+    hits_ud: *mut c_void,
 ) -> i32 {
     guarded("ensure_host_resident", || {
         // SAFETY: see `state_of`.
@@ -2652,10 +2677,33 @@ pub extern "C" fn ensure_host_resident(
             h.fail_storage();
         }
         let t0 = std::time::Instant::now();
-        let paged = h.pool.ensure_batch(entry.layer, &scratch, out);
+        // Disk span start: the hits hand-off, else the ensure start.
+        let mut t_disk = t0;
+        let paged = h
+            .pool
+            .ensure_batch_with(entry.layer, &scratch, out, |hits| {
+                t_disk = std::time::Instant::now();
+                if let Some(f) = hits_ready {
+                    // SAFETY: C passes `hits_ud` with `hits_ready` and keeps it
+                    // alive for this call (golem-hooks.h v17); `hits` is the
+                    // `n_miss`-long out array (`*const u8` and `*const c_void`
+                    // share layout), valid for the duration of the callback.
+                    // `hits` is a shared reborrow of `out`; C only reads
+                    // through it (golem-hooks.h), so nothing writes through
+                    // the live `&mut` during the call.
+                    unsafe { f(hits_ud, hits.as_ptr().cast()) }
+                }
+            });
         drop(scratch);
+        let t_end = std::time::Instant::now();
         h.p3_wait_ns
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add((t_end - t0).as_nanos() as u64, Ordering::Relaxed);
+        if let Some(a) = h.ensure_disk_wait_ns.get(entry.layer as usize) {
+            a.fetch_add(
+                t_end.saturating_duration_since(t_disk).as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+        }
         h.ensure_calls.fetch_add(1, Ordering::Relaxed);
         match paged {
             Ok(()) => {}

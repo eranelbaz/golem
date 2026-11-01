@@ -1057,16 +1057,18 @@ impl Session {
             "golem_get_device_cache_stats returned null"
         );
         // SAFETY: layout contract from the C++ definition (bindgen renders
-        // the struct opaque): 5 contiguous lock-free u64 counters in member
+        // the struct opaque): 6 contiguous lock-free u64 counters in member
         // order bytes_copied, bytes_skipped, evictions, cache_experts_copied,
-        // stream_experts_copied (pinned by static_assert/offsetof there).
-        let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 5]>() };
+        // stream_experts_copied, early_h2d_units (pinned by
+        // static_assert/offsetof there).
+        let counters = unsafe { &*block.cast::<[std::sync::atomic::AtomicU64; 6]>() };
         let [
             bytes_copied,
             bytes_skipped,
             evictions,
             cache_copies,
             stream_copies,
+            early_h2d_units,
         ] = counters
             .each_ref()
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
@@ -1076,6 +1078,7 @@ impl Session {
             evictions,
             cache_copies,
             stream_copies,
+            early_h2d_units,
             skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
         })
     }
@@ -1893,6 +1896,7 @@ impl SessionInner {
                 tokens: n_gen,
                 wall_ms: t0.elapsed().as_secs_f64() * 1_000.0,
                 p3_wait_ms: ns2ms(io.p3_wait_ns),
+                disk_wait_ms: io.ensure_disk_wait_ns.map_or(f64::NAN, ns2ms),
                 disk_worker_ms: io.disk_ns.map_or(f64::NAN, ns2ms),
                 disk_bytes: io.disk_bytes.unwrap_or(0),
                 h2d_ms: io.h2d.map_or(f64::NAN, |h| h.0),
@@ -2354,6 +2358,9 @@ pub struct DeviceCacheStats {
     pub cache_copies: u64,
     /// Expert planes copied host→device by streamed prefill.
     pub stream_copies: u64,
+    /// Expert units whose H2D was issued at the RAM-hit hand-off, before the
+    /// ensure's blocking disk reads.
+    pub early_h2d_units: u64,
     /// `bytes_skipped / (bytes_skipped + bytes_copied)`; 0.0 with no traffic.
     pub skip_ratio: f64,
 }

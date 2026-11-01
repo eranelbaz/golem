@@ -60,7 +60,7 @@ inline std::atomic<int> & join_sleep_ms() { static std::atomic<int> ms{0}; retur
 inline golem_hook_handle_t & abort_handle() { static golem_hook_handle_t h = nullptr; return h; }
 
 inline int32_t h_ensure(void * p, const void * tensor, const int32_t * mk, const int32_t * mi,
-                     int32_t n, const void ** out) {
+                     int32_t n, const void ** out, golem_hits_ready_fn hits_ready, void * hits_ud) {
     auto * s = (HState *) p;
     s->ensure_calls.fetch_add(1);
     s->miss_kinds.assign(mk, mk + n);
@@ -75,13 +75,16 @@ inline int32_t h_ensure(void * p, const void * tensor, const int32_t * mk, const
         out[i] = pool().data() + plane * ((size_t) (kind - 1) * N_EXP + mi[i]);
     }
     (void) tensor;
+    if (hits_ready != nullptr) {
+        hits_ready(hits_ud, out);
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(join_sleep_ms().load()));
     s->cb_returned.store(true);
     return 0;
 }
 
 inline int32_t h_abort_ensure(void *, const void *, const int32_t *, const int32_t *,
-                           int32_t, const void **) {
+                           int32_t, const void **, golem_hits_ready_fn, void *) {
     golem_unregister_hooks(abort_handle()); // must GGML_ABORT (join waits for the calling step)
     return 0;
 }

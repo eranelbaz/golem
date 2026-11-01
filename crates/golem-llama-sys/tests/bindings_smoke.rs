@@ -50,8 +50,10 @@ fn hook_abi_types_generated() {
     // constant the bindings came from matches the compiled substrate.
     // ABI v9 adds the abandoned-D2H hook (parked evictions whose plane
     // copies were not all issued must be reported, not committed).
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 16);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 16);
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 17);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 17);
+    // v17: ensure reports RAM hits early through `hits_ready`.
+    assert_thin_fn_ptr::<raw::golem_hits_ready_fn>();
     // v16: CPU expert math surface.
     assert_thin_fn_ptr::<raw::golem_cpu_lease_fn>();
     // v15: stream source return codes.
@@ -113,7 +115,8 @@ fn hook_abi_types_generated() {
 #[test]
 fn batched_ensure_signature() {
     // The batched ensure carries the miss list (kinds + ids) and writes the
-    // pool pointers — the v5 shape; v13 returns a failure code.
+    // pool pointers — the v5 shape; v13 returns a failure code; v17 adds the
+    // `hits_ready` callback + its user data.
     extern "C" fn f(
         _payload: *mut std::ffi::c_void,
         _tensor: *const std::ffi::c_void,
@@ -121,6 +124,8 @@ fn batched_ensure_signature() {
         _ids: *const i32,
         _n: i32,
         _out: *mut *const std::ffi::c_void,
+        _hits_ready: raw::golem_hits_ready_fn,
+        _hits_ud: *mut std::ffi::c_void,
     ) -> i32 {
         0
     }

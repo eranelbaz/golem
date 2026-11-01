@@ -26,6 +26,9 @@ pub struct StepTiming {
     pub wall_ms: f64,
     /// Time spent inside P3 `ensure_host_resident` page-ins.
     pub p3_wait_ms: f64,
+    /// Ensure time blocked on disk misses after the RAM hits were handed off
+    /// (a component of `p3_wait_ms`), summed over layers; NaN with no hooks.
+    pub disk_wait_ms: f64,
     /// Time spent in store shard reads on the parallel drain worker
     /// (a component of `p3_wait_ms`, not part of the compute remainder).
     pub disk_worker_ms: f64,
@@ -114,7 +117,7 @@ impl TimingRecorder {
         )?;
         writeln!(
             w,
-            "step,tokens,wall_ms,p3_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,h2d_bytes,policy_ms,compute_ms,\
+            "step,tokens,wall_ms,p3_wait_ms,disk_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,h2d_bytes,policy_ms,compute_ms,\
              cpu_expert_math_experts,cpu_expert_math_bytes,cpu_expert_math_ms,cpu_expert_join_wait_ms"
         )
     }
@@ -151,11 +154,12 @@ impl TimingRecorder {
             };
             writeln!(
                 w,
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 t.step,
                 t.tokens,
                 ms(t.wall_ms),
                 ms(t.p3_wait_ms),
+                ms(t.disk_wait_ms),
                 ms(t.disk_worker_ms),
                 if t.disk_worker_ms.is_nan() {
                     "unmeasured".to_owned()
@@ -195,6 +199,7 @@ mod tests {
             tokens: 1,
             wall_ms,
             p3_wait_ms,
+            disk_wait_ms: f64::NAN,
             disk_worker_ms: 0.5,
             disk_bytes: 64,
             h2d_ms: f64::NAN,

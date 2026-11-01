@@ -557,6 +557,41 @@ impl ExpertPool {
         misses: &[(ExpertKind, u32)],
         out: &mut [*const u8],
     ) -> Result<(), PoolError> {
+        self.ensure_batch_inner(layer, misses, out, None::<fn(&[*const u8])>)
+    }
+
+    /// [`Self::ensure_batch`] with a hook between claim and disk read: once
+    /// every unit is claimed, `out[i]` holds the plane pointer of each miss
+    /// whose unit is already resident (readable now, leased until
+    /// [`Self::end_batch_step`]) and null for each unit still to be read;
+    /// `hits_ready` then sees that view, before the blocking source read, so
+    /// the caller can queue the hits' H2D to overlap it (§3.4 P3). It runs at
+    /// most once, only when there is at least one hit, and never when the
+    /// claim fails; a later source failure returns after it already ran.
+    /// The closure runs under the `batch_claims` lock and the demand guard:
+    /// it must not re-enter the pool.
+    ///
+    /// # Errors
+    /// As [`Self::ensure_batch`].
+    pub fn ensure_batch_with(
+        &self,
+        layer: u32,
+        misses: &[(ExpertKind, u32)],
+        out: &mut [*const u8],
+        hits_ready: impl FnOnce(&[*const u8]),
+    ) -> Result<(), PoolError> {
+        self.ensure_batch_inner(layer, misses, out, Some(hits_ready))
+    }
+
+    /// Shared body of [`Self::ensure_batch`] and [`Self::ensure_batch_with`];
+    /// with no `hits_ready` the pre-fill hit view is skipped.
+    fn ensure_batch_inner(
+        &self,
+        layer: u32,
+        misses: &[(ExpertKind, u32)],
+        out: &mut [*const u8],
+        hits_ready: Option<impl FnOnce(&[*const u8])>,
+    ) -> Result<(), PoolError> {
         if out.len() != misses.len() {
             return Err(PoolError::Contract {
                 reason: format!(
@@ -583,7 +618,26 @@ impl ExpertPool {
         let base = layer as usize * n as usize;
         let mut fills: Vec<(u32, u32, FillClaim<'_>)> = recycle(std::mem::take(&mut batch.fills));
         let claimed = self.claim_misses(layer, misses, batch, &mut fills);
-        let result = claimed.and_then(|()| self.fill_batch(layer, batch, &mut fills));
+        let result = claimed.and_then(|()| {
+            let Some(hits_ready) = hits_ready else {
+                return self.fill_batch(layer, batch, &mut fills);
+            };
+            let mut hits = 0;
+            for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
+                let lease_at = batch.lease_of[base + expert as usize];
+                *dst = if lease_at == UNCLAIMED {
+                    std::ptr::null()
+                } else {
+                    hits += 1;
+                    self.plane_bytes(layer, &batch.leases[lease_at as usize], kind)
+                        .as_ptr()
+                };
+            }
+            if hits > 0 {
+                hits_ready(&*out);
+            }
+            self.fill_batch(layer, batch, &mut fills)
+        });
         batch.fills = recycle(fills);
         result?;
         for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
@@ -1714,6 +1768,145 @@ mod tests {
         assert!(pool.residency.is_resident(0, 0), "earlier lease kept");
         assert_eq!(pool.fill(), 0.5, "cancelled slot back on the free list");
         assert_eq!(src.batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_with_hands_out_hits_before_the_disk_read() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, src) = batched_pool_slots(layout, 0, 4);
+        let mut warm = [std::ptr::null(); 2];
+        pool.ensure_batch(
+            0,
+            &[(ExpertKind::Gate, 1), (ExpertKind::Gate, 3)],
+            &mut warm,
+        )
+        .unwrap();
+        pool.end_batch_step();
+        let batches = src.batches.load(std::sync::atomic::Ordering::SeqCst);
+        let misses = [
+            (ExpertKind::Gate, 1),
+            (ExpertKind::Up, 2),
+            (ExpertKind::Down, 3),
+            (ExpertKind::Gate, 5),
+        ];
+        let mut out = [std::ptr::null(); 4];
+        let mut calls = 0;
+        pool.ensure_batch_with(0, &misses, &mut out, |seen| {
+            calls += 1;
+            let hits: Vec<bool> = seen.iter().map(|p| !p.is_null()).collect();
+            assert_eq!(hits, [true, false, true, false]);
+            assert_eq!(
+                src.batches.load(std::sync::atomic::Ordering::SeqCst),
+                batches,
+                "no disk read before the callback"
+            );
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(out.iter().all(|p| !p.is_null()));
+        let mut again = [std::ptr::null(); 4];
+        pool.ensure_batch(0, &misses, &mut again).unwrap();
+        assert_eq!(out, again);
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_with_all_hits_calls_back_without_a_read() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, src) = batched_pool_slots(layout, 0, 4);
+        let misses = [(ExpertKind::Gate, 1), (ExpertKind::Up, 2)];
+        let mut out = [std::ptr::null(); 2];
+        pool.ensure_batch(0, &misses, &mut out).unwrap();
+        pool.end_batch_step();
+        let batches = src.batches.load(std::sync::atomic::Ordering::SeqCst);
+        let mut calls = 0;
+        pool.ensure_batch_with(0, &misses, &mut out, |seen| {
+            calls += 1;
+            assert!(seen.iter().all(|p| !p.is_null()));
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            src.batches.load(std::sync::atomic::Ordering::SeqCst),
+            batches
+        );
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_with_all_misses_skips_the_callback() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, _) = batched_pool_slots(layout, 0, 4);
+        let mut out = [std::ptr::null(); 2];
+        let mut calls = 0;
+        pool.ensure_batch_with(
+            0,
+            &[(ExpertKind::Gate, 1), (ExpertKind::Up, 2)],
+            &mut out,
+            |_| calls += 1,
+        )
+        .unwrap();
+        assert_eq!(calls, 0);
+        assert!(out.iter().all(|p| !p.is_null()));
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_with_busy_skips_the_callback() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, _) = batched_pool_slots(layout, 0, 2);
+        let mut one = [std::ptr::null()];
+        pool.ensure_batch(0, &[(ExpertKind::Gate, 0)], &mut one)
+            .unwrap();
+        let mut three = [std::ptr::null(); 3];
+        let mut calls = 0;
+        let res = pool.ensure_batch_with(
+            0,
+            &[
+                (ExpertKind::Gate, 0),
+                (ExpertKind::Gate, 1),
+                (ExpertKind::Gate, 2),
+            ],
+            &mut three,
+            |_| calls += 1,
+        );
+        assert!(matches!(res, Err(PoolError::Busy)));
+        assert_eq!(calls, 0);
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_with_source_failure_after_the_callback() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, src) = batched_pool_slots(layout, 0, 4);
+        let mut warm = [std::ptr::null()];
+        pool.ensure_batch(0, &[(ExpertKind::Gate, 0)], &mut warm)
+            .unwrap();
+        pool.end_batch_step();
+        src.fail_down_times
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let mut out = [std::ptr::null(); 2];
+        let mut calls = 0;
+        let res = pool.ensure_batch_with(
+            0,
+            &[(ExpertKind::Gate, 0), (ExpertKind::Gate, 1)],
+            &mut out,
+            |_| calls += 1,
+        );
+        assert!(matches!(res, Err(PoolError::Source { .. })));
+        assert_eq!(calls, 1);
+        assert!(!pool.residency.is_resident(0, 1), "no ghost residency");
         pool.end_batch_step();
     }
 

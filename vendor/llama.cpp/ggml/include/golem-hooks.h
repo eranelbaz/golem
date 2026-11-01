@@ -15,6 +15,9 @@
 //   v16 opt-in decode-only CPU expert math (design §1 O1):
 //       golem_set_cpu_expert_math, golem_cpu_lease_fn,
 //       golem_take_cpu_expert_stats, golem_sched_get_ctx.
+//   v17 ensure takes a hits_ready callback: RAM-resident hits are reported
+//       before the blocking source read so their H2D overlaps it; device-cache
+//       stats gain early_h2d_units.
 // Part of the vendored ggml include tree; the ABI is versioned -- a change
 // updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
@@ -49,7 +52,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 16
+#define GOLEM_HOOKS_ABI_VERSION 17
 GOLEM_API int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -64,12 +67,25 @@ GOLEM_API int golem_hooks_abi_version(void);
  * of the layer that step (identity only for logging).
  * Returns 0 = out_ptrs filled; nonzero (ABI v13) = the misses could not be
  * paged in (every replica unreadable): C drains the split's issued copies
- * and the compute returns GGML_STATUS_FAILED -- llama_decode returns -3. */
+ * and the compute returns GGML_STATUS_FAILED -- llama_decode returns -3.
+ *
+ * ABI v17: `hits_ready` (may be NULL = no early issue, the v16 behaviour) is
+ * called AT MOST ONCE per ensure, on the decode thread, after every miss is
+ * claimed and BEFORE any blocking source read, as hits_ready(hits_ud, ptrs)
+ * where `ptrs` is out_ptrs: ptrs[i] != NULL = resident hit, readable now (its
+ * lease is already held); ptrs[i] == NULL = pending until ensure returns. C
+ * reads hits ONLY through that argument and only queues async H2D copies of
+ * them. The callback runs under the pool's claim lock: it must not re-enter
+ * the pool or call any golem hook / golem_* entry point. Not called when the
+ * claim fails; may already have run when ensure then returns nonzero. */
+typedef void (*golem_hits_ready_fn)(void *ud, const void *const *out_ptrs);
 typedef int32_t (*golem_ensure_host_resident_fn)(void *payload, const void *tensor,
                                                  const int32_t *miss_kinds,
                                                  const int32_t *miss_ids,
                                                  int32_t n_miss,
-                                                 const void **out_ptrs);
+                                                 const void **out_ptrs,
+                                                 golem_hits_ready_fn hits_ready,
+                                                 void *hits_ud);
 
 /* Hook (exclusive residency, design §6.3 O10): device-slab slots were
  * evicted; decide where their bytes go. ONE call per (layer, compute) with
