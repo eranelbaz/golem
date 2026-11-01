@@ -541,7 +541,11 @@ fn fold_defaults(axes: &mut [Axis], config: &EngineConfig) {
             Axis::NumaInterleave(v) => fold(v, |x| x == config.numa_interleave, false),
             Axis::ODirect(v) => fold(v, |x| x == config.o_direct, false),
             Axis::IoThreads(v) => fold(v, |x| Some(x) == config.io_threads, 0),
-            Axis::IoDepth(v) => fold(v, |x| x == config.io_depth.max(1), 0),
+            Axis::IoDepth(v) => fold(
+                v,
+                |x| x as usize == golem_store::resolve_io_depth(config.io_depth as usize),
+                0,
+            ),
             Axis::VramExpertsFrac(v) => fold(v, |x| x == config.vram_experts_frac, 0.0),
             Axis::AsyncH2d(v) => fold(v, |x| x == config.async_h2d, false),
             Axis::CpuExpertMath(v) => fold(v, |x| x == config.cpu_expert_math, false),

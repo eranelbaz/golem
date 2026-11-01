@@ -118,7 +118,7 @@ pub struct EngineArgs {
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
     /// Derived store reader threads per physical drive (D-12: 1–2; default
-    /// 1); `--io-threads` overrides the derived count.
+    /// 2); `--io-threads` overrides the derived count.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=8))]
     pub io_depth: Option<u32>,
     /// Interleave the RAM expert pool across NUMA nodes (no-op on one node).

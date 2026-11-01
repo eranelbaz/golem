@@ -52,7 +52,8 @@ pub struct EngineConfig {
     /// one thread per physical drive hosting an eligible replica.
     pub io_threads: Option<usize>,
     /// Derived store reader threads per physical drive (§5.2, D-12: 1–2);
-    /// 0 = 1. Ignored when `io_threads` is set.
+    /// 0 = `golem_store::DEFAULT_IO_DEPTH` (2). Ignored when `io_threads` is
+    /// set.
     pub io_depth: u32,
     /// Interleave the RAM expert pool's pages across every NUMA node
     /// (`MPOL_INTERLEAVE` while the arena faults in); `false` keeps the

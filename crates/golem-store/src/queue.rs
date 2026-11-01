@@ -109,6 +109,18 @@ struct QueueInner {
     shutdown: bool,
 }
 
+/// Derived reader threads per drive when unset (D-12). Two: GLM-5.3-Flash
+/// UD-IQ3_XXS decode at a 63 GiB pool, 128 tokens, both drives, A/B in both
+/// orders: 6.55–6.65 tok/s at 1 vs 6.74–6.77 at 2, cold and warm; 3
+/// regresses in `read_bench`.
+pub const DEFAULT_IO_DEPTH: usize = 2;
+
+/// The derived reader threads per drive for a configured depth: 0 →
+/// [`DEFAULT_IO_DEPTH`].
+pub fn resolve_io_depth(depth: usize) -> usize {
+    if depth == 0 { DEFAULT_IO_DEPTH } else { depth }
+}
+
 /// One shared queue of chunk reads (§5.2).
 pub struct ChunkQueue {
     inner: Mutex<QueueInner>,
@@ -116,7 +128,7 @@ pub struct ChunkQueue {
     /// An explicit override wins over the derived per-drive count (D-12
     /// bounds the default at 1–2 per drive; the operator's flag does not).
     io_threads: usize,
-    /// Derived reader threads per drive (D-12: 1–2); 0 behaves as 1.
+    /// Derived reader threads per drive (D-12: 1–2).
     io_depth: usize,
     /// R-15: CPUs each drain reader pins itself to at spawn.
     io_cpuset: Option<crate::sys::CpuSet>,
@@ -144,7 +156,7 @@ impl ChunkQueue {
         Self {
             inner: Mutex::new(QueueInner::default()),
             io_threads,
-            io_depth: 1,
+            io_depth: DEFAULT_IO_DEPTH,
             io_cpuset,
             disk_ns: AtomicU64::new(0),
             disk_bytes: AtomicU64::new(0),
@@ -153,11 +165,11 @@ impl ChunkQueue {
         }
     }
 
-    /// Derived reader threads per drive (`--io-depth`, D-12); an explicit
-    /// `io_threads` still wins.
+    /// Derived reader threads per drive (`--io-depth`, D-12); 0 keeps
+    /// [`DEFAULT_IO_DEPTH`]. An explicit `io_threads` still wins.
     #[must_use]
     pub fn with_io_depth(mut self, depth: usize) -> Self {
-        self.io_depth = depth.max(1);
+        self.io_depth = resolve_io_depth(depth);
         self
     }
 
@@ -1461,7 +1473,7 @@ mod tests {
             gates: Vec::new(),
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(0, None)); // 0 = derived, one worker per drive
+        let queue = Arc::new(ChunkQueue::new(0, None).with_io_depth(1)); // one worker per drive
         let mut dst = vec![0u8; bytes];
         queue
             .enqueue(ReadJob {
@@ -1642,7 +1654,7 @@ mod tests {
             gates: vec![Some(fast_gate), Some(gate)],
             wait_for_pair: None,
         };
-        let queue = Arc::new(ChunkQueue::new(0, None)); // derived: one worker per drive
+        let queue = Arc::new(ChunkQueue::new(0, None).with_io_depth(1)); // one worker per drive
         let mut dst = vec![0u8; bytes];
         queue
             .enqueue(ReadJob {

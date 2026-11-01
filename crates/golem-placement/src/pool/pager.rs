@@ -15,7 +15,7 @@ use super::residency::{
     Claim, ClaimError, ExpertKind, FillClaim, P3Stats, PolicySnapshot, PoolConfigError,
     ResidencyMap,
 };
-use super::source::{ExpertSource, PoolGeometry};
+use super::source::{ExpertSource, PoolGeometry, UnitLayout};
 
 /// Read handle over the current [`PolicySnapshot`] (rebuilt by the placement
 /// thread each pass). Guarded by a primitives mutex held only for an `Arc`
@@ -312,6 +312,12 @@ struct BatchClaims {
     lease_of: Vec<u32>,
     leases: Vec<Lease>,
     snapshot: Arc<PolicySnapshot>,
+    /// Reused per-call scratch of [`ExpertPool::ensure_batch`]: the layer's
+    /// pending fills `(expert, slot, claim)`, their planes and read targets.
+    /// Empty between calls; [`recycle`] re-lifetimes the allocations.
+    fills: Vec<(u32, u32, FillClaim<'static>)>,
+    planes: Vec<(ExpertKind, u32)>,
+    targets: Vec<(&'static mut [u8], usize)>,
 }
 
 impl BatchClaims {
@@ -320,6 +326,9 @@ impl BatchClaims {
             lease_of: vec![UNCLAIMED; n_layers * n_experts as usize],
             leases: Vec::new(),
             snapshot: Arc::new(PolicySnapshot::empty()),
+            fills: Vec::new(),
+            planes: Vec::new(),
+            targets: Vec::new(),
         }
     }
 
@@ -330,6 +339,18 @@ impl BatchClaims {
         }
         self.snapshot = pool.snapshot();
     }
+}
+
+/// Moves `v`'s allocation into a vector of the same element type under
+/// other lifetimes: an in-place `collect` keeps the buffer when the layouts
+/// match (best-effort std specialization; a miss only re-allocates).
+fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
+    debug_assert!(
+        size_of::<T>() == size_of::<U>() && align_of::<T>() == align_of::<U>(),
+        "recycle across layouts never reuses the buffer"
+    );
+    v.clear();
+    v.into_iter().filter_map(|_| None).collect()
 }
 
 struct DemandGuard<'a>(&'a AtomicUsize);
@@ -510,20 +531,26 @@ impl ExpertPool {
     }
 
     /// Claims and page-ins the whole `(kind, expert)` miss list of ONE layer
-    /// in a single call (ABI v5 batched P3: one shared-queue submission for
-    /// all planes), writing each miss's pool-side plane pointer into `out`.
-    /// Each `(layer, expert)` unit is claimed and leased exactly once per
-    /// step regardless of how many of its planes miss; the leases are held
-    /// until [`Self::end_batch_step`] so eviction cannot recycle a slot
-    /// mid-DMA. Steady state allocates nothing (preallocated table + lease
-    /// list). Caller-preallocated `out` (`misses.len()` entries).
+    /// in a single call (ABI v5 batched P3), writing each miss's pool-side
+    /// plane pointer into `out`. Every unit is claimed first, in miss order,
+    /// so slot assignment never depends on I/O completion order; then all
+    /// missing units' planes go to the source as ONE batched read (one
+    /// shared-queue drain, §5.2), so the queue keeps `io_depth` reads in
+    /// flight per drive instead of one unit at a time. Each `(layer,
+    /// expert)` unit is claimed and leased exactly once per step regardless
+    /// of how many of its planes miss; the leases are held until
+    /// [`Self::end_batch_step`] so eviction cannot recycle a slot mid-DMA.
+    /// Steady state allocates nothing (preallocated table, lease list and
+    /// fill scratch). Caller-preallocated `out` (`misses.len()` entries).
     ///
     /// # Errors
-    /// Length-mismatched `out`, a layer or expert out of range, a source
-    /// failure after bounded retries, or an over-subscribed pool
-    /// ([`PoolError::Contract`] for the first three shapes' contract
-    /// violations). On error the units claimed so far stay leased until the
-    /// next `end_batch_step`.
+    /// Length-mismatched `out`, a layer or expert out of range
+    /// ([`PoolError::Contract`], before any claim), a source failure after
+    /// bounded retries (every fill of this call is cancelled), or an
+    /// over-subscribed pool (fills claimed before the `Busy` are cancelled;
+    /// victims they evicted stay evicted). On error the units leased by earlier calls and
+    /// this call's resident hits stay leased until the next
+    /// `end_batch_step`.
     pub fn ensure_batch(
         &self,
         layer: u32,
@@ -545,28 +572,121 @@ impl ExpertPool {
             });
         }
         let n = self.geometry.n_experts;
-        let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, expert)) = misses.iter().find(|&&(_, e)| e >= n) {
+            return Err(PoolError::Contract {
+                reason: format!("expert {expert} out of range (n_experts {n})"),
+            });
+        }
+        let mut guard = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        let batch = &mut *guard;
         let _inflight = self.demand_guard(true);
+        let base = layer as usize * n as usize;
+        let mut fills: Vec<(u32, u32, FillClaim<'_>)> = recycle(std::mem::take(&mut batch.fills));
+        let claimed = self.claim_misses(layer, misses, batch, &mut fills);
+        let result = claimed.and_then(|()| self.fill_batch(layer, batch, &mut fills));
+        batch.fills = recycle(fills);
+        result?;
         for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
-            if expert >= n {
-                return Err(PoolError::Contract {
-                    reason: format!("expert {expert} out of range (n_experts {n})"),
-                });
-            }
-            let base = layer as usize * n as usize + expert as usize;
-            if batch.lease_of[base] == UNCLAIMED {
-                let lease = self.claim_leased(true, layer, expert, &batch.snapshot)?;
-                // Count successes only, as in ensure_range_leased.
-                self.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
-                batch.lease_of[base] = batch.leases.len() as u32;
-                batch.leases.push(lease);
-            }
-            let lease_at = batch.lease_of[base] as usize;
+            let lease_at = batch.lease_of[base + expert as usize] as usize;
             *dst = self
                 .plane_bytes(layer, &batch.leases[lease_at], kind)
                 .as_ptr();
         }
         Ok(())
+    }
+
+    /// Phase 1 of [`Self::ensure_batch`]: claims every unit of `misses` not
+    /// yet leased this step, in miss order. Resident units are leased at
+    /// once; units needing a fill are pushed to `fills` (their lease is the
+    /// fill claim's until [`Self::fill_batch`] settles it). On `Busy` the
+    /// pending fills are left for the caller to drop (dropping cancels).
+    fn claim_misses<'m>(
+        &'m self,
+        layer: u32,
+        misses: &[(ExpertKind, u32)],
+        batch: &mut BatchClaims,
+        fills: &mut Vec<(u32, u32, FillClaim<'m>)>,
+    ) -> Result<(), PoolError> {
+        let base = layer as usize * self.geometry.n_experts as usize;
+        for &(_, expert) in misses {
+            let at = base + expert as usize;
+            if batch.lease_of[at] != UNCLAIMED || fills.iter().any(|f| f.0 == expert) {
+                continue;
+            }
+            let snapshot = &batch.snapshot;
+            match self
+                .residency
+                .claim_for(layer, expert, snapshot, true, f32::NEG_INFINITY)
+            {
+                Ok(Claim::Resident { slot, prefetch_hit }) => {
+                    self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+                    if prefetch_hit {
+                        self.stats.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
+                    batch.lease_of[at] = batch.leases.len() as u32;
+                    batch.leases.push(self.lease(layer, expert, slot));
+                }
+                Ok(Claim::Filled { slot, claim }) => fills.push((expert, slot, claim)),
+                Err(ClaimError::Evicted(evicted)) => {
+                    self.note_eviction(&evicted.victim);
+                    debug_assert_eq!(evicted.slot, evicted.victim.slot);
+                    fills.push((expert, evicted.slot, evicted.claim));
+                }
+                Err(ClaimError::Busy) => return Err(PoolError::Busy),
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 2 of [`Self::ensure_batch`]: one batched source read landing
+    /// every pending unit's three planes straight in its claimed slot, then
+    /// each fill settles. Success leases every unit (in claim order); any
+    /// failure cancels every fill of the batch (no ghost residency).
+    fn fill_batch<'m>(
+        &'m self,
+        layer: u32,
+        batch: &mut BatchClaims,
+        fills: &mut Vec<(u32, u32, FillClaim<'m>)>,
+    ) -> Result<(), PoolError> {
+        if fills.is_empty() {
+            return Ok(());
+        }
+        let unit = &self.geometry.layers[layer as usize];
+        let mut planes = std::mem::take(&mut batch.planes);
+        let mut targets: Vec<(&mut [u8], usize)> = recycle(std::mem::take(&mut batch.targets));
+        for (expert, _, claim) in fills.iter_mut() {
+            planes.extend(ExpertKind::ALL.map(|k| (k, *expert)));
+            let (t0, rest) = self
+                .arena
+                .slot_mut(claim)
+                .split_at_mut(unit.region[0] as usize);
+            let (t1, t2) = rest.split_at_mut(unit.region[1] as usize);
+            targets.push((t0, unit.head[0] as usize));
+            targets.push((t1, unit.head[1] as usize));
+            targets.push((t2, unit.head[2] as usize));
+        }
+        let read = self
+            .source
+            .read_expert_batched(layer, &planes, &mut targets);
+        planes.clear();
+        batch.planes = planes;
+        batch.targets = recycle(targets);
+        let base = layer as usize * self.geometry.n_experts as usize;
+        for (expert, slot, claim) in fills.drain(..) {
+            if read.is_ok() {
+                self.settle_fill(true, unit, claim, true);
+                self.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
+                batch.lease_of[base + expert as usize] = batch.leases.len() as u32;
+                batch.leases.push(self.lease(layer, expert, slot));
+            } else {
+                self.settle_fill(true, unit, claim, false);
+            }
+        }
+        read.map_err(|source| {
+            self.stats.source_errors.fetch_add(1, Ordering::Relaxed);
+            PoolError::Source { source }
+        })
     }
 
     /// Ends the batched step: releases every lease taken by
@@ -968,27 +1088,38 @@ impl ExpertPool {
                     slot
                 }
                 Err(ClaimError::Evicted(evicted)) => {
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                    self.note_eviction(&evicted.victim);
                     let slot = evicted.slot;
                     debug_assert_eq!(slot, evicted.victim.slot);
-                    if evicted.victim.prefetched {
-                        let unit = &self.geometry.layers[evicted.victim.layer as usize];
-                        self.stats
-                            .prefetch_wasted_bytes
-                            .fetch_add(unit.bytes(), Ordering::Relaxed);
-                    }
                     self.page_in(demand, layer, expert, evicted.claim)?;
                     slot
                 }
                 Err(ClaimError::Busy) => return Err(PoolError::Busy),
             };
-        Ok(Lease {
+        Ok(self.lease(layer, expert, slot))
+    }
+
+    /// The lease object for a claim grant on `slot` (the grant already
+    /// counted the lease in the residency shard).
+    fn lease(&self, layer: u32, expert: u32, slot: u32) -> Lease {
+        Lease {
             map: self.residency.clone(),
             _arena: self.arena.clone(),
             layer,
             expert,
             slot,
-        })
+        }
+    }
+
+    /// Eviction counters for a claim that displaced `victim`.
+    fn note_eviction(&self, victim: &super::residency::Victim) {
+        self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        if victim.prefetched {
+            let unit = &self.geometry.layers[victim.layer as usize];
+            self.stats
+                .prefetch_wasted_bytes
+                .fetch_add(unit.bytes(), Ordering::Relaxed);
+        }
     }
 
     /// The `kind` plane's sub-slice of the unit's slot (§6.1 plane layout).
@@ -1104,27 +1235,31 @@ impl ExpertPool {
             ];
             self.source.read_expert_batched(layer, &batch, &mut targets)
         };
-        match result {
-            Ok(()) => {
-                claim.finish();
-                let counter = if demand {
-                    &self.stats.demand_slow_pageins
-                } else {
-                    &self.stats.prefetch_pageins
-                };
-                counter.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .bytes_paged
-                    .fetch_add(unit.bytes(), Ordering::Relaxed);
-                Ok(())
-            }
-            Err(source) => {
-                // Any plane failure aborts the whole unit: no ghost
-                // residency, the slot goes back to its class's free list.
-                claim.cancel();
-                self.stats.source_errors.fetch_add(1, Ordering::Relaxed);
-                Err(PoolError::Source { source })
-            }
+        self.settle_fill(demand, unit, claim, result.is_ok());
+        result.map_err(|source| {
+            self.stats.source_errors.fetch_add(1, Ordering::Relaxed);
+            PoolError::Source { source }
+        })
+    }
+
+    /// Settles one fill after its read: `ok` opens the fill gate and counts
+    /// the page-in; otherwise the claim is cancelled — any plane failure
+    /// aborts the whole unit (no ghost residency, the slot goes back to its
+    /// class's free list).
+    fn settle_fill(&self, demand: bool, unit: &UnitLayout, claim: FillClaim<'_>, ok: bool) {
+        if ok {
+            claim.finish();
+            let counter = if demand {
+                &self.stats.demand_slow_pageins
+            } else {
+                &self.stats.prefetch_pageins
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .bytes_paged
+                .fetch_add(unit.bytes(), Ordering::Relaxed);
+        } else {
+            claim.cancel();
         }
     }
 
@@ -1339,6 +1474,7 @@ mod tests {
         stride: usize,
         fail_down_times: std::sync::atomic::AtomicUsize,
         calls: Mutex<Vec<(ExpertKind, u32, usize, usize)>>,
+        batches: std::sync::atomic::AtomicUsize,
     }
 
     #[cfg(not(loom))]
@@ -1348,6 +1484,7 @@ mod tests {
                 stride,
                 fail_down_times: std::sync::atomic::AtomicUsize::new(fail_down_times),
                 calls: Mutex::new(Vec::new()),
+                batches: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1375,6 +1512,8 @@ mod tests {
             batch: &[(ExpertKind, u32)],
             targets: &mut [(&mut [u8], usize)],
         ) -> io::Result<()> {
+            self.batches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             for (&(kind, expert), (into, head)) in batch.iter().zip(targets.iter_mut()) {
                 self.calls
                     .lock()
@@ -1407,9 +1546,18 @@ mod tests {
         layout: UnitLayout,
         fail_down_times: usize,
     ) -> (Arc<ExpertPool>, Arc<BatchedSource>) {
+        batched_pool_slots(layout, fail_down_times, 2)
+    }
+
+    #[cfg(not(loom))]
+    fn batched_pool_slots(
+        layout: UnitLayout,
+        fail_down_times: usize,
+        slots: u32,
+    ) -> (Arc<ExpertPool>, Arc<BatchedSource>) {
         let arena = Arena::new(&[SlotClass {
             slot_size: layout.region.iter().sum::<u64>() as usize,
-            slots: 2,
+            slots,
         }])
         .unwrap();
         let src = Arc::new(BatchedSource::new(
@@ -1462,6 +1610,111 @@ mod tests {
         assert_eq!(pool.stats.demand_slow_pageins.load(Ordering::Relaxed), 1);
         assert_eq!(pool.stats.bytes_paged.load(Ordering::Relaxed), 3 * stride);
         assert!(pool.residency.is_resident(0, 3));
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_submits_a_layers_misses_as_one_read() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, src) = batched_pool_slots(layout, 0, 4);
+        let misses = [
+            (ExpertKind::Gate, 5),
+            (ExpertKind::Up, 2),
+            (ExpertKind::Down, 5),
+            (ExpertKind::Gate, 7),
+        ];
+        let mut out = [std::ptr::null(); 4];
+        pool.ensure_batch(0, &misses, &mut out).unwrap();
+        assert_eq!(
+            src.batches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one drain for the whole layer"
+        );
+        let experts: Vec<u32> = src.calls.lock().unwrap().iter().map(|c| c.1).collect();
+        assert_eq!(experts, [5, 5, 5, 2, 2, 2, 7, 7, 7], "claim (miss) order");
+        {
+            let b = pool.batch_claims.lock().unwrap();
+            for (&(kind, expert), &p) in misses.iter().zip(&out) {
+                let lease = b.leases.iter().find(|l| l.expert == expert).unwrap();
+                let plane = pool.plane_bytes(0, lease, kind);
+                assert_eq!(plane.as_ptr(), p);
+                assert!(plane.iter().all(|&x| x == plane_byte(kind, expert)));
+            }
+        }
+        assert_eq!(pool.stats.demand_slow_pageins.load(Ordering::Relaxed), 3);
+        assert_eq!(pool.stats.demand_claims.load(Ordering::Relaxed), 3);
+        // A repeat within the step reads nothing.
+        pool.ensure_batch(0, &misses, &mut out).unwrap();
+        assert_eq!(src.batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_slots_follow_miss_order_not_io_order() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let slots_of = |misses: &[(ExpertKind, u32)]| {
+            let (pool, _) = batched_pool_slots(layout, 0, 4);
+            let mut out = vec![std::ptr::null(); misses.len()];
+            pool.ensure_batch(0, misses, &mut out).unwrap();
+            let b = pool.batch_claims.lock().unwrap();
+            b.leases
+                .iter()
+                .map(|l| (l.expert, l.slot()))
+                .collect::<Vec<_>>()
+        };
+        let misses = [
+            (ExpertKind::Gate, 6),
+            (ExpertKind::Gate, 1),
+            (ExpertKind::Gate, 4),
+        ];
+        let a = slots_of(&misses);
+        assert_eq!(a, slots_of(&misses), "same misses, same slots");
+        assert_eq!(a.iter().map(|x| x.0).collect::<Vec<_>>(), [6, 1, 4]);
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_failure_cancels_every_fill_of_the_layer() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, _) = batched_pool_slots(layout, 1, 4);
+        let misses = [(ExpertKind::Gate, 1), (ExpertKind::Gate, 2)];
+        let mut out = [std::ptr::null(); 2];
+        assert!(matches!(
+            pool.ensure_batch(0, &misses, &mut out),
+            Err(PoolError::Source { .. })
+        ));
+        assert!(!pool.residency.is_resident(0, 1), "no ghost residency");
+        assert!(!pool.residency.is_resident(0, 2), "no ghost residency");
+        assert!(pool.batch_claims.lock().unwrap().leases.is_empty());
+        assert_eq!(pool.stats.source_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.fill(), 0.0, "every slot recycled");
+        pool.ensure_batch(0, &misses, &mut out).unwrap();
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_busy_mid_claim_cancels_pending_fills() {
+        let stride = 64u64;
+        let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
+        let (pool, src) = batched_pool_slots(layout, 0, 2);
+        let mut one = [std::ptr::null()];
+        pool.ensure_batch(0, &[(ExpertKind::Gate, 0)], &mut one)
+            .unwrap();
+        let mut two = [std::ptr::null(); 2];
+        assert!(matches!(
+            pool.ensure_batch(0, &[(ExpertKind::Gate, 1), (ExpertKind::Gate, 2)], &mut two),
+            Err(PoolError::Busy)
+        ));
+        assert!(!pool.residency.is_resident(0, 1), "pending fill cancelled");
+        assert!(pool.residency.is_resident(0, 0), "earlier lease kept");
+        assert_eq!(pool.fill(), 0.5, "cancelled slot back on the free list");
+        assert_eq!(src.batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        pool.end_batch_step();
     }
 
     #[test]

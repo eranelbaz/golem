@@ -49,6 +49,8 @@ struct Args {
     plane_bytes: usize,
     seed: u64,
     io_threads: usize,
+    io_depth: usize,
+    batch: usize,
     sequential: bool,
     whole: bool,
     replica: usize,
@@ -61,6 +63,8 @@ fn parse_args() -> Result<Args, String> {
     let mut plane_bytes = DEFAULT_PLANE_BYTES;
     let mut seed = 0u64;
     let mut io_threads = 0usize;
+    let mut io_depth = 0usize;
+    let mut batch = 1usize;
     let mut sequential = false;
     let mut whole = false;
     let mut replica = 0usize;
@@ -95,6 +99,20 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--io-threads must be an integer")?;
             }
+            "--io-depth" => {
+                io_depth = it
+                    .next()
+                    .ok_or("--io-depth needs a value")?
+                    .parse()
+                    .map_err(|_| "--io-depth must be an integer")?;
+            }
+            "--batch" => {
+                batch = it
+                    .next()
+                    .ok_or("--batch needs a value")?
+                    .parse()
+                    .map_err(|_| "--batch must be a usize")?;
+            }
             "--manifest" => {
                 manifest = Some(it.next().ok_or("--manifest needs a path")?);
             }
@@ -121,7 +139,7 @@ fn parse_args() -> Result<Args, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>] [--sequential] [--whole [--replica <i>] [--piece <bytes>]] [--io-threads <usize>]"
+                    "unknown arg {a}; usage: read_bench --manifest <path> [--n <reads>] [--plane-bytes <usize>] [--seed <u64>] [--sequential] [--whole [--replica <i>] [--piece <bytes>]] [--io-threads <usize>] [--io-depth <usize>] [--batch <reads>]"
                 ));
             }
         }
@@ -135,6 +153,8 @@ fn parse_args() -> Result<Args, String> {
         plane_bytes,
         seed,
         io_threads,
+        io_depth,
+        batch: batch.max(1),
         sequential,
         whole,
         replica,
@@ -175,7 +195,7 @@ fn run() -> Result<(), golem_store::StoreError> {
         return run_whole(&args, &manifest);
     }
     let registry = ReplicaRegistry::open(&manifest)?;
-    let queue = Arc::new(ChunkQueue::new(args.io_threads, None)); // 0 = one reader thread per physical drive (§5.2); 2 = two per drive (D-12)
+    let queue = Arc::new(ChunkQueue::new(args.io_threads, None).with_io_depth(args.io_depth)); // reader threads per physical drive; 0 = DEFAULT_IO_DEPTH (D-12)
 
     // Startup hygiene (H-9): a replica whose open-time probe failed serves
     // buffered from byte 0 — its GB/s is a page-cache number, not a disk one.
@@ -194,7 +214,8 @@ fn run() -> Result<(), golem_store::StoreError> {
     // (§5.4 plan shape); one preallocation, reused for every read. The region
     // start must be 4 KiB-aligned or every read silently takes the buffered
     // fallback (§5.4 direct reads require an aligned buffer).
-    let mut raw = vec![0u8; args.plane_bytes + 2 * CHUNK + 2 * 4096];
+    let per_read = (args.plane_bytes + 2 * CHUNK).next_multiple_of(4096);
+    let mut raw = vec![0u8; args.batch * per_read + 4096];
     let skip = 4096 - raw.as_ptr() as usize % 4096;
     let buf = &mut raw[skip..];
 
@@ -205,47 +226,68 @@ fn run() -> Result<(), golem_store::StoreError> {
     let mut total_logical = 0u64;
     let mut total_chunks = 0usize;
     let mut shard0_chunks = 0usize;
-    let shard_count = manifest.shards.len();
-    let t0 = Instant::now();
-    for i in 0..args.n {
-        let s = i % shard_count;
-        let offset = read_offset(&args, manifest.shards[s].bytes, i, shard_count);
-        let plan = plan_aligned(offset, args.plane_bytes);
-        let covering: usize = plan.iter().map(|c| c.1).sum();
-        let (dst, rest) = buf.split_at_mut(covering);
-        let handle = queue.enqueue(ReadJob {
-            shard_index: s,
-            offset,
-            len: args.plane_bytes,
-            expected_crc: 0,
-            verify_crc: false, // bandwidth bench, not integrity
-            prefetch: false,
-            sources: &registry,
-            dst,
+    // Split GGUFs lead with a metadata-only shard (9 MB on GLM-5.3-Flash):
+    // reads wrapping inside it hit the drive cache, not the media.
+    let shards: Vec<usize> = (0..manifest.shards.len())
+        .filter(|&s| manifest.shards[s].bytes >= 64 * CHUNK as u64)
+        .collect();
+    if shards.is_empty() {
+        return Err(golem_store::StoreError::Invalid {
+            msg: "no shard large enough to bench".into(),
         });
-        handle.wait()?;
-        let _ = rest;
-        total_logical += args.plane_bytes as u64;
-        total_chunks += plan.len();
-        if s == 0 {
-            shard0_chunks += plan.len();
+    }
+    let shard_count = shards.len();
+    let t0 = Instant::now();
+    // `--batch k`: k reads enqueued then drained together (one decode
+    // layer's misses, §3.4 P3); 1 = one drain per plane.
+    let mut i = 0;
+    while i < args.n {
+        let mut rb = queue.batch();
+        let mut rest: &mut [u8] = &mut *buf;
+        for _ in 0..args.batch.min(args.n - i) {
+            let s = shards[i % shard_count];
+            let offset = read_offset(&args, manifest.shards[s].bytes, i, shard_count);
+            let plan = plan_aligned(offset, args.plane_bytes);
+            let covering: usize = plan.iter().map(|c| c.1).sum();
+            let (slot, tail) = std::mem::take(&mut rest).split_at_mut(per_read);
+            rest = tail;
+            rb.push(ReadJob {
+                shard_index: s,
+                offset,
+                len: args.plane_bytes,
+                expected_crc: 0,
+                verify_crc: false, // bandwidth bench, not integrity
+                prefetch: false,
+                sources: &registry,
+                dst: &mut slot[..covering],
+            });
+            total_logical += args.plane_bytes as u64;
+            total_chunks += plan.len();
+            if s == shards[0] {
+                shard0_chunks += plan.len();
+            }
+            i += 1;
         }
+        rb.wait()?;
     }
     let wall = t0.elapsed();
 
-    let healthy: Vec<usize> = registry.shards()[0]
+    let healthy: Vec<usize> = registry.shards()[shards[0]]
         .replicas
         .iter()
         .enumerate()
         .filter(|(_, r)| r.health() == ReplicaHealth::Healthy)
         .map(|(i, _)| i)
         .collect();
-    let replica_count = registry.shards()[0].replicas.len();
-    eprintln!("shard 0: {replica_count} replica(s), healthy: {healthy:?}");
+    let replica_count = registry.shards()[shards[0]].replicas.len();
+    eprintln!(
+        "shard {}: {replica_count} replica(s), healthy: {healthy:?}",
+        shards[0]
+    );
 
     // Measured share: chunks each replica actually served (§5.2 striping
     // homes chunks round-robin across healthy replicas; skew shows up here).
-    for (r, slot) in registry.shards()[0].replicas.iter().enumerate() {
+    for (r, slot) in registry.shards()[shards[0]].replicas.iter().enumerate() {
         let served = slot.served_chunks();
         let direct = slot.served_direct();
         eprintln!(
