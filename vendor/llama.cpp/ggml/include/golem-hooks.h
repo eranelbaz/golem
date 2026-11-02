@@ -378,9 +378,10 @@ GOLEM_API int32_t golem_take_sync_gap_stats(golem_ctx_t ctx, double *sync_ms, do
  * split backend, and layers missing a plane take the host-sync path. */
 
 /* `mode`: 0 off, 1 auto (stream wait when the device supports it, else the
- * wait kernel), 2 force the wait kernel. `dev` = the GPU device whose
- * registry exports the device-wait iface (the caller resolves it: ggml-base
- * does not link the registry). `n_used` = routed experts per token,
+ * wait kernel), 2 force the wait kernel. `dev` = the split backend's GPU
+ * device (single-GPU): its registry supplies the device-wait iface and its
+ * capability picks the mode (the caller resolves it: ggml-base does not link
+ * the registry). `n_used` = routed experts per token,
  * `n_pred` = prediction ids per source layer (lookahead x (n_used + margin),
  * 0 = predictions off). Allocates the mapped ring (bounded by n_layers x
  * (n_used + n_pred + 6 n_used) words, never by the expert count). Returns 0,
@@ -413,8 +414,8 @@ GOLEM_API void golem_device_wait_stats(golem_ctx_t ctx, uint64_t *served, uint64
 /* Test seam (ABI v20): on GPU device `dev`, the compute stream waits (in
  * `mode` 1 or 2) for a mapped word to reach 7, then gathers it into a device
  * tensor; returns 0 when the stream stayed blocked until the host wrote the
- * word and the gather read 7, 1 when the order was violated, -1 when the mode
- * is unsupported. */
+ * word and the gather read 7, 1 when the order was violated, -1 when `dev` is
+ * NULL, lacks the device-wait iface, or the mode is unsupported. */
 GOLEM_API int32_t golem_device_wait_probe(struct ggml_backend_device *dev, int32_t mode);
 #endif
 
