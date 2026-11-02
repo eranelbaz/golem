@@ -24,7 +24,8 @@ fn csv_header_carries_version_fork_commit_and_config() {
     assert!(
         s.lines().nth(1).unwrap().ends_with(
             ",policy_ms,compute_ms,cpu_expert_math_experts,cpu_expert_math_bytes,\
-             cpu_expert_math_ms,cpu_expert_join_wait_ms"
+             cpu_expert_math_ms,cpu_expert_join_wait_ms,ids_readbacks,ids_sync_ms,ids_gap_ms,\
+             ids_gap_max_ms"
         ),
         "{s}"
     );
@@ -46,6 +47,7 @@ fn cpu_expert_columns_measured_and_not_subtracted_from_compute() {
         h2d_ms: f64::NAN,
         h2d_bytes: 0,
         policy_ms: f64::NAN,
+        sync_gap: None,
         cpu_expert: Some(CpuExpertStats {
             experts: 12,
             bytes: 69_206_016,
@@ -57,7 +59,10 @@ fn cpu_expert_columns_measured_and_not_subtracted_from_compute() {
     let mut out = Vec::new();
     r.flush(&mut out).unwrap();
     let line = std::str::from_utf8(&out).unwrap().lines().last().unwrap();
-    assert!(line.ends_with(",40.0,12,69206016,25.0,3.5"), "row: {line}");
+    assert!(
+        line.ends_with(",40.0,12,69206016,25.0,3.5,unmeasured,unmeasured,unmeasured,unmeasured"),
+        "row: {line}"
+    );
 }
 
 #[test]
@@ -74,6 +79,7 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
         h2d_ms: f64::NAN,
         h2d_bytes: 0,
         policy_ms: f64::NAN,
+        sync_gap: None,
         cpu_expert: None,
     });
     let mut out = Vec::new();
@@ -86,8 +92,10 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
         .to_string();
     assert!(line.contains("unmeasured"));
     assert!(
-        line.ends_with(",unmeasured,unmeasured,unmeasured,unmeasured"),
-        "cpu_expert columns off: {line}"
+        line.ends_with(
+            ",unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured"
+        ),
+        "cpu_expert and ids columns off: {line}"
     );
     assert!(!line.contains(",0,")); // no silent zero for unmeasured
     assert!(line.contains("55") && line.contains("121634816"));
@@ -109,6 +117,7 @@ fn compute_is_wall_minus_p3_h2d_policy_not_disk_worker() {
         h2d_ms: f64::NAN,
         h2d_bytes: 0,
         policy_ms: 4.5,
+        sync_gap: None,
         cpu_expert: None,
     });
     let mut out = Vec::new();
@@ -169,4 +178,66 @@ fn h2d_columns_measured_only_with_async_h2d() {
     let off = col(&rows(false), 7);
     assert!(!off.is_empty());
     assert!(off.iter().all(|v| v == "unmeasured"), "{off:?}");
+}
+
+/// HIP, pooled offload through the engine-registered hooks: `policy_ms` and
+/// the four ids-readback columns are measured numbers on every generation
+/// row, and each row counts at least one readback per decode step.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn policy_and_ids_readback_columns_measured_with_hooks() {
+    use golem_engine::config::EngineConfig;
+    use golem_engine::session::{ChatTurn, Session};
+    use xtask::tiny_moe::dims;
+    let off = common::offload::offload_config();
+    let csv_path = std::env::temp_dir().join(format!("golem-unused-p-{}.csv", std::process::id()));
+    let cfg = EngineConfig {
+        ram_experts_gib: 1,
+        device_cache_experts: 4,
+        n_predict: 4,
+        timing_csv: Some(csv_path.clone()),
+        ..off
+    };
+    let mut s = Session::new(&cfg).unwrap();
+    s.chat_turn(
+        &[ChatTurn {
+            role: "user",
+            content: "hello",
+        }],
+        &mut |_| {},
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    s.write_timing(&mut out).unwrap();
+    let csv = String::from_utf8(out).unwrap();
+    // Rows only; the column names come from the recorder's own header.
+    let mut hdr = Vec::new();
+    golem_engine::timing::TimingRecorder::header(&mut hdr, "", "", "").unwrap();
+    let hdr = String::from_utf8(hdr).unwrap();
+    let header: Vec<&str> = hdr.lines().nth(1).unwrap().split(',').collect();
+    let idx = |name: &str| header.iter().position(|h| *h == name).unwrap();
+    let rows: Vec<Vec<&str>> = csv
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("step"))
+        .map(|l| l.split(',').collect())
+        .collect();
+    assert!(!rows.is_empty(), "{csv}");
+    for r in &rows {
+        for c in ["policy_ms", "ids_sync_ms", "ids_gap_ms", "ids_gap_max_ms"] {
+            assert!(r[idx(c)].parse::<f64>().is_ok(), "{c}: {csv}");
+        }
+        let f = |c: &str| r[idx(c)].parse::<f64>().unwrap();
+        assert!(f("ids_gap_max_ms") <= f("ids_gap_ms"), "max <= sum: {csv}");
+        assert!(f("policy_ms") <= f("wall_ms"), "policy within wall: {csv}");
+        // One readback per hooked MoE layer per decoded token.
+        let moe_layers = u64::from(dims::N_LAYER - dims::N_LAYER_DENSE_LEAD);
+        let tokens: u64 = r[idx("tokens")].parse().unwrap();
+        let n: u64 = r[idx("ids_readbacks")].parse().unwrap();
+        assert_eq!(
+            n,
+            moe_layers * tokens,
+            "one readback per MoE layer per step: {csv}"
+        );
+    }
+    let _ = std::fs::remove_file(&csv_path);
 }

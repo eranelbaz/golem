@@ -13,6 +13,7 @@
 /// mlock'd slot arena — the only `unsafe` in the pool module.
 #[allow(unsafe_code)]
 pub mod arena;
+pub mod landed;
 pub mod primitives;
 
 mod pager;

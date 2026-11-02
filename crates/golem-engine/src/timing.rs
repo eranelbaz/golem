@@ -6,7 +6,11 @@
 //! because it runs inside the `p3_wait` window on a parallel worker (it can
 //! even exceed the step wall time), so subtracting it would double-count.
 //! Unmeasured parts contribute nothing to the remainder. The CPU expert
-//! math worker's time is not subtracted either: it overlaps the GPU.
+//! math worker's time is not subtracted either: it overlaps the GPU. Nor are
+//! the MoE ids-readback columns (`ids_sync_ms`, `ids_gap_ms`): the gap from
+//! a readback's sync to the next launch contains the P3 ensure and policy
+//! time already subtracted, so they locate the host-sync bubbles (§3.4) and
+//! are not a disjoint part of the wall.
 //!
 //! Hot-path cost (§11-allowed): a few `Instant::now()` per layer plus
 //! per-step atomic take-snapshots. The recorder is fixed-capacity and
@@ -15,8 +19,8 @@
 use std::io::{self, Write};
 
 /// One generation step's timing. `f64::NAN` marks an unmeasured component
-/// (`h2d_*`: measured only on the async_h2d copy stream; `policy_ms`: P2
-/// order-building is not instrumented).
+/// (`h2d_*`: measured only on the async_h2d copy stream; `policy_ms` and the
+/// `ids_*` columns: measured only while the P3 hooks are registered).
 pub struct StepTiming {
     /// 0-based generation step within the turn.
     pub step: u64,
@@ -43,8 +47,11 @@ pub struct StepTiming {
     /// Host→device bytes, MMQ padding tails included (unmeasured alongside
     /// `h2d_ms`).
     pub h2d_bytes: u64,
-    /// P2 policy order-building time (unmeasured today).
+    /// Decode-thread P2 policy time: the routing readback's booking and the
+    /// `copy_done` order flush (the publisher thread's builds overlap).
     pub policy_ms: f64,
+    /// MoE ids-readback host-sync timing; `None` without the P3 hooks.
+    pub sync_gap: Option<SyncGapStats>,
     /// Decode-only CPU expert math (design §1 O1); `None` unless
     /// `cpu_expert_math` measured it.
     pub cpu_expert: Option<CpuExpertStats>,
@@ -73,6 +80,34 @@ impl CpuExpertStats {
         self.ms += o.ms;
         self.join_wait_ms += o.join_wait_ms;
         self.padded += o.padded;
+    }
+}
+
+/// One step's MoE ids-readback host-sync timing (design §3.4, §11): each
+/// hooked MoE layer reads its routed ids back, synchronizing only the ids
+/// backend; from the first readback's return until the next split launch no
+/// compute is queued there (the async_h2d copy stream may still run).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct SyncGapStats {
+    /// Host time blocked inside the readback synchronizes, mostly waiting on
+    /// the prior compute to finish (not a pure sync overhead).
+    pub sync_ms: f64,
+    /// Summed readback-return → next-launch spans (compute idle, host
+    /// planning; copy-stream H2D may overlap).
+    pub gap_ms: f64,
+    /// Largest single span.
+    pub gap_max_ms: f64,
+    /// Readbacks counted (one per MoE layer per decode step).
+    pub readbacks: u64,
+}
+
+impl SyncGapStats {
+    /// Adds `o` into `self` (max for `gap_max_ms`).
+    pub fn add(&mut self, o: &Self) {
+        self.sync_ms += o.sync_ms;
+        self.gap_ms += o.gap_ms;
+        self.gap_max_ms = self.gap_max_ms.max(o.gap_max_ms);
+        self.readbacks += o.readbacks;
     }
 }
 
@@ -119,7 +154,8 @@ impl TimingRecorder {
         writeln!(
             w,
             "step,tokens,wall_ms,p3_wait_ms,disk_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,h2d_bytes,policy_ms,compute_ms,\
-             cpu_expert_math_experts,cpu_expert_math_bytes,cpu_expert_math_ms,cpu_expert_join_wait_ms"
+             cpu_expert_math_experts,cpu_expert_math_bytes,cpu_expert_math_ms,cpu_expert_join_wait_ms,\
+             ids_readbacks,ids_sync_ms,ids_gap_ms,ids_gap_max_ms"
         )
     }
 
@@ -153,9 +189,14 @@ impl TimingRecorder {
                     .as_ref()
                     .map_or_else(|| "unmeasured".to_owned(), f)
             };
+            let sg = |f: fn(&SyncGapStats) -> String| {
+                t.sync_gap
+                    .as_ref()
+                    .map_or_else(|| "unmeasured".to_owned(), f)
+            };
             writeln!(
                 w,
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 t.step,
                 t.tokens,
                 ms(t.wall_ms),
@@ -179,6 +220,10 @@ impl TimingRecorder {
                 cpu(|c| c.bytes.to_string()),
                 cpu(|c| ms(c.ms)),
                 cpu(|c| ms(c.join_wait_ms)),
+                sg(|g| g.readbacks.to_string()),
+                sg(|g| ms(g.sync_ms)),
+                sg(|g| ms(g.gap_ms)),
+                sg(|g| ms(g.gap_max_ms)),
             )?;
         }
         if self.dropped > 0 {
@@ -206,6 +251,7 @@ mod tests {
             h2d_ms: f64::NAN,
             h2d_bytes: 0,
             policy_ms: f64::NAN,
+            sync_gap: None,
             cpu_expert: None,
         }
     }
@@ -244,6 +290,50 @@ mod tests {
         assert!(l0.contains(",8.0"), "compute = wall − p3_wait: {l0}");
         let l1 = s.lines().nth(1).unwrap();
         assert!(l1.contains(",0.0,unmeasured"), "clamped: {l1}");
+    }
+
+    /// Measured policy time is subtracted from compute; the ids-readback
+    /// columns render, and are not subtracted (they overlap ensure/policy).
+    #[test]
+    fn policy_subtracted_and_sync_gap_columns_render_not_subtracted() {
+        let mut rec = TimingRecorder::new(1);
+        let mut r = row(0, 20.0, 5.0);
+        r.policy_ms = 1.5;
+        r.sync_gap = Some(SyncGapStats {
+            sync_ms: 2.0,
+            gap_ms: 9.0,
+            gap_max_ms: 0.5,
+            readbacks: 42,
+        });
+        rec.row(r);
+        let mut out = Vec::new();
+        rec.flush(&mut out).unwrap();
+        let l = String::from_utf8(out).unwrap();
+        let cols: Vec<&str> = l.trim_end().split(',').collect();
+        assert_eq!(cols[9], "1.5", "policy_ms: {l}");
+        assert_eq!(cols[10], "13.5", "compute = 20 − 5 − 1.5: {l}");
+        assert_eq!(&cols[15..], ["42", "2.0", "9.0", "0.5"], "{l}");
+    }
+
+    /// Sync-gap merge sums and keeps the max span.
+    #[test]
+    fn sync_gap_add_sums_and_maxes() {
+        let mut a = SyncGapStats {
+            sync_ms: 1.0,
+            gap_ms: 2.0,
+            gap_max_ms: 0.3,
+            readbacks: 1,
+        };
+        a.add(&SyncGapStats {
+            sync_ms: 1.0,
+            gap_ms: 1.0,
+            gap_max_ms: 0.7,
+            readbacks: 2,
+        });
+        assert_eq!(
+            (a.sync_ms, a.gap_ms, a.gap_max_ms, a.readbacks),
+            (2.0, 3.0, 0.7, 3)
+        );
     }
 
     /// Overflow past the fixed capacity is counted and reported by flush.

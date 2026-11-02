@@ -18,6 +18,11 @@
 //   v17 ensure takes a hits_ready callback: RAM-resident hits are reported
 //       before the blocking source read so their H2D overlaps it; device-cache
 //       stats gain early_h2d_units.
+//   v18 golem_take_sync_gap_stats: per-step host time blocked in the MoE ids
+//       readback sync and the gap from its return to the next split launch.
+//   v19 device-side landed wait: golem_set_device_wait,
+//       golem_device_wait_mode, golem_device_wait_ring, golem_device_wait_serve,
+//       golem_device_wait_stats.
 // Part of the vendored ggml include tree; the ABI is versioned -- a change
 // updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
@@ -52,7 +57,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 17
+#define GOLEM_HOOKS_ABI_VERSION 19
 GOLEM_API int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -333,6 +338,75 @@ GOLEM_API int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
  * last call; resets both. Returns 1 when measured, 0 when async_h2d is off
  * or the per-step ring overflowed. Call between computes. */
 GOLEM_API int32_t golem_take_h2d_timing(golem_ctx_t ctx, double *ms, uint64_t *bytes);
+
+/* Host-sync timing of the hooked MoE ids readbacks since the last call
+ * (design §11): `sync_ms` is host time blocked synchronizing the ids
+ * backend -- mostly waiting on the prior compute to finish; `gap_ms` the
+ * summed time from a readback's return to the next split launch (no compute
+ * queued on the ids backend; the async_h2d copy stream may still run),
+ * opened by the first readback before that launch; `gap_max_ms` its largest
+ * single span; `n` the readbacks counted. Resets all four. Returns 1 when the
+ * ctx is hooked, 0 otherwise or on a NULL output (outputs untouched). Call
+ * between computes. */
+GOLEM_API int32_t golem_take_sync_gap_stats(golem_ctx_t ctx, double *sync_ms, double *gap_ms,
+                                            double *gap_max_ms, uint64_t *n);
+
+/* --- Device-side landed wait (ABI v19). --- */
+
+/* Single-token decode MoE layers stop synchronizing the host per layer: the
+ * compute stream publishes the routed ids (and the layer's P5 predictions)
+ * into a mapped request ring, then waits ON THE DEVICE for one landed word
+ * per routed unit and plane before that plane's MUL_MAT_ID. A host
+ * controller polls the ring and calls golem_device_wait_serve, which runs the
+ * routing/predict hooks, the P2 slot step, ONE ensure call for the layer and
+ * the H2D from the pool on the copy stream; each copied unit's landed word is
+ * written ON THE COPY STREAM behind its copy, so it is never set before the
+ * slab holds the bytes. Units already valid in the slab are landed by a host
+ * store. The remapped ids are written to the mapped reply table and gathered
+ * into the plane's remapped-ids tensor on the device after the wait.
+ *
+ * Modes: 0 off, 1 hipStreamWaitValue32 (hipDeviceAttributeCanUseStreamWaitValue
+ * = 1), 2 wait kernel (spins on the landed words; the fallback). Prefill
+ * ubatches, layers whose ids or predictions are not device tensors of the
+ * split backend, and layers missing a plane take the host-sync path. */
+
+/* `mode`: 0 off, 1 auto (stream wait when the device supports it, else the
+ * wait kernel), 2 force the wait kernel. `n_used` = routed experts per token,
+ * `n_pred` = prediction ids per source layer (lookahead x (n_used + margin),
+ * 0 = predictions off). Allocates the mapped ring (bounded by n_layers x
+ * (n_used + n_pred + 6 n_used) words, never by the expert count). Returns 0,
+ * or -1 when refused: NULL ctx, already armed, async_h2d off, CPU expert math
+ * armed, no routing/ensure hook, exclusive residency (evict_batch set), or a
+ * backend without the device-wait iface. Config-time call. */
+GOLEM_API int32_t golem_set_device_wait(golem_ctx_t ctx, int32_t mode, int32_t n_used, int32_t n_pred);
+/* 0 off, 1 stream wait, 2 wait kernel (0 for a NULL ctx). */
+GOLEM_API int32_t golem_device_wait_mode(golem_ctx_t ctx);
+/* The request words: req_seq[blk] for blk in [0, *n_blk) is the compute
+ * sequence of blk's newest published request (written by the device after
+ * its ids); req_seq[*n_blk] is the active word, nonzero while a compute with
+ * published requests is in flight. Valid until golem_ctx_free. Returns 1 when
+ * armed, else 0 (outputs untouched). */
+GOLEM_API int32_t golem_device_wait_ring(golem_ctx_t ctx, const uint32_t **req_seq, int32_t *n_blk);
+/* Serves blk's request `seq` on the calling (controller) thread. Every unit
+ * of the request is landed on return (or queued to land behind its copy),
+ * including on failure: a failed page-in lands the words unchanged-bytes and
+ * flags the compute, which then returns GGML_STATUS_FAILED (llama_decode -3,
+ * ABI v13 semantics). The decode thread waits for every published request to
+ * be served before it leaves the compute. Returns 0 served, 1 page-in failed,
+ * -1 stale (seq not the blk's open request). */
+GOLEM_API int32_t golem_device_wait_serve(golem_ctx_t ctx, int32_t blk, uint32_t seq);
+/* Since ctx creation: layer requests served off the decode thread, and
+ * decode computes whose layers all took the device-wait path (no MoE ids
+ * readback). Zeros for a NULL ctx; either out pointer may be NULL. */
+GOLEM_API void golem_device_wait_stats(golem_ctx_t ctx, uint64_t *served, uint64_t *computes);
+#ifdef GOLEM_TEST_SUPPORT
+/* Test seam (ABI v19): on the first GPU device, the compute stream waits (in
+ * `mode` 1 or 2) for a mapped word to reach 7, then gathers it into a device
+ * tensor; returns 0 when the stream stayed blocked until the host wrote the
+ * word and the gather read 7, 1 when the order was violated, -1 when the mode
+ * is unsupported. */
+GOLEM_API int32_t golem_device_wait_probe(int32_t mode);
+#endif
 
 /* Hook (ABI v16, design §1 O1): among ids[0..n) of layer `blk`, count the
  * units RESIDENT in the host pool (no paging in, no scoring), and lease the

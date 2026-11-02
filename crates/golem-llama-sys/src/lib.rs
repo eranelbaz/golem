@@ -48,9 +48,9 @@ pub fn hooks_abi_version() -> i32 {
 
 // The RAII surface below is written against ABI v5 (per-model `golem_ctx`,
 // handle-returning register, batched ensure, triple-buffered order push).
-// A header drift past v17 must fail this build, not silently re-shape the
+// A header drift past v19 must fail this build, not silently re-shape the
 // guards.
-const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 17);
+const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 19);
 
 /// GPU devices (discrete or integrated) in the backend registry (each one a
 /// device backend a llama context may split across).
@@ -156,6 +156,135 @@ impl GolemCtx {
     }
 }
 
+/// Outcome of [`DeviceWaitRing::serve`] (ABI v19 `golem_device_wait_serve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Serve {
+    /// Every unit of the request is landed or queued to land behind its copy.
+    Served,
+    /// The page-in failed: the words were landed and the compute will fail.
+    Failed,
+    /// `seq` is not the blk's open request (already served or superseded).
+    Stale,
+}
+
+/// The mapped request words of an armed device-wait ctx (ABI v19): `n_blk`
+/// per-blk sequence words plus the active word. Keeps the ctx (and so the
+/// mapped allocation, freed by `golem_ctx_free`) alive. The device and the
+/// decode thread write the words concurrently; reads are atomic.
+///
+/// Exactly one ring exists per ctx (`golem_set_device_wait` refuses a second
+/// arm) and it is `!Sync` with a `&mut self` [`serve`](Self::serve), so the
+/// serve's unsynchronized C scratch and per-blk `served_seq` have one caller
+/// by construction: whichever thread owns the ring.
+pub struct DeviceWaitRing {
+    ctx: std::sync::Arc<CtxRaw>,
+    req: *const u32,
+    n_blk: usize,
+}
+
+// SAFETY: `req` points into the ctx's mapped allocation, alive as long as the
+// held `Arc<CtxRaw>`, and is only read through atomic loads. Moving the ring
+// to another thread moves the sole right to serve with it (not `Sync`).
+unsafe impl Send for DeviceWaitRing {}
+
+impl DeviceWaitRing {
+    /// Number of blk request words.
+    pub fn n_blk(&self) -> usize {
+        self.n_blk
+    }
+
+    fn word(&self, i: usize) -> Option<u32> {
+        if i > self.n_blk {
+            return None;
+        }
+        // SAFETY: `i <= n_blk` stays inside the `n_blk + 1` request words of
+        // the live mapped allocation (held Arc); u32 is 4-aligned there and
+        // AtomicU32 has u32's layout, so this is an atomic load of a word
+        // other agents only ever store to atomically.
+        Some(unsafe {
+            (*self.req.add(i).cast::<std::sync::atomic::AtomicU32>())
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
+    /// The newest published request sequence of `blk` (0 = none yet);
+    /// `None` when `blk` is out of range.
+    pub fn request(&self, blk: usize) -> Option<u32> {
+        if blk >= self.n_blk {
+            return None;
+        }
+        self.word(blk)
+    }
+
+    /// Nonzero while a compute with published requests is in flight.
+    pub fn active(&self) -> u32 {
+        self.word(self.n_blk).unwrap_or(0)
+    }
+
+    /// Serves `blk`'s request `seq` on the calling thread (runs the ensure,
+    /// routing and predict hooks of the registration). An out-of-range `blk`
+    /// is [`Serve::Stale`].
+    pub fn serve(&mut self, blk: usize, seq: u32) -> Serve {
+        let Ok(b) = i32::try_from(blk) else {
+            return Serve::Stale;
+        };
+        if blk >= self.n_blk {
+            return Serve::Stale;
+        }
+        // SAFETY: live ctx (held Arc). `&mut self` on the ctx's only ring
+        // (not `Sync`) makes this the sole caller of golem_device_wait_serve,
+        // whose scratch is unsynchronized; the decode thread never reads it
+        // (it quiesces on the release-counted `dw_served` instead). The C side
+        // also refuses a stale or superseded `seq`.
+        match unsafe { raw::golem_device_wait_serve(self.ctx.0, b, seq) } {
+            0 => Serve::Served,
+            1 => Serve::Failed,
+            _ => Serve::Stale,
+        }
+    }
+}
+
+impl<T> Hooked<T> {
+    /// Arms the device-side landed wait (ABI v19) after registration (the
+    /// substrate checks the hooks): `mode` 1 auto, 2 force the wait kernel.
+    /// Returns the resolved mode (1 stream wait, 2 wait kernel) and the
+    /// ctx's only ring, or `None` when the substrate refused (see
+    /// golem-hooks.h). Takes `&mut self`: arming writes plain ctx fields and
+    /// must not race another arm or a compute.
+    pub fn arm_device_wait(
+        &mut self,
+        mode: i32,
+        n_used: i32,
+        n_pred: i32,
+    ) -> Option<(i32, DeviceWaitRing)> {
+        // SAFETY: config-time FFI call on a live ctx, exclusive through
+        // `&mut self` (the registration is not yet shared and no compute has
+        // run); refusals, including a second arm, return -1.
+        if unsafe { raw::golem_set_device_wait(self.ctx.0, mode, n_used, n_pred) } != 0 {
+            return None;
+        }
+        let mut req: *const u32 = std::ptr::null();
+        let mut n_blk = 0i32;
+        // SAFETY: live ctx; out-params are live locals.
+        if unsafe { raw::golem_device_wait_ring(self.ctx.0, &mut req, &mut n_blk) } != 1
+            || req.is_null()
+        {
+            return None;
+        }
+        let n_blk = usize::try_from(n_blk).ok()?;
+        // SAFETY: live ctx, pure query.
+        let resolved = unsafe { raw::golem_device_wait_mode(self.ctx.0) };
+        Some((
+            resolved,
+            DeviceWaitRing {
+                ctx: self.ctx.clone(),
+                req,
+                n_blk,
+            },
+        ))
+    }
+}
+
 /// The three hook fn pointers for [`GolemCtx::register`].
 #[derive(Clone, Copy, Default)]
 pub struct HookFns {
@@ -190,7 +319,9 @@ pub struct Hooked<T> {
 // contract) and the C handle is only consumed by golem_unregister_hooks on
 // this thread; the ctx Arc clone is Send+Sync.
 unsafe impl<T: Send> Send for Hooked<T> {}
-// SAFETY: drop is the only mutation and `&self` methods do not exist.
+// SAFETY: the only `&self` methods (`ctx_ptr`, `ctx_arc`) read immutable
+// fields; every mutation of C ctx state (`arm_device_wait`, drop) takes
+// `&mut self` or `self`.
 unsafe impl<T: Send> Sync for Hooked<T> {}
 
 impl<T> Drop for Hooked<T> {

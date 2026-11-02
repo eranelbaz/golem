@@ -283,6 +283,14 @@ struct HookState {
     /// Cumulative ns spent inside the ensure trampoline's page-in section
     /// (§11 per-step timing; taken (swap-to-zero) per decode step).
     p3_wait_ns: AtomicU64,
+    /// Cumulative ns in P2 policy work (§11 `policy_ms`; taken per step): the
+    /// routing hook's booking and the `copy_done` order flush, whichever
+    /// thread runs them. With device wait the routing hook runs in the
+    /// controller's serve and overlaps the GPU; the work counted is the same
+    /// in both modes, so on/off rows compare. The publisher thread's order
+    /// builds and the substrate's slab step (inside the serve, or the
+    /// decode-thread pre-pass) are not counted in either mode.
+    policy_ns: AtomicU64,
     /// Per-layer cumulative ns from the `hits_ready` hand-off (or the ensure
     /// start without one) to the ensure return: the blocking disk span the
     /// early hit H2D overlaps. Preallocated `n_layers` long; taken per step.
@@ -341,6 +349,10 @@ struct HookState {
     /// before its page-in reads, so the read itself fails.
     #[cfg(any(test, feature = "test-support"))]
     test_fail_storage_in_read: AtomicBool,
+    /// Test seam: the next decode-step ensure with misses reports a page-in
+    /// failure (ABI v13 return 1) without reading.
+    #[cfg(any(test, feature = "test-support"))]
+    test_fail_decode_page_in: AtomicBool,
 }
 
 /// The `cpu_lease` hook's state: the step's leases (capacity `n_layers ×
@@ -797,6 +809,11 @@ pub(crate) fn advance_decode_step() {
 #[derive(Default)]
 pub(crate) struct StepIoStats {
     pub p3_wait_ns: u64,
+    /// P2 policy ns (see `HookState::policy_ns`); `None` while hooks are
+    /// unregistered.
+    pub policy_ns: Option<u64>,
+    /// MoE ids-readback host-sync timing; `None` while unhooked.
+    pub sync_gap: Option<crate::timing::SyncGapStats>,
     /// Ensure disk span (ns) summed over layers; `None` while hooks are
     /// unregistered.
     pub ensure_disk_wait_ns: Option<u64>,
@@ -818,6 +835,7 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
     let mut out = StepIoStats::default();
     for h in current_states() {
         out.p3_wait_ns += h.p3_wait_ns.swap(0, Ordering::Relaxed);
+        out.policy_ns = Some(out.policy_ns.unwrap_or(0) + h.policy_ns.swap(0, Ordering::Relaxed));
         let disk_wait: u64 = h
             .ensure_disk_wait_ns
             .iter()
@@ -853,6 +871,23 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
             } == 1
             {
                 out.cpu_expert.get_or_insert_with(Default::default).add(&c);
+            }
+            let mut g = crate::timing::SyncGapStats::default();
+            // SAFETY: as above; writes only the four out-params. The C side's
+            // `sg_*` fields are decode-thread-only: written by the compute
+            // and read/reset here, and this take runs on the decode thread
+            // between computes, so there is no concurrent access.
+            if unsafe {
+                raw::golem_take_sync_gap_stats(
+                    ctx,
+                    &mut g.sync_ms,
+                    &mut g.gap_ms,
+                    &mut g.gap_max_ms,
+                    &mut g.readbacks,
+                )
+            } == 1
+            {
+                out.sync_gap.get_or_insert_with(Default::default).add(&g);
             }
         }
     }
@@ -925,6 +960,11 @@ pub struct SessionHooks {
     warm_planned: Vec<(u32, u32)>,
     /// The eviction-order publisher (background thread).
     publisher: PublisherHandle,
+    /// Device-side landed wait controller; `None` when off. Stopped
+    /// before the hooks are unregistered: its serves invoke them.
+    landed: Option<crate::landed::Controller>,
+    /// Resolved device-wait mode: 0 off, 1 stream wait, 2 wait kernel.
+    device_wait_mode: i32,
     /// The live hook registration; also owns the ctx (`Arc` inside the
     /// guard). Taken first in `drop`.
     hooked: Option<Hooked<HookState>>,
@@ -1009,6 +1049,17 @@ impl SessionHooks {
     pub fn fail_storage_in_read_for_test(&self) {
         self.state
             .test_fail_storage_in_read
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Test seam: the next decode-step ensure with misses reports a page-in
+    /// failure (ABI v13) without reading — the device-wait serve's failure
+    /// path when the pool cannot land a layer.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_decode_page_in_for_test(&self) {
+        self.state
+            .test_fail_decode_page_in
             .store(true, Ordering::Relaxed);
     }
 
@@ -1414,6 +1465,23 @@ impl SessionHooks {
     /// recovering the payload Arc). `Session` calls this explicitly BEFORE
     /// `llama_free`; the remaining teardown (publisher/prefetch stop, then
     /// `golem_ctx_free`, then the pool) rides [`Drop for SessionHooks`].
+    /// Resolved device-side landed wait mode: 0 off, 1 stream wait, 2 wait
+    /// kernel.
+    pub fn device_wait_mode(&self) -> i32 {
+        self.device_wait_mode
+    }
+
+    /// Device-side landed wait counters: (layer requests served off the
+    /// decode thread, decode computes with no MoE ids readback).
+    pub fn device_wait_stats(&self) -> (u64, u64) {
+        let (mut served, mut computes) = (0u64, 0u64);
+        // SAFETY: a NULL ctx (after the teardown cleared it) reports zeros;
+        // otherwise the ctx is live while hooks are registered. Out-params
+        // are live locals.
+        unsafe { raw::golem_device_wait_stats(self.live_ctx_ptr(), &mut served, &mut computes) };
+        (served, computes)
+    }
+
     /// The live ctx pointer while hooks are registered (or before the Drop
     /// clears it): the Session teardown's slab-reclamation seam —
     /// `golem_reset_device_cache` must run while the substrate backend is
@@ -1426,6 +1494,9 @@ impl SessionHooks {
     /// §3.4 Session teardown calls this before `llama_free`, the Drop runs it
     /// as a backstop).
     pub fn unregister(&mut self) {
+        if let Some(c) = &mut self.landed {
+            c.stop();
+        }
         self.hooked = None;
         CURRENT
             .lock()
@@ -2046,6 +2117,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     });
     let state = Arc::new(HookState {
         p3_wait_ns: AtomicU64::new(0),
+        policy_ns: AtomicU64::new(0),
         ensure_disk_wait_ns: (0..n_layers).map(|_| AtomicU64::new(0)).collect(),
         slow_calls: AtomicUsize::new(0),
         routing_calls: AtomicUsize::new(0),
@@ -2092,6 +2164,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         test_spurious_cancel: AtomicBool::new(false),
         #[cfg(any(test, feature = "test-support"))]
         test_fail_storage_in_read: AtomicBool::new(false),
+        #[cfg(any(test, feature = "test-support"))]
+        test_fail_decode_page_in: AtomicBool::new(false),
     });
     if config.prefetch != PrefetchMode::Off {
         // SAFETY: FFI setter on the live ctx, before the first graph build;
@@ -2124,7 +2198,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // pre-reject here). The ctx is consumed into the guard: the registration
     // borrow is encoded by moving, so the ctx always outlives the hooks.
     let exclusive = state.exclusive;
-    let hooked = ctx.register(
+    let mut hooked = ctx.register(
         HookFns {
             ensure: Some(ensure_host_resident),
             routing: Some(routing),
@@ -2160,6 +2234,45 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         ));
     }
 
+    // Device-side landed wait (ABI v19): armed after registration (the
+    // substrate checks the hooks) and before the first graph build. The ring
+    // carries the routed ids plus the P5 predictions of each source layer:
+    // lookahead × (top-k + margin) words (GLM: 1 × 12).
+    let (landed, device_wait_mode) = if config.device_wait == crate::config::DeviceWait::Off {
+        (None, 0)
+    } else {
+        let n_pred = if config.prefetch == PrefetchMode::Off {
+            0
+        } else {
+            config.prefetch_lookahead * (n_expert_used + PREDICT_MARGIN)
+        };
+        let mode = if config.device_wait == crate::config::DeviceWait::Kernel {
+            2
+        } else {
+            1
+        };
+        let (resolved, ring) = hooked
+            .arm_device_wait(mode, n_expert_used as i32, n_pred as i32)
+            .ok_or_else(|| {
+                EngineError::InvalidConfig(
+                    "device_wait: the substrate refused to arm it (needs async_h2d, a HIP \
+                     device, no cpu_expert_math, inclusive residency, top-k <= 32)"
+                        .into(),
+                )
+            })?;
+        let c = crate::landed::Controller::spawn(ring)
+            .map_err(|e| EngineError::PoolInit(format!("device_wait controller: {e}")))?;
+        tracing::info!(
+            mode = if resolved == 1 {
+                "stream-wait"
+            } else {
+                "wait-kernel"
+            },
+            "device-side landed wait armed"
+        );
+        (Some(c), resolved)
+    };
+
     tracing::info!(
         layers = n_layers,
         experts = geo.n_experts,
@@ -2177,6 +2290,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         #[cfg(any(test, feature = "test-support"))]
         warm_planned: Vec::new(),
         publisher,
+        landed,
+        device_wait_mode,
         hooked: Some(hooked),
         stats: state.pool.stats.clone(),
         state,
@@ -2676,6 +2791,13 @@ pub extern "C" fn ensure_host_resident(
         if h.test_fail_storage_in_read.swap(false, Ordering::Relaxed) {
             h.fail_storage();
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if h.policy.scoring.load(Ordering::Relaxed)
+            && h.test_fail_decode_page_in.swap(false, Ordering::Relaxed)
+        {
+            drop(scratch);
+            return 1;
+        }
         let t0 = std::time::Instant::now();
         // Disk span start: after the hits hand-off, else the ensure start.
         let mut t_disk = t0;
@@ -2774,10 +2896,26 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
         // blocks — a full triple-buffer set leaves the layer dirty for the
         // publisher's next pass.
         if h.policy.dirty_any.load(Ordering::Relaxed) {
+            // Decode-thread time: includes waiting on `flush_scratch` held
+            // by the publisher thread.
+            let _policy = PolicyTimer(&h.policy_ns, std::time::Instant::now());
             let mut scratch = h.flush_scratch.lock().unwrap_or_else(|e| e.into_inner());
             publish_dirty(h, 8, &mut scratch);
         }
     });
+}
+
+/// Adds the elapsed ns since `.1` to `.0` on drop: one `Instant::now()` pair
+/// per policy section (§11-sanctioned hot-path cost), on every exit path.
+struct PolicyTimer<'a>(&'a AtomicU64, std::time::Instant);
+
+impl Drop for PolicyTimer<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(
+            u64::try_from(self.1.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// The prefill-stream byte-source hook (ABI v11, design §7.6): one call per
@@ -3086,12 +3224,15 @@ pub extern "C" fn routing(
         let layer = (blk - h.dense_lead as i32) as usize;
         // SAFETY: C passes `n_ids` gathered ids it read this step.
         let ids = unsafe { std::slice::from_raw_parts(ids_dense, n_ids as usize) };
-        h.policy.book_routed(layer, ids);
-        h.policy.mark_dirty(layer);
-        // The layer ran: its prediction is spent, so `protect` releases
-        // the shield (a stale one would pin slots through prefill).
-        if h.pred.score(layer, ids) && h.pred.mode == PrefetchMode::Protect {
-            h.pool.protect(layer as u32, std::iter::empty());
+        {
+            let _policy = PolicyTimer(&h.policy_ns, std::time::Instant::now());
+            h.policy.book_routed(layer, ids);
+            h.policy.mark_dirty(layer);
+            // The layer ran: its prediction is spent, so `protect` releases
+            // the shield (a stale one would pin slots through prefill).
+            if h.pred.score(layer, ids) && h.pred.mode == PrefetchMode::Protect {
+                h.pool.protect(layer as u32, std::iter::empty());
+            }
         }
         if let Some(trace) = &h.trace {
             let mut t = trace.lock().unwrap_or_else(|e| e.into_inner());

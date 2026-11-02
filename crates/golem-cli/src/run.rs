@@ -13,7 +13,7 @@ use golem_engine::FinishReason;
 use golem_engine::ParityStep;
 use golem_engine::TurnRequest;
 use golem_engine::atomic::write_atomic;
-use golem_engine::config::{EngineConfig, PrefetchMode, Residency, VramOrder};
+use golem_engine::config::{DeviceWait, EngineConfig, PrefetchMode, Residency, VramOrder};
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::timing::TimingRecorder;
@@ -132,6 +132,15 @@ pub struct EngineArgs {
     /// pool; refused on the CPU substrate).
     #[arg(long, hide = true)]
     pub async_h2d: bool,
+    /// Device-side landed wait: `on` publishes each decode MoE layer's
+    /// routed ids to a mapped ring and waits on the GPU for its experts to
+    /// land (stream wait-value, else a wait kernel) instead of a host sync
+    /// per layer; `kernel` forces the wait-kernel fallback; `off` (default)
+    /// keeps the host-sync path. Needs `--async-h2d`, the RAM expert pool on
+    /// a HIP device, inclusive residency, no `--cpu-expert-math`, and
+    /// top-k <= 32; refused at load otherwise.
+    #[arg(long, value_name = "MODE")]
+    pub device_wait: Option<DeviceWait>,
     /// Share of the planner's device-expert-cache allowance a derived
     /// `--device-cache-experts` may use, in (0, 1] (default 1).
     #[arg(long, value_name = "FRAC")]
@@ -300,6 +309,7 @@ impl EngineArgs {
             numa_interleave: l.get(flag(self.numa_interleave), "numa_interleave", false)?,
             o_direct: l.get(flag(self.o_direct), "o_direct", false)?,
             async_h2d: l.get(flag(self.async_h2d), "async_h2d", false)?,
+            device_wait: l.get(self.device_wait, "device_wait", d.device_wait)?,
             vram_experts_frac: l.get(
                 self.vram_experts_frac,
                 "vram_experts_frac",

@@ -5,6 +5,7 @@ pub mod chat;
 pub mod config;
 pub mod error;
 pub mod gguf;
+pub mod landed;
 pub mod p3_glue;
 pub mod parity;
 pub mod sanity;

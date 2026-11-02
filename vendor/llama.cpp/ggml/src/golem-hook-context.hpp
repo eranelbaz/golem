@@ -15,10 +15,12 @@
 
 #include "golem-hooks.h"
 #include "golem-copy-stream.h"
+#include "golem-device-wait.h"
 #include "golem-device-cache.hpp" // golem::GolemSlabEntry + GolemLayerSlots (ODR: shared with the ctest fuzz TU)
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -194,6 +196,80 @@ struct golem_ctx {
     double cem_ms = 0.0;
     double cem_join_wait_ms = 0.0;
     uint64_t cem_padded = 0;
+
+    // --- §11 host-sync timing (golem_take_sync_gap_stats), decode-thread-only ---
+    // Each MoE layer's ids readback synchronizes the ids backend; the gap runs
+    // from the first such return to the next split launch (no compute queued
+    // there; the async_h2d copy stream may still run).
+    bool sg_pending = false;
+    std::chrono::steady_clock::time_point sg_t_ids{};
+    double sg_sync_ms = 0.0;
+    double sg_gap_ms = 0.0;
+    double sg_gap_max_ms = 0.0;
+    uint64_t sg_n = 0;
+
+    // --- device-side landed wait (golem_set_device_wait, ABI v19) ---
+    // One mapped allocation, sized at arm time by n_blk x (n_used + n_pred):
+    //   req[n_blk + 1]             newest published compute seq per blk; active word last
+    //   ids[n_blk][stride]         routed ids then P5 prediction ids
+    //   remap[n_blk][3][n_used]    slab slot per routed position (reply)
+    //   landed[n_blk][3][n_used]   seq once the unit's plane is in the slab
+    // GLM-5.3-Flash (n_used 8, n_pred 12, 46 blk): (47 + 46 x 68) x 4 B ≈ 12.7 KB.
+    // Decode-thread fields are written before the blk's publish and read by
+    // the serving thread after blk_seq (release/acquire) names that publish.
+    struct golem_dw_blk {
+        std::atomic<uint32_t> host_seq{0}; // compute seq whose setup below is current
+        uint32_t served_seq = 0;           // serving-thread-only
+        struct ggml_tensor * inp[3] = {};  // host weights tensors (gate, up, down)
+        golem::GolemSlabEntry * st[3] = {};
+        int32_t K = 0;
+        int32_t n_expert = 0;
+        int32_t n_pred_t = 0;
+        int32_t pred_target[GOLEM_DW_MAX_PRED] = {};
+        int32_t pred_n[GOLEM_DW_MAX_PRED] = {};
+    };
+    int32_t dw_mode = 0;      // resolved: 0 off, 1 stream wait, 2 wait kernel
+    int32_t dw_n_used = 0;
+    int32_t dw_n_pred = 0;
+    int32_t dw_stride = 0;    // ids words per blk
+    int32_t dw_n_blk = 0;
+    const struct golem_device_wait_iface * dw = nullptr;
+    uint32_t * dw_mem = nullptr;
+    uint32_t dw_seq = 0;      // decode-thread compute sequence (published ones only)
+    std::vector<golem_dw_blk> dw_blk;
+    std::atomic<uint32_t> dw_served{0};   // serves completed in the current compute
+    std::atomic<int32_t> dw_failed{0};    // a serve's page-in failed this compute
+    std::atomic<uint64_t> dw_served_total{0};
+    std::atomic<uint64_t> dw_host_computes{0};
+    // Serving-thread scratch, preallocated at arm time (n_used / n_experts).
+    std::vector<int32_t> dw_dense, dw_routed, dw_identity, dw_miss_kinds, dw_miss_ids;
+    std::vector<int32_t> dw_miss_k, dw_miss_j, dw_miss_slot;
+    std::vector<const void *> dw_miss_out;
+    std::vector<std::pair<int32_t, int32_t>> dw_pending;
+
+    std::vector<uint8_t> dw_miss_issued;
+    uint32_t dw_published = 0;            // decode-thread: requests published this compute
+    // Serving-thread copy accounting: written by serves, read and reset by
+    // golem_take_h2d_timing on the decode thread after golem_dw_quiesce (the
+    // acquire on dw_served orders every serve's writes before the read).
+    uint64_t dw_cs_bytes = 0;
+    void * dw_t0[GOLEM_CS_RING] = {};
+    void * dw_t1[GOLEM_CS_RING] = {};
+    int32_t dw_t_n = 0;
+    bool dw_t_overflow = false;
+
+    // Word offsets: req[n_blk + 1] (the last is the active word), ids, remap, landed.
+    uint32_t * dw_req() const { return dw_mem; }
+    uint32_t * dw_ids(int32_t blk) const { return dw_mem + (dw_n_blk + 1) + (size_t) blk * dw_stride; }
+    uint32_t * dw_remap(int32_t blk, int32_t k) const {
+        return dw_mem + (dw_n_blk + 1) + (size_t) dw_n_blk * dw_stride + ((size_t) blk * 3 + k) * dw_n_used;
+    }
+    uint32_t * dw_landed(int32_t blk, int32_t k) const {
+        return dw_remap(blk, k) + (size_t) dw_n_blk * 3 * dw_n_used;
+    }
+    size_t dw_words() const {
+        return (size_t) (dw_n_blk + 1) + (size_t) dw_n_blk * dw_stride + (size_t) dw_n_blk * 6 * dw_n_used;
+    }
 
     golem_ctx(int32_t n_layers, int32_t n_experts_)
         : orders((size_t) (n_layers > 0 ? n_layers : 1) * 3), n_experts(n_experts_) {

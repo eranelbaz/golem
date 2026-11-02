@@ -6,6 +6,7 @@ extern "C" int golem_graphs_disabled(void);
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "golem-copy-stream.h"
+#include "golem-device-wait.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -6205,10 +6206,225 @@ static const golem_copy_stream_iface golem_cs_iface = {
     /* .elapsed_ms     = */ golem_cs_elapsed_ms,
 };
 
+// Golem device-side landed wait (golem-device-wait.h, ABI v19). Words live
+// in host-mapped memory; device code addresses them through the mapped
+// device pointer. System-scope atomics: the host writes them concurrently.
+// The ring's mapped base, resolved once at host_alloc: every per-layer wait,
+// gather and land offsets into it instead of querying the runtime per call
+// (≈ 3 calls × 3 planes × 42 layers per GLM-5.3-Flash token).
+static std::atomic<const char *> golem_dw_host_base{nullptr};
+static std::atomic<char *> golem_dw_dev_base{nullptr};
+static std::atomic<size_t> golem_dw_size{0};
+
+static uint32_t * golem_dw_dev(const uint32_t * host) {
+    const char * hb = golem_dw_host_base.load(std::memory_order_acquire);
+    const char * h = (const char *) host;
+    if (hb != nullptr && h >= hb && h < hb + golem_dw_size.load(std::memory_order_relaxed)) {
+        return (uint32_t *) (golem_dw_dev_base.load(std::memory_order_relaxed) + (h - hb));
+    }
+    void * d = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&d, (void *) host, 0));
+    return (uint32_t *) d;
+}
+
+static __device__ __forceinline__ uint32_t golem_dw_load(const uint32_t * p) {
+#if defined(GGML_USE_HIP)
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return *(const volatile uint32_t *) p;
+#endif
+}
+
+static __device__ __forceinline__ void golem_dw_store(uint32_t * p, uint32_t v) {
+#if defined(GGML_USE_HIP)
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    __threadfence_system();
+    *(volatile uint32_t *) p = v;
+#endif
+}
+
+struct golem_dw_publish_args {
+    const char * ids;
+    int64_t ids_nb0;
+    int32_t n_ids;
+    const int32_t * pred[GOLEM_DW_MAX_PRED];
+    int32_t n_pred[GOLEM_DW_MAX_PRED];
+    int32_t n_pred_tensors;
+    uint32_t * dst;
+    uint32_t * req;
+    uint32_t seq;
+};
+
+// One block: copy ids then predictions into the ring, then publish `seq`
+// after the copies are visible system-wide.
+static __global__ void golem_dw_publish_kernel(const golem_dw_publish_args a) {
+    for (int i = threadIdx.x; i < a.n_ids; i += blockDim.x) {
+        a.dst[i] = (uint32_t) *(const int32_t *) (a.ids + i * a.ids_nb0);
+    }
+    int off = a.n_ids;
+    for (int t = 0; t < a.n_pred_tensors; ++t) {
+        for (int i = threadIdx.x; i < a.n_pred[t]; i += blockDim.x) {
+            a.dst[off + i] = (uint32_t) a.pred[t][i];
+        }
+        off += a.n_pred[t];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        golem_dw_store(a.req, a.seq);
+    }
+}
+
+// The wait-kernel fallback: one lane spins until every word reaches `value`.
+static __global__ void golem_dw_wait_kernel(const uint32_t * words, int n, uint32_t value) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        while (golem_dw_load(&words[i]) < value) {
+#if defined(GGML_USE_HIP)
+            __builtin_amdgcn_s_sleep(2);
+#else
+            __nanosleep(1000);
+#endif
+        }
+    }
+    __threadfence_system();
+}
+
+static __global__ void golem_dw_gather_kernel(int32_t * dst, const uint32_t * src, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = (int32_t) golem_dw_load(&src[i]);
+    }
+}
+
+static __global__ void golem_dw_land_kernel(uint32_t * words, uint32_t mask, uint32_t value) {
+    const int i = threadIdx.x;
+    if (i < 32 && (mask >> i) & 1u) {
+        golem_dw_store(&words[i], value);
+    }
+}
+
+static int golem_dw_can_stream_wait(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP)
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    ggml_cuda_set_device(device);
+    int v = 0;
+    CUDA_CHECK(hipDeviceGetAttribute(&v, hipDeviceAttributeCanUseStreamWaitValue, device));
+    return v != 0 ? 1 : 0;
+#else
+    GGML_UNUSED(dev);
+    return 0;
+#endif
+}
+
+static void * golem_dw_host_alloc(size_t size) {
+    void * p = nullptr;
+    if (cudaHostAlloc(&p, size, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    memset(p, 0, size);
+    void * d = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&d, p, 0));
+    golem_dw_dev_base.store((char *) d, std::memory_order_relaxed);
+    golem_dw_size.store(size, std::memory_order_relaxed);
+    golem_dw_host_base.store((const char *) p, std::memory_order_release);
+    return p;
+}
+
+static void golem_dw_host_free(void * ptr) {
+    if (ptr != nullptr) {
+        const char * expect = (const char *) ptr;
+        golem_dw_host_base.compare_exchange_strong(expect, nullptr, std::memory_order_acq_rel);
+        CUDA_CHECK(cudaFreeHost(ptr));
+    }
+}
+
+static void golem_dw_publish(ggml_backend_t backend, const golem_dw_publish * p) {
+    ggml_backend_cuda_context * cuda_ctx = golem_cs_ctx(backend);
+    golem_dw_publish_args a = {};
+    a.ids = (const char *) p->ids->data;
+    a.ids_nb0 = (int64_t) p->ids->nb[0];
+    a.n_ids = p->n_ids;
+    a.n_pred_tensors = p->n_pred_tensors;
+    for (int t = 0; t < p->n_pred_tensors; ++t) {
+        a.pred[t] = (const int32_t *) p->pred[t]->data;
+        a.n_pred[t] = p->n_pred[t];
+    }
+    a.dst = golem_dw_dev(p->dst);
+    a.req = golem_dw_dev(p->req);
+    a.seq = p->seq;
+    golem_dw_publish_kernel<<<1, 64, 0, cuda_ctx->stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void golem_dw_wait(ggml_backend_t backend, int mode, const uint32_t * words, int n, uint32_t value) {
+    ggml_backend_cuda_context * cuda_ctx = golem_cs_ctx(backend);
+    uint32_t * dev = golem_dw_dev(words);
+#if defined(GGML_USE_HIP)
+    if (mode == 1) {
+        for (int i = 0; i < n; ++i) {
+            CUDA_CHECK(hipStreamWaitValue32(cuda_ctx->stream(), dev + i, value, hipStreamWaitValueGte, 0xFFFFFFFFu));
+        }
+        return;
+    }
+#endif
+    GGML_ASSERT(mode == 2 && "golem device wait: stream wait unsupported on this backend");
+    golem_dw_wait_kernel<<<1, 32, 0, cuda_ctx->stream()>>>(dev, n, value);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void golem_dw_gather(ggml_backend_t backend, ggml_tensor * dst, const uint32_t * src, int n) {
+    ggml_backend_cuda_context * cuda_ctx = golem_cs_ctx(backend);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst) && ggml_nelements(dst) == n);
+    golem_dw_gather_kernel<<<1, 64, 0, cuda_ctx->stream()>>>((int32_t *) dst->data, golem_dw_dev(src), n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void golem_dw_land_copy(ggml_backend_t backend, uint32_t * words, uint32_t mask, uint32_t value) {
+    cudaStream_t s = golem_cs_stream(backend);
+    uint32_t * dev = golem_dw_dev(words);
+#if defined(GGML_USE_HIP)
+    for (int i = 0; mask != 0; ++i, mask >>= 1) {
+        if (mask & 1u) {
+            CUDA_CHECK(hipStreamWriteValue32(s, dev + i, value, 0));
+        }
+    }
+#else
+    golem_dw_land_kernel<<<1, 32, 0, s>>>(dev, mask, value);
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
+static int golem_dw_compute_idle(ggml_backend_t backend) {
+    const cudaError_t e = cudaStreamQuery(golem_cs_ctx(backend)->stream());
+    if (e == cudaSuccess) {
+        return 1;
+    }
+    (void) cudaGetLastError();
+    return 0;
+}
+
+static const golem_device_wait_iface golem_dw_iface = {
+    /* .can_stream_wait = */ golem_dw_can_stream_wait,
+    /* .host_alloc      = */ golem_dw_host_alloc,
+    /* .host_free       = */ golem_dw_host_free,
+    /* .publish         = */ golem_dw_publish,
+    /* .wait            = */ golem_dw_wait,
+    /* .gather          = */ golem_dw_gather,
+    /* .land_copy       = */ golem_dw_land_copy,
+    /* .compute_idle    = */ golem_dw_compute_idle,
+};
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "golem_copy_stream_iface") == 0) {
         return (void *) &golem_cs_iface;
+    }
+    if (strcmp(name, "golem_device_wait_iface") == 0) {
+        return (void *) &golem_dw_iface;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
