@@ -7,9 +7,14 @@
 use golem_llama_sys::raw;
 
 fn probe(mode: i32) -> i32 {
-    // SAFETY: self-contained probe: it creates and frees its own backend,
-    // mapped words and tensor.
-    unsafe { raw::golem_device_wait_probe(mode) }
+    // SAFETY: registry query, then a self-contained probe on that device: it
+    // creates and frees its own backend, mapped words and tensor.
+    unsafe {
+        let dev =
+            raw::ggml_backend_dev_by_type(raw::ggml_backend_dev_type::GGML_BACKEND_DEVICE_TYPE_GPU);
+        assert!(!dev.is_null(), "no GPU device in the registry");
+        raw::golem_device_wait_probe(dev, mode)
+    }
 }
 
 #[test]

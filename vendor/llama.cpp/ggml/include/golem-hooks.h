@@ -48,6 +48,7 @@ extern "C" {
 #endif
 
 struct ggml_backend_sched;
+struct ggml_backend_device;
 struct golem_ctx;
 /* Opaque per-model hook context (state defined cpp-side in
  * ggml/src/golem-hook-context.hpp; shared by ggml-backend.cpp and the vendor
@@ -377,14 +378,17 @@ GOLEM_API int32_t golem_take_sync_gap_stats(golem_ctx_t ctx, double *sync_ms, do
  * split backend, and layers missing a plane take the host-sync path. */
 
 /* `mode`: 0 off, 1 auto (stream wait when the device supports it, else the
- * wait kernel), 2 force the wait kernel. `n_used` = routed experts per token,
+ * wait kernel), 2 force the wait kernel. `dev` = the GPU device whose
+ * registry exports the device-wait iface (the caller resolves it: ggml-base
+ * does not link the registry). `n_used` = routed experts per token,
  * `n_pred` = prediction ids per source layer (lookahead x (n_used + margin),
  * 0 = predictions off). Allocates the mapped ring (bounded by n_layers x
  * (n_used + n_pred + 6 n_used) words, never by the expert count). Returns 0,
- * or -1 when refused: NULL ctx, already armed, async_h2d off, CPU expert math
+ * or -1 when refused: NULL ctx or dev, already armed, async_h2d off, CPU expert math
  * armed, no routing/ensure hook, exclusive residency (evict_batch set), or a
  * backend without the device-wait iface. Config-time call. */
-GOLEM_API int32_t golem_set_device_wait(golem_ctx_t ctx, int32_t mode, int32_t n_used, int32_t n_pred);
+GOLEM_API int32_t golem_set_device_wait(golem_ctx_t ctx, struct ggml_backend_device *dev, int32_t mode,
+                                          int32_t n_used, int32_t n_pred);
 /* 0 off, 1 stream wait, 2 wait kernel (0 for a NULL ctx). */
 GOLEM_API int32_t golem_device_wait_mode(golem_ctx_t ctx);
 /* The request words: req_seq[blk] for blk in [0, *n_blk) is the compute
@@ -406,12 +410,12 @@ GOLEM_API int32_t golem_device_wait_serve(golem_ctx_t ctx, int32_t blk, uint32_t
  * readback). Zeros for a NULL ctx; either out pointer may be NULL. */
 GOLEM_API void golem_device_wait_stats(golem_ctx_t ctx, uint64_t *served, uint64_t *computes);
 #ifdef GOLEM_TEST_SUPPORT
-/* Test seam (ABI v20): on the first GPU device, the compute stream waits (in
+/* Test seam (ABI v20): on GPU device `dev`, the compute stream waits (in
  * `mode` 1 or 2) for a mapped word to reach 7, then gathers it into a device
  * tensor; returns 0 when the stream stayed blocked until the host wrote the
  * word and the gather read 7, 1 when the order was violated, -1 when the mode
  * is unsupported. */
-GOLEM_API int32_t golem_device_wait_probe(int32_t mode);
+GOLEM_API int32_t golem_device_wait_probe(struct ggml_backend_device *dev, int32_t mode);
 #endif
 
 /* VRAM victim ring (ABI v18, exclusive residency). `slots > 0` arms a ring of

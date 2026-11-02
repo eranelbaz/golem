@@ -56,7 +56,7 @@ fn hook_abi_types_generated() {
     // SAFETY: NULL ctx is the documented refusal path of each entry point.
     unsafe {
         assert_eq!(
-            raw::golem_set_device_wait(std::ptr::null_mut(), 1, 8, 0),
+            raw::golem_set_device_wait(std::ptr::null_mut(), std::ptr::null_mut(), 1, 8, 0),
             -1
         );
         assert_eq!(raw::golem_device_wait_mode(std::ptr::null_mut()), 0);

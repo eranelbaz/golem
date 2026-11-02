@@ -571,7 +571,7 @@ static inline void golem_dw_st(uint32_t * p, uint32_t v) {
     __atomic_store_n(p, v, __ATOMIC_RELEASE);
 }
 
-int32_t golem_set_device_wait(golem_ctx_t ctx, int32_t mode, int32_t n_used, int32_t n_pred) {
+int32_t golem_set_device_wait(golem_ctx_t ctx, ggml_backend_dev_t dev, int32_t mode, int32_t n_used, int32_t n_pred) {
     if (ctx == NULL || ctx->dw_mem != nullptr || mode < 0 || mode > 2) {
         return -1;
     }
@@ -583,7 +583,6 @@ int32_t golem_set_device_wait(golem_ctx_t ctx, int32_t mode, int32_t n_used, int
         ctx->ensure == nullptr || ctx->evict_batch != nullptr || n_used < 1 || n_used > 32 || n_pred < 0) {
         return -1;
     }
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (dev == nullptr) {
         return -1;
     }
@@ -915,8 +914,7 @@ void golem_device_wait_stats(golem_ctx_t ctx, uint64_t * served, uint64_t * comp
 }
 
 #ifdef GOLEM_TEST_SUPPORT
-int32_t golem_device_wait_probe(int32_t mode) {
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+int32_t golem_device_wait_probe(ggml_backend_dev_t dev, int32_t mode) {
     if (dev == nullptr || (mode != 1 && mode != 2)) {
         return -1;
     }

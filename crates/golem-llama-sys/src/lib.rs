@@ -257,10 +257,14 @@ impl<T> Hooked<T> {
         n_used: i32,
         n_pred: i32,
     ) -> Option<(i32, DeviceWaitRing)> {
+        // SAFETY: registry query; a NULL result is refused below.
+        let dev = unsafe {
+            raw::ggml_backend_dev_by_type(raw::ggml_backend_dev_type::GGML_BACKEND_DEVICE_TYPE_GPU)
+        };
         // SAFETY: config-time FFI call on a live ctx, exclusive through
         // `&mut self` (the registration is not yet shared and no compute has
-        // run); refusals, including a second arm, return -1.
-        if unsafe { raw::golem_set_device_wait(self.ctx.0, mode, n_used, n_pred) } != 0 {
+        // run); refusals, including a NULL dev or a second arm, return -1.
+        if unsafe { raw::golem_set_device_wait(self.ctx.0, dev, mode, n_used, n_pred) } != 0 {
             return None;
         }
         let mut req: *const u32 = std::ptr::null();
