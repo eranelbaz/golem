@@ -67,7 +67,7 @@ pub struct EngineConfig {
     /// Pooled expert H2D on a dedicated copy stream overlapping compute.
     /// Not implemented by the vendored scheduler: `true` is refused at load.
     pub async_h2d: bool,
-    /// Device-side landed wait (ABI v19): decode MoE layers publish
+    /// Device-side landed wait (ABI v20): decode MoE layers publish
     /// their routed ids to a mapped ring and the GPU waits on device for the
     /// experts to land, served by a controller thread instead of a host sync
     /// per layer. Needs `async_h2d`, the RAM pool and a HIP substrate;
@@ -129,6 +129,14 @@ pub struct EngineConfig {
     /// the pool slot once the H2D lands and D2Hs evictions back into the
     /// pool. Exclusive stays opt-in until the A/B proves it on decode.
     pub residency: Residency,
+    /// VRAM victim ring slots for exclusive-residency eviction D2H (§6.3
+    /// O10): `0` (the default) = off. Each slot is 3 × max plane stride; an
+    /// evicted unit's planes go slab → ring on the compute stream and ring →
+    /// host on a dedicated D2H stream, off the stolen slot's refill path.
+    /// Target (UD-Q4_K_XL): max plane ≈ 6.88 MB → slot ≈ 20.6 MB; 16 slots
+    /// ≈ 330 MB ≈ 1.4% of 24 GiB, priced off the derived K's budget. Needs
+    /// `Exclusive`, the RAM pool, the HIP substrate and a single GPU.
+    pub victim_ring_slots: u32,
     /// Prefill layer streaming (§7.6, `--prefill-stream`): prompt chunks of
     /// `prefill_ubatch` tokens stream each expert plane through
     /// double-buffered device slabs instead of paging misses into the pool.
@@ -269,6 +277,7 @@ impl Default for EngineConfig {
             prefetch: PrefetchMode::default(),
             prefetch_lookahead: 1,
             residency: Residency::default(),
+            victim_ring_slots: 0,
             prefill_stream: false,
             prefill_ubatch: 2048,
             prefill_stream_min: 256,

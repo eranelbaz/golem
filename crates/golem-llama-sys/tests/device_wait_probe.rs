@@ -1,4 +1,4 @@
-//! ABI v19: the device-side landed wait blocks the compute stream until
+//! ABI v20: the device-side landed wait blocks the compute stream until
 //! the host stores the landed word, in both the stream wait-value mode and the
 //! wait-kernel fallback. HIP substrate with the C test seams.
 #![cfg(golem_backend_hip)]

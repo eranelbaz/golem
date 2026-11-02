@@ -3,7 +3,7 @@
 #[cfg(feature = "hip-tests")]
 mod common;
 
-use golem_engine::timing::{CpuExpertStats, StepTiming, TimingRecorder};
+use golem_engine::timing::{CpuExpertStats, StepTiming, TimingRecorder, VictimRingStats};
 
 #[test]
 fn csv_header_carries_version_fork_commit_and_config() {
@@ -24,8 +24,8 @@ fn csv_header_carries_version_fork_commit_and_config() {
     assert!(
         s.lines().nth(1).unwrap().ends_with(
             ",policy_ms,compute_ms,cpu_expert_math_experts,cpu_expert_math_bytes,\
-             cpu_expert_math_ms,cpu_expert_join_wait_ms,ids_readbacks,ids_sync_ms,ids_gap_ms,\
-             ids_gap_max_ms"
+             cpu_expert_math_ms,cpu_expert_join_wait_ms,ring_d2h_ms,ring_d2h_bytes,ring_units,ring_full,\
+             ids_readbacks,ids_sync_ms,ids_gap_ms,ids_gap_max_ms"
         ),
         "{s}"
     );
@@ -55,12 +55,13 @@ fn cpu_expert_columns_measured_and_not_subtracted_from_compute() {
             join_wait_ms: 3.5,
             padded: 36,
         }),
+        victim_ring: None,
     });
     let mut out = Vec::new();
     r.flush(&mut out).unwrap();
     let line = std::str::from_utf8(&out).unwrap().lines().last().unwrap();
     assert!(
-        line.ends_with(",40.0,12,69206016,25.0,3.5,unmeasured,unmeasured,unmeasured,unmeasured"),
+        line.ends_with(",40.0,12,69206016,25.0,3.5,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured"),
         "row: {line}"
     );
 }
@@ -81,6 +82,7 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
         policy_ms: f64::NAN,
         sync_gap: None,
         cpu_expert: None,
+        victim_ring: None,
     });
     let mut out = Vec::new();
     r.flush(&mut out).unwrap();
@@ -93,12 +95,47 @@ fn rows_write_unmeasured_for_unmeasured_columns_never_zero() {
     assert!(line.contains("unmeasured"));
     assert!(
         line.ends_with(
-            ",unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured"
+            ",unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured,unmeasured"
         ),
-        "cpu_expert and ids columns off: {line}"
+        "cpu_expert, ring and ids columns off: {line}"
     );
     assert!(!line.contains(",0,")); // no silent zero for unmeasured
     assert!(line.contains("55") && line.contains("121634816"));
+}
+
+/// Victim ring armed: the four ring columns are numbers, and the D2H
+/// stream's ms is not subtracted from `compute_ms` (it is off the refill
+/// path). 16 planes × 6,881,280 B = 110,100,480 B.
+#[test]
+fn ring_columns_measured_and_not_subtracted_from_compute() {
+    let mut r = TimingRecorder::new(64);
+    r.row(StepTiming {
+        step: 0,
+        tokens: 1,
+        wall_ms: 100.0,
+        p3_wait_ms: 60.0,
+        disk_wait_ms: f64::NAN,
+        disk_worker_ms: f64::NAN,
+        disk_bytes: 0,
+        h2d_ms: f64::NAN,
+        h2d_bytes: 0,
+        policy_ms: f64::NAN,
+        sync_gap: None,
+        cpu_expert: None,
+        victim_ring: Some(VictimRingStats {
+            units: 16,
+            full: 1,
+            d2h_ms: 4.5,
+            d2h_bytes: 110_100_480,
+        }),
+    });
+    let mut out = Vec::new();
+    r.flush(&mut out).unwrap();
+    let line = std::str::from_utf8(&out).unwrap().lines().last().unwrap();
+    assert!(
+        line.ends_with(",40.0,unmeasured,unmeasured,unmeasured,unmeasured,4.5,110100480,16,1,unmeasured,unmeasured,unmeasured,unmeasured"),
+        "row: {line}"
+    );
 }
 
 #[test]
@@ -119,6 +156,7 @@ fn compute_is_wall_minus_p3_h2d_policy_not_disk_worker() {
         policy_ms: 4.5,
         sync_gap: None,
         cpu_expert: None,
+        victim_ring: None,
     });
     let mut out = Vec::new();
     r.flush(&mut out).unwrap();

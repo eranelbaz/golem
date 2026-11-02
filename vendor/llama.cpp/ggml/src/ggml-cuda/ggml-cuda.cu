@@ -6133,8 +6133,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 }
 
 // Golem async_h2d copy stream (golem-copy-stream.h): the last stream index
-// of the backend's device; the scheduler refuses it while concurrent-stream
-// forking (which uses indices >= 1) is enabled.
+// of the backend's device (the victim-ring D2H stream the one below it); the
+// scheduler refuses both while concurrent-stream forking (which uses indices
+// >= 1) is enabled.
 // Every wrapper makes the backend's device current first: the scheduler may
 // call in from a thread whose current device is another one.
 static ggml_backend_cuda_context * golem_cs_ctx(ggml_backend_t backend) {
@@ -6184,14 +6185,53 @@ static void golem_cs_compute_wait(ggml_backend_t backend, void * event) {
     CUDA_CHECK(cudaStreamWaitEvent(golem_cs_ctx(backend)->stream(), (cudaEvent_t) event, 0));
 }
 
+// Victim-ring D2H stream: the index below the copy stream (both above the
+// compute stream 0, so 4 streams leave index 1 to upstream).
+static_assert(GGML_CUDA_MAX_STREAMS >= 4, "golem copy + D2H streams need GGML_CUDA_MAX_STREAMS >= 4");
+static cudaStream_t golem_cs_d2h_stream(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = golem_cs_ctx(backend);
+    return cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_MAX_STREAMS - 2);
+}
+
 static void golem_cs_sync(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(golem_cs_stream(backend)));
+    CUDA_CHECK(cudaStreamSynchronize(golem_cs_d2h_stream(backend)));
 }
 
 static float golem_cs_elapsed_ms(void * start, void * end) {
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, (cudaEvent_t) start, (cudaEvent_t) end));
     return ms;
+}
+
+static void golem_cs_d2d_compute(ggml_backend_t backend, ggml_tensor * dst, size_t dst_off,
+                                 const ggml_tensor * src, size_t src_off, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = golem_cs_ctx(backend);
+    CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + dst_off, (const char *) src->data + src_off, size,
+                               cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+}
+
+static void golem_cs_d2h_get_async(ggml_backend_t backend, void * dst, const ggml_tensor * src, size_t offset, size_t size) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, (const char *) src->data + offset, size, cudaMemcpyDeviceToHost,
+                               golem_cs_d2h_stream(backend)));
+}
+
+static void golem_cs_record_d2h(ggml_backend_t backend, void * event) {
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) event, golem_cs_d2h_stream(backend)));
+}
+
+static void golem_cs_d2h_wait(ggml_backend_t backend, void * event) {
+    CUDA_CHECK(cudaStreamWaitEvent(golem_cs_d2h_stream(backend), (cudaEvent_t) event, 0));
+}
+
+static int golem_cs_event_query(void * event) {
+    const cudaError_t err = cudaEventQuery((cudaEvent_t) event);
+    if (err == cudaErrorNotReady) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    CUDA_CHECK(err);
+    return 1;
 }
 
 static const golem_copy_stream_iface golem_cs_iface = {
@@ -6204,9 +6244,14 @@ static const golem_copy_stream_iface golem_cs_iface = {
     /* .compute_wait   = */ golem_cs_compute_wait,
     /* .sync           = */ golem_cs_sync,
     /* .elapsed_ms     = */ golem_cs_elapsed_ms,
+    /* .d2d_compute    = */ golem_cs_d2d_compute,
+    /* .d2h_get_async  = */ golem_cs_d2h_get_async,
+    /* .record_d2h     = */ golem_cs_record_d2h,
+    /* .d2h_wait       = */ golem_cs_d2h_wait,
+    /* .event_query    = */ golem_cs_event_query,
 };
 
-// Golem device-side landed wait (golem-device-wait.h, ABI v19). Words live
+// Golem device-side landed wait (golem-device-wait.h, ABI v20). Words live
 // in host-mapped memory; device code addresses them through the mapped
 // device pointer. System-scope atomics: the host writes them concurrently.
 // The ring's mapped base, resolved once at host_alloc: every per-layer wait,

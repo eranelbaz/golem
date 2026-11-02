@@ -50,9 +50,9 @@ fn hook_abi_types_generated() {
     // constant the bindings came from matches the compiled substrate.
     // ABI v9 adds the abandoned-D2H hook (parked evictions whose plane
     // copies were not all issued must be reported, not committed).
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 19);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 19);
-    // v19: device-side landed wait; a NULL ctx is refused / reports off.
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 20);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 20);
+    // v20: device-side landed wait; a NULL ctx is refused / reports off.
     // SAFETY: NULL ctx is the documented refusal path of each entry point.
     unsafe {
         assert_eq!(
@@ -69,7 +69,7 @@ fn hook_abi_types_generated() {
         );
         assert!(req.is_null() && n == 0);
     }
-    // v18: host-sync timing of the MoE ids readbacks; a NULL ctx is refused.
+    // v19: host-sync timing of the MoE ids readbacks; a NULL ctx is refused.
     let (mut s, mut g, mut gm, mut n) = (0.0, 0.0, 0.0, 0u64);
     // SAFETY: a NULL ctx is the documented refusal path; the out-params are
     // live locals and untouched on refusal.
@@ -77,6 +77,10 @@ fn hook_abi_types_generated() {
         raw::golem_take_sync_gap_stats(std::ptr::null_mut(), &mut s, &mut g, &mut gm, &mut n)
     };
     assert_eq!((rc, n), (0, 0));
+    // v18: VRAM victim ring setter + stats.
+    let _: unsafe extern "C" fn(raw::golem_ctx_t, i32, i32) -> i32 = raw::golem_set_victim_ring;
+    let _: unsafe extern "C" fn(raw::golem_ctx_t, *mut u64, *mut u64, *mut f64, *mut u64) -> i32 =
+        raw::golem_take_victim_ring_stats;
     // v17: ensure reports RAM hits early through `hits_ready`.
     assert_thin_fn_ptr::<raw::golem_hits_ready_fn>();
     // v16: CPU expert math surface.

@@ -665,6 +665,9 @@ pub(crate) struct SessionInner {
     /// Session-cumulative CPU expert math counters (`/metrics`); zero when
     /// `cpu_expert_math` is off.
     cpu_expert_total: crate::timing::CpuExpertStats,
+    /// Session-cumulative victim ring counters (§6.3 O10); zero when the
+    /// ring is off.
+    victim_ring_total: crate::timing::VictimRingStats,
 }
 
 impl Drop for Session {
@@ -757,6 +760,30 @@ impl Session {
                 "async_h2d: needs the RAM expert pool (ram_experts_gib > 0)".into(),
             ));
         }
+        // The victim ring (§6.3 O10) moves exclusive-residency eviction D2H
+        // onto a device ring + D2H stream of the split backend's context.
+        if config.victim_ring_slots > 0 {
+            if config.residency != crate::config::Residency::Exclusive {
+                return Err(EngineError::InvalidConfig(
+                    "victim_ring_slots: needs residency = exclusive".into(),
+                ));
+            }
+            if config.ram_experts_gib == 0 {
+                return Err(EngineError::InvalidConfig(
+                    "victim_ring_slots: needs the RAM expert pool (ram_experts_gib > 0)".into(),
+                ));
+            }
+            if substrate_backend() == Backend::Cpu {
+                return Err(EngineError::InvalidConfig(
+                    "victim_ring_slots: no device ring in this substrate".into(),
+                ));
+            }
+            if i32::try_from(config.victim_ring_slots).is_err() {
+                return Err(EngineError::InvalidConfig(
+                    "victim_ring_slots exceeds i32::MAX".into(),
+                ));
+            }
+        }
         // Decode-only CPU expert math (design §1 O1) reads RAM-pool slots in
         // place of the H2D copy: it needs the pool and a GPU to overlap.
         if config.cpu_expert_math
@@ -812,12 +839,17 @@ impl Session {
         // C-side FFI abort in golem_cs_begin, and the load's self-check decode
         // already binds the copy stream. `init_backend` first: the registry
         // must not be touched before it sets the op-offload threshold.
-        if config.async_h2d {
+        if config.async_h2d || config.victim_ring_slots > 0 {
             init_backend(forces_expert_offload(config));
             if golem_llama_sys::gpu_device_count() > 1 {
-                return Err(EngineError::InvalidConfig(
-                    "async_h2d: supports a single GPU device".into(),
-                ));
+                let what = if config.async_h2d {
+                    "async_h2d"
+                } else {
+                    "victim_ring_slots"
+                };
+                return Err(EngineError::InvalidConfig(format!(
+                    "{what}: supports a single GPU device"
+                )));
             }
         }
         // P3 (§3.4): build the RAM expert pool + create the per-model ctx
@@ -909,6 +941,7 @@ impl Session {
                     degraded: None,
                     test_fail_gen_step: 0,
                     cpu_expert_total: Default::default(),
+                    victim_ring_total: Default::default(),
                 },
             }
         })
@@ -957,6 +990,7 @@ impl Session {
                     degraded: None,
                     test_fail_gen_step: 0,
                     cpu_expert_total: Default::default(),
+                    victim_ring_total: Default::default(),
                 },
             }
         })
@@ -1079,6 +1113,8 @@ impl Session {
             cache_copies,
             stream_copies,
             early_h2d_units,
+            victim_ring_units: self.inner.victim_ring_total.units,
+            victim_ring_full: self.inner.victim_ring_total.full,
             skip_ratio: skip_ratio(bytes_copied, bytes_skipped),
         })
     }
@@ -1876,7 +1912,8 @@ impl SessionInner {
         // The lease-release contract: synchronize before the next compute.
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
-        if self.timing.is_some() || self.config.cpu_expert_math {
+        if self.timing.is_some() || self.config.cpu_expert_math || self.config.victim_ring_slots > 0
+        {
             // §11 step boundary: snapshot (and reset) the P3/store
             // accumulators into this step's row; a prefill-only decode's
             // are discarded, not charged to the next generation row. H2D is
@@ -1886,6 +1923,10 @@ impl SessionInner {
             let cpu_expert = io.cpu_expert;
             if let Some(c) = &cpu_expert {
                 self.cpu_expert_total.add(c);
+            }
+            let victim_ring = io.victim_ring;
+            if let Some(r) = &victim_ring {
+                self.victim_ring_total.add(r);
             }
             let Some(t) = self.timing.as_mut().filter(|_| n_gen > 0) else {
                 return Ok(true);
@@ -1904,6 +1945,7 @@ impl SessionInner {
                 policy_ms: io.policy_ns.map_or(f64::NAN, ns2ms),
                 sync_gap: io.sync_gap,
                 cpu_expert,
+                victim_ring,
             });
         }
         Ok(true)
@@ -2362,6 +2404,12 @@ pub struct DeviceCacheStats {
     /// Expert planes whose H2D was issued at the RAM-hit hand-off, before the
     /// ensure's blocking disk reads (counted per plane, like `cache_copies`).
     pub early_h2d_units: u64,
+    /// Eviction planes copied through the victim ring (§6.3 O10;
+    /// session-cumulative, 0 when the ring is off).
+    pub victim_ring_units: u64,
+    /// Parked evictions that found the victim ring full and fell back to the
+    /// same-stream D2H.
+    pub victim_ring_full: u64,
     /// `bytes_skipped / (bytes_skipped + bytes_copied)`; 0.0 with no traffic.
     pub skip_ratio: f64,
 }
@@ -2404,6 +2452,7 @@ fn plan_input(config: &EngineConfig, m: &golem_plan::ModelFacts) -> golem_plan::
         },
         snapshot_ram: config.snapshot_ram_bytes.unwrap_or(0),
         vram_reserve: 0,
+        victim_ring_slots: config.victim_ring_slots,
         ws: golem_plan::WS_MEASURED,
     }
 }

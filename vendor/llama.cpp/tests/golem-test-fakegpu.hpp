@@ -12,9 +12,12 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-backend-impl.h" // tests link ggml and include ggml/src
+#include "golem-copy-stream.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 
 namespace golem_test {
 
@@ -72,6 +75,75 @@ inline ggml_backend_buffer_type_t fake_buft() {
     return &buft;
 }
 
+// Fake copy-stream iface (golem-copy-stream.h). The compute and copy streams
+// are synchronous (every op lands at issue); the D2H stream is DEFERRED: its
+// copies and event records queue up and run only when something waits on
+// them (sync, a compute-stream wait on a D2H-recorded event), and they read
+// their source at RUN time — so a ring slot reused before its D2H ran, or a
+// missing release wait, shows up as wrong destination bytes.
+struct fg_event { bool done = true; };
+struct fg_d2h_op { void * dst; const char * src; size_t size; fg_event * ev; };
+inline std::deque<fg_d2h_op> & fg_d2h_queue() {
+    static std::deque<fg_d2h_op> q;
+    return q;
+}
+inline void fg_d2h_run_until(const fg_event * ev) {
+    auto & q = fg_d2h_queue();
+    while (!q.empty() && (ev == nullptr || !ev->done)) {
+        const fg_d2h_op op = q.front();
+        q.pop_front();
+        if (op.ev != nullptr) {
+            op.ev->done = true;
+        } else {
+            memcpy(op.dst, op.src, op.size);
+        }
+    }
+}
+inline const golem_copy_stream_iface * fake_cs_iface() {
+    static golem_copy_stream_iface cs = {};
+    if (cs.set_async == nullptr) {
+        cs.set_async = [](ggml_backend_t, ggml_tensor * t, const void * data, size_t off, size_t size) {
+            memcpy((char *) t->data + off, data, size);
+        };
+        cs.event_new = [](ggml_backend_t, int) { return (void *) new fg_event(); };
+        cs.event_free = [](void * ev) { delete (fg_event *) ev; };
+        cs.record_compute = [](ggml_backend_t, void * ev) { ((fg_event *) ev)->done = true; };
+        cs.record_copy = [](ggml_backend_t, void * ev) { ((fg_event *) ev)->done = true; };
+        cs.copy_wait = [](ggml_backend_t, void *) {};
+        cs.compute_wait = [](ggml_backend_t, void * ev) { fg_d2h_run_until((fg_event *) ev); };
+        cs.sync = [](ggml_backend_t) { fg_d2h_run_until(nullptr); };
+        cs.elapsed_ms = [](void *, void *) { return 0.0f; };
+        cs.d2d_compute = [](ggml_backend_t, ggml_tensor * dst, size_t dst_off, const ggml_tensor * src,
+                            size_t src_off, size_t size) {
+            memcpy((char *) dst->data + dst_off, (const char *) src->data + src_off, size);
+        };
+        cs.d2h_get_async = [](ggml_backend_t, void * dst, const ggml_tensor * src, size_t off, size_t size) {
+            fg_d2h_queue().push_back({dst, (const char *) src->data + off, size, nullptr});
+        };
+        cs.record_d2h = [](ggml_backend_t, void * ev) {
+            ((fg_event *) ev)->done = false;
+            fg_d2h_queue().push_back({nullptr, nullptr, 0, (fg_event *) ev});
+        };
+        cs.d2h_wait = [](ggml_backend_t, void *) {}; // compute-recorded events are complete
+        cs.event_query = [](void * ev) { return ((fg_event *) ev)->done ? 1 : 0; };
+    }
+    return &cs;
+}
+
+inline ggml_backend_reg_t fake_reg() {
+    static ggml_backend_reg reg = {};
+    if (reg.iface.get_name == nullptr) {
+        reg.api_version = GGML_BACKEND_API_VERSION;
+        reg.iface.get_name = [](ggml_backend_reg_t) { return "FAKEGPU"; };
+        reg.iface.get_device_count = [](ggml_backend_reg_t) { return (size_t) 1; };
+        reg.iface.get_device = [](ggml_backend_reg_t, size_t) { return fake_dev(); };
+        reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) {
+            return strcmp(name, "golem_copy_stream_iface") == 0 ? const_cast<void *>((const void *) fake_cs_iface()) : nullptr;
+        };
+    }
+    return &reg;
+}
+
 inline ggml_backend_dev_t fake_dev() {
     static ggml_backend_device dev = {};
     if (dev.iface.get_name == nullptr) {
@@ -91,6 +163,7 @@ inline ggml_backend_dev_t fake_dev() {
         dev.iface.supports_buft = [](ggml_backend_dev_t, ggml_backend_buffer_type_t buft_) {
             return buft_ == fake_buft();
         };
+        dev.reg = fake_reg();
     }
     return &dev;
 }

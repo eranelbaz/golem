@@ -1,4 +1,4 @@
-//! Device-side landed wait controller thread (ABI v19).
+//! Device-side landed wait controller thread (ABI v20).
 //!
 //! The decode thread no longer synchronizes per MoE layer: the GPU publishes
 //! each layer's routed ids into a mapped ring and waits on the device for the

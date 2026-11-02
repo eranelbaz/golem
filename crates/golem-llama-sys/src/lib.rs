@@ -48,9 +48,9 @@ pub fn hooks_abi_version() -> i32 {
 
 // The RAII surface below is written against ABI v5 (per-model `golem_ctx`,
 // handle-returning register, batched ensure, triple-buffered order push).
-// A header drift past v19 must fail this build, not silently re-shape the
+// A header drift past v20 must fail this build, not silently re-shape the
 // guards.
-const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 19);
+const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 20);
 
 /// GPU devices (discrete or integrated) in the backend registry (each one a
 /// device backend a llama context may split across).
@@ -156,7 +156,7 @@ impl GolemCtx {
     }
 }
 
-/// Outcome of [`DeviceWaitRing::serve`] (ABI v19 `golem_device_wait_serve`).
+/// Outcome of [`DeviceWaitRing::serve`] (ABI v20 `golem_device_wait_serve`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Serve {
     /// Every unit of the request is landed or queued to land behind its copy.
@@ -167,7 +167,7 @@ pub enum Serve {
     Stale,
 }
 
-/// The mapped request words of an armed device-wait ctx (ABI v19): `n_blk`
+/// The mapped request words of an armed device-wait ctx (ABI v20): `n_blk`
 /// per-blk sequence words plus the active word. Keeps the ctx (and so the
 /// mapped allocation, freed by `golem_ctx_free`) alive. The device and the
 /// decode thread write the words concurrently; reads are atomic.
@@ -245,7 +245,7 @@ impl DeviceWaitRing {
 }
 
 impl<T> Hooked<T> {
-    /// Arms the device-side landed wait (ABI v19) after registration (the
+    /// Arms the device-side landed wait (ABI v20) after registration (the
     /// substrate checks the hooks): `mode` 1 auto, 2 force the wait kernel.
     /// Returns the resolved mode (1 stream wait, 2 wait kernel) and the
     /// ctx's only ring, or `None` when the substrate refused (see

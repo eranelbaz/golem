@@ -174,6 +174,37 @@ struct golem_ctx {
     bool cs_t_overflow = false;
     uint64_t cs_bytes = 0;
 
+    // --- VRAM victim ring (golem_set_victim_ring, ABI v18) ---
+    // Decode-thread-only. One device buffer of vr_slots x 3 x vr_stride
+    // bytes on cs_backend: a parked exclusive eviction reserves a slot, each
+    // plane is copied slab -> ring on the compute stream (the stolen slab
+    // slot is refillable right after) and ring -> host on the D2H stream.
+    // Per-slot vectors are sized by the setter; buffer + events are created
+    // at the first park and released by golem_reset_device_cache. A slot is
+    // FREE (unused this compute), RESERVED (owned by a parked entry) or
+    // RELEASING (its D2H is issued; vr_rel_ev recorded after it on the D2H
+    // stream — reuse makes the compute stream wait on it). All slots return
+    // to FREE at compute entry after the backend + copy/D2H stream drain.
+    enum : uint8_t { GOLEM_VR_FREE = 0, GOLEM_VR_RESERVED = 1, GOLEM_VR_RELEASING = 2 };
+    int32_t vr_slots = 0;  // <= 0 = off (inclusive-cost same-stream D2H)
+    int32_t vr_stride = 0; // bytes per plane slot
+    bool vr_off = false;   // bind/tensor setup failed: ring disabled until reset
+    bool vr_alloc_failed = false; // device allocation failed: sticky across reset
+    int32_t vr_next = 0;   // round-robin start for RELEASING-slot reuse
+    struct ggml_context * vr_ctx = nullptr;
+    struct ggml_backend_buffer * vr_buf = nullptr;
+    struct ggml_tensor * vr_tensor = nullptr; // I8 view over the whole buffer
+    std::vector<uint8_t> vr_state;            // [vr_slots]
+    std::vector<void *> vr_rel_ev;            // [vr_slots]
+    void * vr_ev_fence = nullptr;             // compute stream -> D2H stream (ring D2D landed)
+    void * vr_t0[GOLEM_CS_RING] = {};         // timed pairs, one per issuing drain
+    void * vr_t1[GOLEM_CS_RING] = {};
+    int32_t vr_t_n = 0;
+    bool vr_t_overflow = false; // a ring drain went untimed (timing ring full)
+    uint64_t vr_units = 0; // planes copied through the ring
+    uint64_t vr_full = 0;  // parked entries that found every slot RESERVED
+    uint64_t vr_bytes = 0;
+
     // --- O1 CPU expert math (golem_set_cpu_expert_math, design §1 O1) ---
     // Config is init-only; everything else is decode-thread-only. The worker
     // and iface are bound lazily on the first eligible compute. Per-blk
@@ -208,7 +239,7 @@ struct golem_ctx {
     double sg_gap_max_ms = 0.0;
     uint64_t sg_n = 0;
 
-    // --- device-side landed wait (golem_set_device_wait, ABI v19) ---
+    // --- device-side landed wait (golem_set_device_wait, ABI v20) ---
     // One mapped allocation, sized at arm time by n_blk x (n_used + n_pred):
     //   req[n_blk + 1]             newest published compute seq per blk; active word last
     //   ids[n_blk][stride]         routed ids then P5 prediction ids

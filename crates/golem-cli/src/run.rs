@@ -210,6 +210,12 @@ pub struct EngineArgs {
     /// exclusive A/B proves it on decode tok/s.
     #[arg(long, value_name = "MODE")]
     pub residency: Option<Residency>,
+    /// VRAM victim ring slots for `--residency exclusive` (design §6.3
+    /// O10): eviction D2H goes through a device ring on its own stream,
+    /// off the refill path. Each slot is 3 × the max plane stride (~20.6 MB
+    /// at UD-Q4_K_XL). 0 (default) = off. Needs the HIP substrate.
+    #[arg(long, value_name = "N")]
+    pub victim_ring: Option<u32>,
     /// Prefill layer streaming (design §7.6): prompt chunks of
     /// `--prefill-ubatch` tokens stream each expert plane through
     /// double-buffered device slabs instead of paging misses into the pool.
@@ -332,6 +338,7 @@ impl EngineArgs {
             prefetch: l.get(self.prefetch, "prefetch", d.prefetch)?,
             prefetch_lookahead: l.get(self.prefetch_lookahead, "prefetch_lookahead", 1)?,
             residency: l.get(self.residency, "residency", d.residency)?,
+            victim_ring_slots: l.get(self.victim_ring, "victim_ring_slots", d.victim_ring_slots)?,
             prefill_stream: l.get(flag(self.prefill_stream), "prefill_stream", false)?,
             prefill_ubatch: l.get(self.prefill_ubatch, "prefill_ubatch", d.prefill_ubatch)?,
             prefill_stream_min: l.get(
@@ -676,8 +683,14 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     }
     if let Some(dc) = session.device_cache_stats() {
         let line = format!(
-            "device_cache bytes_copied={} bytes_skipped={} evictions={} early_h2d_units={}",
-            dc.bytes_copied, dc.bytes_skipped, dc.evictions, dc.early_h2d_units
+            "device_cache bytes_copied={} bytes_skipped={} evictions={} early_h2d_units={} \
+             victim_ring_units={} victim_ring_full={}",
+            dc.bytes_copied,
+            dc.bytes_skipped,
+            dc.evictions,
+            dc.early_h2d_units,
+            dc.victim_ring_units,
+            dc.victim_ring_full
         );
         eprintln!("golem: {line}");
         if let Some(Err(e)) = timing_out
@@ -1873,6 +1886,34 @@ mod tests {
             let r = RunArgs::augment_args(clap::Command::new("run")).try_get_matches_from(argv);
             assert!(r.is_err(), "{bad:?} must not parse");
         }
+    }
+
+    #[test]
+    fn run_args_map_victim_ring_flag_and_key_into_config() {
+        let config = parse_run_args(&["run", "m.gguf"])
+            .engine
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
+        assert_eq!(config.victim_ring_slots, 0, "ring off by default");
+        let config = parse_run_args(&["run", "m.gguf", "--victim-ring", "16"])
+            .engine
+            .to_config("model.gguf".into(), &crate::config::Layers::none())
+            .unwrap();
+        assert_eq!(config.victim_ring_slots, 16);
+        let file = crate::config::Layers {
+            file: toml::from_str("victim_ring_slots = 8").unwrap(),
+            ..crate::config::Layers::none()
+        };
+        let config = parse_run_args(&["run", "m.gguf"])
+            .engine
+            .to_config("model.gguf".into(), &file)
+            .unwrap();
+        assert_eq!(config.victim_ring_slots, 8, "config-file key");
+        let config = parse_run_args(&["run", "m.gguf", "--victim-ring", "4"])
+            .engine
+            .to_config("model.gguf".into(), &file)
+            .unwrap();
+        assert_eq!(config.victim_ring_slots, 4, "flag beats file");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-// Golem device-side landed wait (ABI v19). ggml-base cannot call into a
+// Golem device-side landed wait (ABI v20). ggml-base cannot call into a
 // device backend, so the device backend exports this table through
 // ggml_backend_reg_get_proc_address(reg, "golem_device_wait_iface"); NULL
 // there means device wait is unavailable on that backend (golem_set_device_wait

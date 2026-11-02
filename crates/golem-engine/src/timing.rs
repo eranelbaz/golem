@@ -6,8 +6,8 @@
 //! because it runs inside the `p3_wait` window on a parallel worker (it can
 //! even exceed the step wall time), so subtracting it would double-count.
 //! Unmeasured parts contribute nothing to the remainder. The CPU expert
-//! math worker's time is not subtracted either: it overlaps the GPU. Nor are
-//! the MoE ids-readback columns (`ids_sync_ms`, `ids_gap_ms`): the gap from
+//! math worker's time is not subtracted either: it overlaps the GPU, nor is
+//! the victim ring's D2H stream time (off the refill path). Nor are the MoE ids-readback columns (`ids_sync_ms`, `ids_gap_ms`): the gap from
 //! a readback's sync to the next launch contains the P3 ensure and policy
 //! time already subtracted, so they locate the host-sync bubbles (§3.4) and
 //! are not a disjoint part of the wall.
@@ -55,6 +55,31 @@ pub struct StepTiming {
     /// Decode-only CPU expert math (design §1 O1); `None` unless
     /// `cpu_expert_math` measured it.
     pub cpu_expert: Option<CpuExpertStats>,
+    /// Exclusive-residency victim ring (§6.3 O10); `None` unless armed.
+    pub victim_ring: Option<VictimRingStats>,
+}
+
+/// One step's (or a session's cumulative) victim ring counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct VictimRingStats {
+    /// Eviction planes copied through the ring.
+    pub units: u64,
+    /// Parked evictions that found every slot reserved (same-stream D2H).
+    pub full: u64,
+    /// D2H-stream wall time, including its waits on the compute stream.
+    pub d2h_ms: f64,
+    /// Ring → host bytes.
+    pub d2h_bytes: u64,
+}
+
+impl VictimRingStats {
+    /// Adds `o` into `self`.
+    pub fn add(&mut self, o: &Self) {
+        self.units += o.units;
+        self.full += o.full;
+        self.d2h_ms += o.d2h_ms;
+        self.d2h_bytes += o.d2h_bytes;
+    }
 }
 
 /// One step's (or a session's cumulative) CPU expert math counters.
@@ -155,6 +180,7 @@ impl TimingRecorder {
             w,
             "step,tokens,wall_ms,p3_wait_ms,disk_wait_ms,disk_worker_ms,disk_bytes,h2d_ms,h2d_bytes,policy_ms,compute_ms,\
              cpu_expert_math_experts,cpu_expert_math_bytes,cpu_expert_math_ms,cpu_expert_join_wait_ms,\
+             ring_d2h_ms,ring_d2h_bytes,ring_units,ring_full,\
              ids_readbacks,ids_sync_ms,ids_gap_ms,ids_gap_max_ms"
         )
     }
@@ -189,6 +215,12 @@ impl TimingRecorder {
                     .as_ref()
                     .map_or_else(|| "unmeasured".to_owned(), f)
             };
+            // The ring's D2H stream runs off the refill path: not subtracted.
+            let ring = |f: fn(&VictimRingStats) -> String| {
+                t.victim_ring
+                    .as_ref()
+                    .map_or_else(|| "unmeasured".to_owned(), f)
+            };
             let sg = |f: fn(&SyncGapStats) -> String| {
                 t.sync_gap
                     .as_ref()
@@ -196,7 +228,7 @@ impl TimingRecorder {
             };
             writeln!(
                 w,
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 t.step,
                 t.tokens,
                 ms(t.wall_ms),
@@ -220,6 +252,10 @@ impl TimingRecorder {
                 cpu(|c| c.bytes.to_string()),
                 cpu(|c| ms(c.ms)),
                 cpu(|c| ms(c.join_wait_ms)),
+                ring(|r| ms(r.d2h_ms)),
+                ring(|r| r.d2h_bytes.to_string()),
+                ring(|r| r.units.to_string()),
+                ring(|r| r.full.to_string()),
                 sg(|g| g.readbacks.to_string()),
                 sg(|g| ms(g.sync_ms)),
                 sg(|g| ms(g.gap_ms)),
@@ -253,6 +289,7 @@ mod tests {
             policy_ms: f64::NAN,
             sync_gap: None,
             cpu_expert: None,
+            victim_ring: None,
         }
     }
 
@@ -312,7 +349,7 @@ mod tests {
         let cols: Vec<&str> = l.trim_end().split(',').collect();
         assert_eq!(cols[9], "1.5", "policy_ms: {l}");
         assert_eq!(cols[10], "13.5", "compute = 20 − 5 − 1.5: {l}");
-        assert_eq!(&cols[15..], ["42", "2.0", "9.0", "0.5"], "{l}");
+        assert_eq!(&cols[19..], ["42", "2.0", "9.0", "0.5"], "{l}");
     }
 
     /// Sync-gap merge sums and keeps the max span.

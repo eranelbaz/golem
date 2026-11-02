@@ -1,4 +1,4 @@
-//! Device-side landed wait (ABI v19), through the engine-registered
+//! Device-side landed wait (ABI v20), through the engine-registered
 //! hooks on the GPU split: the decode MoE layers are served off the decode
 //! thread (no ids readback), greedy output is byte-identical to the host-sync
 //! path in both the stream-wait mode and the wait-kernel fallback, every
