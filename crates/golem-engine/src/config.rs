@@ -67,6 +67,13 @@ pub struct EngineConfig {
     /// Pooled expert H2D on a dedicated copy stream overlapping compute.
     /// Not implemented by the vendored scheduler: `true` is refused at load.
     pub async_h2d: bool,
+    /// Device-side landed wait (ABI v20): decode MoE layers publish
+    /// their routed ids to a mapped ring and the GPU waits on device for the
+    /// experts to land, served by a controller thread instead of a host sync
+    /// per layer. Needs `async_h2d`, the RAM pool and a HIP substrate;
+    /// excludes CPU expert math and exclusive residency. `Off` keeps the
+    /// host-sync path.
+    pub device_wait: DeviceWait,
     /// Share of the §10 planner's `device_expert_cache` allowance the
     /// derived K may use (1.0 = all of it). No effect with an explicit K.
     pub vram_experts_frac: f32,
@@ -189,6 +196,30 @@ pub enum Residency {
     Exclusive,
 }
 
+/// Device-side landed wait mode (`--device-wait`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceWait {
+    /// Host sync per MoE layer (the ids-readback path).
+    #[default]
+    Off,
+    /// Stream wait-value when the device supports it, else the wait kernel.
+    On,
+    /// Always the wait-kernel fallback (A/B and devices without stream wait).
+    Kernel,
+}
+
+impl std::str::FromStr for DeviceWait {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" | "false" => Ok(Self::Off),
+            "on" | "true" => Ok(Self::On),
+            "kernel" => Ok(Self::Kernel),
+            _ => Err(format!("device_wait: expected off|on|kernel, got {s:?}")),
+        }
+    }
+}
+
 /// What a P5 next-layer prediction drives (§6.5, `--prefetch`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefetchMode {
@@ -232,6 +263,7 @@ impl Default for EngineConfig {
             numa_interleave: false,
             o_direct: false,
             async_h2d: false,
+            device_wait: DeviceWait::Off,
             vram_experts_frac: 1.0,
             vram_reserve_bytes: None,
             cpu_expert_math: false,

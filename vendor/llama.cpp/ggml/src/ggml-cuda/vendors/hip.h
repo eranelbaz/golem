@@ -81,6 +81,7 @@
 #define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostAllocMapped hipHostMallocMapped
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaStreamQuery hipStreamQuery
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly

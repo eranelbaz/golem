@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -95,6 +96,102 @@ static void golem_ids_pin_alloc(golem::GolemSlabEntry &st, ggml_backend_t split_
     st.ids_pin_step = 0;
 }
 
+// True when golem_slab_prepare reallocates the remapped-ids tensor, which
+// synchronizes the split backend's compute stream.
+static bool golem_slab_prepare_syncs(const golem::GolemSlabEntry & st, int64_t ids_ne0, int64_t ids_ne1) {
+    return st.ids_dev == nullptr || st.ids_ne0 != ids_ne0 || st.ids_ne1 != ids_ne1;
+}
+
+// True when golem_slab_prepare frees or allocates anything: the slab (K or
+// plane stride changed, e.g. after the engine lowers K on ALLOC_FAILED) or the
+// remapped-ids tensor. Each of those can synchronize the device (buffer free,
+// buffer clear, pinned-host free), so the caller must not hold work the
+// compute stream is waiting on.
+static bool golem_slab_prepare_reallocs(const golem::GolemSlabEntry & st, const struct ggml_tensor * inp, int32_t K,
+                                        int64_t ids_ne0, int64_t ids_ne1) {
+    return st.slab == nullptr || st.K != K || st.expert_size != inp->nb[2] ||
+           golem_slab_prepare_syncs(st, ids_ne0, ids_ne1);
+}
+
+// (Re)allocates (layer blk, plane kind)'s slab and remapped-ids tensor on a
+// fingerprint change (K, plane stride, ids shape). Caller holds dc_mutex. The
+// slab is zeroed once (the padding slot must stay non-NaN); its plane bytes
+// are written only by the expert copies. Returns false on a failed device
+// allocation (ABI v12: the compute fails, the engine resets the cache and
+// lowers K); a reallocated slab invalidates the plane's validity bits.
+static bool golem_slab_prepare(golem_ctx_t gctx, golem::GolemSlabEntry & st, golem::GolemLayerSlots & L,
+                               const struct ggml_tensor * inp, int kind, int32_t K, int64_t ids_ne0,
+                               int64_t ids_ne1, ggml_backend_t split_backend) {
+    const size_t expert_size_j = inp->nb[2];
+    if (st.slab == nullptr || st.K != K || st.expert_size != expert_size_j) {
+        if (st.buf != nullptr) {
+            ggml_backend_buffer_free(st.buf);
+        }
+        if (st.ctx != nullptr) {
+            ggml_free(st.ctx);
+        }
+        struct ggml_init_params ip = { 512, nullptr, /* no_alloc */ true };
+        st.ctx = ggml_init(ip);
+        GGML_ASSERT(st.ctx != nullptr);
+        st.slab = ggml_new_tensor_3d(st.ctx, inp->type, inp->ne[0], inp->ne[1], (int64_t) K + 1);
+        GGML_ASSERT(st.slab != nullptr);
+#ifdef GOLEM_TEST_SUPPORT
+        const bool inject = gctx->slab_fail_inject.load(std::memory_order_relaxed) > 0 &&
+                            gctx->slab_fail_inject.fetch_sub(1, std::memory_order_relaxed) > 0;
+        st.buf = inject ? nullptr : ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
+#else
+        st.buf = ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
+#endif
+        if (st.buf == nullptr) {
+            ggml_free(st.ctx);
+            st.ctx = nullptr;
+            st.slab = nullptr;
+            st.K = 0;
+            golem::golem_layer_invalidate(L, kind - 1);
+            gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        GGML_ASSERT(st.slab->nb[2] == expert_size_j);
+        ggml_backend_buffer_clear(st.buf, 0);
+        st.K = K;
+        st.expert_size = expert_size_j;
+        golem::golem_layer_invalidate(L, kind - 1);
+    }
+    if (golem_slab_prepare_syncs(st, ids_ne0, ids_ne1)) {
+        // A prior step's H2D may still be reading the old ids_pin (and the
+        // old ids_dev may be queued behind graph work); drain before freeing
+        // either buffer. One sync per ids-shape change, not per step.
+        ggml_backend_synchronize(split_backend);
+        if (st.ids_buf != nullptr) {
+            ggml_backend_buffer_free(st.ids_buf);
+        }
+        if (st.ids_ctx != nullptr) {
+            ggml_free(st.ids_ctx);
+        }
+        struct ggml_init_params ip = { 512, nullptr, /* no_alloc */ true };
+        st.ids_ctx = ggml_init(ip);
+        GGML_ASSERT(st.ids_ctx != nullptr);
+        st.ids_dev = ggml_new_tensor_2d(st.ids_ctx, GGML_TYPE_I32, ids_ne0, ids_ne1);
+        GGML_ASSERT(st.ids_dev != nullptr);
+        st.ids_buf = ggml_backend_alloc_ctx_tensors(st.ids_ctx, split_backend);
+        if (st.ids_buf == nullptr) {
+            ggml_free(st.ids_ctx);
+            st.ids_ctx = nullptr;
+            st.ids_dev = nullptr;
+            st.ids_ne0 = st.ids_ne1 = 0;
+            gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        st.ids_ne0 = ids_ne0;
+        st.ids_ne1 = ids_ne1;
+        // Pinned staging for the remap H2D: (re)allocated under this SAME
+        // ids-shape-change condition as ids_dev, so its registration never
+        // outlives the device it was pinned against.
+        golem_ids_pin_alloc(st, split_backend, ids_ne0, ids_ne1);
+    }
+    return true;
+}
+
 namespace golem { // same namespace as the shared header's inline types
 } // namespace golem // (the dc/layers maps + their mutex moved into golem_ctx)
 
@@ -155,7 +252,11 @@ int32_t golem_set_victim_ring(golem_ctx_t ctx, int32_t slots, int32_t max_plane_
 // Blocks until the copy and D2H streams are idle. Every release of H2D sources (pool
 // leases, stream staging, evict destinations) and every slab free runs after
 // this: ggml_backend_synchronize covers the compute stream only.
+static void golem_dw_quiesce(golem_ctx_t ctx); // device-wait section below
+
 static void golem_drain_copy_stream(golem_ctx_t ctx) {
+    // Every device-wait serve of this compute queues its copies first.
+    golem_dw_quiesce(ctx);
     if (ctx != NULL && ctx->cs_backend != nullptr) {
         ctx->cs->sync(ctx->cs_backend);
     }
@@ -176,7 +277,14 @@ static void golem_cs_free(golem_ctx_t ctx) {
             ctx->cs->event_free(ctx->cs_t1[i]);
             ctx->cs_t0[i] = ctx->cs_t1[i] = nullptr;
         }
+        if (ctx->dw_t0[i] != nullptr) {
+            ctx->cs->event_free(ctx->dw_t0[i]);
+            ctx->cs->event_free(ctx->dw_t1[i]);
+            ctx->dw_t0[i] = ctx->dw_t1[i] = nullptr;
+        }
     }
+    ctx->dw_t_n = 0;
+    ctx->dw_t_overflow = false;
     ctx->cs_ev_ready = ctx->cs_ev_done = nullptr;
     ctx->cs_backend = nullptr;
     ctx->cs = nullptr;
@@ -205,6 +313,10 @@ static bool golem_cs_bind(golem_ctx_t ctx, ggml_backend_t be) {
     for (int i = 0; i < golem_ctx::GOLEM_CS_RING; ++i) {
         ctx->cs_t0[i] = ctx->cs->event_new(be, 1);
         ctx->cs_t1[i] = ctx->cs->event_new(be, 1);
+        if (ctx->dw_mem != nullptr) {
+            ctx->dw_t0[i] = ctx->cs->event_new(be, 1);
+            ctx->dw_t1[i] = ctx->cs->event_new(be, 1);
+        }
     }
     return true;
 }
@@ -306,6 +418,13 @@ static void golem_cs_begin(golem_ctx_t ctx, ggml_backend_t be, bool first, bool 
         GGML_ABORT("golem async_h2d on a backend without a copy stream");
     }
     GGML_ASSERT(ctx->cs_backend == be && "golem async_h2d: one device backend per ctx");
+    // A split mixing host-path planes with device-wait planes: the compute
+    // stream may already hold a landed wait whose landed write a serve has
+    // yet to queue on the copy stream. Fencing the copy stream on compute
+    // first would put that write behind the wait it releases (a cycle).
+    // Once every published request is served, their writes precede the fence.
+    // It also keeps the serves' copies out of the timing pair opened here.
+    golem_dw_quiesce(ctx);
     if (wait) {
         ctx->cs->record_compute(be, ctx->cs_ev_ready);
         ctx->cs->copy_wait(be, ctx->cs_ev_ready);
@@ -381,14 +500,461 @@ int32_t golem_take_h2d_timing(golem_ctx_t ctx, double * ms, uint64_t * bytes) {
     for (int32_t i = 0; i < ctx->cs_t_n; ++i) {
         total += ctx->cs->elapsed_ms(ctx->cs_t0[i], ctx->cs_t1[i]);
     }
-    const bool ok = !ctx->cs_t_overflow;
+    // Device-wait serves time their own copies (one pair per landed batch);
+    // the quiesce in the drain above orders their fields before this read.
+    for (int32_t i = 0; i < ctx->dw_t_n; ++i) {
+        total += ctx->cs->elapsed_ms(ctx->dw_t0[i], ctx->dw_t1[i]);
+    }
+    const bool ok = !ctx->cs_t_overflow && !ctx->dw_t_overflow;
     *ms = total;
-    *bytes = ctx->cs_bytes;
+    *bytes = ctx->cs_bytes + ctx->dw_cs_bytes;
     ctx->cs_t_n = 0;
     ctx->cs_t_overflow = false;
     ctx->cs_bytes = 0;
+    ctx->dw_t_n = 0;
+    ctx->dw_t_overflow = false;
+    ctx->dw_cs_bytes = 0;
     return ok ? 1 : 0;
 }
+
+int32_t golem_take_sync_gap_stats(golem_ctx_t ctx, double * sync_ms, double * gap_ms, double * gap_max_ms,
+                                  uint64_t * n) {
+    if (ctx == NULL || sync_ms == NULL || gap_ms == NULL || gap_max_ms == NULL || n == NULL ||
+        !ctx->hooked.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    *sync_ms = ctx->sg_sync_ms;
+    *gap_ms = ctx->sg_gap_ms;
+    *gap_max_ms = ctx->sg_gap_max_ms;
+    *n = ctx->sg_n;
+    ctx->sg_pending = false;
+    ctx->sg_sync_ms = 0.0;
+    ctx->sg_gap_ms = 0.0;
+    ctx->sg_gap_max_ms = 0.0;
+    ctx->sg_n = 0;
+    return 1;
+}
+
+// Books one hooked MoE ids readback whose ids_backend synchronize started at
+// `t_sync` (design §11). Several readbacks before one split launch open a
+// single gap: its start stays at the FIRST open readback's return, since
+// ids_backend has had no new compute queued since then.
+static void golem_sg_readback(golem_ctx_t ctx, std::chrono::steady_clock::time_point t_sync) {
+    const auto now = std::chrono::steady_clock::now();
+    ctx->sg_sync_ms += std::chrono::duration<double, std::milli>(now - t_sync).count();
+    ctx->sg_n += 1;
+    if (!ctx->sg_pending) {
+        ctx->sg_t_ids = now;
+        ctx->sg_pending = true;
+    }
+}
+
+// Closes the open ids-readback gap at a split launch (design §11).
+static void golem_sg_launch(golem_ctx_t ctx) {
+    if (ctx == NULL || !ctx->sg_pending) {
+        return;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - ctx->sg_t_ids).count();
+    ctx->sg_gap_ms += ms;
+    ctx->sg_gap_max_ms = std::max(ctx->sg_gap_max_ms, ms);
+    ctx->sg_pending = false;
+}
+
+// --- Device-side landed wait (ABI v20; golem-hooks.h) ---
+
+static inline uint32_t golem_dw_ld(const uint32_t * p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static inline void golem_dw_st(uint32_t * p, uint32_t v) {
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
+int32_t golem_set_device_wait(golem_ctx_t ctx, ggml_backend_dev_t dev, int32_t mode, int32_t n_used, int32_t n_pred) {
+    if (ctx == NULL || ctx->dw_mem != nullptr || mode < 0 || mode > 2) {
+        return -1;
+    }
+    if (mode == 0) {
+        return 0;
+    }
+    // The landed mask is one 32-bit word per (blk, plane).
+    if (!ctx->async_h2d || ctx->cem_on.load(std::memory_order_acquire) || ctx->routing == nullptr ||
+        ctx->ensure == nullptr || ctx->evict_batch != nullptr || n_used < 1 || n_used > 32 || n_pred < 0) {
+        return -1;
+    }
+    if (dev == nullptr) {
+        return -1;
+    }
+    const golem_device_wait_iface * dw = (const golem_device_wait_iface *)
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "golem_device_wait_iface");
+    if (dw == nullptr) {
+        return -1;
+    }
+    const int32_t n_blk = (int32_t) (ctx->orders.size() / 3);
+    ctx->dw_n_used = n_used;
+    ctx->dw_n_pred = n_pred;
+    ctx->dw_stride = n_used + n_pred;
+    ctx->dw_n_blk = n_blk;
+    uint32_t * mem = (uint32_t *) dw->host_alloc(ctx->dw_words() * sizeof(uint32_t));
+    if (mem == nullptr) {
+        ctx->dw_n_blk = 0;
+        return -1;
+    }
+    ctx->dw_blk = std::vector<golem_ctx::golem_dw_blk>(n_blk);
+    ctx->dw_dense.reserve(n_used);
+    ctx->dw_routed.reserve(n_used);
+    ctx->dw_identity.reserve(ctx->n_experts);
+    ctx->dw_pending.reserve(n_used);
+    for (auto * v : { &ctx->dw_miss_kinds, &ctx->dw_miss_ids, &ctx->dw_miss_k, &ctx->dw_miss_j, &ctx->dw_miss_slot }) {
+        v->reserve((size_t) 3 * n_used);
+    }
+    ctx->dw_miss_out.reserve((size_t) 3 * n_used);
+    ctx->dw_miss_issued.reserve((size_t) 3 * n_used);
+    ctx->dw = dw;
+    ctx->dw_mem = mem;
+    ctx->dw_mode = mode == 2 || !dw->can_stream_wait(dev) ? 2 : 1;
+    return 0;
+}
+
+int32_t golem_device_wait_mode(golem_ctx_t ctx) {
+    return ctx != NULL ? ctx->dw_mode : 0;
+}
+
+int32_t golem_device_wait_ring(golem_ctx_t ctx, const uint32_t ** req_seq, int32_t * n_blk) {
+    if (ctx == NULL || ctx->dw_mem == nullptr || req_seq == NULL || n_blk == NULL) {
+        return 0;
+    }
+    *req_seq = ctx->dw_req();
+    *n_blk = ctx->dw_n_blk;
+    return 1;
+}
+
+// Lands every word of `mask` for (blk, k) by a host store: the unit's plane
+// bytes are already in the slab (valid from an earlier, drained compute) or
+// the compute is failing and its result is discarded.
+static void golem_dw_land_host(golem_ctx_t ctx, int32_t blk, int k, uint32_t mask, uint32_t seq) {
+    uint32_t * w = ctx->dw_landed(blk, k);
+    for (int i = 0; mask != 0; ++i, mask >>= 1) {
+        if (mask & 1u) {
+            golem_dw_st(&w[i], seq);
+        }
+    }
+}
+
+// Issues miss m's pool->slab H2D on the copy stream (from pinned pool memory)
+// and marks it for the landed write queued behind it.
+static void golem_dw_issue(golem_ctx_t ctx, int32_t blk, size_t m, const void * src, uint32_t * land_mask) {
+    golem_ctx::golem_dw_blk & B = ctx->dw_blk[blk];
+    const int k = ctx->dw_miss_k[m];
+    golem::GolemSlabEntry & st = *B.st[k];
+    const size_t off = (size_t) ctx->dw_miss_slot[m] * st.expert_size;
+    GGML_ASSERT(off + st.expert_size <= ggml_nbytes(st.slab));
+    ctx->cs->set_async(ctx->cs_backend, st.slab, src, off, st.expert_size);
+    ctx->dw_cs_bytes += st.expert_size;
+    ctx->dw_miss_issued[m] = 1;
+    land_mask[k] |= 1u << ctx->dw_miss_j[m];
+}
+
+// Serving thread: opens / closes one timed copy batch on the copy stream
+// (counted in h2d_ms beside the decode thread's pairs).
+static void golem_dw_time_open(golem_ctx_t ctx) {
+    if (ctx->dw_t_n < golem_ctx::GOLEM_CS_RING && ctx->dw_t0[ctx->dw_t_n] != nullptr) {
+        ctx->cs->record_copy(ctx->cs_backend, ctx->dw_t0[ctx->dw_t_n]);
+    } else {
+        ctx->dw_t_overflow = true;
+    }
+}
+
+static void golem_dw_time_close(golem_ctx_t ctx) {
+    if (ctx->dw_t_n < golem_ctx::GOLEM_CS_RING && ctx->dw_t1[ctx->dw_t_n] != nullptr) {
+        ctx->cs->record_copy(ctx->cs_backend, ctx->dw_t1[ctx->dw_t_n]);
+        ctx->dw_t_n++;
+    } else {
+        ctx->dw_t_overflow = true;
+    }
+}
+
+// Serving thread: dc_mutex, bounded. The decode thread never holds it while
+// the compute stream waits on a landed word this serve has yet to write
+// (golem_dw_setup quiesces first); a holder past 120 s is that deadlock, so
+// it aborts with the blk instead of hanging both threads.
+static std::unique_lock<std::mutex> golem_dw_lock(golem_ctx_t ctx, int32_t blk) {
+    std::unique_lock<std::mutex> lk(ctx->dc_mutex, std::try_to_lock);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!lk.owns_lock()) {
+        std::this_thread::yield();
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(120)) {
+            GGML_ABORT("golem device wait: serve of blk %d could not take the slot table lock in 120 s -- "
+                       "the decode thread holds it while waiting on this layer's landed words", blk);
+        }
+        lk.try_lock();
+    }
+    return lk;
+}
+
+int32_t golem_device_wait_serve(golem_ctx_t ctx, int32_t blk, uint32_t seq) {
+    if (ctx == NULL || ctx->dw_mem == nullptr || blk < 0 || blk >= ctx->dw_n_blk || seq == 0) {
+        return -1;
+    }
+    golem_ctx::golem_dw_blk & B = ctx->dw_blk[blk];
+    if (B.host_seq.load(std::memory_order_acquire) != seq || B.served_seq >= seq ||
+        golem_dw_ld(&ctx->dw_req()[blk]) != seq) {
+        return -1;
+    }
+    B.served_seq = seq;
+    const int32_t n_used = ctx->dw_n_used;
+    const int32_t n_expert = B.n_expert;
+    const uint32_t * ring = ctx->dw_ids(blk);
+    auto & dense = ctx->dw_dense;
+    dense.resize(n_used);
+    for (int32_t i = 0; i < n_used; ++i) {
+        const uint32_t id = golem_dw_ld(&ring[i]);
+        GGML_ASSERT(id < (uint32_t) n_expert && "golem device wait: routed id out of range");
+        dense[i] = (int32_t) id;
+    }
+    {
+        golem_cb_guard cb;
+        ctx->routing(ctx->payload, blk, B.inp[0], dense.data(), n_used, n_expert);
+    }
+    if (ctx->predict != nullptr) {
+        int32_t off = n_used;
+        for (int32_t t = 0; t < B.n_pred_t; ++t) {
+            // the prediction ids are plain words of the published ring slot
+            golem_cb_guard cb;
+            ctx->predict(ctx->payload, blk, B.pred_target[t], (const int32_t *) &ring[off], B.pred_n[t]);
+            off += B.pred_n[t];
+        }
+    }
+    auto & routed = ctx->dw_routed;
+    routed.assign(dense.begin(), dense.end());
+    std::sort(routed.begin(), routed.end());
+    routed.erase(std::unique(routed.begin(), routed.end()), routed.end());
+
+    ctx->dw_miss_kinds.clear();
+    ctx->dw_miss_ids.clear();
+    ctx->dw_miss_k.clear();
+    ctx->dw_miss_j.clear();
+    ctx->dw_miss_slot.clear();
+    uint32_t host_mask[3] = { 0, 0, 0 };
+    {
+        // Slot assignment happens here, at claim time, in routed order --
+        // never in read-completion order (I1).
+        std::unique_lock<std::mutex> lk = golem_dw_lock(ctx, blk);
+        golem::GolemLayerSlots & L = ctx->layers[blk];
+        for (int k = 0; k < 3; ++k) {
+            golem::GolemSlabEntry & st = *B.st[k];
+            const int32_t * order = golem_policy_order(ctx, B.inp[k], n_expert);
+            if (order == nullptr) {
+                if (!ctx->order_warned.exchange(true)) {
+                    GGML_LOG_WARN("%s: golem eviction order not yet published (blk %d); identity order in effect\n",
+                                  __func__, blk);
+                }
+                ctx->dw_identity.resize(n_expert);
+                for (int32_t i = 0; i < n_expert; ++i) {
+                    ctx->dw_identity[i] = i;
+                }
+                order = ctx->dw_identity.data();
+            }
+            ctx->dw_pending.clear();
+            const golem::GolemSlabCounters c = golem::golem_slab_step_ev(L, k, routed, dense.data(), n_used, order,
+                B.K, n_expert, st.remap, nullptr,
+                [&](int32_t slot, int32_t id) { ctx->dw_pending.emplace_back(slot, id); }, nullptr);
+            GGML_ASSERT((int32_t) st.remap.size() == n_used);
+            uint32_t * remap = ctx->dw_remap(blk, k);
+            for (int32_t i = 0; i < n_used; ++i) {
+                golem_dw_st(&remap[i], (uint32_t) st.remap[i]);
+            }
+            uint32_t miss_mask = 0;
+            for (const auto & pr : ctx->dw_pending) {
+                for (int32_t i = 0; i < n_used; ++i) {
+                    if (dense[i] == pr.second) {
+                        ctx->dw_miss_kinds.push_back(k + 1);
+                        ctx->dw_miss_ids.push_back(pr.second);
+                        ctx->dw_miss_k.push_back(k);
+                        ctx->dw_miss_j.push_back(i);
+                        ctx->dw_miss_slot.push_back(pr.first);
+                        miss_mask |= 1u << i;
+                        break;
+                    }
+                }
+            }
+            host_mask[k] = (n_used == 32 ? ~0u : ((1u << n_used) - 1u)) & ~miss_mask;
+            ctx->dc_stats.bytes_copied.fetch_add(c.copied * st.expert_size, std::memory_order_relaxed);
+            ctx->dc_stats.cache_experts_copied.fetch_add(c.copied, std::memory_order_relaxed);
+            ctx->dc_stats.bytes_skipped.fetch_add(c.skipped * st.expert_size, std::memory_order_relaxed);
+            ctx->dc_stats.evictions.fetch_add(c.evicted, std::memory_order_relaxed);
+        }
+    }
+    // Units already in the slab land now; the remap above is visible first.
+    for (int k = 0; k < 3; ++k) {
+        golem_dw_land_host(ctx, blk, k, host_mask[k], seq);
+    }
+    int32_t rc = 0;
+    const size_t n_miss = ctx->dw_miss_ids.size();
+    if (n_miss != 0) {
+        ctx->dw_miss_out.assign(n_miss, nullptr);
+        ctx->dw_miss_issued.assign(n_miss, 0);
+        // ABI v17 hits_ready: RAM-resident hits go to the copy stream before
+        // the pool blocks on the disk read of the misses; each landed word is
+        // queued behind its copy, so it is never set before the slab holds
+        // the bytes (and only after the unit's last byte reached the pool).
+        auto hits_ready = [&](const void * const * hits) {
+            uint32_t land[3] = { 0, 0, 0 };
+            bool timed = false;
+            for (size_t m = 0; m < n_miss; ++m) {
+                if (hits[m] != nullptr) {
+                    if (!timed) {
+                        golem_dw_time_open(ctx);
+                        timed = true;
+                    }
+                    golem_dw_issue(ctx, blk, m, hits[m], land);
+                }
+            }
+            if (timed) {
+                golem_dw_time_close(ctx);
+            }
+            for (int k = 0; k < 3; ++k) {
+                if (land[k] != 0) {
+                    ctx->dw->land_copy(ctx->cs_backend, ctx->dw_landed(blk, k), land[k], seq);
+                }
+            }
+            ctx->dc_stats.early_h2d_units.fetch_add(
+                (uint64_t) std::count(ctx->dw_miss_issued.begin(), ctx->dw_miss_issued.end(), (uint8_t) 1),
+                std::memory_order_relaxed);
+        };
+        using hits_ready_t = decltype(hits_ready);
+        {
+            golem_cb_guard cb;
+            rc = ctx->ensure(ctx->payload, B.inp[0], ctx->dw_miss_kinds.data(), ctx->dw_miss_ids.data(),
+                             (int32_t) n_miss, ctx->dw_miss_out.data(),
+                             [](void * ud, const void * const * hits) { (*(hits_ready_t *) ud)(hits); },
+                             &hits_ready);
+        }
+        uint32_t land[3] = { 0, 0, 0 };
+        if (rc == 0) {
+            bool timed = false;
+            for (size_t m = 0; m < n_miss; ++m) {
+                if (!ctx->dw_miss_issued[m]) {
+                    GGML_ASSERT(ctx->dw_miss_out[m] != nullptr);
+                    if (!timed) {
+                        golem_dw_time_open(ctx);
+                        timed = true;
+                    }
+                    golem_dw_issue(ctx, blk, m, ctx->dw_miss_out[m], land);
+                }
+            }
+            if (timed) {
+                golem_dw_time_close(ctx);
+            }
+            for (int k = 0; k < 3; ++k) {
+                if (land[k] != 0) {
+                    ctx->dw->land_copy(ctx->cs_backend, ctx->dw_landed(blk, k), land[k], seq);
+                }
+            }
+        } else {
+            // ABI v13: the misses could not be paged in. Their slots hold no
+            // current bytes: drop their validity, land the words so the
+            // device does not hang, and fail the compute at its end.
+            std::unique_lock<std::mutex> lk = golem_dw_lock(ctx, blk);
+            golem::GolemLayerSlots & L = ctx->layers[blk];
+            for (size_t m = 0; m < n_miss; ++m) {
+                if (!ctx->dw_miss_issued[m]) {
+                    ggml_bitset_clear(L.valid[ctx->dw_miss_k[m]].data(), ctx->dw_miss_slot[m]);
+                    land[ctx->dw_miss_k[m]] |= 1u << ctx->dw_miss_j[m];
+                }
+            }
+            for (int k = 0; k < 3; ++k) {
+                golem_dw_land_host(ctx, blk, k, land[k], seq);
+            }
+            ctx->dw_failed.store(1, std::memory_order_release);
+        }
+    }
+    ctx->dw_served_total.fetch_add(1, std::memory_order_relaxed);
+    ctx->dw_served.fetch_add(1, std::memory_order_release);
+    return rc != 0 ? 1 : 0;
+}
+
+// Decode thread: waits until every request published this compute has been
+// served (every copy and landed write is queued). Required before the copy
+// stream is waited on from the compute stream, before it is drained, and
+// before any other hook runs on the decode thread.
+static void golem_dw_quiesce(golem_ctx_t ctx) {
+    if (ctx == NULL || ctx->dw_published == 0) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    while (ctx->dw_served.load(std::memory_order_acquire) < ctx->dw_published) {
+        std::this_thread::yield();
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(120)) {
+            GGML_ABORT("golem device wait: %u of %u published layer requests unserved after 120 s -- "
+                       "no controller is serving the ring", ctx->dw_served.load(), ctx->dw_published);
+        }
+    }
+}
+
+// Decode thread, at every compute exit: quiesce, then close the compute.
+static void golem_dw_finish(golem_ctx_t ctx) {
+    if (ctx == NULL || ctx->dw_mem == nullptr) {
+        return;
+    }
+    golem_dw_quiesce(ctx);
+    golem_dw_st(&ctx->dw_req()[ctx->dw_n_blk], 0);
+    ctx->dw_published = 0;
+    ctx->dw_served.store(0, std::memory_order_relaxed);
+}
+
+void golem_device_wait_stats(golem_ctx_t ctx, uint64_t * served, uint64_t * computes) {
+    if (served != NULL) {
+        *served = ctx != NULL ? ctx->dw_served_total.load(std::memory_order_relaxed) : 0;
+    }
+    if (computes != NULL) {
+        *computes = ctx != NULL ? ctx->dw_host_computes.load(std::memory_order_relaxed) : 0;
+    }
+}
+
+#ifdef GOLEM_TEST_SUPPORT
+int32_t golem_device_wait_probe(ggml_backend_dev_t dev, int32_t mode) {
+    if (dev == nullptr || (mode != 1 && mode != 2)) {
+        return -1;
+    }
+    const golem_device_wait_iface * dw = (const golem_device_wait_iface *)
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "golem_device_wait_iface");
+    if (dw == nullptr || (mode == 1 && !dw->can_stream_wait(dev))) {
+        return -1;
+    }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    if (be == nullptr) {
+        return -1;
+    }
+    uint32_t * w = (uint32_t *) dw->host_alloc(2 * sizeof(uint32_t));
+    GGML_ASSERT(w != nullptr);
+    // Compute stream: wait for w[0] >= 7, then gather w[0] into a device
+    // tensor. The stream must stay blocked until the host stores 7, and the
+    // gathered value must be 7 (the gather ran after the wait released).
+    struct ggml_init_params ip = { 512, nullptr, true };
+    struct ggml_context * tctx = ggml_init(ip);
+    struct ggml_tensor * t = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, 1);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(tctx, be);
+    GGML_ASSERT(buf != nullptr);
+    dw->wait(be, mode, &w[0], 1, 7);
+    dw->gather(be, t, &w[0], 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    int32_t rc = dw->compute_idle(be) ? 1 : 0; // must still be blocked
+    golem_dw_st(&w[0], 7);
+    ggml_backend_synchronize(be);
+    int32_t got = 0;
+    ggml_backend_tensor_get(t, &got, 0, sizeof(got));
+    if (got != 7) {
+        rc = 1;
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(tctx);
+    dw->host_free(w);
+    ggml_backend_free(be);
+    return rc;
+}
+#endif
 
 int32_t golem_take_victim_ring_stats(golem_ctx_t ctx, uint64_t * ring_units, uint64_t * ring_full,
                                      double * d2h_ms, uint64_t * d2h_bytes) {
@@ -2407,6 +2973,8 @@ static thread_local std::atomic<uint64_t> step_id{0};
 // join mutex, so an unregister waiter that checked the predicate before this
 // decrement cannot miss the wakeup (lost-wakeup).
 static void golem_in_flight_done(golem_ctx_t gctx) {
+    // Close the compute's device-wait window on every exit path.
+    golem_dw_finish(gctx);
     {
         std::lock_guard<std::mutex> lk(gctx->join_mutex);
         gctx->in_flight.fetch_sub(1, std::memory_order_acq_rel);
@@ -2602,6 +3170,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
     };
+    // Device-side landed wait (ABI v20): a decode compute (one token)
+    // whose MoE layers' ids and predictions are device tensors of the split
+    // backend publishes them to the mapped ring and waits on the device for
+    // the landed words; the controller serves the layer off this thread.
+    // golem_dw_plane[input index of the split] = (blk, plane) for planes
+    // served that way. Decode only: prefill keeps the host-sync path.
+    struct golem_dw_plane_ref {
+        int split_id;
+        int input_id;
+        int blk;
+        int k;
+    };
+    static thread_local std::vector<golem_dw_plane_ref> golem_dw_planes;
+    golem_dw_planes.clear();
+    const bool golem_dw_on = golem_hooked && gctx->dw_mem != nullptr && gctx->ensure != NULL &&
+                             gctx->routing != NULL && gctx->evict_batch == NULL &&
+                             !gctx->stream_on.load(std::memory_order_acquire) && !golem_cem_on;
+    if (golem_dw_on) {
+        GGML_ASSERT(gctx->dw_published == 0);
+        gctx->dw_failed.store(0, std::memory_order_relaxed);
+        gctx->dw_served.store(0, std::memory_order_relaxed);
+        if (gctx->dw_seq == UINT32_MAX - 1) {
+            // Sequence wrap (≈4e9 computes): every word restarts from zero.
+            memset(gctx->dw_mem, 0, gctx->dw_words() * sizeof(uint32_t));
+            for (auto & B : gctx->dw_blk) {
+                B.host_seq.store(0, std::memory_order_relaxed);
+                B.served_seq = 0;
+            }
+            gctx->dw_seq = 0;
+        }
+        gctx->dw_seq++;
+    }
+    const uint32_t golem_dw_seq = golem_dw_on ? gctx->dw_seq : 0;
+    // A layer of this compute fell back to the host-sync ids readback.
+    bool golem_dw_host_readback = false;
+
     // P5: prediction nodes named golem_pred-<target blk>-<source blk>, indexed
     // once per compute (one strncmp per node) and delivered in the source
     // layer's pre-pass, right after its ids readback synchronized the device.
@@ -2900,7 +3504,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // its full extent, then index by nb[]
                 ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                 ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                const auto golem_t_sync = std::chrono::steady_clock::now();
                 ggml_backend_synchronize(ids_backend);
+                if (golem_hooked) {
+                    // §11: the gap closes at the next split launch (golem_sg_launch).
+                    golem_sg_readback(gctx, golem_t_sync);
+                }
                 // find the used experts
                 used_ids.clear();
                 used_ids.resize(ggml_bitset_size(n_expert));
@@ -2926,6 +3535,164 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             return ids_tensor;
         };
 
+        // Device-side landed wait (ABI v20): sets up blk(input)'s request --
+        // its three planes' slabs (this split and the following ones of the
+        // same compute), prediction tensors and ring slot -- and publishes it
+        // on the compute stream. Returns 1 published (the planes are served
+        // off-thread), 0 not eligible (host-sync path), -1 slab allocation
+        // failed (ABI v12).
+        auto golem_dw_setup = [&](int input_id, struct ggml_tensor * input, struct ggml_tensor * ids_orig) -> int {
+            const int blk = golem_tensor_blk(input->name);
+            const int32_t n_used = gctx->dw_n_used;
+            if (blk < 0 || blk >= gctx->dw_n_blk || ids_orig->ne[1] != 1 || ids_orig->ne[0] != n_used ||
+                ids_orig->type != GGML_TYPE_I32 || ggml_backend_sched_get_tensor_backend(sched, ids_orig) != split_backend ||
+                ids_orig->buffer == nullptr || ggml_backend_buffer_is_host(ids_orig->buffer)) {
+                return 0;
+            }
+            // The publish reads the ids and predictions when it runs on the
+            // compute stream, before this split's graph: they must come from
+            // an earlier split (on GLM the router precedes the weights split).
+            auto in_split = [&](const struct ggml_tensor * t) {
+                const struct ggml_tensor * base = t->view_src != nullptr ? t->view_src : t;
+                for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
+                    const struct ggml_tensor * n = split->graph.nodes[ni];
+                    if (n == t || n == base) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            if (in_split(ids_orig)) {
+                return 0;
+            }
+            golem_ctx::golem_dw_blk & B = gctx->dw_blk[blk];
+            // Find the layer's three planes: this split from input_id, then the
+            // next splits on the same backend (one plane per split on GLM).
+            struct ggml_tensor * planes[3] = { nullptr, nullptr, nullptr };
+            int plane_split[3] = { -1, -1, -1 };
+            int plane_input[3] = { -1, -1, -1 };
+            for (int sj = split_id; sj < sched->n_splits; ++sj) {
+                struct ggml_backend_sched_split * sp = &splits[sj];
+                if (sp->backend_id != split_backend_id) {
+                    break;
+                }
+                for (int j = (sj == split_id ? input_id : 0); j < sp->n_inputs; ++j) {
+                    struct ggml_tensor * inp = sp->inputs[j];
+                    const int kind = golem_expert_stem_kind(inp->name);
+                    if (kind == 0 || golem_tensor_blk(inp->name) != blk || planes[kind - 1] != nullptr) {
+                        continue;
+                    }
+                    if (!(ggml_backend_buffer_get_usage(inp->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                          ggml_backend_buffer_is_host(inp->buffer)) || inp->ne[2] != input->ne[2]) {
+                        return 0;
+                    }
+                    planes[kind - 1] = inp;
+                    plane_split[kind - 1] = sj;
+                    plane_input[kind - 1] = j;
+                }
+                if (planes[0] != nullptr && planes[1] != nullptr && planes[2] != nullptr) {
+                    break;
+                }
+            }
+            if (planes[0] == nullptr || planes[1] == nullptr || planes[2] == nullptr) {
+                return 0; // fused gate_up or a plane outside this backend's run
+            }
+            // P5 predictions sourced at this blk must be device tensors of the
+            // split backend computed by now (the ring carries them).
+            golem_dw_publish pub = {};
+            int32_t n_pred_words = 0;
+            B.n_pred_t = 0;
+            for (const auto & pr : golem_preds) {
+                if (pr.src != blk) {
+                    continue;
+                }
+                if (pub.n_pred_tensors == GOLEM_DW_MAX_PRED || in_split(pr.t) ||
+                    ggml_backend_sched_get_tensor_backend(sched, pr.t) != split_backend ||
+                    pr.t->buffer == nullptr || ggml_backend_buffer_is_host(pr.t->buffer) ||
+                    n_pred_words + (int32_t) pr.t->ne[0] > gctx->dw_n_pred) {
+                    return 0;
+                }
+                pub.pred[pub.n_pred_tensors] = pr.t;
+                pub.n_pred[pub.n_pred_tensors] = (int32_t) pr.t->ne[0];
+                B.pred_target[pub.n_pred_tensors] = pr.target;
+                B.pred_n[pub.n_pred_tensors] = (int32_t) pr.t->ne[0];
+                pub.n_pred_tensors++;
+                n_pred_words += (int32_t) pr.t->ne[0];
+            }
+            B.n_pred_t = pub.n_pred_tensors;
+            const int32_t K_cfg = gctx->k_cfg.load(std::memory_order_relaxed);
+            if (K_cfg <= 0) {
+                GGML_ABORT("golem P2: device cache budget unset (K=%d): the slab must be "
+                           "bounded by golem_set_device_cache_experts, never by the expert count", (int) K_cfg);
+            }
+            const int32_t n_expert = (int32_t) input->ne[2];
+            const int32_t K = std::min<int32_t>(K_cfg, n_expert);
+            if (n_used > K) {
+                return 0;
+            }
+            {
+                std::unique_lock<std::mutex> lk(gctx->dc_mutex);
+                // Any slab or ids (re)allocation may synchronize the device,
+                // which may sit behind an earlier layer's landed wait; that
+                // layer's serve needs dc_mutex to land. Every serve of this
+                // compute finishes first, so the sync never waits on an
+                // unserved word.
+                bool sync = false;
+                for (int k = 0; k < 3; ++k) {
+                    sync = sync || golem_slab_prepare_reallocs(gctx->dc[planes[k]->data], planes[k], K, n_used, 1);
+                }
+                if (sync && gctx->dw_published != 0) {
+                    lk.unlock();
+                    golem_dw_quiesce(gctx);
+                    lk.lock();
+                }
+                golem::GolemLayerSlots & L = gctx->layers[blk];
+                for (int k = 0; k < 3; ++k) {
+                    golem::GolemSlabEntry & st = gctx->dc[planes[k]->data];
+                    if (!golem_slab_prepare(gctx, st, L, planes[k], k + 1, K, n_used, 1, split_backend)) {
+                        return -1;
+                    }
+                    B.inp[k] = planes[k];
+                    B.st[k] = &st;
+                }
+            }
+            B.K = K;
+            B.n_expert = n_expert;
+            // The copy stream is bound before any serve can use it. No
+            // compute->copy fence: the previous compute's reads of these slots
+            // were drained at entry, and within this compute the layer's slab
+            // is read only after its own landed wait. (A fence here would make
+            // the copy stream wait behind an earlier layer's landed wait whose
+            // landed write is queued on the same copy stream: a deadlock.)
+            if (!golem_cs_bind(gctx, split_backend)) {
+                GGML_ABORT("golem device wait on a backend without a copy stream");
+            }
+            GGML_ASSERT(gctx->cs_backend == split_backend && "golem device wait: one device backend per ctx");
+            for (int k = 0; k < 3; ++k) {
+                golem_dw_plane_ref r = { plane_split[k], plane_input[k], blk, k };
+                golem_dw_planes.push_back(r);
+            }
+            pub.ids = ids_orig;
+            pub.n_ids = n_used;
+            pub.dst = gctx->dw_ids(blk);
+            pub.req = &gctx->dw_req()[blk];
+            pub.seq = golem_dw_seq;
+            B.host_seq.store(golem_dw_seq, std::memory_order_release);
+            golem_dw_st(&gctx->dw_req()[gctx->dw_n_blk], golem_dw_seq);
+            gctx->dw->publish(split_backend, &pub);
+            gctx->dw_published++;
+            return 1;
+        };
+        // The plane of (split_id, input_id) when device wait serves it.
+        auto golem_dw_plane_of = [&](int input_id) -> const golem_dw_plane_ref * {
+            for (const auto & r : golem_dw_planes) {
+                if (r.split_id == split_id && r.input_id == input_id) {
+                    return &r;
+                }
+            }
+            return nullptr;
+        };
+
         // Golem: layer-level miss hoisting pre-pass over split->inputs,
         // grouped by golem_tensor_blk — ONE ensure_host_resident call per
         // (layer, step, split-segment) with all planes' misses (a layer
@@ -2943,6 +3710,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_tensor * input = split->inputs[input_id];
                 if (golem_expert_stem_kind(input->name) == 0) {
                     continue;
+                }
+                if (golem_dw_on && golem_dw_plane_of(input_id) != nullptr) {
+                    continue; // served off-thread (device-side landed wait)
                 }
                 struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
                 // the layer's expert input feeds a MUL_MAT_ID node somewhere in
@@ -2980,11 +3750,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (ggml_nelements(ids_orig) == 0) {
                     continue;
                 }
+                if (golem_dw_on && golem_tensor_blk(input->name) != done_blk) {
+                    const int dw_rc = golem_dw_setup(input_id, input, ids_orig);
+                    if (dw_rc < 0) {
+                        golem_cem_join(gctx);
+                        golem_restore_ids();
+                        for (int i = 0; i < sched->n_backends; i++) {
+                            ggml_backend_synchronize(sched->backends[i]);
+                        }
+                        golem_drain_copy_stream(gctx);
+                        gctx->sg_pending = false;
+                        golem_in_flight_done(gctx);
+                        return GGML_STATUS_ALLOC_FAILED;
+                    }
+                    if (dw_rc > 0) {
+                        done_blk = golem_tensor_blk(input->name);
+                        continue;
+                    }
+                }
                 if (ids_orig != prev_ids_tensor) {
+                    // Host-path hooks never run beside a device-wait serve.
+                    golem_dw_quiesce(gctx);
+                    golem_dw_host_readback = true;
                     ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched, ids_orig);
                     ids.resize(ggml_nbytes(ids_orig) / sizeof(int32_t));
                     ggml_backend_tensor_get_async(ids_backend, ids_orig, ids.data(), 0, ggml_nbytes(ids_orig));
+                    const auto golem_t_sync = std::chrono::steady_clock::now();
                     ggml_backend_synchronize(ids_backend);
+                    golem_sg_readback(gctx, golem_t_sync);
                     used_ids.clear();
                     used_ids.resize(ggml_bitset_size(n_expert));
                     for (int64_t i1 = 0; i1 < ids_orig->ne[1]; i1++) {
@@ -3285,96 +4078,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // ids, so slot assignment + eviction run once per layer; the
                             // table lives past any single slab's (re)allocation.
                             golem::GolemLayerSlots & L = gctx->layers[blk];
-                            // (Re)allocate the slab + remapped-ids tensor on
-                            // fingerprint change. The slab is zeroed once (the
-                            // padding slot must stay non-NaN); its plane bytes
-                            // are written only by the copies below.
-                            const size_t expert_size_j = inp->nb[2];
-                            if (st.slab == nullptr || st.K != K || st.expert_size != expert_size_j) {
-                                if (st.buf != nullptr) {
-                                    ggml_backend_buffer_free(st.buf);
-                                }
-                                if (st.ctx != nullptr) {
-                                    ggml_free(st.ctx);
-                                }
-                                struct ggml_init_params ip = { 512, nullptr, /* no_alloc */ true };
-                                st.ctx = ggml_init(ip);
-                                GGML_ASSERT(st.ctx != nullptr);
-                                st.slab = ggml_new_tensor_3d(st.ctx, inp->type,
-                                    inp->ne[0], inp->ne[1], (int64_t) K + 1);
-                                GGML_ASSERT(st.slab != nullptr);
-                                // ABI v12: a slab that no longer fits (VRAM taken
-                                // after load) fails the compute, never the process;
-                                // the engine resets the cache and lowers K.
-#ifdef GOLEM_TEST_SUPPORT
-                                const bool inject = gctx->slab_fail_inject.load(std::memory_order_relaxed) > 0 &&
-                                                    gctx->slab_fail_inject.fetch_sub(1, std::memory_order_relaxed) > 0;
-                                st.buf = inject ? nullptr : ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
-#else
-                                st.buf = ggml_backend_alloc_ctx_tensors(st.ctx, split_backend);
-#endif
-                                if (st.buf == nullptr) {
-                                    ggml_free(st.ctx);
-                                    st.ctx = nullptr;
-                                    st.slab = nullptr;
-                                    st.K = 0;
-                                    golem::golem_layer_invalidate(L, kind - 1);
-                                    gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
-                                    golem_slab_failed = true;
-                                } else {
-                                    GGML_ASSERT(st.slab->nb[2] == expert_size_j);
-                                    ggml_backend_buffer_clear(st.buf, 0);
-                                    st.K = K;
-                                    st.expert_size = expert_size_j;
-                                    // The slab's device bytes are gone: this plane must
-                                    // re-copy everything on its next step.
-                                    golem::golem_layer_invalidate(L, kind - 1);
-                                }
-                            }
-                            if (golem_slab_failed) {
+                            if (!golem_slab_prepare(gctx, st, L, inp, kind, K, node2->src[2]->ne[0],
+                                                    node2->src[2]->ne[1], split_backend)) {
+                                golem_slab_failed = true;
                                 break;
-                            }
-                            // Remapped-ids device tensor: resized on ids-shape
-                            // change (slot validity is independent of it).
-                            if (st.ids_dev == nullptr || st.ids_ne0 != (int64_t) node2->src[2]->ne[0] ||
-                                st.ids_ne1 != (int64_t) node2->src[2]->ne[1]) {
-                                // A prior step's H2D may still be reading the old
-                                // ids_pin (and the old ids_dev may be queued behind
-                                // graph work); drain before freeing either buffer.
-                                // One sync per ids-shape change, not per step.
-                                ggml_backend_synchronize(split_backend);
-                                if (st.ids_buf != nullptr) {
-                                    ggml_backend_buffer_free(st.ids_buf);
-                                }
-                                if (st.ids_ctx != nullptr) {
-                                    ggml_free(st.ids_ctx);
-                                }
-                                struct ggml_init_params ip = { 512, nullptr, /* no_alloc */ true };
-                                st.ids_ctx = ggml_init(ip);
-                                GGML_ASSERT(st.ids_ctx != nullptr);
-                                st.ids_dev = ggml_new_tensor_2d(st.ids_ctx, GGML_TYPE_I32,
-                                    node2->src[2]->ne[0], node2->src[2]->ne[1]);
-                                GGML_ASSERT(st.ids_dev != nullptr);
-                                st.ids_buf = ggml_backend_alloc_ctx_tensors(st.ids_ctx, split_backend);
-                                if (st.ids_buf == nullptr) {
-                                    // Same ABI v12 path as the slab: fail the compute.
-                                    ggml_free(st.ids_ctx);
-                                    st.ids_ctx = nullptr;
-                                    st.ids_dev = nullptr;
-                                    st.ids_ne0 = st.ids_ne1 = 0;
-                                    gctx->slab_alloc_failures.fetch_add(1, std::memory_order_relaxed);
-                                    golem_slab_failed = true;
-                                    break;
-                                }
-                                st.ids_ne0 = node2->src[2]->ne[0];
-                                st.ids_ne1 = node2->src[2]->ne[1];
-                                // Pinned staging for the H2D below: (re)allocated
-                                // under this SAME ids-shape-change condition as
-                                // ids_dev, so its registration never outlives the
-                                // device it was pinned against. Pinnedness is
-                                // load-bearing: assert it so a regression to
-                                // pageable memory cannot pass silently.
-                                golem_ids_pin_alloc(st, split_backend, node2->src[2]->ne[0], node2->src[2]->ne[1]);
                             }
                             // Slab step: decide skips/copies/evictions + remap.
                             plan.dc = golem::golem_slab_step_ev(L, kind - 1, plan.routed, golem_dense.data(),
@@ -3427,6 +4134,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (!golem_evict_d2h.empty()) {
                         golem_evict_abandon_unfinished();
                     }
+                    // The failed compute never launches: drop its open §11 gap.
+                    gctx->sg_pending = false;
                     golem_in_flight_done(gctx);
                     return GGML_STATUS_ALLOC_FAILED;
                 }
@@ -3627,6 +4336,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (!golem_evict_d2h.empty()) {
                             golem_evict_abandon_unfinished();
                         }
+                        // The failed compute never launches: drop its open §11 gap.
+                        gctx->sg_pending = false;
                         golem_in_flight_done(gctx);
                         return GGML_STATUS_FAILED;
                     }
@@ -3685,6 +4396,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // Device-side landed wait (ABI v20): the plane's slab is written
+                // off-thread from the pool on the copy stream; the compute
+                // stream waits on the device for each routed unit's landed
+                // word, then gathers the remapped ids. No host sync, and the
+                // split's weights copy is never written (src[0] moves to the slab).
+                const golem_dw_plane_ref * dwp = golem_dw_on ? golem_dw_plane_of(input_id) : nullptr;
+                if (dwp != nullptr) {
+                    const golem_ctx::golem_dw_blk & B = gctx->dw_blk[dwp->blk];
+                    golem::GolemSlabEntry & st = *B.st[dwp->k];
+                    gctx->dw->wait(split_backend, gctx->dw_mode, gctx->dw_landed(dwp->blk, dwp->k),
+                                   gctx->dw_n_used, golem_dw_seq);
+                    gctx->dw->gather(split_backend, st.ids_dev, gctx->dw_remap(dwp->blk, dwp->k), gctx->dw_n_used);
+                    bool redirected = false;
+                    for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
+                        struct ggml_tensor * n2 = split->graph.nodes[ni];
+                        if (n2->op == GGML_OP_MUL_MAT_ID && n2->src[0] == input_cpy) {
+                            golem_ids_redirects.emplace_back(&n2->src[0], n2->src[0]);
+                            n2->src[0] = st.slab;
+                            golem_ids_redirects.emplace_back(&n2->src[2], n2->src[2]);
+                            n2->src[2] = st.ids_dev;
+                            redirected = true;
+                        }
+                    }
+                    GGML_ASSERT(redirected && "golem device wait: plane without its MUL_MAT_ID");
+                    continue;
+                }
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -4066,6 +4803,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             golem_cs_join(gctx, golem_cs_pair_open);
         }
 
+        if (golem_hooked) {
+            golem_sg_launch(gctx);
+        }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             // Prefill stream: the compute above consumed this split's slabs --
@@ -4173,7 +4913,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (golem_hooked) {
         golem_cem_join(gctx);
         golem_drain_copy_stream(gctx);
+        // A device-wait serve whose page-in failed landed its words over
+        // stale slots: the compute's result is garbage, so it fails (ABI v13).
+        if (golem_dw_on && gctx->dw_published != 0 && !golem_dw_host_readback) {
+            gctx->dw_host_computes.fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool dw_failed = golem_dw_on && gctx->dw_failed.load(std::memory_order_acquire) != 0;
+        if (dw_failed) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
+        }
         golem_in_flight_done(gctx);
+        if (dw_failed) {
+            return GGML_STATUS_FAILED;
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -4988,6 +5742,9 @@ void golem_ctx_free(golem_ctx_t ctx) {
     GGML_ASSERT(ctx->cem_pending_blk == -1);
     if (ctx->cem_worker != nullptr) {
         ctx->cem_if->destroy(ctx->cem_worker);
+    }
+    if (ctx->dw_mem != nullptr) {
+        ctx->dw->host_free(ctx->dw_mem);
     }
     delete ctx;
 }

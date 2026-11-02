@@ -1917,8 +1917,8 @@ impl SessionInner {
             // §11 step boundary: snapshot (and reset) the P3/store
             // accumulators into this step's row; a prefill-only decode's
             // are discarded, not charged to the next generation row. H2D is
-            // measured only on the async_h2d copy stream; policy stays
-            // unmeasured.
+            // measured only on the async_h2d copy stream; policy and the ids
+            // readback columns only while the P3 hooks are registered.
             let io = p3_glue::take_step_io_stats();
             let cpu_expert = io.cpu_expert;
             if let Some(c) = &cpu_expert {
@@ -1942,7 +1942,8 @@ impl SessionInner {
                 disk_bytes: io.disk_bytes.unwrap_or(0),
                 h2d_ms: io.h2d.map_or(f64::NAN, |h| h.0),
                 h2d_bytes: io.h2d.map_or(0, |h| h.1),
-                policy_ms: f64::NAN,
+                policy_ms: io.policy_ns.map_or(f64::NAN, ns2ms),
+                sync_gap: io.sync_gap,
                 cpu_expert,
                 victim_ring,
             });
