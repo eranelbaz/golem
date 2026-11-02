@@ -655,6 +655,9 @@ pub struct PlanInput {
     /// after load; subtracted before the derived cache, so neither
     /// `vram_experts_frac` nor an explicit K can claim it.
     pub vram_reserve: u64,
+    /// Exclusive-residency VRAM victim ring slots (§6.3 O10), each
+    /// 3 × max plane stride; 0 = off.
+    pub victim_ring_slots: u32,
     /// Workspace model.
     pub ws: WsModel,
 }
@@ -793,6 +796,10 @@ pub fn vram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
             bytes: stream_bytes(m, i) + u64::from(i.prefill_stream) * 2 * m.max_plane_stride,
         },
         Term {
+            name: "victim_ring",
+            bytes: victim_ring_bytes(m, i),
+        },
+        Term {
             name: "rocm_overhead",
             bytes: mach.rocm_overhead,
         },
@@ -928,6 +935,13 @@ fn stream_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
     }
 }
 
+/// Exclusive-residency victim ring (§6.3 O10): slots × 3 × max plane
+/// stride. Target: 16 × 3 × 6,881,280 = 330,301,440 B ≈ 1.4% of 24 GiB.
+#[must_use]
+pub fn victim_ring_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
+    u64::from(i.victim_ring_slots) * 3 * m.max_plane_stride
+}
+
 /// RAM tier (§10). Default pool = min(0.75 · free, Σ expert bytes); target:
 /// 0.75 × 88 GiB = 66 GiB < Σ experts, + 2 GiB host + 3.69 GiB staging ring.
 #[must_use]
@@ -1005,6 +1019,27 @@ mod tests {
         );
         assert_eq!(get(&r.vram, "stream_slabs"), 3_977_379_840);
         assert_eq!(get(&r.ram, "staging_ring"), 3_963_617_280);
+    }
+
+    /// Victim ring (§6.3 O10): 16 × 3 × 6,881,280 = 330,301,440 B ≈ 1.4% of
+    /// 24 GiB, and it comes off the derived device cache byte for byte.
+    #[test]
+    fn victim_ring_term_prices_slots_and_shrinks_the_cache() {
+        let off = plan(&glm(), &box24(), &PlanInput::default());
+        let on = plan(
+            &glm(),
+            &box24(),
+            &PlanInput {
+                victim_ring_slots: 16,
+                ..PlanInput::default()
+            },
+        );
+        assert_eq!(get(&off.vram, "victim_ring"), 0);
+        assert_eq!(get(&on.vram, "victim_ring"), 330_301_440);
+        assert_eq!(
+            get(&off.vram, "device_expert_cache") - get(&on.vram, "device_expert_cache"),
+            330_301_440
+        );
     }
 
     #[test]

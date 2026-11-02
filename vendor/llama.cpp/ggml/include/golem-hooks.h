@@ -18,6 +18,8 @@
 //   v17 ensure takes a hits_ready callback: RAM-resident hits are reported
 //       before the blocking source read so their H2D overlaps it; device-cache
 //       stats gain early_h2d_units.
+//   v18 VRAM victim ring for exclusive-residency D2H (golem_set_victim_ring,
+//       golem_take_victim_ring_stats): eviction D2H leaves the refill path.
 // Part of the vendored ggml include tree; the ABI is versioned -- a change
 // updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
@@ -52,7 +54,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 17
+#define GOLEM_HOOKS_ABI_VERSION 18
 GOLEM_API int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -100,11 +102,15 @@ typedef int32_t (*golem_ensure_host_resident_fn)(void *payload, const void *tens
  * before any pool reader is admitted. Called on the decode thread, once
  * per layer per compute.
  *
- * Stream/cost note: the D2H copies run on the SPLIT BACKEND's stream — the
- * same stream the H2D refills of the stolen slots use — and are issued
- * BEFORE those refills, so stream order lands the eviction D2H first (it
- * is NOT on a separate promotion stream). Cost ≈ 15.2 MB / 25 GB/s ≈
- * 0.6 ms per evicted expert; measured decode impact pending A/B. */
+ * Stream/cost note: without the victim ring (golem_set_victim_ring) the
+ * D2H copies run on the SPLIT BACKEND's stream — the same stream the H2D
+ * refills of the stolen slots use — and are issued BEFORE those refills,
+ * so stream order lands the eviction D2H first; cost ≈ 15.2 MB / 25 GB/s
+ * ≈ 0.6 ms per evicted expert on the refill path. With the ring, each
+ * plane is a D2D (slab → ring slot, ≈ 15.2 MB / ~800 GB/s ≈ 0.02 ms) on
+ * the compute stream and the D2H runs on a dedicated D2H stream off the
+ * refill path; an entry that finds the ring full falls back to the
+ * same-stream D2H (never dropped). */
 typedef void (*golem_evict_batch_fn)(void *payload, const void *tensor,
                                      const int32_t *experts, int32_t n_evicts,
                                      void *const *out_ptrs, int32_t *keep);
@@ -333,6 +339,34 @@ GOLEM_API int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on);
  * last call; resets both. Returns 1 when measured, 0 when async_h2d is off
  * or the per-step ring overflowed. Call between computes. */
 GOLEM_API int32_t golem_take_h2d_timing(golem_ctx_t ctx, double *ms, uint64_t *bytes);
+
+/* VRAM victim ring (ABI v18, exclusive residency). `slots > 0` arms a ring of
+ * `slots` device slots of 3 x max_plane_stride bytes (one buffer, allocated
+ * lazily on the first eviction park, freed by golem_reset_device_cache):
+ * each kept eviction plane is copied slab → ring on the compute stream and
+ * ring → host on a dedicated D2H stream, so the stolen slab slot's refill no
+ * longer queues behind the readback. A plane wider than max_plane_stride, a
+ * backend other than the copy-stream one, or every slot still owned by a
+ * parked entry falls back to the same-stream D2H; a backend without
+ * "golem_copy_stream_iface" disables the ring until golem_reset_device_cache,
+ * a failed device allocation disables it for the ctx's life (survives
+ * reset, so no retry per reload; one warning each).
+ * `slots <= 0` = off (the v17 behaviour). Returns 0, or -1 when refused:
+ * NULL ctx, GGML_CUDA_GRAPH_OPT=1 (owns the stream indices), copy_done or
+ * evict_batch not registered, ring already allocated, or slots > 0 with
+ * max_plane_stride <= 0. Config-time call; one device backend per ctx. */
+GOLEM_API int32_t golem_set_victim_ring(golem_ctx_t ctx, int32_t slots, int32_t max_plane_stride);
+
+/* Victim-ring counters since the last call; resets them. ring_units = planes
+ * copied through the ring, ring_full = parked entries that found every slot
+ * reserved (same-stream fallback), d2h_ms = wall time of the D2H stream's
+ * per-drain event pairs (includes its waits on the compute stream),
+ * d2h_bytes = ring D2H bytes. d2h_ms is NaN when some drain went untimed
+ * (per-step timing ring overflowed). Returns 1 when the ring is armed and
+ * not disabled, else 0 (outputs untouched): slots <= 0, or the ring was
+ * disabled by a bind/allocation failure. Call between computes. */
+GOLEM_API int32_t golem_take_victim_ring_stats(golem_ctx_t ctx, uint64_t *ring_units, uint64_t *ring_full,
+                                               double *d2h_ms, uint64_t *d2h_bytes);
 
 /* Hook (ABI v16, design §1 O1): among ids[0..n) of layer `blk`, count the
  * units RESIDENT in the host pool (no paging in, no scoring), and lease the

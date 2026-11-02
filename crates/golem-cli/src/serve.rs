@@ -252,6 +252,7 @@ pub fn instance(
         vram_reserve: config
             .vram_reserve_bytes
             .unwrap_or_else(|| golem_plan::default_vram_reserve(mach.vram_total)),
+        victim_ring_slots: config.victim_ring_slots,
         ws: golem_plan::WS_MEASURED,
     };
     input.vram_experts = explicit_cache_bytes(config, &facts, &mach, &input);

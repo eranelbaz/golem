@@ -50,8 +50,12 @@ fn hook_abi_types_generated() {
     // constant the bindings came from matches the compiled substrate.
     // ABI v9 adds the abandoned-D2H hook (parked evictions whose plane
     // copies were not all issued must be reported, not committed).
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 17);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 17);
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 18);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 18);
+    // v18: VRAM victim ring setter + stats.
+    let _: unsafe extern "C" fn(raw::golem_ctx_t, i32, i32) -> i32 = raw::golem_set_victim_ring;
+    let _: unsafe extern "C" fn(raw::golem_ctx_t, *mut u64, *mut u64, *mut f64, *mut u64) -> i32 =
+        raw::golem_take_victim_ring_stats;
     // v17: ensure reports RAM hits early through `hits_ready`.
     assert_thin_fn_ptr::<raw::golem_hits_ready_fn>();
     // v16: CPU expert math surface.

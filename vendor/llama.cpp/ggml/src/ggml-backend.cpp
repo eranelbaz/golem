@@ -17,6 +17,7 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,7 +129,30 @@ int32_t golem_set_async_h2d(golem_ctx_t ctx, int32_t on) {
     return 0;
 }
 
-// Blocks until the copy stream is idle. Every release of H2D sources (pool
+int32_t golem_set_victim_ring(golem_ctx_t ctx, int32_t slots, int32_t max_plane_stride) {
+    if (ctx == NULL || ctx->vr_buf != nullptr) {
+        return -1;
+    }
+    if (slots <= 0) {
+        ctx->vr_slots = 0;
+        return 0;
+    }
+    // The D2H stream is a stream index concurrent-stream forking also uses.
+    const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+    if ((env != nullptr && atoi(env) == 1) || ctx->copy_done == NULL || ctx->evict_batch == NULL ||
+        max_plane_stride <= 0) {
+        return -1;
+    }
+    ctx->vr_slots = slots;
+    ctx->vr_stride = max_plane_stride;
+    ctx->vr_off = false;
+    ctx->vr_alloc_failed = false;
+    ctx->vr_state.assign((size_t) slots, golem_ctx::GOLEM_VR_FREE);
+    ctx->vr_rel_ev.assign((size_t) slots, nullptr);
+    return 0;
+}
+
+// Blocks until the copy and D2H streams are idle. Every release of H2D sources (pool
 // leases, stream staging, evict destinations) and every slab free runs after
 // this: ggml_backend_synchronize covers the compute stream only.
 static void golem_drain_copy_stream(golem_ctx_t ctx) {
@@ -161,25 +185,125 @@ static void golem_cs_free(golem_ctx_t ctx) {
     ctx->cs_bytes = 0;
 }
 
+// Binds the copy-stream iface + its events to `be` on first use (async_h2d
+// copy stream and the victim ring share one binding). false = the backend
+// exports no "golem_copy_stream_iface"; nothing is bound.
+static bool golem_cs_bind(golem_ctx_t ctx, ggml_backend_t be) {
+    if (ctx->cs_backend != nullptr) {
+        return true;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
+    ctx->cs = reg != nullptr
+        ? (const golem_copy_stream_iface *) ggml_backend_reg_get_proc_address(reg, "golem_copy_stream_iface")
+        : nullptr;
+    if (ctx->cs == nullptr) {
+        return false;
+    }
+    ctx->cs_backend = be;
+    ctx->cs_ev_ready = ctx->cs->event_new(be, 0);
+    ctx->cs_ev_done = ctx->cs->event_new(be, 0);
+    for (int i = 0; i < golem_ctx::GOLEM_CS_RING; ++i) {
+        ctx->cs_t0[i] = ctx->cs->event_new(be, 1);
+        ctx->cs_t1[i] = ctx->cs->event_new(be, 1);
+    }
+    return true;
+}
+
+// Frees the victim ring (events, then the buffer). Runs before golem_cs_free,
+// whose iface the event frees go through; the caller drained both streams.
+static void golem_vr_free(golem_ctx_t ctx) {
+    if (ctx->cs != nullptr) {
+        for (void *& ev : ctx->vr_rel_ev) {
+            ctx->cs->event_free(ev);
+            ev = nullptr;
+        }
+        ctx->cs->event_free(ctx->vr_ev_fence);
+        for (int i = 0; i < golem_ctx::GOLEM_CS_RING; ++i) {
+            ctx->cs->event_free(ctx->vr_t0[i]);
+            ctx->cs->event_free(ctx->vr_t1[i]);
+            ctx->vr_t0[i] = ctx->vr_t1[i] = nullptr;
+        }
+        ctx->vr_ev_fence = nullptr;
+    }
+    if (ctx->vr_buf != nullptr) {
+        ggml_backend_buffer_free(ctx->vr_buf);
+        ctx->vr_buf = nullptr;
+    }
+    if (ctx->vr_ctx != nullptr) {
+        ggml_free(ctx->vr_ctx);
+        ctx->vr_ctx = nullptr;
+    }
+    ctx->vr_tensor = nullptr;
+    ctx->vr_off = false;
+    ctx->vr_t_n = 0;
+    ctx->vr_t_overflow = false;
+    std::fill(ctx->vr_state.begin(), ctx->vr_state.end(), (uint8_t) golem_ctx::GOLEM_VR_FREE);
+}
+
+// Allocates the victim ring on `be` at the first eviction park. false = the
+// ring is unusable for this backend (off, not the copy-stream backend, or
+// binding/allocation failed — the latter two disable it with one warning).
+static bool golem_vr_ready(golem_ctx_t ctx, ggml_backend_t be) {
+    if (ctx->vr_slots <= 0 || ctx->vr_off || ctx->vr_alloc_failed) {
+        return false;
+    }
+    if (ctx->vr_buf != nullptr) {
+        return ctx->cs_backend == be;
+    }
+    if (!golem_cs_bind(ctx, be)) {
+        GGML_LOG_WARN("%s: golem victim ring disabled: backend %s has no copy stream\n", __func__,
+                      ggml_backend_name(be));
+        ctx->vr_off = true;
+        return false;
+    }
+    if (ctx->cs_backend != be) {
+        return false;
+    }
+    const size_t size = (size_t) ctx->vr_slots * 3 * (size_t) ctx->vr_stride;
+    ctx->vr_buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(be), size);
+    if (ctx->vr_buf == nullptr) {
+        GGML_LOG_WARN("%s: golem victim ring disabled: %zu-byte device allocation failed\n", __func__, size);
+        ctx->vr_alloc_failed = true; // survives reset: no hipMalloc retry per reload
+        return false;
+    }
+    struct ggml_init_params ip = { ggml_tensor_overhead(), nullptr, /* no_alloc */ true };
+    ctx->vr_ctx = ggml_init(ip);
+    if (ctx->vr_ctx != nullptr) {
+        ctx->vr_tensor = ggml_new_tensor_1d(ctx->vr_ctx, GGML_TYPE_I8, (int64_t) size);
+    }
+    if (ctx->vr_ctx == nullptr || ggml_backend_tensor_alloc(ctx->vr_buf, ctx->vr_tensor,
+            ggml_backend_buffer_get_base(ctx->vr_buf)) != GGML_STATUS_SUCCESS) {
+        GGML_LOG_WARN("%s: golem victim ring disabled: ring tensor setup failed\n", __func__);
+        if (ctx->vr_ctx != nullptr) {
+            ggml_free(ctx->vr_ctx);
+            ctx->vr_ctx = nullptr;
+        }
+        ctx->vr_tensor = nullptr;
+        ggml_backend_buffer_free(ctx->vr_buf);
+        ctx->vr_buf = nullptr;
+        ctx->vr_off = true;
+        return false;
+    }
+    for (void *& ev : ctx->vr_rel_ev) {
+        ev = ctx->cs->event_new(be, 0);
+    }
+    ctx->vr_ev_fence = ctx->cs->event_new(be, 0);
+    for (int i = 0; i < golem_ctx::GOLEM_CS_RING; ++i) {
+        ctx->vr_t0[i] = ctx->cs->event_new(be, 1);
+        ctx->vr_t1[i] = ctx->cs->event_new(be, 1);
+    }
+    std::fill(ctx->vr_state.begin(), ctx->vr_state.end(), (uint8_t) golem_ctx::GOLEM_VR_FREE);
+    return true;
+}
+
 // Orders the copy stream after everything already queued on the split
 // backend's compute stream (prior computes reading the destination, O10
 // eviction D2H of the slots about to be refilled). Called before each
 // plane's copy-stream H2D batch; `first` opens the split's timing pair;
 // `wait` is false when nothing was queued on compute since the last wait.
 static void golem_cs_begin(golem_ctx_t ctx, ggml_backend_t be, bool first, bool wait) {
-    if (ctx->cs_backend == nullptr) {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
-        ctx->cs = (const golem_copy_stream_iface *) ggml_backend_reg_get_proc_address(reg, "golem_copy_stream_iface");
-        if (ctx->cs == nullptr) {
-            GGML_ABORT("golem async_h2d on a backend without a copy stream");
-        }
-        ctx->cs_backend = be;
-        ctx->cs_ev_ready = ctx->cs->event_new(be, 0);
-        ctx->cs_ev_done = ctx->cs->event_new(be, 0);
-        for (int i = 0; i < golem_ctx::GOLEM_CS_RING; ++i) {
-            ctx->cs_t0[i] = ctx->cs->event_new(be, 1);
-            ctx->cs_t1[i] = ctx->cs->event_new(be, 1);
-        }
+    if (!golem_cs_bind(ctx, be)) {
+        GGML_ABORT("golem async_h2d on a backend without a copy stream");
     }
     GGML_ASSERT(ctx->cs_backend == be && "golem async_h2d: one device backend per ctx");
     if (wait) {
@@ -264,6 +388,33 @@ int32_t golem_take_h2d_timing(golem_ctx_t ctx, double * ms, uint64_t * bytes) {
     ctx->cs_t_overflow = false;
     ctx->cs_bytes = 0;
     return ok ? 1 : 0;
+}
+
+int32_t golem_take_victim_ring_stats(golem_ctx_t ctx, uint64_t * ring_units, uint64_t * ring_full,
+                                     double * d2h_ms, uint64_t * d2h_bytes) {
+    if (ctx == NULL || ctx->vr_slots <= 0 || ctx->vr_off || ctx->vr_alloc_failed) {
+        return 0;
+    }
+    double total = 0.0;
+    if (ctx->vr_t_n > 0) {
+        golem_drain_copy_stream(ctx);
+        for (int32_t i = 0; i < ctx->vr_t_n; ++i) {
+            total += ctx->cs->elapsed_ms(ctx->vr_t0[i], ctx->vr_t1[i]);
+        }
+    }
+    if (ctx->vr_t_overflow) {
+        total = NAN; // some drains untimed: a partial sum would under-report
+    }
+    *ring_units = ctx->vr_units;
+    *ring_full = ctx->vr_full;
+    *d2h_ms = total;
+    *d2h_bytes = ctx->vr_bytes;
+    ctx->vr_t_n = 0;
+    ctx->vr_t_overflow = false;
+    ctx->vr_units = 0;
+    ctx->vr_full = 0;
+    ctx->vr_bytes = 0;
+    return 1;
 }
 
 int32_t golem_set_cpu_expert_math(golem_ctx_t ctx, int32_t on, float frac, int32_t n_threads,
@@ -356,6 +507,10 @@ void golem_reset_device_cache(golem_ctx_t ctx) {
         ctx->cem_acc = nullptr;
         ctx->cem_acc_n_embd = 0;
     }
+    // Victim ring before the copy stream it borrows the iface from; both
+    // streams are drained first (golem_drain_copy_stream syncs both).
+    golem_drain_copy_stream(ctx);
+    golem_vr_free(ctx);
     golem_cs_free(ctx);
     golem_stream_slabs_free(ctx);
     std::lock_guard<std::mutex> lk(ctx->dc_mutex);
@@ -2347,6 +2502,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_synchronize(sched->backends[i]);
         }
         golem_drain_copy_stream(gctx);
+        // Every ring D2H of the previous compute has landed: all slots free.
+        std::fill(gctx->vr_state.begin(), gctx->vr_state.end(), (uint8_t) golem_ctx::GOLEM_VR_FREE);
         golem_cb_guard cb;
         gctx->copy_done(gctx->payload);
     }
@@ -2402,8 +2559,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // segments of one step run inside one compute_splits call, ahead of the
     // next copy_done drain. Entries whose planes never all drain are
     // reported abandoned at compute end (ABI v9), so nothing incomplete
-    // survives to a copy_done commit.
-    struct golem_evict_d2h_entry { int32_t blk; int32_t id; int32_t slot; void * dst[3]; uint32_t done; };
+    // survives to a copy_done commit. ABI v18: `ring` >= 0 = the victim-ring
+    // slot the planes stage through (D2D on compute, D2H on the D2H stream;
+    // `ring_wait` = the slot was RELEASING, the compute stream waits on its
+    // release event before the first D2D); `ring_pend` = per-kind D2D issued,
+    // D2H not yet.
+    struct golem_evict_d2h_entry {
+        int32_t blk; int32_t id; int32_t slot; void * dst[3]; uint32_t done;
+        int32_t ring; uint8_t ring_wait; uint8_t ring_pend;
+    };
     static thread_local std::vector<golem_evict_d2h_entry> golem_evict_d2h;
     golem_evict_d2h.clear();
     // ABI v9 abandon scratch: expert ids of one blk's unfinished parked D2Hs.
@@ -2598,7 +2762,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // (joined into the compute stream before the split's graph).
         bool golem_cs_used = false;
         // Copy stream already ordered after every compute-stream op queued
-        // so far in this split (cleared by eviction D2H).
+        // so far in this split (cleared by eviction D2H / victim-ring D2D).
         bool golem_cs_fenced = false;
         // A timing pair (t0 recorded by golem_cs_begin) is open on the copy
         // stream. Closed by the hits_ready callback and by golem_cs_join, so
@@ -2612,11 +2776,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             golem_cs_fenced = true;
         };
         // Exclusive D2H drain (see golem_evict_d2h): issue plane `inp`'s share
-        // of its layer's parked evictions on the split stream. Must precede
-        // the plane's staged H2D refills (stream order lands the D2H read of
-        // a stolen slot before the refill overwrites it); idempotent through
-        // the per-kind done bits, so the hits_ready callback and the copy
-        // loop may both call it.
+        // of its layer's parked evictions. Must precede the plane's staged
+        // H2D refills (stream order lands the read of a stolen slot before
+        // the refill overwrites it); idempotent through the per-kind done
+        // bits, so the hits_ready callback and the copy loop may both call
+        // it. Ring entries copy slab -> ring slot on the compute stream, then
+        // one fence hands every ring slot of this plane to the D2H stream;
+        // the rest D2H straight from the slab on the split stream.
         auto golem_d2h_drain = [&](const ggml_tensor * inp, golem::GolemSlabEntry & st) {
             const int blk_d = golem_tensor_blk(inp->name);
             const int kind_d = golem_expert_stem_kind(inp->name) - 1;
@@ -2624,6 +2790,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return;
             }
             const uint32_t bit = 1u << kind_d;
+            const bool ring_ok = gctx->vr_buf != nullptr && split_backend == gctx->cs_backend &&
+                st.expert_size <= (size_t) gctx->vr_stride;
+            const size_t ring_slot_bytes = 3 * (size_t) gctx->vr_stride;
+            bool ring_any = false;
+            for (golem_evict_d2h_entry & e : golem_evict_d2h) {
+                if (e.blk != blk_d || (e.done & bit) || (e.ring_pend & bit)) {
+                    continue;
+                }
+                if (ring_ok && e.ring >= 0) {
+                    if (e.ring_wait) {
+                        gctx->cs->compute_wait(split_backend, gctx->vr_rel_ev[e.ring]);
+                        e.ring_wait = 0;
+                    }
+                    gctx->cs->d2d_compute(split_backend, gctx->vr_tensor,
+                        (size_t) e.ring * ring_slot_bytes + (size_t) kind_d * gctx->vr_stride,
+                        st.slab, (size_t) e.slot * st.expert_size, st.expert_size);
+                    e.ring_pend |= bit;
+                    ring_any = true;
+                } else {
+                    ggml_backend_tensor_get_async(split_backend, st.slab,
+                        e.dst[kind_d], (size_t) e.slot * st.expert_size,
+                        st.expert_size);
+                    e.done |= bit;
+                }
+                golem_cs_fenced = false;
+            }
+            const bool timed = ring_any && gctx->vr_t_n < golem_ctx::GOLEM_CS_RING;
+            if (ring_any && !timed) {
+                gctx->vr_t_overflow = true;
+            }
+            if (ring_any) {
+                gctx->cs->record_compute(split_backend, gctx->vr_ev_fence);
+                gctx->cs->d2h_wait(split_backend, gctx->vr_ev_fence);
+                if (timed) {
+                    gctx->cs->record_d2h(split_backend, gctx->vr_t0[gctx->vr_t_n]);
+                }
+            }
             size_t w = 0;
             for (size_t r = 0; r < golem_evict_d2h.size(); ++r) {
                 golem_evict_d2h_entry & e = golem_evict_d2h[r];
@@ -2631,18 +2834,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     golem_evict_d2h[w++] = e;
                     continue;
                 }
-                if (!(e.done & bit)) {
-                    ggml_backend_tensor_get_async(split_backend, st.slab,
-                        e.dst[kind_d], (size_t) e.slot * st.expert_size,
+                if (e.ring_pend & bit) {
+                    gctx->cs->d2h_get_async(split_backend, e.dst[kind_d], gctx->vr_tensor,
+                        (size_t) e.ring * ring_slot_bytes + (size_t) kind_d * gctx->vr_stride,
                         st.expert_size);
+                    e.ring_pend &= (uint8_t) ~bit;
                     e.done |= bit;
-                    golem_cs_fenced = false;
+                    gctx->vr_units++;
+                    gctx->vr_bytes += st.expert_size;
+                    if (e.done == 7u) {
+                        gctx->cs->record_d2h(split_backend, gctx->vr_rel_ev[e.ring]);
+                        gctx->vr_state[e.ring] = golem_ctx::GOLEM_VR_RELEASING;
+                    }
+                } else if (e.done == 7u && e.ring >= 0 && gctx->vr_state[e.ring] == golem_ctx::GOLEM_VR_RESERVED) {
+                    // Last plane fell back to the split stream: the slot's
+                    // earlier ring D2Hs are on the D2H stream already.
+                    // cs_backend on purpose: record_d2h targets the ring's
+                    // D2H stream, and ring_ok above held only for it.
+                    gctx->cs->record_d2h(gctx->cs_backend, gctx->vr_rel_ev[e.ring]);
+                    gctx->vr_state[e.ring] = golem_ctx::GOLEM_VR_RELEASING;
                 }
                 if (e.done != 7u) {
                     golem_evict_d2h[w++] = e;
                 }
             }
             golem_evict_d2h.resize(w);
+            if (timed) {
+                gctx->cs->record_d2h(split_backend, gctx->vr_t1[gctx->vr_t_n]);
+                gctx->vr_t_n++;
+            }
         };
 
         // ensure the previous split's async work has completed before we start
@@ -3212,17 +3432,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 // Exclusive residency (O10): hand the layer's fully-valid
                 // evictions to the pool in ONE batched call — it returns D2H
-                // destinations per kept expert (copied here, before any H2D
-                // re-fill of the stolen slots; both run on the split
-                // backend's stream — the SAME stream as the H2D refills, not
-                // a separate promotion stream — and the D2H is issued first,
-                // so stream order lands it before the refill; ≈ 15.2 MB /
-                // 25 GB/s ≈ 0.6 ms per evicted expert, measured decode
-                // impact pending A/B) or scores the bytes droppable. Runs
+                // destinations per kept expert (copied before any H2D
+                // re-fill of the stolen slots, by golem_d2h_drain: with the
+                // victim ring a D2D into a reserved ring slot on the compute
+                // stream, then D2H on the D2H stream off the refill path;
+                // otherwise the D2H itself on the split stream, ≈ 15.2 MB /
+                // 25 GB/s ≈ 0.6 ms per evicted expert ahead of the refill)
+                // or scores the bytes droppable. Runs
                 // only when the evict_batch hook is registered; NULL-hooked
                 // runs keep inclusive residency verbatim. Post-drain, so the
                 // previous compute has finished reading these slots.
                 if (gctx->evict_batch != NULL && !golem_evicts.empty()) {
+                    const bool vr_on = golem_vr_ready(gctx, split_backend);
                     const size_t n_ev = golem_evicts.size();
                     golem_evict_ids.resize(n_ev);
                     golem_evict_out.assign(3 * n_ev, NULL);
@@ -3253,6 +3474,47 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             e.dst[k] = golem_evict_out[3 * i_ev + k];
                         }
                         e.done = 0;
+                        e.ring = -1;
+                        e.ring_wait = 0;
+                        e.ring_pend = 0;
+                        if (vr_on) {
+                            // Prefer a FREE slot, then a RELEASING one whose
+                            // release event already completed (no wait); else
+                            // the next RELEASING slot round-robin, reused
+                            // stream-ordered behind its release event.
+                            int32_t rs = -1;
+                            bool rs_wait = false;
+                            for (int32_t q = 0; q < gctx->vr_slots; ++q) {
+                                if (gctx->vr_state[q] == golem_ctx::GOLEM_VR_FREE) {
+                                    rs = q;
+                                    rs_wait = false;
+                                    break;
+                                }
+                            }
+                            for (int32_t i_q = 0; rs < 0 && i_q < gctx->vr_slots; ++i_q) {
+                                const int32_t q = (gctx->vr_next + i_q) % gctx->vr_slots;
+                                if (gctx->vr_state[q] == golem_ctx::GOLEM_VR_RELEASING &&
+                                    gctx->cs->event_query(gctx->vr_rel_ev[q]) == 1) {
+                                    rs = q;
+                                    rs_wait = false;
+                                }
+                            }
+                            for (int32_t i_q = 0; rs < 0 && i_q < gctx->vr_slots; ++i_q) {
+                                const int32_t q = (gctx->vr_next + i_q) % gctx->vr_slots;
+                                if (gctx->vr_state[q] == golem_ctx::GOLEM_VR_RELEASING) {
+                                    rs = q;
+                                    rs_wait = true;
+                                }
+                            }
+                            if (rs < 0) {
+                                gctx->vr_full++; // all RESERVED: same-stream D2H
+                            } else {
+                                e.ring = rs;
+                                e.ring_wait = rs_wait;
+                                gctx->vr_state[rs] = golem_ctx::GOLEM_VR_RESERVED;
+                                gctx->vr_next = (rs + 1) % gctx->vr_slots;
+                            }
+                        }
                         golem_evict_d2h.push_back(e);
                     }
                 }
@@ -4711,6 +4973,10 @@ void golem_ctx_free(golem_ctx_t ctx) {
         GGML_ABORT("golem ctx_free with a bound copy stream: the owner must "
                    "call golem_reset_device_cache while the backend is still alive");
     }
+    if (ctx->vr_buf != nullptr) {
+        GGML_ABORT("golem ctx_free with a live victim ring: the owner must "
+                   "call golem_reset_device_cache while the backend is still alive");
+    }
     if (ctx->stream_slabs[0].buf != nullptr || ctx->stream_slabs[1].buf != nullptr) {
         GGML_ABORT("golem ctx_free with live prefill-stream slabs: the owner must "
                    "call golem_reset_device_cache while the backend is still alive");
@@ -4924,8 +5190,8 @@ void golem_set_expert_offload_min_batch(int n) {
 
 // Declared `extern "C"` in the CUDA/HIP TUs (ggml-cuda.cu); the header does
 // not declare these internal helpers, so pin the linkage here.
-extern "C" int golem_expert_offload_min_batch(int default_value);
-extern "C" int golem_graphs_disabled(void);
+extern "C" GOLEM_API int golem_expert_offload_min_batch(int default_value);
+extern "C" GOLEM_API int golem_graphs_disabled(void);
 
 int golem_graphs_disabled(void) {
     return golem_any_ctx_hooked();

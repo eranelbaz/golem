@@ -41,9 +41,17 @@ fi
 
 # --- configure + build ---
 mkdir -p "$BUILD_DIR"
+# Without the ROCm root CMake compiles .cu as CUDA; mirror golem-llama-sys/build.rs.
+# Explicit CMAKE_HIP_COMPILER also makes CMake discard a cache holding another compiler.
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+HIPCXX="${HIPCXX:-$ROCM_PATH/llvm/bin/clang++}"
+[ -x "$HIPCXX" ] || { echo "FATAL: HIP compiler $HIPCXX missing (set ROCM_PATH or HIPCXX)"; exit 1; }
 cmake -S "$VENDOR" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_HIP=ON \
+  -DCMAKE_HIP_COMPILER="$HIPCXX" \
+  -DCMAKE_HIP_COMPILER_ROCM_ROOT="$ROCM_PATH" \
+  -DCMAKE_HIP_ARCHITECTURES="$TARGET" \
   -DAMDGPU_TARGETS="$TARGET"
 cmake --build "$BUILD_DIR" --target llama-cli -j"$(nproc)"
 

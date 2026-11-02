@@ -56,6 +56,10 @@ pub struct PlanArgs {
     /// V cache element type the KV term is priced at (as `--cache-type-k`).
     #[arg(long, value_name = "TYPE")]
     pub cache_type_v: Option<golem_plan::KvCacheType>,
+    /// VRAM victim ring slots priced as a VRAM term (as `run --victim-ring`;
+    /// flag > golem.toml `victim_ring_slots` > 0 = off).
+    #[arg(long, value_name = "N")]
+    pub victim_ring: Option<u32>,
     /// Machine-readable report on stdout.
     #[arg(long)]
     pub json: bool,
@@ -170,6 +174,7 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
             || golem_plan::default_vram_reserve(mach.vram_total),
             |g| bytes(Some(g)),
         ),
+        victim_ring_slots: l.get(args.victim_ring, "victim_ring_slots", 0)?,
         ws: WS_MEASURED,
     };
     let r = golem_plan::plan_at_frac(&m, &mach, &input, args.vram_experts_frac);

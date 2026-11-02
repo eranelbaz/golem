@@ -804,6 +804,8 @@ pub(crate) struct StepIoStats {
     pub disk_bytes: Option<u64>,
     /// Copy-stream H2D (ms, bytes); `None` unless async_h2d measured it.
     pub h2d: Option<(f64, u64)>,
+    /// `None` unless the victim ring is armed.
+    pub victim_ring: Option<crate::timing::VictimRingStats>,
     /// `None` unless cpu_expert_math is armed.
     pub cpu_expert: Option<crate::timing::CpuExpertStats>,
 }
@@ -838,6 +840,20 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
             if unsafe { raw::golem_take_h2d_timing(ctx, &mut ms, &mut bytes) } == 1 {
                 let (m0, b0) = out.h2d.unwrap_or((0.0, 0));
                 out.h2d = Some((m0 + ms, b0 + bytes));
+            }
+            let mut r = crate::timing::VictimRingStats::default();
+            // SAFETY: as above; writes only the four out-params.
+            if unsafe {
+                raw::golem_take_victim_ring_stats(
+                    ctx,
+                    &mut r.units,
+                    &mut r.full,
+                    &mut r.d2h_ms,
+                    &mut r.d2h_bytes,
+                )
+            } == 1
+            {
+                out.victim_ring.get_or_insert_with(Default::default).add(&r);
             }
             let mut c = crate::timing::CpuExpertStats::default();
             // SAFETY: as above; writes only the five out-params.
@@ -960,6 +976,9 @@ pub struct SessionHooks {
     vram_stream: bool,
     /// Both stream slabs' bytes (0 without streaming).
     stream_slab_vram: u64,
+    /// The victim ring's bytes (0 when off).
+    #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
+    victim_ring_vram: u64,
     /// Device bytes of one K slot across the model (§3.4). Read only on
     /// the HIP path (`refit_stream_k`'s VRAM query).
     #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
@@ -1105,6 +1124,8 @@ impl SessionHooks {
             k_from_free_vram(budget, fit.plan_cap, fit.slab_bytes_per_expert, self.top_k)
                 .map(|k| k.min(fit.k_bound))
         };
+        // The ring lives for the session (stream slabs or not).
+        let free = free.saturating_sub(fit.victim_ring_vram);
         let k = match k_of(free.saturating_sub(fit.stream_slab_vram)) {
             Ok(k) => {
                 // Decode runs with the stream slabs freed: the §10 cap
@@ -1216,7 +1237,9 @@ impl SessionHooks {
         #[cfg(golem_backend_hip)]
         if let Some((free, _)) = golem_llama_sys::pinned::free_device_mem() {
             return k_from_free_vram(
-                (free as u64).saturating_sub(self.stream_slab_vram),
+                (free as u64)
+                    .saturating_sub(self.stream_slab_vram)
+                    .saturating_sub(self.victim_ring_vram),
                 u64::MAX,
                 self.slab_bytes_per_expert,
                 self.top_k,
@@ -1860,6 +1883,10 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     } else {
         0
     };
+    // Victim ring (§6.3 O10): slots × 3 × max plane stride, allocated lazily
+    // at the first eviction park, so priced off K's budget like the stream
+    // slabs. Target: 16 × 3 × 6.88 MB ≈ 330 MB ≈ 16 fewer of ~756 K slots.
+    let victim_ring_vram = u64::from(config.victim_ring_slots) * 3 * max_plane_stride;
     // The device-cache budget is a per-layer expert count, never a
     // byte cap on whichever tensor registers first.
     // It is never "unlimited": device allocations are bounded by the VRAM
@@ -2159,6 +2186,32 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
                 .into(),
         ));
     }
+    let ring_stride = if config.victim_ring_slots > 0 {
+        i32::try_from(max_plane_stride).map_err(|_| {
+            EngineError::InvalidConfig(format!(
+                "victim_ring_slots: max plane stride {max_plane_stride} B exceeds i32"
+            ))
+        })?
+    } else {
+        0
+    };
+    // SAFETY: FFI config setter on the live ctx after copy_done and
+    // evict_batch are registered, before the first compute (no ring yet).
+    if config.victim_ring_slots > 0
+        && unsafe {
+            raw::golem_set_victim_ring(
+                hooked.ctx_ptr(),
+                config.victim_ring_slots as i32,
+                ring_stride,
+            )
+        } != 0
+    {
+        return Err(EngineError::InvalidConfig(
+            "victim_ring_slots: the substrate refused to arm the ring (exclusive hooks \
+             not registered, GGML_CUDA_GRAPH_OPT=1, or plane stride out of range)"
+                .into(),
+        ));
+    }
 
     tracing::info!(
         layers = n_layers,
@@ -2187,6 +2240,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             k_bound: k,
             slab_bytes_per_expert: slab,
             stream_slab_vram,
+            victim_ring_vram,
             plan_cap: u64::MAX,
         }),
         top_k: n_expert_used,
@@ -2196,6 +2250,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         k_decode: k_start,
         vram_stream: true,
         stream_slab_vram,
+        victim_ring_vram,
         slab_bytes_per_expert: slab,
     })
 }
@@ -2314,6 +2369,9 @@ struct DeviceFit {
     /// Both prefill-stream slabs (0 without streaming); they allocate
     /// lazily, so the post-load free VRAM does not net them out yet.
     stream_slab_vram: u64,
+    /// The victim ring's bytes (0 when off); allocated lazily like the
+    /// stream slabs.
+    victim_ring_vram: u64,
     /// The §10 plan's `device_expert_cache` bytes ([`SessionHooks::cap_device_cache`]);
     /// `u64::MAX` = uncapped.
     plan_cap: u64,
