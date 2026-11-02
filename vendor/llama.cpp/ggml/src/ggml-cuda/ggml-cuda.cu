@@ -6366,7 +6366,14 @@ static int golem_dw_can_stream_wait(ggml_backend_dev_t dev) {
 
 static void * golem_dw_host_alloc(size_t size) {
     void * p = nullptr;
-    if (cudaHostAlloc(&p, size, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+#if defined(GGML_USE_HIP)
+    // Coherent: the wait kernel's system-scope loads and the host's landed
+    // stores must see each other without a cache flush on either side.
+    const unsigned int flags = hipHostMallocPortable | hipHostMallocMapped | hipHostMallocCoherent;
+#else
+    const unsigned int flags = cudaHostAllocPortable | cudaHostAllocMapped;
+#endif
+    if (cudaHostAlloc(&p, size, flags) != cudaSuccess) {
         (void) cudaGetLastError();
         return nullptr;
     }

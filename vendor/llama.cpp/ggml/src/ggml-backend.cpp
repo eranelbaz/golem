@@ -3977,6 +3977,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 golem_miss_ids.clear();
                 golem_evicts.clear();
                 bool golem_slab_failed = false;
+                // Invariant: a valid bit implies the slot's H2D was queued. The
+                // slab step sets the bits of this layer's planned slots before
+                // their copies, so a failing compute drops the unissued ones
+                // and the next compute re-pages them.
+                auto golem_drop_unissued = [&]() {
+                    std::lock_guard<std::mutex> lk(gctx->dc_mutex);
+                    for (int j = input_id; j < split->n_inputs; ++j) {
+                        const golem_plane_plan & plan = golem_planes[j];
+                        if (plan.mode != 2 || golem_tensor_blk(split->inputs[j]->name) != blk) {
+                            continue;
+                        }
+                        golem::GolemLayerSlots & L = gctx->layers[blk];
+                        const int kind = golem_expert_stem_kind(split->inputs[j]->name);
+                        for (size_t k = 0; k < plan.pending.size(); ++k) {
+                            if (k >= plan.issued.size() || !plan.issued[k]) {
+                                ggml_bitset_clear(L.valid[kind - 1].data(), plan.pending[k].first);
+                            }
+                        }
+                    }
+                };
                 for (int j = input_id; j < split->n_inputs; ++j) {
                     struct ggml_tensor * inp = split->inputs[j];
                     const int kind = golem_expert_stem_kind(inp->name);
@@ -4123,8 +4143,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (golem_slab_failed) {
                     // Nothing of this layer was issued yet; drain what
                     // earlier layers queued, then fail the compute
-                    // (llama_decode -2). The slot tables already stepped
-                    // are stale until the engine resets the cache.
+                    // (llama_decode -2). This layer's stepped planes drop
+                    // their unissued bits; its golem_evicts were never handed
+                    // to the pool, so the engine still resets the cache on -2.
+                    golem_drop_unissued();
                     golem_cem_join(gctx);
                     golem_restore_ids();
                     for (int i = 0; i < sched->n_backends; i++) {
@@ -4327,6 +4349,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ensure_rc != 0) {
                         // ABI v13: the misses could not be paged in; drain
                         // what earlier layers queued and fail the compute.
+                        // Early hit copies stay valid; the rest are dropped.
+                        golem_drop_unissued();
                         golem_cem_join(gctx);
                         golem_restore_ids();
                         for (int i = 0; i < sched->n_backends; i++) {

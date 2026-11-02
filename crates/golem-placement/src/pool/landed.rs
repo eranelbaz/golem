@@ -22,8 +22,9 @@ pub trait Ring {
     fn active(&self) -> u32;
     /// The newest published request sequence of `blk` (0 = none).
     fn request(&self, blk: usize) -> u32;
-    /// Serves `blk`'s request `seq`.
-    fn serve(&mut self, blk: usize, seq: u32);
+    /// Serves `blk`'s request `seq`. `false` = not taken (the substrate saw
+    /// it as not yet current): the poller retries it on its next pass.
+    fn serve(&mut self, blk: usize, seq: u32) -> bool;
 }
 
 /// Poll state: the newest sequence served per blk. Preallocated once; a
@@ -45,7 +46,8 @@ impl Poller {
     }
 
     /// One pass over the request words: serves every blk whose newest
-    /// request differs from the last one served. Returns how many it served.
+    /// request differs from the last one served. A refused serve leaves the
+    /// request pending. Returns how many it served.
     pub fn poll<R: Ring + ?Sized>(&mut self, ring: &mut R) -> usize {
         let active = ring.active();
         if active == 0 {
@@ -60,9 +62,8 @@ impl Poller {
         let mut n = 0;
         for (blk, last) in self.served.iter_mut().enumerate() {
             let seq = ring.request(blk);
-            if seq != 0 && seq != *last {
+            if seq != 0 && seq != *last && ring.serve(blk, seq) {
                 *last = seq;
-                ring.serve(blk, seq);
                 n += 1;
             }
         }
@@ -78,6 +79,8 @@ mod tests {
         active: u32,
         req: Vec<u32>,
         served: Vec<(usize, u32)>,
+        /// Serves to refuse (stale) before taking one.
+        refuse: usize,
     }
 
     impl Ring for Fake {
@@ -90,8 +93,13 @@ mod tests {
         fn request(&self, blk: usize) -> u32 {
             self.req[blk]
         }
-        fn serve(&mut self, blk: usize, seq: u32) {
+        fn serve(&mut self, blk: usize, seq: u32) -> bool {
+            if self.refuse > 0 {
+                self.refuse -= 1;
+                return false;
+            }
             self.served.push((blk, seq));
+            true
         }
     }
 
@@ -101,6 +109,7 @@ mod tests {
             active: 3,
             req: vec![3, 0],
             served: Vec::new(),
+            refuse: 0,
         };
         let mut p = Poller::new(2);
         assert_eq!(p.poll(&mut r), 1);
@@ -118,6 +127,7 @@ mod tests {
             active: 5,
             req: vec![5, 0],
             served: Vec::new(),
+            refuse: 0,
         };
         let mut p = Poller::new(2);
         p.poll(&mut r);
@@ -139,5 +149,22 @@ mod tests {
             "blk 0's post-wrap request 5 must be served: {:?}",
             r.served
         );
+    }
+
+    /// A refused (stale) serve is not recorded as served: the next pass
+    /// retries the same request instead of leaving it unserved.
+    #[test]
+    fn stale_serve_is_retried() {
+        let mut r = Fake {
+            active: 2,
+            req: vec![2],
+            served: Vec::new(),
+            refuse: 1,
+        };
+        let mut p = Poller::new(1);
+        assert_eq!(p.poll(&mut r), 0, "refused");
+        assert_eq!(p.poll(&mut r), 1, "retried");
+        assert_eq!(p.poll(&mut r), 0, "served once");
+        assert_eq!(r.served, [(0, 2)]);
     }
 }

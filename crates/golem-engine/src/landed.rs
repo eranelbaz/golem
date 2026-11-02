@@ -29,17 +29,23 @@ impl Ring for SysRing {
     fn request(&self, blk: usize) -> u32 {
         self.0.request(blk).unwrap_or(0)
     }
-    fn serve(&mut self, blk: usize, seq: u32) {
+    fn serve(&mut self, blk: usize, seq: u32) -> bool {
         match self.0.serve(blk, seq) {
-            Serve::Served => {}
-            Serve::Failed => tracing::error!(
-                blk,
-                seq,
-                "device-wait serve: page-in failed; the compute fails"
-            ),
-            // The C side refused a superseded or not-yet-current request; the
-            // poller re-serves the newest one on its next pass.
-            Serve::Stale => tracing::debug!(blk, seq, "device-wait serve: stale request"),
+            Serve::Served => true,
+            Serve::Failed => {
+                tracing::error!(
+                    blk,
+                    seq,
+                    "device-wait serve: page-in failed; the compute fails"
+                );
+                true
+            }
+            // The C side refused a superseded or not-yet-current request; it
+            // stays pending and the poller retries the newest one next pass.
+            Serve::Stale => {
+                tracing::debug!(blk, seq, "device-wait serve: stale request");
+                false
+            }
         }
     }
 }
