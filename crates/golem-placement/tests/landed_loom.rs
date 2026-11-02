@@ -8,8 +8,9 @@
 //! / `golem_dw_quiesce`, landed.rs `Poller`):
 //! - publisher: write the layer setup, release-store host_seq, set active,
 //!   release-store the request word (the device's publish), and count it;
-//! - server: poll; for a new request, acquire host_seq == seq, read the
-//!   setup, take a lease, mark landed, count the serve;
+//! - server: poll; for a new request, acquire host_seq == seq (else refuse
+//!   it as stale: the poller retries), read the setup, take a lease, mark
+//!   landed, count the serve; a failed page-in still lands and counts;
 //! - decode thread: before `copy_done` releases the step's leases, wait until
 //!   served == published.
 
@@ -32,6 +33,12 @@ struct Model {
     /// Leases taken by serves and not yet released by copy_done.
     leases: AtomicUsize,
     served: AtomicUsize,
+    /// Serves refused because host_seq was not yet current.
+    stale: AtomicUsize,
+    /// Fail the page-in of the next serve (ABI v13 landing path).
+    fail_next: AtomicBool,
+    /// Set by a failed serve; the decode thread fails the compute.
+    failed: AtomicBool,
     /// Set if a serve saw a request whose setup was not yet visible, or
     /// served one twice (stale serve).
     violation: AtomicBool,
@@ -48,6 +55,9 @@ impl Model {
             landed: [z(), z()],
             leases: AtomicUsize::new(0),
             served: AtomicUsize::new(0),
+            stale: AtomicUsize::new(0),
+            fail_next: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             violation: AtomicBool::new(false),
         }
     }
@@ -58,6 +68,15 @@ impl Model {
         self.host_seq[blk].store(seq, Ordering::Release);
         self.active.store(seq, Ordering::Release);
         self.req[blk].store(seq, Ordering::Release);
+    }
+
+    /// A publish whose request word becomes visible before host_seq: the
+    /// serve can see the request while its setup is not yet current.
+    fn publish_request_first(&self, blk: usize, seq: u64) {
+        self.active.store(seq, Ordering::Release);
+        self.req[blk].store(seq, Ordering::Release);
+        self.setup[blk].store(seq * 10 + blk as u64, Ordering::Relaxed);
+        self.host_seq[blk].store(seq, Ordering::Release);
     }
 }
 
@@ -74,8 +93,8 @@ impl Ring for Server {
     fn request(&self, blk: usize) -> u32 {
         self.0.request(blk)
     }
-    fn serve(&mut self, blk: usize, seq: u32) {
-        self.0.serve(blk, seq);
+    fn serve(&mut self, blk: usize, seq: u32) -> bool {
+        self.0.serve(blk, seq)
     }
 }
 
@@ -86,12 +105,12 @@ impl Model {
     fn request(&self, blk: usize) -> u32 {
         self.req[blk].load(Ordering::Acquire) as u32
     }
-    fn serve(&self, blk: usize, seq: u32) {
+    fn serve(&self, blk: usize, seq: u32) -> bool {
         let seq = u64::from(seq);
         // The C serve refuses a request whose host_seq is not current.
         if self.host_seq[blk].load(Ordering::Acquire) != seq {
-            self.violation.store(true, Ordering::Relaxed);
-            return;
+            self.stale.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
         if self.setup[blk].load(Ordering::Relaxed) != seq * 10 + blk as u64 {
             self.violation.store(true, Ordering::Relaxed);
@@ -99,9 +118,33 @@ impl Model {
         if self.landed[blk].swap(seq, Ordering::AcqRel) == seq {
             self.violation.store(true, Ordering::Relaxed); // served twice
         }
-        self.leases.fetch_add(1, Ordering::AcqRel);
+        if self.fail_next.swap(false, Ordering::Relaxed) {
+            // Failed page-in: no lease, the words still land (no device
+            // hang) and the compute fails at its end.
+            self.failed.store(true, Ordering::Relaxed);
+        } else {
+            self.leases.fetch_add(1, Ordering::AcqRel);
+        }
         self.served.fetch_add(1, Ordering::Release);
+        true
     }
+}
+
+/// The controller loop: polls until `stop`, then one final pass.
+fn spawn_server(m: &Arc<Model>, stop: &Arc<AtomicBool>) -> primitives::JoinHandle<()> {
+    let mut ring = Server(m.clone());
+    let stop = stop.clone();
+    primitives::spawn(move || {
+        let mut p = Poller::new(N_BLK);
+        loop {
+            p.poll(&mut ring);
+            if stop.load(Ordering::Acquire) {
+                p.poll(&mut ring);
+                return;
+            }
+            primitives::yield_now();
+        }
+    })
 }
 
 /// One compute of two layers: every published request is served exactly
@@ -147,7 +190,12 @@ fn every_published_request_is_served_once_with_its_setup_visible() {
         }
         stop.store(true, Ordering::Release);
         server.join().unwrap();
-        assert!(!m.violation.load(Ordering::Relaxed), "stale or torn serve");
+        assert!(!m.violation.load(Ordering::Relaxed), "torn or double serve");
+        assert_eq!(
+            m.stale.load(Ordering::Relaxed),
+            0,
+            "host_seq precedes the publish"
+        );
         assert_eq!(
             m.served.load(Ordering::Acquire),
             published,
@@ -194,8 +242,65 @@ fn back_to_back_computes_never_serve_a_replaced_setup() {
         }
         stop.store(true, Ordering::Release);
         server.join().unwrap();
-        assert!(!m.violation.load(Ordering::Relaxed), "stale or torn serve");
+        assert!(!m.violation.load(Ordering::Relaxed), "torn or double serve");
+        assert_eq!(
+            m.stale.load(Ordering::Relaxed),
+            0,
+            "host_seq precedes the publish"
+        );
         assert_eq!(m.landed[0].load(Ordering::Acquire), 2);
+    });
+}
+
+/// A request seen before its host_seq is refused as stale and stays pending:
+/// the poller retries it until the setup is current, so the decode thread's
+/// quiesce never waits on a request the controller dropped.
+#[test]
+fn stale_request_is_retried_until_served() {
+    primitives::model(|| {
+        let m = Arc::new(Model::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = spawn_server(&m, &stop);
+        m.publish_request_first(0, 1);
+        while m.served.load(Ordering::Acquire) < 1 {
+            primitives::yield_now();
+        }
+        assert_eq!(m.leases.swap(0, Ordering::AcqRel), 1);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert!(!m.violation.load(Ordering::Relaxed), "torn or double serve");
+        assert_eq!(m.landed[0].load(Ordering::Acquire), 1, "served once");
+        assert_eq!(m.served.load(Ordering::Acquire), 1, "no extra serve");
+    });
+}
+
+/// A failed page-in still lands its words and counts as served (the device
+/// is released, no lease is taken) and fails the compute; the other layer
+/// serves normally.
+#[test]
+fn failed_page_in_lands_and_fails_the_compute() {
+    primitives::model(|| {
+        let m = Arc::new(Model::new());
+        m.fail_next.store(true, Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = spawn_server(&m, &stop);
+        m.publish(0, 1);
+        m.publish(1, 1);
+        while m.served.load(Ordering::Acquire) < 2 {
+            primitives::yield_now();
+        }
+        assert_eq!(
+            m.leases.swap(0, Ordering::AcqRel),
+            1,
+            "only the good serve leases"
+        );
+        for blk in 0..N_BLK {
+            assert_eq!(m.landed[blk].load(Ordering::Acquire), 1, "blk {blk} landed");
+        }
+        assert!(m.failed.load(Ordering::Relaxed), "the compute fails");
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert!(!m.violation.load(Ordering::Relaxed), "torn or double serve");
     });
 }
 

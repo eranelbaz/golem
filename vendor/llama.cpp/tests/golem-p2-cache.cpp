@@ -371,6 +371,49 @@ int main() {
         golem_ctx_free(c);
     }
 
+    // --- a failed ensure after early hit copies: the hit stays valid, the
+    // unissued miss drops its bit, so the next compute re-pages it without
+    // a cache reset. ---
+    {
+        using namespace golem_test;
+        pool_init();
+        HState s;
+        static bool fail_once;
+        fail_once = true;
+        auto ensure = [](void * p, const void * tensor, const int32_t * mk, const int32_t * mi, int32_t n,
+                         const void ** out, golem_hits_ready_fn hits_ready, void * hits_ud) -> int32_t {
+            if (!fail_once) {
+                return h_ensure(p, tensor, mk, mi, n, out, hits_ready, hits_ud);
+            }
+            fail_once = false;
+            const size_t plane = (size_t) NE0 * NE1 * sizeof(float);
+            for (int32_t i = 0; i < n; ++i) {
+                out[i] = mi[i] == 0 ? pool().data() + plane * ((size_t) (mk[i] - 1) * N_EXP) : nullptr;
+            }
+            if (hits_ready != nullptr) {
+                hits_ready(hits_ud, out);
+            }
+            return 1;
+        };
+        golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXP);
+        golem_set_device_cache_experts(c, 2);
+        auto * h = golem_register_hooks(c, ensure, h_routing, h_copy_done, nullptr, nullptr, nullptr, nullptr, &s);
+        {
+            ExpertSched es;
+            es.build(1);
+            golem_sched_set_ctx(es.sched, c);
+            T_REQUIRE(ggml_backend_sched_graph_compute(es.sched, es.gf) == GGML_STATUS_FAILED,
+                      "failed ensure must fail the compute");
+            T_REQUIRE(ggml_backend_sched_graph_compute(es.sched, es.gf) == GGML_STATUS_SUCCESS, "retry");
+            T_REQUIRE(s.miss_ids.size() == 1 && s.miss_ids[0] == 1,
+                      "retry must re-page only the unissued expert 1 (got %zu misses)", s.miss_ids.size());
+        }
+        golem_unregister_hooks(h);
+        golem_reset_device_cache(c);
+        golem_ctx_free(c);
+    }
+
+    g_failures += golem_test::failures();
     if (g_failures != 0) {
         printf("golem-p2-cache: %d FAILURES\n", g_failures);
         return 1;
