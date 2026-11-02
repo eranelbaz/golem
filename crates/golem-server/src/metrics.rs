@@ -29,6 +29,10 @@ pub struct MetricsSnapshot {
     /// Expert units whose H2D was issued at the RAM-hit hand-off, ahead of
     /// the ensure's blocking disk reads.
     pub early_h2d_units: Option<u64>,
+    /// Victim-ring-full fallbacks (§6.3 O10); `None` without the pooled GPU split.
+    pub victim_ring_full: Option<u64>,
+    /// Eviction planes copied through the victim ring (§6.3 O10).
+    pub victim_ring_units: Option<u64>,
     /// P3: demand page-ins, fast hits, evictions, bytes paged, source errors.
     pub p3: Option<[u64; 5]>,
     /// §6.5: prefetch page-ins, hits, wasted bytes, demand stand-downs.
@@ -63,6 +67,8 @@ impl MetricsSnapshot {
             .as_ref()
             .map(|d| (d.bytes_copied, d.bytes_skipped, d.evictions));
         self.early_h2d_units = dc.as_ref().map(|d| d.early_h2d_units);
+        self.victim_ring_full = dc.as_ref().map(|d| d.victim_ring_full);
+        self.victim_ring_units = dc.as_ref().map(|d| d.victim_ring_units);
         self.h2d_copies = dc.map(|d| (d.cache_copies, d.stream_copies));
         self.p3 = s.p3_stats().map(|p| {
             [
@@ -165,6 +171,22 @@ pub(crate) fn render(h: &HealthState) -> String {
             "counter",
             "expert planes whose H2D was issued before the ensure's blocking disk reads",
             early as f64,
+        );
+    }
+    if let Some(full) = m.victim_ring_full {
+        g(
+            "golem_victim_ring_full_total",
+            "counter",
+            "exclusive-residency evictions that found the VRAM victim ring full (same-stream D2H fallback)",
+            full as f64,
+        );
+    }
+    if let Some(units) = m.victim_ring_units {
+        g(
+            "golem_victim_ring_units_total",
+            "counter",
+            "exclusive-residency eviction planes copied through the VRAM victim ring",
+            units as f64,
         );
     }
     if let Some([demand, fast, ev, paged, errs]) = m.p3 {

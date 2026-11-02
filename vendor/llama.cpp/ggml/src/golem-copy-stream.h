@@ -21,9 +21,20 @@ struct golem_copy_stream_iface {
     // the copy stream waits for `event` / the compute stream waits for `event`
     void (*copy_wait)(ggml_backend_t backend, void * event);
     void (*compute_wait)(ggml_backend_t backend, void * event);
-    // blocks until the copy stream is idle
+    // blocks until the copy stream AND the D2H stream are idle
     void (*sync)(ggml_backend_t backend);
     float (*elapsed_ms)(void * start, void * end);
+    // VRAM victim ring (ABI v18): device-to-device copy on the compute stream
+    void (*d2d_compute)(ggml_backend_t backend, struct ggml_tensor * dst, size_t dst_off,
+                        const struct ggml_tensor * src, size_t src_off, size_t size);
+    // D2H on a dedicated D2H stream (never the H2D copy stream: an in-order
+    // stream would head-of-line block the refills behind the readbacks)
+    void (*d2h_get_async)(ggml_backend_t backend, void * dst, const struct ggml_tensor * src, size_t offset, size_t size);
+    // record on the D2H stream / the D2H stream waits for `event`
+    void (*record_d2h)(ggml_backend_t backend, void * event);
+    void (*d2h_wait)(ggml_backend_t backend, void * event);
+    // 1 = every op before the event's record has completed
+    int (*event_query)(void * event);
 };
 
 #endif

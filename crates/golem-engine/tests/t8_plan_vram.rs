@@ -70,6 +70,7 @@ fn predicted(
         },
         snapshot_ram: 0,
         vram_reserve: reserve,
+        victim_ring_slots: 0,
         ws: golem_plan::WS_MEASURED,
     };
     let r = golem_plan::plan(m, &mach, &i);

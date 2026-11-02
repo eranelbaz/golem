@@ -436,3 +436,114 @@ fn store_knobs_keep_output_and_experts_on_gpu() {
     let (on_gpu, on_cpu) = (after.on_gpu - before.on_gpu, after.on_cpu - before.on_cpu);
     assert!(on_cpu == 0 && on_gpu > 0, "on_gpu={on_gpu} on_cpu={on_cpu}");
 }
+
+/// The victim ring is off by default; on, it needs exclusive residency and
+/// the RAM pool on any substrate, and a device substrate on the CPU one.
+#[test]
+fn victim_ring_preconditions_are_refused() {
+    use golem_engine::config::Residency;
+    assert_eq!(EngineConfig::default().victim_ring_slots, 0);
+    let inclusive = EngineConfig {
+        victim_ring_slots: 4,
+        ..pooled()
+    };
+    let e = greedy(&inclusive).unwrap_err().to_string();
+    assert!(
+        e.contains("victim_ring_slots") && e.contains("exclusive"),
+        "{e}"
+    );
+    let no_pool = EngineConfig {
+        residency: Residency::Exclusive,
+        ram_experts_gib: 0,
+        ..inclusive.clone()
+    };
+    let e = greedy(&no_pool).unwrap_err().to_string();
+    assert!(
+        e.contains("victim_ring_slots") && e.contains("ram_experts_gib > 0"),
+        "{e}"
+    );
+    if golem_llama_sys::substrate_backend() == golem_llama_sys::Backend::Cpu {
+        let cpu = EngineConfig {
+            residency: Residency::Exclusive,
+            ..inclusive
+        };
+        let e = greedy(&cpu).unwrap_err().to_string();
+        assert!(
+            e.contains("victim_ring_slots") && e.contains("substrate"),
+            "{e}"
+        );
+    }
+}
+
+/// HIP: exclusive residency with the victim ring, K = 4 < 8 experts so slab
+/// evictions park and D2H through the ring, through the engine-registered
+/// hooks: two turns decode the inclusive baseline's text, planes went
+/// through the ring, and every expert op stayed on the GPU.
+#[cfg(feature = "hip-tests")]
+#[test]
+fn victim_ring_exclusive_matches_inclusive_output() {
+    use golem_engine::TurnRequest;
+    use golem_engine::config::Residency;
+    use golem_engine::session::expert_placement;
+
+    const LONG: &[ChatTurn<'static>] = &[ChatTurn {
+        role: "user",
+        content: "one two three four five six seven eight nine ten eleven twelve thirteen \
+                  fourteen fifteen sixteen seventeen eighteen nineteen twenty",
+    }];
+    const NEXT: &[ChatTurn<'static>] = &[ChatTurn {
+        role: "user",
+        content: "count to ten",
+    }];
+    let gpu = |residency: Residency, victim_ring_slots: u32| {
+        let off = common::offload::offload_config();
+        EngineConfig {
+            n_gpu_layers: off.n_gpu_layers,
+            cpu_moe_layers: off.cpu_moe_layers,
+            residency,
+            victim_ring_slots,
+            ..pooled()
+        }
+    };
+    let turn = |s: &mut Session, msgs: &[ChatTurn<'_>]| {
+        let mut out = String::new();
+        s.turn(&TurnRequest::new(msgs).max_tokens(Some(16)), &mut |t| {
+            out.push_str(t)
+        })
+        .expect("turn");
+        out
+    };
+    let two_turns = |cfg: &EngineConfig| {
+        let mut s = Session::new(cfg).expect("session");
+        let a = turn(&mut s, LONG);
+        let b = turn(&mut s, NEXT);
+        (a, b, s.device_cache_stats().expect("pooled GPU split"))
+    };
+    let before = expert_placement();
+    let (a0, b0, _) = two_turns(&gpu(Residency::Inclusive, 0));
+    assert!(!a0.is_empty() && !b0.is_empty());
+    for slots in [1, 4] {
+        let (a1, b1, dc) = two_turns(&gpu(Residency::Exclusive, slots));
+        assert_eq!(
+            (&a1, &b1),
+            (&a0, &b0),
+            "victim ring ({slots} slots) changed output"
+        );
+        assert!(dc.evictions > 0, "K = 4 never evicted: {dc:?}");
+        // Logged, not asserted: the fixture does not guarantee >1 parked
+        // eviction per (layer, compute), so a 1-slot ring may never be full.
+        eprintln!(
+            "victim ring {slots} slots: units={} full={}",
+            dc.victim_ring_units, dc.victim_ring_full
+        );
+        assert!(
+            dc.victim_ring_units > 0,
+            "no plane went through the ring: {dc:?}"
+        );
+    }
+    assert_eq!(
+        expert_placement().on_cpu,
+        before.on_cpu,
+        "expert MUL_MAT_ID ran on the CPU"
+    );
+}

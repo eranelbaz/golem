@@ -48,9 +48,9 @@ pub fn hooks_abi_version() -> i32 {
 
 // The RAII surface below is written against ABI v5 (per-model `golem_ctx`,
 // handle-returning register, batched ensure, triple-buffered order push).
-// A header drift past v17 must fail this build, not silently re-shape the
+// A header drift past v18 must fail this build, not silently re-shape the
 // guards.
-const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 17);
+const _: () = assert!(raw::GOLEM_HOOKS_ABI_VERSION == 18);
 
 /// GPU devices (discrete or integrated) in the backend registry (each one a
 /// device backend a llama context may split across).

@@ -103,8 +103,9 @@ inline void h_routing(void * p, int32_t blk, const void * tensor, const int32_t 
 
 inline void h_copy_done(void * p) { ((HState *) p)->copy_done_calls.fetch_add(1); }
 
-// One-layer MoE graph: `n_planes` expert tensors of the same layer (gate/up/
-// down names so golem_tensor_kind resolves), one shared ids tensor, each
+// MoE graph of `layers` (default 1) layers blk.0.. in order, each with
+// `n_planes` expert tensors (gate/up/down names so golem_tensor_kind
+// resolves), one ids tensor shared by every layer, each
 // MUL_MAT_ID forced onto the fake GPU backend so the split's cross-backend
 // copy path (and its golem branches) engages.
 struct ExpertSched {
@@ -117,24 +118,22 @@ struct ExpertSched {
     ggml_tensor * b = nullptr, * ids = nullptr;
     ggml_cgraph * gf = nullptr;
 
-    void build(int planes) {
+    void build(int planes, int layers = 1) {
         n_planes = planes;
-        static const char * names[3] = {
-            "blk.0.ffn_gate_exps.weight",
-            "blk.0.ffn_up_exps.weight",
-            "blk.0.ffn_down_exps.weight",
-        };
+        static const char * names[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
         ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
         ctx = ggml_init(ip);
         b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NE0, 2);
         ggml_set_name(b, "blk.0.cur_ffn_inp");
         ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
         ggml_set_name(ids, "blk.0.ffn_router");
-        for (int k = 0; k < planes; ++k) {
-            ggml_tensor * wk = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, NE0, NE1, N_EXP);
-            ggml_set_name(wk, names[k]);
-            w.push_back(wk);
-            outs.push_back(ggml_mul_mat_id(ctx, wk, b, ids));
+        for (int l = 0; l < layers; ++l) {
+            for (int k = 0; k < planes; ++k) {
+                ggml_tensor * wk = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, NE0, NE1, N_EXP);
+                ggml_format_name(wk, "blk.%d.%s.weight", l, names[k]);
+                w.push_back(wk);
+                outs.push_back(ggml_mul_mat_id(ctx, wk, b, ids));
+            }
         }
         gf = ggml_new_graph(ctx);
         for (auto * o : outs) {
