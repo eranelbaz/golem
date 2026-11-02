@@ -977,6 +977,7 @@ pub struct SessionHooks {
     /// Both stream slabs' bytes (0 without streaming).
     stream_slab_vram: u64,
     /// The victim ring's bytes (0 when off).
+    #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
     victim_ring_vram: u64,
     /// Device bytes of one K slot across the model (§3.4). Read only on
     /// the HIP path (`refit_stream_k`'s VRAM query).
