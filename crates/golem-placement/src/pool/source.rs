@@ -155,11 +155,12 @@ pub fn class_slots(classes: &[(u64, Vec<u32>)], pool_bytes: u64) -> Vec<u64> {
 /// Reads one expert plane from a byte source.
 pub trait ExpertSource: Send + Sync {
     /// Read one expert plane into `into[head..head + stride]` (`into` may be
-    /// longer; every byte outside that range is scratch the source may
-    /// overwrite — a direct read lands the whole aligned range covering the
-    /// plane). Pass `head = 0` for a plain plane buffer. Blocking; bounded
-    /// internal retries on EINTR/short
-    /// reads; a 0-byte read is `UnexpectedEof`. `layer` is the
+    /// longer). Bytes outside that range are left untouched or set to the
+    /// file bytes at the matching offsets (zero past EOF) — a direct read lands the
+    /// whole aligned range covering the plane. Prefill staging relies on
+    /// this: neighbouring experts' covering regions overlap (§7.6). Pass
+    /// `head = 0` for a plain plane buffer. Blocking; bounded internal
+    /// retries on EINTR/short reads; a 0-byte read is `UnexpectedEof`. `layer` is the
     /// DENSE-LEAD-ADJUSTED index (blk.1 is expert layer 0 in tiny-moe).
     ///
     /// # Errors

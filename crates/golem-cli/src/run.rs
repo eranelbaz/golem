@@ -681,8 +681,9 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
             eprintln!("golem: timing CSV trailer: {e}");
         }
     }
-    if let Some(n) = session.p3_hooks().and_then(|h| h.scratch_planes()) {
-        let line = format!("store scratch_planes={n}");
+    if let Some([head, len, align]) = session.p3_hooks().and_then(|h| h.scratch_by_reason()) {
+        let n = head + len + align;
+        let line = format!("store scratch_planes={n} head={head} len={len} align={align}");
         eprintln!("golem: {line}");
         if let Some(Err(e)) = timing_out
             .as_mut()

@@ -110,7 +110,7 @@ impl Lease {
     /// # struct Src;
     /// # impl ExpertSource for Src {
     /// #     fn read_expert(&self, _: u32, _: ExpertKind, _: u32, into: &mut [u8], _: usize)
-    /// #         -> std::io::Result<()> { into.fill(1); Ok(()) }
+    /// #         -> std::io::Result<()> { into[..8].fill(1); Ok(()) }
     /// #     fn plane(&self, _: u32, _: ExpertKind, _: u32) -> Option<(u64, u64)> { None }
     /// # }
     /// # let arena = Arena::new(&[SlotClass { slot_size: 24, slots: 1 }]).unwrap();
@@ -2067,7 +2067,8 @@ mod tests {
             if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 panic!("source panicked mid-fill");
             }
-            into[head..].fill(0x10 * (kind.ordinal() as u8 + 1) + expert as u8);
+            let n = into.len().min(head + 64);
+            into[head..n].fill(0x10 * (kind.ordinal() as u8 + 1) + expert as u8);
             Ok(())
         }
 

@@ -29,6 +29,6 @@ pub use pager::{
 pub use prefetch::{AccessFeed, PredictionQueue, PrefetchHandle, WarmFeed, spawn_prefetch};
 pub use residency::{ExpertKind, P3Stats, PolicySnapshot, PoolConfigError};
 pub use source::{
-    ExpertSource, GgufPreadSource, PoolGeometry, SourceError, UnitLayout, class_slots,
+    DIRECT_ALIGN, ExpertSource, GgufPreadSource, PoolGeometry, SourceError, UnitLayout, class_slots,
 };
-pub use store_source::StoreExpertSource;
+pub use store_source::{ScratchReason, StoreExpertSource};
