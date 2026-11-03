@@ -681,6 +681,16 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
             eprintln!("golem: timing CSV trailer: {e}");
         }
     }
+    if let Some(n) = session.p3_hooks().and_then(|h| h.scratch_planes()) {
+        let line = format!("store scratch_planes={n}");
+        eprintln!("golem: {line}");
+        if let Some(Err(e)) = timing_out
+            .as_mut()
+            .map(|f| writeln!(f, "# {line}").and_then(|()| f.flush()))
+        {
+            eprintln!("golem: timing CSV trailer: {e}");
+        }
+    }
     if let Some(dc) = session.device_cache_stats() {
         let line = format!(
             "device_cache bytes_copied={} bytes_skipped={} evictions={} early_h2d_units={} \

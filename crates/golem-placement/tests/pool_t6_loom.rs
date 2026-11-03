@@ -43,10 +43,14 @@ impl golem_placement::pool::ExpertSource for ProvenanceSource {
 
 /// 1 unit slot (3 planes × 8 B) over 2 experts of one layer.
 fn loom_pool() -> Arc<ExpertPool> {
+    loom_pool_slots(1)
+}
+
+fn loom_pool_slots(slots: u32) -> Arc<ExpertPool> {
     let plane = 8u64;
     let arena = Arena::new(&[SlotClass {
         slot_size: 3 * plane as usize,
-        slots: 1,
+        slots,
     }])
     .unwrap();
     let geometry = PoolGeometry {
@@ -262,6 +266,60 @@ fn t6_ensure_batch_interleaves_with_range_claims() {
             Err(e) => panic!("unexpected pool error: {e}"),
         }
         step.next_step();
+    });
+}
+
+/// One `ensure_batch` holding fill claims on both units of a 2-slot layer
+/// races a step claim on one of them: the shared unit gets one fill and one
+/// slot, and every lease is gone once both sides end their step.
+#[test]
+fn t6_ensure_batch_fills_race_a_claim_on_one_unit() {
+    primitives::model(|| {
+        let pool = loom_pool_slots(2);
+        let p2 = pool.clone();
+        let batch = primitives::spawn(move || {
+            let mut out = [std::ptr::null(); 3];
+            let misses = [
+                (ExpertKind::Gate, 0u32),
+                (ExpertKind::Down, 1u32),
+                (ExpertKind::Up, 0u32),
+            ];
+            p2.ensure_batch(0, &misses, &mut out).unwrap();
+            out[1] as usize - 16
+        });
+        let mut step = StepClaims::new(pool.clone());
+        let mut ptr = [std::ptr::null()];
+        step.ensure_range_leased(0, ExpertKind::Gate, 1, 1, &mut ptr)
+            .unwrap();
+        let bytes = step.leases()[0].bytes();
+        assert!(
+            bytes[..8]
+                .iter()
+                .all(|&b| b == plane_byte(ExpertKind::Gate, 1))
+        );
+        assert!(
+            bytes[16..]
+                .iter()
+                .all(|&b| b == plane_byte(ExpertKind::Down, 1))
+        );
+        let batch_slot_base = batch.join().unwrap();
+        assert_eq!(
+            bytes.as_ptr() as usize,
+            batch_slot_base,
+            "one slot per unit"
+        );
+        let s = &pool.stats;
+        assert_eq!(
+            s.demand_slow_pageins.load(Ordering::Relaxed),
+            2,
+            "one fill per unit"
+        );
+        step.next_step();
+        pool.end_batch_step();
+        for e in 0..2u32 {
+            assert!(pool.is_resident(0, e));
+            assert_eq!(pool.outstanding_leases(0, e), 0, "lease leaked");
+        }
     });
 }
 
