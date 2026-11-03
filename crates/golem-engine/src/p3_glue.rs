@@ -1155,7 +1155,9 @@ impl SessionHooks {
     /// auto-disables with a warning and K is refit without the slabs.
     /// An explicit K is only checked: see [`Self::check_explicit_fit`].
     /// Called once per load, after the self-check decode: a ring that
-    /// failed to set up there fails the load, not the first user turn.
+    /// failed to set up there fails the load. The one-token self-check
+    /// rarely evicts, so the ring usually first allocates (and can first
+    /// fail) on a user turn, which `run_batch` reports.
     pub(crate) fn fit_device_cache(&mut self) -> Result<(), EngineError> {
         let mut r = crate::timing::VictimRingStats::default();
         // SAFETY: FFI on this session's live ctx between computes; writes
@@ -3667,7 +3669,7 @@ mod tests {
     #[test]
     fn explicit_k_ring_fit_prices_slabs_ring_and_headroom() {
         let slab = 644_022_272;
-        let ring = 16 * 3 * 5_767_168;
+        let ring = 16 * 3 * 6_881_280;
         let need = 9 * slab + ring + VRAM_HEADROOM_BYTES;
         explicit_k_fits(24 << 30, 8, slab, ring).unwrap();
         explicit_k_fits(need, 8, slab, ring).unwrap();
