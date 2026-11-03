@@ -876,6 +876,148 @@ mod tests {
 
     const PAGE_STRIDE: u64 = DIRECT_ALIGN;
 
+    /// End to end over the real store source (§5.4): a split-free GGUF whose
+    /// expert tensors start off a page boundary with 4 KiB strides (the
+    /// GLM-5.3-Flash shape: bases 32–4000 B past a page, page-multiple
+    /// strides). A streamed plane lands byte-exact with zero scratch copies.
+    #[test]
+    fn store_backed_staging_reads_every_plane_in_place() {
+        use golem_placement::pool::{GgufPreadSource, StoreExpertSource};
+        use golem_store::ChunkQueue;
+        use xtask::gguf::{GgufKv, GgufTensorMeta, GgufValue, write_gguf};
+
+        const N: u64 = 4;
+        // F32 rows of 1024 elems = 4096 B per expert.
+        let stride = DIRECT_ALIGN;
+        let byte = |k: usize, e: u64, i: u64| (k as u64 * 64 + e * 8 + i % 7) as u8;
+        let dir = std::env::temp_dir().join(format!("golem-stream-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = "m.gguf";
+        let kvs = vec![
+            GgufKv {
+                key: "general.architecture".into(),
+                value: GgufValue::Str("glm4moe".into()),
+            },
+            GgufKv {
+                key: "glm4moe.leading_dense_block_count".into(),
+                value: GgufValue::U32(1),
+            },
+        ];
+        // A small leading tensor pushes the expert bases off the page.
+        let mut tensors = vec![(
+            GgufTensorMeta {
+                name: "blk.0.attn_norm.weight".into(),
+                dims: vec![8, 1, 1],
+                ggml_type: 0,
+            },
+            vec![0u8; 32],
+        )];
+        for (k, kind) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+            .iter()
+            .enumerate()
+        {
+            let payload = (0..N)
+                .flat_map(|e| (0..stride).map(move |i| byte(k, e, i)))
+                .collect();
+            tensors.push((
+                GgufTensorMeta {
+                    name: format!("blk.1.{kind}.weight"),
+                    dims: vec![stride / 4, 1, N],
+                    ggml_type: 0,
+                },
+                payload,
+            ));
+        }
+        let path = dir.join(file);
+        let f = std::fs::File::create(&path).unwrap();
+        write_gguf(&mut &f, &kvs, &tensors).unwrap();
+        drop(f);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.resize(bytes.len().next_multiple_of(4096) + 4096, 0);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        let index: Vec<serde_json::Value> = golem_gguf::tensor_entries(&mut f)
+            .unwrap()
+            .iter()
+            .filter(|e| e.expert_kind().is_some())
+            .map(|e| {
+                serde_json::json!({
+                    "tensor": e.name,
+                    "layer": 1,
+                    "experts": N,
+                    "bytes_per_expert": stride,
+                    "offsets_bytes": (0..N).map(|i| i * stride).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let manifest = dir.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            serde_json::json!({
+                "name": "stream-store",
+                "shards": [{"file": file, "bytes": bytes.len(),
+                            "sha256": "0".repeat(64), "replicas": [dir]}],
+                "expert_index": index,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let geo = GgufPreadSource::open(&path, 1)
+            .unwrap()
+            .geometry()
+            .unwrap()
+            .unwrap();
+        let layout = geo.layers[0];
+        assert!(
+            layout.head.iter().all(|&h| h != 0),
+            "fixture must misalign every plane: {layout:?}"
+        );
+        let store = Arc::new(
+            StoreExpertSource::open(&manifest, Arc::new(ChunkQueue::new(1, None))).unwrap(),
+        );
+        let source: Arc<dyn ExpertSource> = store.clone();
+        let arena = Arena::new(&[SlotClass {
+            slot_size: layout.slot_bytes() as usize,
+            slots: 1,
+        }])
+        .unwrap();
+        let pool = ExpertPool::new(
+            arena,
+            source.clone(),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            geo,
+            vec![0],
+        );
+        let s = StreamState::new(
+            pool,
+            source,
+            Box::new(|| false),
+            N as usize * stride as usize,
+        )
+        .unwrap();
+        let ids = [0, 1, 2, 3];
+        for (k, code) in [1, 2, 3].into_iter().enumerate() {
+            let mut out = [std::ptr::null(); N as usize];
+            s.source(0, code, k as u64 + 1, &ids, &mut out).unwrap();
+            for (e, &p) in out.iter().enumerate() {
+                // SAFETY: one staged plane, held under seq k + 1.
+                let plane = unsafe { std::slice::from_raw_parts(p as *const u8, stride as usize) };
+                assert!(
+                    plane
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == byte(k, e as u64, i as u64)),
+                    "kind {code} expert {e}"
+                );
+            }
+        }
+        assert_eq!(store.scratch_by_reason(), [0; 3], "a staged plane bounced");
+        s.release_all();
+        s.stop();
+    }
+
     /// Staged planes sit at their file head so the store reads them in place
     /// (§5.4), and staged pointers stay `plane_len` apart for C's coalesced
     /// H2D runs even though neighbouring regions overlap by the tail page.
