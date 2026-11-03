@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-dl.h"
 #include "ggml-impl.h"
+#include "golem-hook-context.hpp"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -595,4 +596,38 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     if (backend_path) {
         ggml_backend_load(backend_path);
     }
+}
+
+// Lives here, not in ggml-backend.cpp: it enumerates devices, which ggml-base cannot link.
+int32_t golem_set_victim_ring(golem_ctx_t ctx, int32_t slots, int32_t max_plane_stride) {
+    if (ctx == NULL || ctx->vr_buf != nullptr) {
+        return -1;
+    }
+    if (slots <= 0) {
+        ctx->vr_slots = 0;
+        return 0;
+    }
+    // The D2H stream is a stream index concurrent-stream forking also uses.
+    const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+    if ((env != nullptr && atoi(env) == 1) || ctx->copy_done == NULL || ctx->evict_batch == NULL ||
+        max_plane_stride <= 0) {
+        return -1;
+    }
+    // Load-time refusal instead of a mid-decode one at the first park.
+    bool has_cs = false;
+    for (size_t i = 0; i < ggml_backend_dev_count() && !has_cs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        has_cs = reg != nullptr && ggml_backend_reg_get_proc_address(reg, "golem_copy_stream_iface") != nullptr;
+    }
+    if (!has_cs) {
+        return -1;
+    }
+    ctx->vr_slots = slots;
+    ctx->vr_stride = max_plane_stride;
+    ctx->vr_off = false;
+    ctx->vr_alloc_failed = false;
+    ctx->vr_state.assign((size_t) slots, golem_ctx::GOLEM_VR_FREE);
+    ctx->vr_rel_ev.assign((size_t) slots, nullptr);
+    return 0;
 }
