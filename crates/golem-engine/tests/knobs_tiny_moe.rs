@@ -547,3 +547,41 @@ fn victim_ring_exclusive_matches_inclusive_output() {
         "expert MUL_MAT_ID ran on the CPU"
     );
 }
+
+/// A ring whose device allocation fails (injected through the substrate's
+/// test seam, engine-registered hooks) fails the turn instead of silently
+/// falling back to the same-stream D2H the run did not ask for.
+#[cfg(feature = "hip-tests")]
+#[test]
+#[allow(unsafe_code)] // FFI test seam (ring allocation failure, cache reset)
+fn victim_ring_setup_failure_fails_the_turn() {
+    use golem_engine::TurnRequest;
+    use golem_engine::config::Residency;
+    use golem_engine::error::EngineError;
+
+    let off = common::offload::offload_config();
+    let cfg = EngineConfig {
+        n_gpu_layers: off.n_gpu_layers,
+        cpu_moe_layers: off.cpu_moe_layers,
+        residency: Residency::Exclusive,
+        victim_ring_slots: 4,
+        ..pooled()
+    };
+    let mut s = Session::new(&cfg).expect("session");
+    let ctx = s.p3_ctx_ptr().expect("pooled ⇒ live ctx");
+    // SAFETY: FFI on the session's live ctx between turns; the ring is
+    // allocated at the first eviction park of the next turn.
+    unsafe {
+        golem_llama_sys::raw::golem_reset_device_cache(ctx);
+        golem_llama_sys::raw::golem_inject_victim_ring_alloc_failure(ctx);
+    }
+    let msgs = [ChatTurn {
+        role: "user",
+        content: "one two three four five six seven eight nine ten eleven twelve thirteen \
+                  fourteen fifteen sixteen seventeen eighteen nineteen twenty",
+    }];
+    let err = s
+        .turn(&TurnRequest::new(&msgs).max_tokens(Some(16)), &mut |_| {})
+        .expect_err("a failed ring setup must fail the turn");
+    assert!(matches!(err, EngineError::VictimRingUnavailable), "{err}");
+}

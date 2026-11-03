@@ -1897,6 +1897,20 @@ impl SessionInner {
             // whose expert-copy leases release only at the next compute.
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+            // A ring disabled by this compute is reported before any reset
+            // (recovery, next turn) clears a non-sticky `vr_off`.
+            if self.config.victim_ring_slots > 0 {
+                let io = p3_glue::take_step_io_stats();
+                if let Some(c) = &io.cpu_expert {
+                    self.cpu_expert_total.add(c);
+                }
+                if let Some(r) = &io.victim_ring {
+                    self.victim_ring_total.add(r);
+                }
+                if io.victim_ring_off {
+                    return Err(EngineError::VictimRingUnavailable);
+                }
+            }
             // 2 = aborted; a cancel only if the predicate both the abort
             // callback and the stream source fire on still holds (the set
             // is cleared only after this returns).
@@ -1920,6 +1934,9 @@ impl SessionInner {
             // measured only on the async_h2d copy stream; policy and the ids
             // readback columns only while the P3 hooks are registered.
             let io = p3_glue::take_step_io_stats();
+            if io.victim_ring_off {
+                return Err(EngineError::VictimRingUnavailable);
+            }
             let cpu_expert = io.cpu_expert;
             if let Some(c) = &cpu_expert {
                 self.cpu_expert_total.add(c);

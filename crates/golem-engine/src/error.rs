@@ -82,6 +82,11 @@ pub enum EngineError {
     /// page-in failed mid-decode; no later decode can succeed.
     #[error("every replica of a model shard is unreadable")]
     StorageUnavailable,
+    /// The requested victim ring (§6.3 O10) was disabled by a failed device
+    /// setup (ABI v21): refused rather than a silent same-stream D2H. The
+    /// allocation failure is sticky, so a replay cannot recover.
+    #[error("victim_ring_slots: the device ring failed to set up (allocation or copy-stream bind)")]
+    VictimRingUnavailable,
 }
 
 #[cfg(test)]

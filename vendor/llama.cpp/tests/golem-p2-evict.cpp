@@ -235,6 +235,7 @@ static void ring_reuse_leg() {
 int main() {
     using namespace golem_test;
     pool_init();
+    ggml_backend_device_register(fake_dev());
     HState s;
     golem_ctx_t c = golem_ctx_create(N_LAYERS, N_EXPERTS);
     golem_set_device_cache_experts(c, 2); // K = 2 < 8: forced eviction churn

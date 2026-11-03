@@ -190,6 +190,7 @@ struct golem_ctx {
     int32_t vr_stride = 0; // bytes per plane slot
     bool vr_off = false;   // bind/tensor setup failed: ring disabled until reset
     bool vr_alloc_failed = false; // device allocation failed: sticky across reset
+    std::atomic<bool> vr_fail_inject{false}; // test seam: the next ring allocation fails
     int32_t vr_next = 0;   // round-robin start for RELEASING-slot reuse
     struct ggml_context * vr_ctx = nullptr;
     struct ggml_backend_buffer * vr_buf = nullptr;
