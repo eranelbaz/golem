@@ -71,8 +71,38 @@ pub struct StoreExpertSource {
     /// GLM-5.3-Flash UD-Q4_K_XL: 3 × ~5.8 MB ≈ 17.5 MB per thread, not
     /// 288 × (4.7 + 4.7 + 5.8) MB ≈ 4.4 GB for a full prefill layer.
     scratch_cap: usize,
-    /// Planes served through the scratch window (one extra copy each).
-    scratch_planes: AtomicU64,
+    /// Planes served through the scratch window (one extra copy each),
+    /// indexed by [`ScratchReason`].
+    scratch_planes: [AtomicU64; 3],
+}
+
+/// Why a plane missed the in-place read (first failing check wins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScratchReason {
+    /// The caller's head differs from the plane's `offset % DIRECT_ALIGN`.
+    Head = 0,
+    /// The buffer is shorter than the page-rounded covering region.
+    Len = 1,
+    /// The buffer is not page-aligned.
+    Align = 2,
+}
+
+/// `None` when `into` can host the aligned covering read in place.
+fn scratch_reason(
+    into: &[u8],
+    head: usize,
+    logical_at: usize,
+    covering: usize,
+) -> Option<ScratchReason> {
+    if head != logical_at {
+        Some(ScratchReason::Head)
+    } else if into.len() < covering {
+        Some(ScratchReason::Len)
+    } else if !(into.as_ptr() as usize).is_multiple_of(DIRECT_ALIGN as usize) {
+        Some(ScratchReason::Align)
+    } else {
+        None
+    }
 }
 
 impl fmt::Debug for StoreExpertSource {
@@ -100,8 +130,8 @@ struct Planned {
     stride: usize,
     covering: usize,
     expected: Option<u32>,
-    /// `Some(i)`: plane i reads in place; `None`: scratch window.
-    in_place: Option<usize>,
+    /// `None`: reads in place; `Some(r)`: scratch window, for reason `r`.
+    scratch: Option<ScratchReason>,
     logical_at: usize,
 }
 
@@ -430,14 +460,25 @@ impl StoreExpertSource {
             last_health: AtomicU8::new(InstanceHealth::Healthy as u8),
             checksum_degraded: AtomicBool::new(false),
             scratch_cap: 3 * max_covering.div_ceil(DIRECT_ALIGN as usize) * DIRECT_ALIGN as usize,
-            scratch_planes: AtomicU64::new(0),
+            scratch_planes: Default::default(),
         })
     }
 
     /// Cumulative planes served through the scratch window instead of in
     /// place (§5.4).
     pub fn scratch_planes(&self) -> u64 {
-        self.scratch_planes.load(Ordering::Relaxed)
+        self.scratch_by_reason().iter().sum()
+    }
+
+    /// [`Self::scratch_planes`] split by [`ScratchReason`] (head, len, align).
+    pub fn scratch_by_reason(&self) -> [u64; 3] {
+        self.scratch_planes
+            .each_ref()
+            .map(|c| c.load(Ordering::Relaxed))
+    }
+
+    fn note_scratch(&self, r: ScratchReason, n: u64) {
+        self.scratch_planes[r as usize].fetch_add(n, Ordering::Relaxed);
     }
 
     /// Whether §5.3 CRC verification is active.
@@ -521,17 +562,14 @@ impl ExpertSource for StoreExpertSource {
         // Fast path: the plane buffer can host the aligned covering read
         // itself (aligned base + head scratch room) — bytes land in place,
         // no copy.
-        if head == logical_at
-            && into.len() >= covering
-            && (into.as_ptr() as usize).is_multiple_of(DIRECT_ALIGN as usize)
-        {
+        let Some(reason) = scratch_reason(into, head, logical_at, covering) else {
             return self.drain(p.shard, offset, stride, expected, &mut into[..covering]);
-        }
+        };
         SCRATCH.with(|s| -> io::Result<()> {
             let mut scratch = s.borrow_mut();
             let buf = aligned_window(&mut scratch, covering);
             self.drain(p.shard, offset, stride, expected, buf)?;
-            self.scratch_planes.fetch_add(1, Ordering::Relaxed);
+            self.note_scratch(reason, 1);
             into[head..head + stride].copy_from_slice(&buf[logical_at..logical_at + stride]);
             Ok(())
         })
@@ -600,11 +638,8 @@ impl ExpertSource for StoreExpertSource {
                 let offset = p.offsets[expert as usize];
                 let covering = p.covering[expert as usize] as usize;
                 let logical_at = (offset % DIRECT_ALIGN) as usize;
-                let in_place = (*head == logical_at
-                    && into.len() >= covering
-                    && (into.as_ptr() as usize).is_multiple_of(page))
-                .then_some(i);
-                if in_place.is_none() {
+                let scratch = scratch_reason(into, *head, logical_at, covering);
+                if scratch.is_some() {
                     scratch_planes.push(i);
                 }
                 plans.push(Planned {
@@ -613,7 +648,7 @@ impl ExpertSource for StoreExpertSource {
                     stride,
                     covering,
                     expected: p.crc.as_ref().map(|c| c[expert as usize]),
-                    in_place,
+                    scratch,
                     logical_at,
                 });
             }
@@ -647,7 +682,7 @@ impl ExpertSource for StoreExpertSource {
                     let mut rb = self.queue.batch();
                     if first == 0 {
                         for ((into, _), plan) in targets.iter_mut().zip(plans.iter()) {
-                            if plan.in_place.is_some() {
+                            if plan.scratch.is_none() {
                                 rb.push(ReadJob {
                                     shard_index: plan.shard,
                                     offset: plan.offset,
@@ -710,8 +745,11 @@ impl ExpertSource for StoreExpertSource {
                         into[*head..*head + plan.stride]
                             .copy_from_slice(&w[plan.logical_at..plan.logical_at + plan.stride]);
                     }
-                    self.scratch_planes
-                        .fetch_add((end - first) as u64, Ordering::Relaxed);
+                    for &i in &scratch_planes[first..end] {
+                        if let Some(r) = plans[i].scratch {
+                            self.note_scratch(r, 1);
+                        }
+                    }
                     first = end;
                     if first >= scratch_covs.len() {
                         return Ok(());
@@ -1218,6 +1256,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scratch_counts_each_failing_condition() {
+        let (mpath, _, _) = fixture("scratch-reasons", Some(true));
+        let src = StoreExpertSource::open(&mpath, Arc::new(ChunkQueue::new(1, None))).unwrap();
+        let page = DIRECT_ALIGN as usize;
+        let (off, stride) = src.plane(0, ExpertKind::Gate, 1).unwrap();
+        let head = (off % DIRECT_ALIGN) as usize;
+        assert_ne!(head, 0, "fixture must exercise an unaligned plane");
+        let covering =
+            (off + stride).div_ceil(DIRECT_ALIGN) as usize * page - (off as usize - head);
+        let mut raw = vec![0u8; covering + 2 * page];
+        let skip = (page - raw.as_ptr() as usize % page) % page;
+        let want = row_bytes(0, 1);
+        let check = |buf: &mut [u8], h: usize, reason: [u64; 3]| {
+            let before = src.scratch_by_reason();
+            src.read_expert(0, ExpertKind::Gate, 1, buf, h).unwrap();
+            assert_eq!(&buf[h..h + stride as usize], &want[..]);
+            let after = src.scratch_by_reason();
+            assert_eq!([0, 1, 2].map(|i| after[i] - before[i]), reason);
+        };
+        check(&mut raw[skip..skip + covering], head, [0; 3]);
+        check(&mut raw[skip..skip + covering], 0, [1, 0, 0]);
+        check(&mut raw[skip..skip + covering - 1], head, [0, 1, 0]);
+        check(&mut raw[skip + 1..skip + 1 + covering], head, [0, 0, 1]);
+        assert_eq!(src.scratch_planes(), 3);
     }
 
     #[test]

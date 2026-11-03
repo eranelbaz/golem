@@ -20,7 +20,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use golem_placement::pool::{Arena, ExpertKind, ExpertPool, ExpertSource, Lease, SlotClass};
+use golem_placement::pool::{
+    Arena, DIRECT_ALIGN, ExpertKind, ExpertPool, ExpertSource, Lease, SlotClass,
+};
 
 use crate::p3_glue::p3_fatal;
 
@@ -52,9 +54,13 @@ struct Task {
     layer: u32,
     kind: ExpertKind,
     expert: u32,
-    /// Staging destination: slot base + `expert × plane_len`.
+    /// Staging destination: slot base + `expert × plane_len`; the plane
+    /// itself sits `head` bytes further.
     dst: *mut u8,
-    plane_len: usize,
+    /// Read region length: `head + plane_len` rounded up to a page, so the
+    /// source can land the aligned covering read in place (§5.4).
+    region: usize,
+    head: usize,
     slot: usize,
 }
 
@@ -123,6 +129,11 @@ pub struct StreamState {
     slot_bytes: usize,
     /// Plane byte length per layer × kind (flat, from the geometry).
     plane_lens: Vec<u32>,
+    /// Plane file misalignment per layer × kind (`UnitLayout::head`): a
+    /// staged plane sits this far past `expert × plane_len` so its covering
+    /// read lands in place. Strides are page multiples whenever a head is
+    /// non-zero, so one head serves every expert of the plane.
+    heads: Vec<u32>,
     n_layers: u32,
     n_experts: u32,
     inner: Mutex<Inner>,
@@ -157,8 +168,9 @@ unsafe impl Send for StreamState {}
 unsafe impl Sync for StreamState {}
 
 impl StreamState {
-    /// Builds the staging ring (`slot_bytes × STAGING_SLOTS`, mlocked) and
-    /// spawns the reader thread.
+    /// Builds the staging ring (`slot_bytes × STAGING_SLOTS`, mlocked, plus
+    /// one page per slot when any plane has a head) and spawns the reader
+    /// thread.
     ///
     /// # Errors
     /// Arena mmap/mlock failure (no unlocked fallback, §5.4).
@@ -168,19 +180,29 @@ impl StreamState {
         storage_lost: Box<dyn Fn() -> bool + Send + Sync>,
         slot_bytes: usize,
     ) -> Result<Arc<Self>, String> {
+        let geo = &pool.geometry;
+        let mut plane_lens = Vec::with_capacity(geo.layers.len() * 3);
+        let mut heads = Vec::with_capacity(geo.layers.len() * 3);
+        for unit in &geo.layers {
+            for kind in [ExpertKind::Gate, ExpertKind::Up, ExpertKind::Down] {
+                let (_, stride) = unit.plane(kind);
+                plane_lens.push(u32::try_from(stride).map_err(|_| "plane stride > u32")?);
+                heads.push(unit.head[kind.ordinal()] as u32);
+            }
+        }
+        // The last expert's covering read runs up to one page past
+        // `n_experts × plane_len`; page-rounded so every slot stays aligned.
+        // GLM-5.3-Flash UD-IQ3_XXS: +4 KiB on 288 × 4.46 MB = 1.28 GB.
+        let slot_bytes = if heads.iter().any(|&h| h != 0) {
+            (slot_bytes + DIRECT_ALIGN as usize).next_multiple_of(DIRECT_ALIGN as usize)
+        } else {
+            slot_bytes
+        };
         let arena = Arena::new(&[SlotClass {
             slot_size: slot_bytes,
             slots: STAGING_SLOTS,
         }])
         .map_err(|e| e.to_string())?;
-        let geo = &pool.geometry;
-        let mut plane_lens = Vec::with_capacity(geo.layers.len() * 3);
-        for unit in &geo.layers {
-            for kind in [ExpertKind::Gate, ExpertKind::Up, ExpertKind::Down] {
-                let (_, stride) = unit.plane(kind);
-                plane_lens.push(u32::try_from(stride).map_err(|_| "plane stride > u32")?);
-            }
-        }
         let state = Arc::new(Self {
             n_experts: geo.n_experts,
             n_layers: geo.layers.len() as u32,
@@ -190,6 +212,7 @@ impl StreamState {
             arena: Arc::new(arena),
             slot_bytes,
             plane_lens,
+            heads,
             inner: Mutex::new(Inner {
                 free_slots: (0..STAGING_SLOTS as usize).collect(),
                 pending_reads: [0; STAGING_SLOTS as usize],
@@ -249,10 +272,17 @@ impl StreamState {
                 }
             };
             // Read OUTSIDE the lock: the disk pass is the pipeline's bound.
-            // SAFETY: `dst..dst+plane_len` is inside the slot (slot_bytes =
-            // n_experts × max stride ≥ plane_len); the task is exclusively
-            // owned here and C reads the bytes only after pending hits 0.
-            let plane = unsafe { std::slice::from_raw_parts_mut(task.dst, task.plane_len) };
+            // SAFETY: `dst..dst+region` is inside the slot (slot_bytes =
+            // n_experts × max stride + one page ≥ expert × plane_len +
+            // region); the slot is exclusively the reader's until pending
+            // hits 0, and C reads the bytes only after that. Adjacent
+            // experts' regions overlap by one page; the single reader runs a
+            // slot's tasks in ascending id order, so a read's tail only
+            // precedes the next expert's own verified plane bytes, and its
+            // head bytes (unverified, §5.3) are restored below.
+            let plane = unsafe { std::slice::from_raw_parts_mut(task.dst, task.region) };
+            let mut saved = [0u8; DIRECT_ALIGN as usize];
+            saved[..task.head].copy_from_slice(&plane[..task.head]);
             #[cfg(any(test, feature = "test-support"))]
             if let Some(f) = self
                 .test_before_read
@@ -269,9 +299,12 @@ impl StreamState {
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match self
                     .source
-                    .read_expert(task.layer, task.kind, task.expert, plane, 0)
+                    .read_expert(task.layer, task.kind, task.expert, plane, task.head)
                 {
-                    Ok(()) => ReadState::Ok,
+                    Ok(()) => {
+                        plane[..task.head].copy_from_slice(&saved[..task.head]);
+                        ReadState::Ok
+                    }
                     Err(_) if (self.storage_lost)() => ReadState::StorageLost,
                     Err(_) => ReadState::Fatal,
                 }
@@ -322,6 +355,9 @@ impl StreamState {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         check_read(inner.read)?;
         let plane_len = self.plane_lens[(layer as usize) * 3 + kind as usize] as usize;
+        let head = self.heads[(layer as usize) * 3 + kind as usize] as usize;
+        let region =
+            (head + plane_len).next_multiple_of(if head == 0 { 1 } else { DIRECT_ALIGN as usize });
         let mut ids = ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
@@ -343,7 +379,8 @@ impl StreamState {
                     kind,
                     expert: id,
                     dst: unsafe { base.add(id as usize * plane_len) },
-                    plane_len,
+                    region,
+                    head,
                     slot,
                 });
             }
@@ -416,6 +453,7 @@ impl StreamState {
         }
         let layer = blk as u32;
         let plane_len = self.plane_lens[(layer as usize) * 3 + kind as usize] as usize;
+        let head = self.heads[(layer as usize) * 3 + kind as usize] as usize;
         self.planes.fetch_add(1, Ordering::Relaxed);
 
         // Fallback: no warm plane (first layer's gate, or C reordered the
@@ -488,8 +526,9 @@ impl StreamState {
             } else if staged {
                 self.staged.fetch_add(1, Ordering::Relaxed);
                 self.bytes.fetch_add(plane_len as u64, Ordering::Relaxed);
-                // SAFETY: id × plane_len inside the slot (slot_bytes bound).
-                out[i] = unsafe { pending.base.add(id as usize * plane_len) } as *const c_void;
+                // SAFETY: id × plane_len + head inside the slot (slot_bytes bound).
+                out[i] =
+                    unsafe { pending.base.add(id as usize * plane_len + head) } as *const c_void;
             } else if pending.warmed_ids.binary_search(&id).is_err() {
                 // A whole fill over a routed-only warm with no misses has no
                 // slot yet: take one with no reads for the stale pointers.
@@ -501,7 +540,8 @@ impl StreamState {
                 }
                 // SAFETY: as above; the bytes are stale (never staged this
                 // plane) but finite, and the id is unrouted.
-                out[i] = unsafe { pending.base.add(id as usize * plane_len) } as *const c_void;
+                out[i] =
+                    unsafe { pending.base.add(id as usize * plane_len + head) } as *const c_void;
             } else {
                 // A warmed id lost residency after warm (the pause protocol
                 // forbids it): fatal, never stale.
@@ -802,6 +842,94 @@ mod tests {
         assert_eq!(s.stats().held, 1);
         s.release(1);
         assert_eq!(s.stats().held, 0);
+        s.release_all();
+        assert!(all_slots_free(&s));
+        s.stop();
+    }
+
+    /// Records each read's head and region length and writes what a file
+    /// of back-to-back planes holds there: the previous expert's tail before
+    /// the plane, the plane's id, then the next expert's head bytes.
+    struct HeadSource(Mutex<Vec<(usize, usize)>>);
+
+    impl ExpertSource for HeadSource {
+        fn read_expert(
+            &self,
+            _layer: u32,
+            _kind: ExpertKind,
+            expert: u32,
+            into: &mut [u8],
+            head: usize,
+        ) -> std::io::Result<()> {
+            self.0.lock().unwrap().push((head, into.len()));
+            let end = head + PAGE_STRIDE as usize;
+            into[..head].fill(expert.wrapping_sub(1) as u8);
+            into[head..end].fill(expert as u8);
+            into[end..].fill((expert as u8).wrapping_add(1));
+            Ok(())
+        }
+
+        fn plane(&self, _layer: u32, _kind: ExpertKind, _expert: u32) -> Option<(u64, u64)> {
+            None
+        }
+    }
+
+    const PAGE_STRIDE: u64 = DIRECT_ALIGN;
+
+    /// Staged planes sit at their file head so the store reads them in place
+    /// (§5.4), and staged pointers stay `plane_len` apart for C's coalesced
+    /// H2D runs even though neighbouring regions overlap by the tail page.
+    #[test]
+    fn staged_planes_sit_at_their_head_and_stay_contiguous() {
+        const HEAD: u64 = 288;
+        let source = Arc::new(HeadSource(Mutex::new(Vec::new())));
+        let dyn_source: Arc<dyn ExpertSource> = source.clone();
+        let layout = UnitLayout::new([PAGE_STRIDE; 3], [Some(HEAD); 3]).unwrap();
+        let arena = Arena::new(&[SlotClass {
+            slot_size: layout.slot_bytes() as usize,
+            slots: 1,
+        }])
+        .unwrap();
+        let pool = ExpertPool::new(
+            arena,
+            dyn_source.clone(),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            PoolGeometry {
+                layers: vec![layout],
+                n_experts: N_EXPERTS,
+                expert_bytes: 0,
+            },
+            vec![0],
+        );
+        let s = StreamState::new(
+            pool,
+            dyn_source,
+            Box::new(|| false),
+            N_EXPERTS as usize * PAGE_STRIDE as usize,
+        )
+        .unwrap();
+        assert_eq!(
+            s.staged_bytes(),
+            STAGING_SLOTS as usize * (N_EXPERTS as usize + 1) * PAGE_STRIDE as usize
+        );
+        let ids = [0, 1, 2, 3];
+        let mut out = [std::ptr::null(); N_EXPERTS as usize];
+        s.source(0, 1, 1, &ids, &mut out).unwrap();
+        let region = (HEAD + PAGE_STRIDE).next_multiple_of(DIRECT_ALIGN) as usize;
+        assert_eq!(
+            *source.0.lock().unwrap(),
+            vec![(HEAD as usize, region); N_EXPERTS as usize]
+        );
+        for (i, &p) in out.iter().enumerate() {
+            assert_eq!(p as usize % DIRECT_ALIGN as usize, HEAD as usize);
+            if i > 0 {
+                assert_eq!(p as usize - out[i - 1] as usize, PAGE_STRIDE as usize);
+            }
+            // SAFETY: the pointer covers one staged plane, held under seq 1.
+            let plane = unsafe { std::slice::from_raw_parts(p as *const u8, PAGE_STRIDE as usize) };
+            assert!(plane.iter().all(|&b| b == i as u8), "expert {i}");
+        }
         s.release_all();
         assert!(all_slots_free(&s));
         s.stop();

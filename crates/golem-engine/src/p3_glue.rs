@@ -1063,6 +1063,11 @@ impl SessionHooks {
         self.state.store.as_ref().map(|s| s.scratch_planes())
     }
 
+    /// [`Self::scratch_planes`] split by reason (head, len, align).
+    pub fn scratch_by_reason(&self) -> Option<[u64; 3]> {
+        self.state.store.as_ref().map(|s| s.scratch_by_reason())
+    }
+
     /// Test seam: marks every replica of every shard unreadable.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
