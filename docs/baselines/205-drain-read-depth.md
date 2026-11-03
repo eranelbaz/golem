@@ -28,3 +28,17 @@ No change outside the spread. The one-unit scratch cap costs nothing measurable 
 | `--io-depth 4` | 8 | 6.400 | 6.424 | 30.6 |
 
 Prefill is flat across depth (44.5–45.8 s). Depth 2 per drive is the knee (+2.4% decode over depth 1); depth 4 gains nothing and costs nothing, so the per-drain thread spawns are not measurable at this scale. Multiple reads in flight per thread (two `pread`s / io_uring) is not pursued: its ceiling is the depth-2 → depth-4 delta, which is zero.
+
+## Zero-allocation drain (562e5c5 vs f69a4ad)
+
+`PERF_LEGS='^(base|new)-(d2|pf)$' scripts/perf-205.sh`, 4 reps ABBA, same model and knobs. A warm drain now allocates only its reader spawns (7 on the caller, was 28).
+
+| | base | new |
+|---|---|---|
+| decode tok/s cold | 6.400 [6.387–6.412] | 6.422 [6.391–6.436] |
+| decode tok/s warm | 6.436 [6.397–6.453] | 6.451 [6.439–6.467] |
+| prefill s cold | 46.6 | 45.8 |
+| prefill s warm | 45.1 | 45.3 |
+| disk wait ms/token (decode, cold / warm) | 30.8 / 30.2 | 30.6 / 30.1 |
+
+Decode +0.3% cold, +0.2% warm, with overlapping ranges: no regression, gain within noise. Prefill unchanged.
