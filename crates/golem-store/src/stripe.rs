@@ -21,12 +21,19 @@ pub const CHUNK: usize = 8 * 1024 * 1024;
 /// chunk 0 starts at the region base, so the bytes before the logical read
 /// are head scratch (mirroring [`crate::engine`]'s region contract).
 pub fn plan_aligned(base: u64, len: usize) -> Vec<(u64, usize)> {
+    let mut plan = Vec::new();
+    plan_aligned_into(base, len, &mut plan);
+    plan
+}
+
+/// [`plan_aligned`] into `plan` (cleared first), reusing its capacity.
+pub(crate) fn plan_aligned_into(base: u64, len: usize, plan: &mut Vec<(u64, usize)>) {
+    plan.clear();
     if len == 0 {
-        return Vec::new();
+        return;
     }
     let start = base - (base % DIRECT_ALIGN);
     let end = (base + len as u64).div_ceil(DIRECT_ALIGN) * DIRECT_ALIGN;
-    let mut plan = Vec::new();
     let mut off = start;
     while off < end {
         let k = (off - start) / CHUNK as u64 + 1;
@@ -34,7 +41,6 @@ pub fn plan_aligned(base: u64, len: usize) -> Vec<(u64, usize)> {
         plan.push((off, (cut - off) as usize));
         off = cut;
     }
-    plan
 }
 
 #[cfg(test)]

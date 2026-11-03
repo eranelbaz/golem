@@ -16,6 +16,7 @@ use super::residency::{
     ResidencyMap,
 };
 use super::source::{ExpertSource, PoolGeometry, UnitLayout};
+use golem_store::recycle;
 
 /// Read handle over the current [`PolicySnapshot`] (rebuilt by the placement
 /// thread each pass). Guarded by a primitives mutex held only for an `Arc`
@@ -342,18 +343,6 @@ impl BatchClaims {
         }
         self.snapshot = pool.snapshot();
     }
-}
-
-/// Moves `v`'s allocation into a vector of the same element type under
-/// other lifetimes: an in-place `collect` keeps the buffer when the layouts
-/// match (best-effort std specialization; a miss only re-allocates).
-fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
-    debug_assert!(
-        size_of::<T>() == size_of::<U>() && align_of::<T>() == align_of::<U>(),
-        "recycle across layouts never reuses the buffer"
-    );
-    v.clear();
-    v.into_iter().filter_map(|_| None).collect()
 }
 
 fn reset_pending(lease_of: &mut [u32], base: usize, misses: &[(ExpertKind, u32)]) {

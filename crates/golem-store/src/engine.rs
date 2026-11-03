@@ -38,6 +38,16 @@ pub trait ShardSources: Send + Sync {
     fn replica_drive(&self, shard_index: usize, replica_index: usize) -> &str {
         self.slot(shard_index, replica_index).drive.as_str()
     }
+    /// Replica count of `shard_index`; the registry answers without building
+    /// the [`ShardSources::slots`] Vec.
+    fn replica_count(&self, shard_index: usize) -> usize {
+        self.slots(shard_index).len()
+    }
+    /// Appends [`ShardSources::slots`] to `out`; the registry overrides it so
+    /// a drain refills its reused Vec without allocating (§5.2).
+    fn slots_into(&self, shard_index: usize, out: &mut Vec<Arc<dyn ChunkSource>>) {
+        out.extend(self.slots(shard_index));
+    }
 }
 
 impl ShardSources for ReplicaRegistry {
@@ -49,6 +59,19 @@ impl ShardSources for ReplicaRegistry {
             .iter()
             .map(|r| Arc::clone(r) as Arc<dyn ChunkSource>)
             .collect()
+    }
+
+    fn replica_count(&self, shard_index: usize) -> usize {
+        self.shards()[shard_index].replicas.len()
+    }
+
+    fn slots_into(&self, shard_index: usize, out: &mut Vec<Arc<dyn ChunkSource>>) {
+        out.extend(
+            self.shards()[shard_index]
+                .replicas
+                .iter()
+                .map(|r| Arc::clone(r) as Arc<dyn ChunkSource>),
+        );
     }
 
     fn slot(&self, shard_index: usize, replica_index: usize) -> &ReplicaSlot {
