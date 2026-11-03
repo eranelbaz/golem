@@ -1057,6 +1057,12 @@ impl SessionHooks {
         self.state.store.as_ref().map(|s| s.health())
     }
 
+    /// Planes the store source served through bounce scratch; `None` on the
+    /// GGUF pread path.
+    pub fn scratch_planes(&self) -> Option<u64> {
+        self.state.store.as_ref().map(|s| s.scratch_planes())
+    }
+
     /// Test seam: marks every replica of every shard unreadable.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]

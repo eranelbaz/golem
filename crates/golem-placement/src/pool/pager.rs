@@ -197,6 +197,9 @@ impl Drop for LeaseBatch {
 
 /// `lease_of` entry of a unit not claimed this step.
 const UNCLAIMED: u32 = u32::MAX;
+/// `BatchClaims::lease_of` entry of a unit with a fill pending in the
+/// current `ensure_batch` call; never survives the call.
+const PENDING: u32 = u32::MAX - 1;
 
 /// The decode thread's claim table for one scheduler compute (§6.6, §3.4
 /// P3): the first plane of a `(layer, expert)` unit claims and leases it
@@ -351,6 +354,15 @@ fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
     );
     v.clear();
     v.into_iter().filter_map(|_| None).collect()
+}
+
+fn reset_pending(lease_of: &mut [u32], base: usize, misses: &[(ExpertKind, u32)]) {
+    for &(_, expert) in misses {
+        let at = &mut lease_of[base + expert as usize];
+        if *at == PENDING {
+            *at = UNCLAIMED;
+        }
+    }
 }
 
 struct DemandGuard<'a>(&'a AtomicUsize);
@@ -616,6 +628,8 @@ impl ExpertPool {
         let batch = &mut *guard;
         let _inflight = self.demand_guard(true);
         let base = layer as usize * n as usize;
+        // A PENDING left by an unwind through a previous call is stale.
+        reset_pending(&mut batch.lease_of, base, misses);
         let mut fills: Vec<(u32, u32, FillClaim<'_>)> = recycle(std::mem::take(&mut batch.fills));
         let claimed = self.claim_misses(layer, misses, batch, &mut fills);
         let result = claimed.and_then(|()| {
@@ -625,7 +639,7 @@ impl ExpertPool {
             let mut hits = 0;
             for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
                 let lease_at = batch.lease_of[base + expert as usize];
-                *dst = if lease_at == UNCLAIMED {
+                *dst = if lease_at == UNCLAIMED || lease_at == PENDING {
                     std::ptr::null()
                 } else {
                     hits += 1;
@@ -639,6 +653,9 @@ impl ExpertPool {
             self.fill_batch(layer, batch, &mut fills)
         });
         batch.fills = recycle(fills);
+        if result.is_err() {
+            reset_pending(&mut batch.lease_of, base, misses);
+        }
         result?;
         for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
             let lease_at = batch.lease_of[base + expert as usize] as usize;
@@ -664,7 +681,7 @@ impl ExpertPool {
         let base = layer as usize * self.geometry.n_experts as usize;
         for &(_, expert) in misses {
             let at = base + expert as usize;
-            if batch.lease_of[at] != UNCLAIMED || fills.iter().any(|f| f.0 == expert) {
+            if batch.lease_of[at] != UNCLAIMED {
                 continue;
             }
             let snapshot = &batch.snapshot;
@@ -681,10 +698,14 @@ impl ExpertPool {
                     batch.lease_of[at] = batch.leases.len() as u32;
                     batch.leases.push(self.lease(layer, expert, slot));
                 }
-                Ok(Claim::Filled { slot, claim }) => fills.push((expert, slot, claim)),
+                Ok(Claim::Filled { slot, claim }) => {
+                    batch.lease_of[at] = PENDING;
+                    fills.push((expert, slot, claim));
+                }
                 Err(ClaimError::Evicted(evicted)) => {
                     self.note_eviction(&evicted.victim);
                     debug_assert_eq!(evicted.slot, evicted.victim.slot);
+                    batch.lease_of[at] = PENDING;
                     fills.push((expert, evicted.slot, evicted.claim));
                 }
                 Err(ClaimError::Busy) => return Err(PoolError::Busy),
@@ -1525,7 +1546,10 @@ mod tests {
     /// plane a bounded number of times (§5.2: one queued drain per unit).
     #[cfg(not(loom))]
     struct BatchedSource {
-        stride: usize,
+        stride: [usize; 3],
+        /// Fill the batch's targets last-to-first (I/O completion order
+        /// opposite to claim order).
+        reverse: bool,
         fail_down_times: std::sync::atomic::AtomicUsize,
         calls: Mutex<Vec<(ExpertKind, u32, usize, usize)>>,
         batches: std::sync::atomic::AtomicUsize,
@@ -1533,9 +1557,10 @@ mod tests {
 
     #[cfg(not(loom))]
     impl BatchedSource {
-        fn new(stride: usize, fail_down_times: usize) -> Self {
+        fn new(stride: [usize; 3], fail_down_times: usize, reverse: bool) -> Self {
             Self {
                 stride,
+                reverse,
                 fail_down_times: std::sync::atomic::AtomicUsize::new(fail_down_times),
                 calls: Mutex::new(Vec::new()),
                 batches: std::sync::atomic::AtomicUsize::new(0),
@@ -1568,7 +1593,11 @@ mod tests {
         ) -> io::Result<()> {
             self.batches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            for (&(kind, expert), (into, head)) in batch.iter().zip(targets.iter_mut()) {
+            let mut order: Vec<_> = batch.iter().zip(targets.iter_mut()).collect();
+            if self.reverse {
+                order.reverse();
+            }
+            for (&(kind, expert), (into, head)) in order {
                 self.calls
                     .lock()
                     .unwrap()
@@ -1583,7 +1612,8 @@ mod tests {
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     return Err(io::Error::other("injected batched plane failure"));
                 }
-                into[*head..*head + self.stride].fill(self.plane_byte(kind, expert));
+                let stride = self.stride[kind.ordinal()];
+                into[*head..*head + stride].fill(self.plane_byte(kind, expert));
             }
             Ok(())
         }
@@ -1609,14 +1639,25 @@ mod tests {
         fail_down_times: usize,
         slots: u32,
     ) -> (Arc<ExpertPool>, Arc<BatchedSource>) {
+        batched_pool_order(layout, fail_down_times, slots, false)
+    }
+
+    #[cfg(not(loom))]
+    fn batched_pool_order(
+        layout: UnitLayout,
+        fail_down_times: usize,
+        slots: u32,
+        reverse: bool,
+    ) -> (Arc<ExpertPool>, Arc<BatchedSource>) {
         let arena = Arena::new(&[SlotClass {
             slot_size: layout.region.iter().sum::<u64>() as usize,
             slots,
         }])
         .unwrap();
         let src = Arc::new(BatchedSource::new(
-            layout.stride[0] as usize,
+            layout.stride.map(|s| s as usize),
             fail_down_times,
+            reverse,
         ));
         let source: Arc<dyn ExpertSource> = src.clone();
         let pool = ExpertPool::new(
@@ -1709,24 +1750,117 @@ mod tests {
     fn ensure_batch_slots_follow_miss_order_not_io_order() {
         let stride = 64u64;
         let layout = UnitLayout::new([stride; 3], [None; 3]).unwrap();
-        let slots_of = |misses: &[(ExpertKind, u32)]| {
-            let (pool, _) = batched_pool_slots(layout, 0, 4);
-            let mut out = vec![std::ptr::null(); misses.len()];
-            pool.ensure_batch(0, misses, &mut out).unwrap();
+        let misses = [
+            (ExpertKind::Gate, 6),
+            (ExpertKind::Up, 1),
+            (ExpertKind::Down, 4),
+            (ExpertKind::Down, 6),
+        ];
+        let slots_of = |reverse: bool| {
+            let (pool, src) = batched_pool_order(layout, 0, 4, reverse);
+            let mut out = [std::ptr::null(); 4];
+            pool.ensure_batch(0, &misses, &mut out).unwrap();
+            let experts: Vec<u32> = src.calls.lock().unwrap().iter().map(|c| c.1).collect();
+            let want = [6, 6, 6, 1, 1, 1, 4, 4, 4];
+            if reverse {
+                assert!(experts.iter().eq(want.iter().rev()), "reverse I/O order");
+            } else {
+                assert_eq!(experts, want);
+            }
             let b = pool.batch_claims.lock().unwrap();
+            for (&(kind, expert), &p) in misses.iter().zip(&out) {
+                let lease = b.leases.iter().find(|l| l.expert == expert).unwrap();
+                let plane = pool.plane_bytes(0, lease, kind);
+                assert_eq!(plane.as_ptr(), p);
+                assert!(plane.iter().all(|&x| x == plane_byte(kind, expert)));
+            }
             b.leases
                 .iter()
                 .map(|l| (l.expert, l.slot()))
                 .collect::<Vec<_>>()
         };
+        let in_order = slots_of(false);
+        assert_eq!(in_order, slots_of(true), "slots independent of I/O order");
+        assert_eq!(in_order.iter().map(|x| x.0).collect::<Vec<_>>(), [6, 1, 4]);
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_mixed_stride_one_claim_per_unit() {
+        let layout = UnitLayout::new([64, 96, 160], [Some(5), None, Some(13)]).unwrap();
+        let (pool, src) = batched_pool_slots(layout, 0, 4);
         let misses = [
-            (ExpertKind::Gate, 6),
-            (ExpertKind::Gate, 1),
-            (ExpertKind::Gate, 4),
+            (ExpertKind::Down, 3),
+            (ExpertKind::Gate, 2),
+            (ExpertKind::Gate, 3),
+            (ExpertKind::Up, 3),
+            (ExpertKind::Down, 3),
         ];
-        let a = slots_of(&misses);
-        assert_eq!(a, slots_of(&misses), "same misses, same slots");
-        assert_eq!(a.iter().map(|x| x.0).collect::<Vec<_>>(), [6, 1, 4]);
+        let mut out = [std::ptr::null(); 5];
+        pool.ensure_batch(0, &misses, &mut out).unwrap();
+        let calls = src.calls.lock().unwrap().clone();
+        let want: Vec<_> = [3, 2]
+            .into_iter()
+            .flat_map(|e| {
+                ExpertKind::ALL.map(|k| {
+                    let o = k.ordinal();
+                    (k, e, layout.head[o] as usize, layout.region[o] as usize)
+                })
+            })
+            .collect();
+        assert_eq!(calls, want, "one claim per unit, every plane at its head");
+        assert_eq!(pool.stats.demand_claims.load(Ordering::Relaxed), 2);
+        {
+            let b = pool.batch_claims.lock().unwrap();
+            assert_eq!(b.leases.len(), 2);
+            for (&(kind, expert), &p) in misses.iter().zip(&out) {
+                let lease = b.leases.iter().find(|l| l.expert == expert).unwrap();
+                let plane = pool.plane_bytes(0, lease, kind);
+                assert_eq!(plane.len() as u64, layout.stride[kind.ordinal()]);
+                assert_eq!(plane.as_ptr(), p);
+                assert!(plane.iter().all(|&x| x == plane_byte(kind, expert)));
+            }
+        }
+        pool.end_batch_step();
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn ensure_batch_errors_leave_no_pending_entry() {
+        let pending = |pool: &ExpertPool| {
+            let b = pool.batch_claims.lock().unwrap();
+            b.lease_of.contains(&PENDING)
+        };
+        let layout = UnitLayout::new([64; 3], [None; 3]).unwrap();
+        let misses = [
+            (ExpertKind::Gate, 1),
+            (ExpertKind::Up, 2),
+            (ExpertKind::Down, 1),
+        ];
+        let mut out = [std::ptr::null(); 3];
+        let (pool, _) = batched_pool_slots(layout, 1, 4);
+        assert!(matches!(
+            pool.ensure_batch(0, &misses, &mut out),
+            Err(PoolError::Source { .. })
+        ));
+        assert!(!pending(&pool));
+        pool.ensure_batch(0, &misses, &mut out).unwrap();
+        assert!(pool.residency.is_resident(0, 1) && pool.residency.is_resident(0, 2));
+        pool.end_batch_step();
+
+        let (pool, _) = batched_pool_slots(layout, 0, 2);
+        let mut one = [std::ptr::null()];
+        pool.ensure_batch(0, &[(ExpertKind::Gate, 0)], &mut one)
+            .unwrap();
+        assert!(matches!(
+            pool.ensure_batch(0, &misses, &mut out),
+            Err(PoolError::Busy)
+        ));
+        assert!(!pending(&pool));
+        pool.end_batch_step();
+        pool.ensure_batch(0, &misses, &mut out).unwrap();
+        assert!(pool.residency.is_resident(0, 1) && pool.residency.is_resident(0, 2));
+        pool.end_batch_step();
     }
 
     #[test]
