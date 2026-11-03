@@ -4,7 +4,7 @@
 # and warm, in both orders (ABBA). Decode and prefill (long prompt) are
 # separate runs; prefill legs decode 16 tokens and report prefill as
 # (long-leg non-decode wall) - (same binary/temp short-leg non-decode wall). Summary: $OUT/summary.md; per-leg logs under $OUT/<leg>/.
-# usage: scripts/perf-205.sh   (env: GOLEM_MODEL, GOLEM_AB_TOKENS, PERF_REPS)
+# usage: scripts/perf-205.sh   (env: GOLEM_MODEL, GOLEM_AB_TOKENS, PERF_REPS, PERF_LEGS, PERF_OUT)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
@@ -75,6 +75,11 @@ run_leg() { # <spec> <temp> <rep>
   echo "wall_ms=$(( ($(date +%s%N) - t0) / 1000000 ))" >> "$OUT/$leg/meta.txt"
 }
 
+# PERF_LEGS: regex over leg names to run a subset (e.g. '^(base|new)-(d2|pf)$').
+if [[ -n ${PERF_LEGS:-} ]]; then
+  keep=(); for l in "${LEGS[@]}"; do [[ ${l%%|*} =~ $PERF_LEGS ]] && keep+=("$l"); done
+  LEGS=("${keep[@]}")
+fi
 for rep in $(seq "$REPS"); do
   order=("${LEGS[@]}")
   if (( rep % 2 == 0 )); then  # reverse order on even reps (ABBA)
