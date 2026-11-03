@@ -240,6 +240,16 @@ int32_t golem_set_victim_ring(golem_ctx_t ctx, int32_t slots, int32_t max_plane_
         max_plane_stride <= 0) {
         return -1;
     }
+    // Load-time refusal instead of a mid-decode one at the first park.
+    bool has_cs = false;
+    for (size_t i = 0; i < ggml_backend_dev_count() && !has_cs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        has_cs = reg != nullptr && ggml_backend_reg_get_proc_address(reg, "golem_copy_stream_iface") != nullptr;
+    }
+    if (!has_cs) {
+        return -1;
+    }
     ctx->vr_slots = slots;
     ctx->vr_stride = max_plane_stride;
     ctx->vr_off = false;
@@ -372,7 +382,12 @@ static bool golem_vr_ready(golem_ctx_t ctx, ggml_backend_t be) {
         return false;
     }
     const size_t size = (size_t) ctx->vr_slots * 3 * (size_t) ctx->vr_stride;
+#ifdef GOLEM_TEST_SUPPORT
+    const bool inject = ctx->vr_fail_inject.exchange(false, std::memory_order_relaxed);
+    ctx->vr_buf = inject ? nullptr : ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(be), size);
+#else
     ctx->vr_buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(be), size);
+#endif
     if (ctx->vr_buf == nullptr) {
         GGML_LOG_WARN("%s: golem victim ring disabled: %zu-byte device allocation failed\n", __func__, size);
         ctx->vr_alloc_failed = true; // survives reset: no hipMalloc retry per reload
@@ -958,8 +973,12 @@ int32_t golem_device_wait_probe(ggml_backend_dev_t dev, int32_t mode) {
 
 int32_t golem_take_victim_ring_stats(golem_ctx_t ctx, uint64_t * ring_units, uint64_t * ring_full,
                                      double * d2h_ms, uint64_t * d2h_bytes) {
-    if (ctx == NULL || ctx->vr_slots <= 0 || ctx->vr_off || ctx->vr_alloc_failed) {
+    if (ctx == NULL || ring_units == NULL || ring_full == NULL || d2h_ms == NULL || d2h_bytes == NULL ||
+        ctx->vr_slots <= 0) {
         return 0;
+    }
+    if (ctx->vr_off || ctx->vr_alloc_failed) {
+        return -1;
     }
     double total = 0.0;
     if (ctx->vr_t_n > 0) {
@@ -5898,6 +5917,12 @@ uint64_t golem_slab_alloc_failures(golem_ctx_t ctx) {
 void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n) {
     if (ctx != NULL) {
         ctx->slab_fail_inject.store(n, std::memory_order_relaxed);
+    }
+}
+
+void golem_inject_victim_ring_alloc_failure(golem_ctx_t ctx) {
+    if (ctx != NULL) {
+        ctx->vr_fail_inject.store(true, std::memory_order_relaxed);
     }
 }
 #endif

@@ -823,6 +823,8 @@ pub(crate) struct StepIoStats {
     pub h2d: Option<(f64, u64)>,
     /// `None` unless the victim ring is armed.
     pub victim_ring: Option<crate::timing::VictimRingStats>,
+    /// The armed victim ring was disabled by a failed device setup (ABI v21).
+    pub victim_ring_off: bool,
     /// `None` unless cpu_expert_math is armed.
     pub cpu_expert: Option<crate::timing::CpuExpertStats>,
 }
@@ -861,7 +863,7 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
             }
             let mut r = crate::timing::VictimRingStats::default();
             // SAFETY: as above; writes only the four out-params.
-            if unsafe {
+            match unsafe {
                 raw::golem_take_victim_ring_stats(
                     ctx,
                     &mut r.units,
@@ -869,9 +871,10 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
                     &mut r.d2h_ms,
                     &mut r.d2h_bytes,
                 )
-            } == 1
-            {
-                out.victim_ring.get_or_insert_with(Default::default).add(&r);
+            } {
+                1 => out.victim_ring.get_or_insert_with(Default::default).add(&r),
+                -1 => out.victim_ring_off = true,
+                _ => {}
             }
             let mut c = crate::timing::CpuExpertStats::default();
             // SAFETY: as above; writes only the five out-params.
@@ -1150,10 +1153,11 @@ impl SessionHooks {
     /// − headroom) / per-expert slab bytes − 1, capped at the pre-load
     /// bound. With streaming on and that K below top-k, streaming
     /// auto-disables with a warning and K is refit without the slabs.
-    /// No-op for an explicit K or after the first call.
+    /// An explicit K is only checked: see [`Self::check_explicit_fit`].
+    /// No-op after the first call.
     pub(crate) fn fit_device_cache(&mut self) -> Result<(), EngineError> {
         let Some(fit) = self.fit.take() else {
-            return Ok(());
+            return self.check_explicit_fit();
         };
         let ctx = self.ctx_ptr();
         // SAFETY: FFI on the live ctx between computes (no slab in flight).
@@ -1223,6 +1227,33 @@ impl SessionHooks {
             k_decode = self.k_decode,
             "device cache fitted"
         );
+        Ok(())
+    }
+
+    /// Explicit K with the victim ring armed: the lazily allocated ring,
+    /// stream slabs and K slabs must fit the post-load free VRAM, else the
+    /// ring's first-park allocation fails mid-decode. Without a VRAM query
+    /// the pre-load §10 plan (which prices the ring) stands.
+    fn check_explicit_fit(&self) -> Result<(), EngineError> {
+        if self.victim_ring_vram == 0 {
+            return Ok(());
+        }
+        #[cfg(golem_backend_hip)]
+        {
+            // SAFETY: FFI on the live ctx between computes (no slab in
+            // flight): frees the self-check's slabs and any ring it parked
+            // into, so `free` nets out neither.
+            unsafe { raw::golem_reset_device_cache(self.ctx_ptr()) };
+            self.device_cache_reset();
+            if let Some((free, _)) = golem_llama_sys::pinned::free_device_mem() {
+                return explicit_k_fits(
+                    free as u64,
+                    self.device_cache_experts,
+                    self.slab_bytes_per_expert,
+                    self.stream_slab_vram + self.victim_ring_vram,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2282,7 +2313,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     {
         return Err(EngineError::InvalidConfig(
             "victim_ring_slots: the substrate refused to arm the ring (exclusive hooks \
-             not registered, GGML_CUDA_GRAPH_OPT=1, or plane stride out of range)"
+             not registered, GGML_CUDA_GRAPH_OPT=1, plane stride out of range, or no \
+             backend with a copy stream)"
                 .into(),
         ));
     }
@@ -2550,6 +2582,32 @@ fn class_layout(
 /// plan's `rocm_overhead` term (2.83 GB > 1 GiB), so `plan_cap` binds first.
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 const VRAM_HEADROOM_BYTES: u64 = 1 << 30;
+
+/// Explicit-K victim-ring fit after a cache reset: `(K + 1) × slab + lazy +
+/// headroom ≤ free`, `lazy` = ring + stream slabs. Target, UD-Q4_K_XL
+/// (~5.8 MB max plane, 644 MB Σ unit bytes per slot): 16 × 3 × 5,767,168 B
+/// = 277 MB of ring + 9 × 644 MB = 5.8 GB of K = 8 slabs + 1 GiB headroom
+/// = 7.1 GB, against 24 GiB.
+#[cfg_attr(not(golem_backend_hip), allow(dead_code))]
+fn explicit_k_fits(
+    free: u64,
+    k: u32,
+    slab_bytes_per_expert: u64,
+    lazy_vram: u64,
+) -> Result<(), EngineError> {
+    let slabs = (u64::from(k) + 1).saturating_mul(slab_bytes_per_expert);
+    let need = slabs
+        .saturating_add(lazy_vram)
+        .saturating_add(VRAM_HEADROOM_BYTES);
+    if need > free {
+        return Err(EngineError::InvalidConfig(format!(
+            "victim_ring_slots: {slabs} B of K = {k} slabs plus {lazy_vram} B of ring and \
+             stream slabs (+ {VRAM_HEADROOM_BYTES} B headroom) exceed the {free} B free \
+             VRAM after load; lower device_cache_experts or victim_ring_slots"
+        )));
+    }
+    Ok(())
+}
 
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 fn k_from_free_vram(
@@ -3588,6 +3646,17 @@ mod tests {
         };
         let err = derive_device_cache_experts(&c_huge, 42 * 5_777_000, 8).unwrap_err();
         assert!(err.to_string().contains("i32::MAX"), "{err}");
+    }
+
+    #[test]
+    fn explicit_k_ring_fit_prices_slabs_ring_and_headroom() {
+        let slab = 644_022_272;
+        let ring = 16 * 3 * 5_767_168;
+        let need = 9 * slab + ring + VRAM_HEADROOM_BYTES;
+        explicit_k_fits(24 << 30, 8, slab, ring).unwrap();
+        explicit_k_fits(need, 8, slab, ring).unwrap();
+        let err = explicit_k_fits(need - 1, 8, slab, ring).unwrap_err();
+        assert!(err.to_string().contains("victim_ring_slots"), "{err}");
     }
 
     const Q4: u64 = 4_718_592;

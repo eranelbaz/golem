@@ -1920,6 +1920,9 @@ impl SessionInner {
             // measured only on the async_h2d copy stream; policy and the ids
             // readback columns only while the P3 hooks are registered.
             let io = p3_glue::take_step_io_stats();
+            if io.victim_ring_off {
+                return Err(EngineError::VictimRingUnavailable);
+            }
             let cpu_expert = io.cpu_expert;
             if let Some(c) = &cpu_expert {
                 self.cpu_expert_total.add(c);

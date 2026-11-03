@@ -599,6 +599,7 @@ pub(crate) fn step(
         }
         // A failed page-in (ABI v13) on a dead shard: nothing is retryable.
         Err(_) if session.storage_lost() => return Err(EngineError::StorageUnavailable),
+        Err(EngineError::VictimRingUnavailable) => return Err(EngineError::VictimRingUnavailable),
         Err(e) if !recover => return Err(e),
         Err(e) => {
             let e = session.recover_slab(e);

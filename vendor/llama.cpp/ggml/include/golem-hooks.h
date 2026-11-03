@@ -60,7 +60,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 20
+#define GOLEM_HOOKS_ABI_VERSION 21
 GOLEM_API int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -302,9 +302,11 @@ GOLEM_API int32_t golem_device_cache_experts(golem_ctx_t ctx);
  * failures since ctx creation (0 for a NULL ctx). */
 GOLEM_API uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
 #ifdef GOLEM_TEST_SUPPORT
-/* Test seam (ABI v15: declared only under GOLEM_TEST_SUPPORT): the next n
+/* Test seam (ABI v15; every seam is declared only under GOLEM_TEST_SUPPORT): the next n
  * slab (re)allocations fail as if out of VRAM. */
 GOLEM_API void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
+/* Test seam (ABI v21): the next victim-ring device allocation fails. */
+GOLEM_API void golem_inject_victim_ring_alloc_failure(golem_ctx_t ctx);
 #endif
 /* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
  * remapped-ids tensors (*slab_bytes) and prefill-stream slabs
@@ -432,8 +434,9 @@ GOLEM_API int32_t golem_device_wait_probe(struct ggml_backend_device *dev, int32
  * reset, so no retry per reload; one warning each).
  * `slots <= 0` = off (the v17 behaviour). Returns 0, or -1 when refused:
  * NULL ctx, GGML_CUDA_GRAPH_OPT=1 (owns the stream indices), copy_done or
- * evict_batch not registered, ring already allocated, or slots > 0 with
- * max_plane_stride <= 0. Config-time call; one device backend per ctx. */
+ * evict_batch not registered, ring already allocated, slots > 0 with
+ * max_plane_stride <= 0, or (ABI v21) no backend exports
+ * "golem_copy_stream_iface". Config-time call; one device backend per ctx. */
 GOLEM_API int32_t golem_set_victim_ring(golem_ctx_t ctx, int32_t slots, int32_t max_plane_stride);
 
 /* Victim-ring counters since the last call; resets them. ring_units = planes
@@ -442,8 +445,10 @@ GOLEM_API int32_t golem_set_victim_ring(golem_ctx_t ctx, int32_t slots, int32_t 
  * per-drain event pairs (includes its waits on the compute stream),
  * d2h_bytes = ring D2H bytes. d2h_ms is NaN when some drain went untimed
  * (per-step timing ring overflowed). Returns 1 when the ring is armed and
- * not disabled, else 0 (outputs untouched): slots <= 0, or the ring was
- * disabled by a bind/allocation failure. Call between computes. */
+ * not disabled; -1 (ABI v21) when armed but disabled by a bind/allocation
+ * failure, so the engine can refuse the silent same-stream fallback; 0 when
+ * slots <= 0 or ctx or any out pointer is NULL. Outputs untouched unless 1.
+ * Call between computes. */
 GOLEM_API int32_t golem_take_victim_ring_stats(golem_ctx_t ctx, uint64_t *ring_units, uint64_t *ring_full,
                                                double *d2h_ms, uint64_t *d2h_bytes);
 
