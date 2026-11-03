@@ -1154,8 +1154,24 @@ impl SessionHooks {
     /// bound. With streaming on and that K below top-k, streaming
     /// auto-disables with a warning and K is refit without the slabs.
     /// An explicit K is only checked: see [`Self::check_explicit_fit`].
-    /// No-op after the first call.
+    /// Called once per load, after the self-check decode: a ring that
+    /// failed to set up there fails the load, not the first user turn.
     pub(crate) fn fit_device_cache(&mut self) -> Result<(), EngineError> {
+        let mut r = crate::timing::VictimRingStats::default();
+        // SAFETY: FFI on this session's live ctx between computes; writes
+        // only the four out-params (the self-check's counters, discarded).
+        let rc = unsafe {
+            raw::golem_take_victim_ring_stats(
+                self.ctx_ptr(),
+                &mut r.units,
+                &mut r.full,
+                &mut r.d2h_ms,
+                &mut r.d2h_bytes,
+            )
+        };
+        if rc == -1 {
+            return Err(EngineError::VictimRingUnavailable);
+        }
         let Some(fit) = self.fit.take() else {
             return self.check_explicit_fit();
         };
@@ -2585,9 +2601,9 @@ const VRAM_HEADROOM_BYTES: u64 = 1 << 30;
 
 /// Explicit-K victim-ring fit after a cache reset: `(K + 1) × slab + lazy +
 /// headroom ≤ free`, `lazy` = ring + stream slabs. Target, UD-Q4_K_XL
-/// (~5.8 MB max plane, 644 MB Σ unit bytes per slot): 16 × 3 × 5,767,168 B
-/// = 277 MB of ring + 9 × 644 MB = 5.8 GB of K = 8 slabs + 1 GiB headroom
-/// = 7.1 GB, against 24 GiB.
+/// (6,881,280 B max plane, 644 MB Σ unit bytes per slot): 16 × 3 × 6.88 MB
+/// = 330 MB of ring + 9 × 644 MB = 5.8 GB of K = 8 slabs + 1 GiB headroom
+/// = 7.2 GB, against 24 GiB.
 #[cfg_attr(not(golem_backend_hip), allow(dead_code))]
 fn explicit_k_fits(
     free: u64,
