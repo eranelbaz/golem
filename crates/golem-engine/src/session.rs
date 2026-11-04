@@ -1900,7 +1900,11 @@ impl SessionInner {
             // A ring disabled by this compute is reported before any reset
             // (recovery, next turn) clears a non-sticky `vr_off`.
             if self.config.victim_ring_slots > 0 {
-                let io = p3_glue::take_step_io_stats();
+                let io = self
+                    .p3
+                    .as_ref()
+                    .map(|h| h.take_step_io_stats(true))
+                    .unwrap_or_default();
                 if let Some(c) = &io.cpu_expert {
                     self.cpu_expert_total.add(c);
                 }
@@ -1933,7 +1937,11 @@ impl SessionInner {
             // are discarded, not charged to the next generation row. H2D is
             // measured only on the async_h2d copy stream; policy and the ids
             // readback columns only while the P3 hooks are registered.
-            let io = p3_glue::take_step_io_stats();
+            let io = self
+                .p3
+                .as_ref()
+                .map(|h| h.take_step_io_stats(self.config.victim_ring_slots > 0))
+                .unwrap_or_default();
             if io.victim_ring_off {
                 return Err(EngineError::VictimRingUnavailable);
             }
@@ -2023,7 +2031,11 @@ impl SessionInner {
         if let Some(t) = self.timing.as_mut() {
             t.flush(&mut std::io::sink())?; // stale rows from a failed prior turn never leak in
         }
-        let _ = p3_glue::take_step_io_stats();
+        let _ = self
+            .p3
+            .as_ref()
+            .map(|h| h.take_step_io_stats(self.config.victim_ring_slots > 0))
+            .unwrap_or_default();
         Ok(())
     }
 

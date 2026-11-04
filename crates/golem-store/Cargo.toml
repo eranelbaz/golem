@@ -15,6 +15,13 @@ thiserror.workspace = true
 libc.workspace = true
 crc32c.workspace = true
 tracing.workspace = true
+# Loom is referenced by lib code (readers.rs) under `cfg(loom)`, so it must be
+# a regular optional dependency — a dev-dependency is invisible to the lib
+# target and the loom leg would not compile.
+loom = { version = "0.7", optional = true }
+
+[features]
+loom = ["dep:loom"]
 
 [lints]
 workspace = true

@@ -2,8 +2,8 @@
 //! claims each routed unit once per step, hands out per-plane pool pointers
 //! and holds the leases until `copy_done`; the merged routing readback books
 //! recency lock-free; `SessionHooks` is fully owned per session (two
-//! sequential enable/drop cycles each decode; two cycles run concurrently on
-//! separate threads). Drives the engine-registered trampolines directly over
+//! sequential enable/drop cycles each decode; of two concurrent enables
+//! exactly one succeeds). Drives the engine-registered trampolines directly over
 //! the tiny-MoE fixture on the CPU backend — no GPU split needed.
 #![allow(unsafe_code)]
 mod common;
@@ -14,6 +14,7 @@ use golem_engine::config::EngineConfig;
 use golem_engine::p3_glue;
 use golem_llama_sys::raw;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Barrier, mpsc};
 
 /// Pooled config for tiny-moe on the CPU backend: explicit K (no VRAM query
 /// exists off HIP), 1 GiB pool. A failed precondition (RLIMIT_MEMLOCK below
@@ -112,53 +113,76 @@ fn two_sequential_enable_drop_cycles_each_decode() {
 }
 
 #[test]
-fn two_sessionhooks_run_their_hook_paths_concurrently() {
-    // Two direct enables on separate threads, each driving its own ctx +
-    // pool state concurrently: the payload state is per-session (no
-    // process-global hook state exists), so both full hook paths pass.
-    let failures = AtomicUsize::new(0);
+fn concurrent_enables_exactly_one_succeeds() {
+    // One pool-enabled session at a time: two enables racing from a shared
+    // start must yield exactly one Ok and one PoolInit refusal. Both results
+    // are collected while the winner is still alive, so a refusal cannot be
+    // explained by the winner having already dropped.
+    let start = Barrier::new(2);
+    let collected = Barrier::new(3);
+    let (tx, rx) = mpsc::channel();
     std::thread::scope(|s| {
         for t in 0..2 {
-            let failures = &failures;
+            let (start, collected, tx) = (&start, &collected, tx.clone());
             s.spawn(move || {
-                let hooks = match p3_glue::enable(&pooled_config()) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("thread {t}: enable failed: {e}");
-                        failures.fetch_add(1, Ordering::SeqCst);
-                        return;
-                    }
-                };
-                hooks.set_scoring(true); // Session::new arms it after the self-check
-                let payload = hooks.payload_ptr();
-                let (_ctx, gate) = xt::gate_tensor();
-                for _ in 0..8 {
-                    let out = drive_step(payload, gate);
-                    if out.iter().any(|p| p.is_null()) {
-                        failures.fetch_add(1, Ordering::SeqCst);
-                        return;
+                start.wait();
+                let result = p3_glue::enable(&pooled_config());
+                tx.send((t, result.as_ref().map(|_| ()).map_err(|e| format!("{e:?}"))))
+                    .unwrap();
+                collected.wait();
+                if let Ok(hooks) = result {
+                    hooks.set_scoring(true); // Session::new arms it after the self-check
+                    let payload = hooks.payload_ptr();
+                    let (_ctx, gate) = xt::gate_tensor();
+                    for step in 0..8 {
+                        let out = drive_step(payload, gate);
+                        assert!(
+                            out.iter().all(|p| !p.is_null()),
+                            "thread {t} step {step}: winner's pooled decode"
+                        );
                     }
                 }
-                drop(hooks);
             });
         }
+        drop(tx);
+        let results: Vec<_> = (0..2).map(|_| rx.recv().unwrap()).collect();
+        collected.wait();
+        let oks = results.iter().filter(|(_, r)| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|(_, r)| matches!(r, Err(e) if e.starts_with("PoolInit")))
+            .count();
+        assert_eq!((oks, refused), (1, 1), "results: {results:?}");
     });
-    assert_eq!(failures.load(Ordering::SeqCst), 0);
+    assert!(!p3_glue::hooks_registered(), "no hooks outlive the winner");
 }
 
-/// A counting allocator that only counts while the current thread opts in,
-/// so background threads (order publisher, prefetcher) don't pollute the
-/// steady-state zero-allocation assertion.
-static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static COUNTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
+/// Process-wide count while armed: the decode thread plus every background
+/// thread (order publisher, store drain readers). Assumes one test per
+/// process (nextest); under `cargo test` sibling tests pollute the count.
+static ALL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ALL: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts allocations on threads that opted in (`COUNT`) and, while armed,
+/// on every thread (`ALL`).
 struct CountingAlloc;
-// SAFETY: forwards to System; the counter is only an observation.
+// SAFETY: forwards to System; the counters are only an observation
+// (const-initialised Cells with no destructor, so no allocation on access).
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            COUNT.fetch_add(1, Ordering::Relaxed);
+        if ALL_ON.load(Ordering::Relaxed) {
+            ALL.fetch_add(1, Ordering::Relaxed);
         }
+        let _ = COUNTING.try_with(|on| {
+            if on.get() {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+        });
         // SAFETY: delegated to the system allocator with the same layout.
         unsafe { std::alloc::System.alloc(layout) }
     }
@@ -180,15 +204,121 @@ fn trampolines_allocate_nothing_in_steady_state() {
     // Warm: first sight registers (allocates), first page-ins fill slots.
     let _ = drive_step(payload, gate);
 
-    COUNT.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    COUNT.with(|c| c.set(0));
+    COUNTING.with(|on| on.set(true));
     for _ in 0..200 {
         let _ = drive_step(payload, gate);
     }
-    COUNTING.store(false, Ordering::Relaxed);
-    let allocs = COUNT.load(Ordering::Relaxed);
+    COUNTING.with(|on| on.set(false));
+    let allocs = COUNT.with(std::cell::Cell::get);
     assert_eq!(
         allocs, 0,
         "batched ensure + routing + copy_done must not allocate in steady state"
+    );
+}
+
+/// Page-padded tiny-moe copy plus a one-replica manifest (store-backed pool),
+/// as in `knobs_tiny_moe.rs`.
+fn manifest_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("golem-p3-hook-fires-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("tiny-moe-320.gguf");
+    let mut bytes = std::fs::read(tiny_moe_path()).unwrap();
+    bytes.resize(bytes.len().next_multiple_of(4096), 0);
+    std::fs::write(&model, &bytes).unwrap();
+    let mut f = std::fs::File::open(&model).unwrap();
+    let index: Vec<serde_json::Value> = golem_gguf::tensor_entries(&mut f)
+        .unwrap()
+        .iter()
+        .filter(|e| e.expert_kind().is_some())
+        .map(|e| {
+            let stride = golem_gguf::ggml_row_bytes(e.ggml_type, e.dims[0]).unwrap() * e.dims[1];
+            serde_json::json!({
+                "tensor": e.name,
+                "layer": golem_gguf::blk_of(&e.name).unwrap(),
+                "experts": e.dims[2],
+                "bytes_per_expert": stride,
+                "offsets_bytes": (0..e.dims[2]).map(|i| i * stride).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let m = serde_json::json!({
+        "name": "tiny-moe",
+        "shards": [{
+            "file": "tiny-moe-320.gguf",
+            "bytes": bytes.len(),
+            "sha256": "0".repeat(64),
+            "replicas": [dir],
+        }],
+        "expert_index": index,
+    });
+    let p = dir.join("manifest.json");
+    std::fs::write(&p, m.to_string()).unwrap();
+    (model, p)
+}
+
+/// Store-backed decode: every counted step misses and pages expert 3 in
+/// through the store drain, and no thread allocates. Exclusive residency
+/// releases the pool slot at each `copy_done` (the unit is marked VRAM-
+/// resident), so the next step's ensure misses again — the 8-expert fixture
+/// fits a 1 GiB pool whole, so inclusive residency would only ever hit.
+/// GLM-5.3-Flash UD-IQ3_XXS: one decode token = 42 layers × 8 routed units
+/// on this path; one allocation per unit would be 336 heap ops per token.
+#[test]
+fn store_backed_decode_allocates_nothing_on_any_thread() {
+    let (model, manifest) = manifest_fixture();
+    let cfg = EngineConfig {
+        model_path: model,
+        manifest_path: Some(manifest),
+        residency: golem_engine::config::Residency::Exclusive,
+        ..pooled_config()
+    };
+    let hooks = p3_glue::enable(&cfg).expect("enable");
+    assert!(hooks.storage_health().is_some(), "store-backed source");
+    hooks.set_scoring(true); // Session::new arms it after the self-check
+    let payload = hooks.payload_ptr();
+    let (_ctx, gate) = xt::gate_tensor();
+    let stats = hooks.state_stats();
+    // Warm: first sight registers, the drain readers and scratch settle.
+    for _ in 0..8 {
+        let _ = drive_step(payload, gate);
+    }
+    // Quiesce the order publisher: wait until no layer is dirty, so it has
+    // nothing left to build once it parks again. Bounded: a publisher that
+    // never drains fails the test rather than hanging it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hooks.orders_dirty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "order publisher did not drain dirty layers within 5 s"
+        );
+        std::thread::yield_now();
+    }
+
+    const STEPS: u64 = 200;
+    let pageins0 = stats.demand_slow_pageins.load(Ordering::Relaxed);
+    let bytes0 = stats.bytes_paged.load(Ordering::Relaxed);
+    let calls0 = hooks.ensure_calls();
+    ALL.store(0, Ordering::Relaxed);
+    ALL_ON.store(true, Ordering::Relaxed);
+    for _ in 0..STEPS {
+        let _ = drive_step(payload, gate);
+    }
+    ALL_ON.store(false, Ordering::Relaxed);
+    let allocs = ALL.load(Ordering::Relaxed);
+
+    assert_eq!(hooks.ensure_calls() - calls0, STEPS as usize);
+    assert_eq!(
+        stats.demand_slow_pageins.load(Ordering::Relaxed) - pageins0,
+        STEPS,
+        "every counted step must page in through the store drain"
+    );
+    assert!(
+        stats.bytes_paged.load(Ordering::Relaxed) > bytes0,
+        "disk bytes must grow"
+    );
+    assert_eq!(
+        allocs, 0,
+        "store-backed ensure + routing + copy_done must not allocate on any thread"
     );
 }

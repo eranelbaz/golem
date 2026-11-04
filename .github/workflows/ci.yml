@@ -53,6 +53,8 @@ jobs:
       # so every test compiled in must pass; a name filter once hid 8 failures.
       - name: Loom (placement pool)
         run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-placement --features loom
+      - name: Loom (store reader crews)
+        run: RUSTFLAGS="--cfg loom" cargo nextest run -p golem-store --features loom
       # Parity-suite tests drive the real xtask comparator, so they must run
       # after the workspace build (target/debug/xtask; no cargo-run fallback).
       - run: python3 -m pip install --quiet 'pytest==8.4.2' openai

@@ -57,10 +57,13 @@ impl PolicySnapshot {
         }
     }
 
-    /// Replaces the score table in place (scores published once per decode
-    /// step; the caller reuses one snapshot to avoid a per-step allocation).
-    pub fn replace_scores(&mut self, scores: Vec<f32>) {
-        self.scores = scores;
+    /// Refills the score table in place with `stride` experts per row,
+    /// reusing its allocation (scores published once per decode step; the
+    /// caller recycles snapshots to avoid a per-step allocation).
+    pub fn fill_scores(&mut self, stride: usize, scores: impl Iterator<Item = f32>) {
+        self.scores.clear();
+        self.scores.extend(scores);
+        self.scores_stride = stride;
     }
 
     /// The published score of one key (0.0 when no scores are published or
@@ -1125,6 +1128,17 @@ impl P3Stats {
 mod tests {
     use super::super::primitives::{self, Arc};
     use super::*;
+
+    #[test]
+    fn fill_scores_sets_stride_and_reuses_table() {
+        let mut snap = PolicySnapshot::empty();
+        snap.fill_scores(4, (0..8).map(|i| i as f32));
+        assert_eq!(snap.score_of(1, 2), 6.0);
+        let ptr = snap.scores.as_ptr();
+        snap.fill_scores(4, (0..8).map(|i| -(i as f32)));
+        assert_eq!(snap.score_of(1, 3), -7.0);
+        assert_eq!(snap.scores.as_ptr(), ptr, "refill reuses the allocation");
+    }
 
     #[test]
     fn kind_parses_ggml_and_gguf_names() {

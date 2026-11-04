@@ -1,8 +1,10 @@
-//! §5.2 decode hot path: a warm batch drain makes no heap allocation on the
-//! calling thread beyond `std::thread::scope`'s own reader-thread spawns.
+//! §5.2 decode hot path: a warm batch drain makes no heap allocation on any
+//! thread; the persistent reader crew is spawned once, not per drain.
 //! Shape: one expert unit = 3 planes, each larger than [`CHUNK`] so every
 //! plane is two chunks, at unaligned offsets (head scratch), mirrored on 2
 //! replicas.
+// Spawns reader crews outside `loom::model`.
+#![cfg(not(loom))]
 #![allow(unsafe_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -20,7 +22,7 @@ thread_local! {
     static COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Process-wide count while armed: calling thread plus its reader threads.
+/// Process-wide count while armed: calling thread plus the reader crew.
 static ALL_ON: AtomicBool = AtomicBool::new(false);
 static ALL: AtomicUsize = AtomicUsize::new(0);
 
@@ -97,7 +99,7 @@ fn fixture() -> (Vec<PathBuf>, ReplicaRegistry) {
 }
 
 #[test]
-fn warm_batch_drain_allocates_only_reader_spawns() {
+fn warm_batch_drain_allocates_nothing() {
     let (_paths, reg) = fixture();
     let queue = Arc::new(ChunkQueue::new(0, None));
     let covering = plan_aligned(plane_offset(0), PLANE)
@@ -128,29 +130,12 @@ fn warm_batch_drain_allocates_only_reader_spawns() {
     let head = (plane_offset(1) % 4096) as usize;
     assert_eq!(dsts[1][head], (plane_offset(1) % 251) as u8);
 
-    // Same scope-and-spawn shape as one drain: both replicas sit in one temp
-    // dir (1 drive), so io_depth readers.
-    let workers = golem_store::DEFAULT_IO_DEPTH;
-    let (spawn_only, spawn_all) = count(|| {
-        std::thread::scope(|s| {
-            for _ in 0..workers {
-                s.spawn(|| {});
-            }
-        })
-    });
     let want: Vec<Vec<u8>> = dsts.clone();
     for _ in 0..16 {
         dsts.iter_mut().for_each(|d| d.fill(0));
         let (n, a) = count(|| drain(&mut dsts));
-        assert_eq!(
-            n, spawn_only,
-            "warm drain allocated {n} times on the calling thread; \
-             {workers} bare reader spawns allocate {spawn_only}"
-        );
-        assert_eq!(
-            a, spawn_all,
-            "reader threads allocated: {a} across all threads vs {spawn_all} for bare spawns"
-        );
+        assert_eq!(n, 0, "warm drain allocated {n} times on the calling thread");
+        assert_eq!(a, 0, "warm drain allocated {a} times across all threads");
         assert!(dsts == want, "warm drain landed every byte");
     }
 }

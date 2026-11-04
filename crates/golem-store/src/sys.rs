@@ -1,6 +1,7 @@
 //! Raw syscall wrappers (§5.4): page-cache hygiene, `O_DIRECT` reads and
-//! filesystem capacity queries. The only `unsafe` in golem-store, each block with its invariant
-//! named.
+//! filesystem capacity queries. Each `unsafe` block names its invariant;
+//! the other `unsafe` in golem-store is the reader-crew task erasure in
+//! `readers`.
 
 use std::path::Path;
 
