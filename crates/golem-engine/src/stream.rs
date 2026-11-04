@@ -1,5 +1,5 @@
 //! Prefill-stream byte sources (design §7.6, ABI v10): the pinned staging
-//! ring, the reader thread, and the two stream trampolines C calls per
+//! ring, the reader threads, and the two stream trampolines C calls per
 //! plane. Decode hot set isolation (§7.6.4): pooled hits lease a resident
 //! slot WITHOUT scoring or paging in ([`ExpertPool::lease_resident`]);
 //! misses are read into staging slots, never into pool slots — a streamed
@@ -31,6 +31,13 @@ use crate::p3_glue::p3_fatal;
 /// (two sourced planes still held until their slab reuse + up to three warm
 /// planes ahead of the copy loop), 6 leaves one spare.
 const STAGING_SLOTS: u32 = 6;
+
+/// Reader threads: one per warm plane in flight (≤ 3 ahead of the copy
+/// loop), so the next plane's drain starts while the previous one's tail
+/// still runs and the drives never drain to zero between planes. Regions
+/// are disjoint per expert and slots are counted per slot, so readers
+/// complete in any order.
+const READERS: usize = 3;
 
 /// Cumulative stream counters (§7.6/§11 observability).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +122,7 @@ struct Inner {
 }
 
 /// The per-session stream state. Shared with C as part of the hook payload;
-/// the decode thread drives `warm`/`source`/`release`, the reader thread
+/// the decode thread drives `warm`/`source`/`release`, the reader threads
 /// consumes `queue` — the `Inner` mutex + condvar are the only shared state
 /// and the happens-before edges for the staging bytes.
 pub struct StreamState {
@@ -139,9 +146,9 @@ pub struct StreamState {
     n_experts: u32,
     inner: Mutex<Inner>,
     cv: Condvar,
-    /// The reader holds an `Arc<Self>`, so `Drop` never runs while it lives:
-    /// `stop` joins it explicitly, releasing the pool and arena with the session.
-    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Each reader holds an `Arc<Self>`, so `Drop` never runs while one
+    /// lives: `stop` joins them, releasing the pool and arena with the session.
+    readers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// H2D expert bytes this module's pointers fed (the copy loop's copies).
     pub bytes: AtomicU64,
     /// Per-expert plane hits served from the pool.
@@ -155,7 +162,7 @@ pub struct StreamState {
     /// Mirror of `Inner::holds.len()`, stored under the lock at every
     /// insert/remove so `stats()` never takes it.
     held: AtomicU64,
-    /// Test seam: runs on the reader thread right before its next read.
+    /// Test seam: runs on a reader thread right before its next read.
     #[cfg(any(test, feature = "test-support"))]
     test_before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -170,7 +177,7 @@ unsafe impl Sync for StreamState {}
 
 impl StreamState {
     /// Builds the staging ring (`STAGING_SLOTS` slots, mlocked) and spawns
-    /// the reader thread. `slot_bytes` is a minimum: each slot grows to fit
+    /// the reader threads. `slot_bytes` is a minimum: each slot grows to fit
     /// the page-aligned per-expert regions of the largest plane.
     ///
     /// # Errors
@@ -232,7 +239,7 @@ impl StreamState {
                 stop: false,
             }),
             cv: Condvar::new(),
-            reader: Mutex::new(None),
+            readers: Mutex::new(Vec::with_capacity(READERS)),
             bytes: AtomicU64::new(0),
             pool_hits: AtomicU64::new(0),
             staged: AtomicU64::new(0),
@@ -242,7 +249,7 @@ impl StreamState {
             #[cfg(any(test, feature = "test-support"))]
             test_before_read: Mutex::new(None),
         });
-        state.spawn_reader();
+        state.spawn_readers();
         Ok(state)
     }
 
@@ -257,13 +264,17 @@ impl StreamState {
         self.slot_bytes * STAGING_SLOTS as usize
     }
 
-    fn spawn_reader(self: &Arc<Self>) {
-        let state = self.clone();
-        let handle = std::thread::Builder::new()
-            .name("golem-stream-reader".into())
-            .spawn(move || state.reader_loop())
-            .expect("spawn stream reader");
-        *self.reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    fn spawn_readers(self: &Arc<Self>) {
+        let mut readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..READERS {
+            let state = self.clone();
+            readers.push(
+                std::thread::Builder::new()
+                    .name("golem-stream-reader".into())
+                    .spawn(move || state.reader_loop())
+                    .expect("spawn stream reader"),
+            );
+        }
     }
 
     fn reader_loop(self: Arc<Self>) {
@@ -297,7 +308,8 @@ impl StreamState {
                 // to the furthest region end) and no two experts' regions
                 // overlap (`plane_at` lays them out ascending, page-aligned),
                 // so the slices are disjoint. The slot is exclusively the
-                // reader's until pending hits 0; C reads only after that.
+                // readers' until pending hits 0; C reads only after that.
+                // Other readers write other slots or other experts' regions.
                 let region = unsafe {
                     std::slice::from_raw_parts_mut(
                         task.base.add(off - head),
@@ -405,7 +417,9 @@ impl StreamState {
                 ids: staged_ids.clone(),
                 slot,
             });
-            self.cv.notify_one();
+            // The condvar is shared with decode-thread waiters: wake every
+            // waiter so a reader is never the one passed over.
+            self.cv.notify_all();
             (slot, base)
         };
         inner.warm.insert(
@@ -659,7 +673,7 @@ impl StreamState {
         }
     }
 
-    /// Test seam: `f` runs on the reader thread before its next read.
+    /// Test seam: `f` runs on a reader thread before its next read.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn before_next_read_for_test(&self, f: Box<dyn FnOnce() + Send>) {
         *self
@@ -668,7 +682,7 @@ impl StreamState {
             .unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
-    /// Stops and joins the reader thread (session teardown; holds are empty
+    /// Stops and joins the reader threads (session teardown; holds are empty
     /// once the hooks are unregistered and copy_done ran).
     pub fn stop(&self) {
         {
@@ -676,11 +690,11 @@ impl StreamState {
             inner.stop = true;
             self.cv.notify_all();
         }
-        let handle = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(h) = handle
-            && h.thread().id() != std::thread::current().id()
-        {
-            let _ = h.join();
+        let handles = std::mem::take(&mut *self.readers.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in handles {
+            if h.thread().id() != std::thread::current().id() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -1310,6 +1324,95 @@ mod tests {
         }
         assert_eq!(store.scratch_by_reason(), [0; 3], "a staged plane bounced");
         s.release_all();
+        s.stop();
+    }
+
+    /// Blocks reads until `want` are in flight at once (or a timeout),
+    /// recording the peak; later reads pass straight through.
+    struct GateSource {
+        live: Mutex<usize>,
+        cv: Condvar,
+        peak: AtomicU64,
+        want: usize,
+    }
+
+    impl ExpertSource for GateSource {
+        fn read_expert(
+            &self,
+            _layer: u32,
+            _kind: ExpertKind,
+            expert: u32,
+            into: &mut [u8],
+            head: usize,
+        ) -> std::io::Result<()> {
+            let mut live = self.live.lock().unwrap();
+            *live += 1;
+            self.peak.fetch_max(*live as u64, Ordering::SeqCst);
+            self.cv.notify_all();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.peak.load(Ordering::SeqCst) < self.want as u64
+                && std::time::Instant::now() < deadline
+            {
+                live = self
+                    .cv
+                    .wait_timeout(live, deadline - std::time::Instant::now())
+                    .unwrap()
+                    .0;
+            }
+            *live -= 1;
+            drop(live);
+            into[head..].fill(expert as u8);
+            Ok(())
+        }
+
+        fn plane(&self, _layer: u32, _kind: ExpertKind, _expert: u32) -> Option<(u64, u64)> {
+            None
+        }
+    }
+
+    /// The warm set's planes drain concurrently, one per reader: a plane
+    /// batch never waits for the previous plane's drain to finish.
+    #[test]
+    fn warm_planes_drain_concurrently() {
+        let gate = Arc::new(GateSource {
+            live: Mutex::new(0),
+            cv: Condvar::new(),
+            peak: AtomicU64::new(0),
+            want: READERS,
+        });
+        let source: Arc<dyn ExpertSource> = gate.clone();
+        let layout = UnitLayout::new([STRIDE; 3], [None; 3]).unwrap();
+        let arena = Arena::new(&[SlotClass {
+            slot_size: layout.slot_bytes() as usize,
+            slots: 1,
+        }])
+        .unwrap();
+        let pool = ExpertPool::new(
+            arena,
+            source.clone(),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            PoolGeometry {
+                layers: vec![layout; 2],
+                n_experts: N_EXPERTS,
+                expert_bytes: 0,
+            },
+            vec![0, 0],
+        );
+        let s = StreamState::new(
+            pool,
+            source,
+            Box::new(|| false),
+            N_EXPERTS as usize * STRIDE as usize,
+        )
+        .unwrap();
+        // Layer 0 up + down routed, layer 1 gate whole: three planes.
+        s.warm(0, &[1]);
+        let mut out = [std::ptr::null(); 1];
+        s.source(0, 2, 1, &[1], &mut out).unwrap();
+        assert_eq!(gate.peak.load(Ordering::SeqCst), READERS as u64);
+        s.release_all();
+        assert!(all_slots_free(&s));
         s.stop();
     }
 }
