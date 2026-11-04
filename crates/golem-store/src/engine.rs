@@ -107,9 +107,9 @@ pub struct PageRead {
 pub const DEFAULT_IO_THREADS: usize = 2;
 
 /// §5.2 pread engine: owns the shared [`ChunkQueue`] feeding demand-first
-/// drains. No persistent worker threads — each `wait()` spawns its own
-/// scoped, per-drive readers, so [`Drop`] only fails queued-but-undrained
-/// reads.
+/// drains. Reader threads are the queue's persistent crews (§5.2), parked
+/// between drains and joined when the last queue handle drops; [`Drop`]
+/// fails queued-but-undrained reads.
 pub struct IoEngine {
     queue: Arc<ChunkQueue>,
 }
@@ -186,7 +186,8 @@ impl Drop for IoEngine {
     }
 }
 
-#[cfg(test)]
+// Every test here spawns reader crews outside `loom::model`.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::manifest::{ModelManifest, ShardEntry};

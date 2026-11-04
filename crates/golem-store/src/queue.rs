@@ -1,11 +1,15 @@
 //! §5.2 shared chunk queue: one queue of chunk reads drained demand-first by
-//! per-drive scoped reader threads (D-12).
+//! per-drive reader threads (D-12) from the queue's persistent crews
+//! ([`crate::readers`]).
 //!
 //! Invariants:
 //! - The global queue holds jobs **without** destination slices; slices live
 //!   only drain-locally, carried by [`DrainJob`] and handed out as disjoint
-//!   `&mut [u8]` regions via `split_at_mut` inside `std::thread::scope` — no
-//!   raw pointer ever crosses a thread and this crate stays `unsafe`-free.
+//!   `&mut [u8]` regions via `split_at_mut`; the drain task borrowing them is
+//!   lifetime-erased only inside `readers`, whose `run` returns after every
+//!   worker released it (scope semantics, no raw pointer in this module).
+//! - A worker that unwinds aborts its drain (`Shared::aborted`), so the other
+//!   workers return instead of waiting for chunks nobody will settle.
 //! - A failed chunk requeues onto the **same drain-local** work list with the
 //!   failed replica's bit set in its exclude mask, so a healthy drive's thread
 //!   retries it within the same `wait()`; the global queue only feeds new
@@ -178,8 +182,10 @@ pub struct ChunkQueue {
     io_threads: usize,
     /// Derived reader threads per drive (D-12: 1–2).
     io_depth: usize,
-    /// R-15: CPUs each drain reader pins itself to at spawn.
-    io_cpuset: Option<crate::sys::CpuSet>,
+    /// Persistent reader crews (§5.2). R-15: every crew thread pins itself
+    /// to `io_cpuset` once at spawn; the serial fallback (all crews busy)
+    /// runs unpinned on the caller thread.
+    readers: crate::readers::ReaderPool,
     /// Cumulative disk time (ns) and bytes served by this queue's drains
     /// (§11 timing): per-chunk atomics on the slow path are acceptable; the
     /// timing consumer takes (swap-to-zero) snapshots per decode step.
@@ -212,7 +218,7 @@ impl ChunkQueue {
             inner: Mutex::new(QueueInner::default()),
             io_threads,
             io_depth: DEFAULT_IO_DEPTH,
-            io_cpuset,
+            readers: crate::readers::ReaderPool::new(io_cpuset),
             disk_ns: AtomicU64::new(0),
             disk_bytes: AtomicU64::new(0),
             degraded_reads: AtomicU64::new(0),
@@ -234,6 +240,12 @@ impl ChunkQueue {
     /// before/after a `wait()` to detect failover on success paths.
     pub fn degraded_reads(&self) -> u64 {
         self.degraded_reads.load(Ordering::Relaxed)
+    }
+
+    /// Drains run serially on their caller because all
+    /// [`crate::readers::MAX_CREWS`] reader crews were busy (§5.2).
+    pub fn serial_fallbacks(&self) -> u64 {
+        self.readers.serial_fallbacks()
     }
 
     /// Drains the accumulated disk time (ns) and byte counters, resetting
@@ -739,11 +751,26 @@ fn healthy_mask(sources: &dyn ShardSources, shard: usize, replica_count: usize) 
         .fold(0u32, |m, r| m | (1 << r))
 }
 
-/// Shared drain state: the drain-local work list (jobs carry their slices)
-/// and the count of unsettled chunks.
+/// Shared drain state: the drain-local work list (jobs carry their slices),
+/// the count of unsettled chunks, and the abort flag a panicking worker sets.
 struct Shared<'a> {
     list: VecDeque<DrainJob<'a>>,
     remaining: usize,
+    aborted: bool,
+}
+
+/// Aborts the drain if a worker unwinds: its chunk never settles, so the
+/// other workers must stop waiting on `remaining`.
+struct AbortOnUnwind<'s, 'a>(&'s (Mutex<Shared<'a>>, Condvar));
+
+impl Drop for AbortOnUnwind<'_, '_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let (lock, cv) = self.0;
+            lock.lock().unwrap_or_else(PoisonError::into_inner).aborted = true;
+            cv.notify_all();
+        }
+    }
 }
 
 /// Per-drain context for one shard (§5.2): resolved once per drain — the hot
@@ -788,7 +815,7 @@ impl ShardBufs {
 /// Runs the drain to completion over a batch of reads: chunks from every
 /// read (possibly spanning shards) share one drain-local work list and one
 /// set of reader threads; each chunk's slice is the disjoint sub-slice of
-/// its own read's destination. Reader threads run inside `thread::scope`.
+/// its own read's destination. Readers come from the queue's crews.
 /// `base`, `slots_buf` and `list_buf` are the drain scratch's reused Vecs.
 fn drain_reads(
     queue: &ChunkQueue,
@@ -829,92 +856,99 @@ fn drain_reads(
 
     // Reader threads per drain (§5.2, D-12): one thread per physical drive
     // hosting an eligible replica by default — per-drive, not per-file. An
-    // explicit `--io-threads` override REPLACES the derived count, capped at
-    // the pending chunk count: more workers than chunks would idle.
+    // explicit `--io-threads` override REPLACES the derived count. The crew
+    // grows to `full`; `workers` caps it at the pending chunk count (more
+    // workers than chunks would idle).
     let drives = ctxs
         .iter()
         .filter_map(|c| c.as_ref())
         .map(|c| c.drives)
         .max()
         .unwrap_or(0);
-    let workers = (if queue.io_threads > 0 {
+    let full = if queue.io_threads > 0 {
         queue.io_threads
     } else {
         drives.max(1) * queue.io_depth
-    })
-    .min(list.len().max(1));
+    };
+    let workers = full.min(list.len().max(1));
 
     let first_home = queue.next_home.fetch_add(workers, Ordering::Relaxed);
-    // Scope-borrowed, not Arc'd: the scope joins every reader before return.
-    let shared = (Mutex::new(Shared { list, remaining }), Condvar::new());
-    std::thread::scope(|s| {
-        for w in 0..workers {
-            let shared = &shared;
-            // Home drive for striping (§5.2): workers are pinned round-robin
-            // to drives, starting at the drain's rotating first home; at pop
-            // time each worker self-selects the chunks its drive can serve,
-            // so the faster drive consumes proportionally more chunks.
-            let home = if drives == 0 {
-                0
-            } else {
-                first_home.wrapping_add(w) % drives
-            };
-            s.spawn(move || {
-                if let Some(set) = &queue.io_cpuset
-                    && let Err(e) = crate::sys::pin_current_thread(set)
-                {
-                    tracing::warn!("io thread pinning: {e}");
-                }
+    // Borrowed by the task, not Arc'd: `run` returns only after every worker
+    // released it.
+    let shared = (
+        Mutex::new(Shared {
+            list,
+            remaining,
+            aborted: false,
+        }),
+        Condvar::new(),
+    );
+    let task = |w: usize| {
+        let shared = &shared;
+        // Any unwind on this worker (pop loop or `run_chunk`) aborts the
+        // drain, so the other workers stop waiting on `remaining`.
+        let _abort = AbortOnUnwind(shared);
+        // Home drive for striping (§5.2): workers are pinned round-robin
+        // to drives, starting at the drain's rotating first home; at pop
+        // time each worker self-selects the chunks its drive can serve,
+        // so the faster drive consumes proportionally more chunks.
+        let home = if drives == 0 {
+            0
+        } else {
+            first_home.wrapping_add(w) % drives
+        };
+        loop {
+            // Pop a job (any drive's thread may serve it — the slice
+            // travels with the job), or exit when everything settled.
+            let job = {
+                let (lock, cv) = shared;
+                let mut sh = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 loop {
-                    // Pop a job (any drive's thread may serve it — the slice
-                    // travels with the job), or exit when everything settled.
-                    let job = {
-                        let (lock, cv) = shared;
-                        let mut sh = lock.lock().unwrap_or_else(PoisonError::into_inner);
-                        loop {
-                            // §5.2 self-selection: take the first job whose
-                            // healthy replicas include this worker's home
-                            // drive, but only if no queued job is exclusively
-                            // served by another drive (that job is that
-                            // drive's worker's to take — no starvation). With
-                            // all-multi-eligible chunks this is the front
-                            // job, so workers race on the list and the faster
-                            // drive (shorter per-chunk latency) pops more.
-                            // Fallback: front, so a job whose home worker is
-                            // busy still drains; exhaustion semantics unchanged.
-                            let home_first = sh.list.iter().position(|j| {
-                                let Some(c) = &ctxs[j.shard] else {
-                                    return true;
-                                };
-                                let elig = healthy_mask(c.sources, c.shard, c.slots.len())
-                                    & !j.job.exclude_mask;
-                                (0..c.slots.len())
-                                    .any(|r| elig & (1 << r) != 0 && c.replica_drive[r] == home)
-                            });
-                            match home_first {
-                                Some(i) => break sh.list.remove(i).unwrap(),
-                                None => {
-                                    if let Some(j) = sh.list.pop_front() {
-                                        break j;
-                                    }
-                                }
+                    if sh.aborted {
+                        return;
+                    }
+                    // §5.2 self-selection: take the first job whose
+                    // healthy replicas include this worker's home
+                    // drive, but only if no queued job is exclusively
+                    // served by another drive (that job is that
+                    // drive's worker's to take — no starvation). With
+                    // all-multi-eligible chunks this is the front
+                    // job, so workers race on the list and the faster
+                    // drive (shorter per-chunk latency) pops more.
+                    // Fallback: front, so a job whose home worker is
+                    // busy still drains; exhaustion semantics unchanged.
+                    let home_first = sh.list.iter().position(|j| {
+                        let Some(c) = &ctxs[j.shard] else {
+                            return true;
+                        };
+                        let elig =
+                            healthy_mask(c.sources, c.shard, c.slots.len()) & !j.job.exclude_mask;
+                        (0..c.slots.len())
+                            .any(|r| elig & (1 << r) != 0 && c.replica_drive[r] == home)
+                    });
+                    match home_first {
+                        Some(i) => break sh.list.remove(i).unwrap(),
+                        None => {
+                            if let Some(j) = sh.list.pop_front() {
+                                break j;
                             }
-                            if sh.remaining == 0 {
-                                return;
-                            }
-                            sh = cv.wait(sh).unwrap_or_else(PoisonError::into_inner);
                         }
-                    };
-                    // Shard ctx resolved once per job at list-build time
-                    // (flat Vec index, §5.2 hot path).
-                    let ctx = ctxs[job.shard]
-                        .as_ref()
-                        .expect("ctx exists for every enqueued job's shard");
-                    run_chunk(queue, shared, ctx, home, job);
+                    }
+                    if sh.remaining == 0 {
+                        return;
+                    }
+                    sh = cv.wait(sh).unwrap_or_else(PoisonError::into_inner);
                 }
-            });
+            };
+            // Shard ctx resolved once per job at list-build time
+            // (flat Vec index, §5.2 hot path).
+            let ctx = ctxs[job.shard]
+                .as_ref()
+                .expect("ctx exists for every enqueued job's shard");
+            run_chunk(queue, shared, ctx, home, job);
         }
-    });
+    };
+    queue.readers.run(full, workers, &task);
     let list = shared
         .0
         .into_inner()
@@ -1026,7 +1060,8 @@ fn settle(shared: &(Mutex<Shared<'_>>, Condvar), read: &ReadState, result: Resul
     cv.notify_all();
 }
 
-#[cfg(test)]
+// Every test here spawns reader crews outside `loom::model`.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::replica::{ReplicaRegistry, ReplicaSlot};
@@ -1344,19 +1379,26 @@ mod tests {
         assert_eq!(&d1[1024..], pattern(1024, 3072));
     }
 
-    struct PanicSource;
+    /// Panics on every read, or with a flag only on the first one (later
+    /// reads succeed without touching `buf`).
+    struct PanicSource(Option<Arc<AtomicBool>>);
 
     impl ChunkSource for PanicSource {
         fn read_chunk(&self, _offset: u64, _buf: &mut [u8]) -> io::Result<()> {
+            if let Some(fired) = &self.0
+                && fired.swap(true, Ordering::SeqCst)
+            {
+                return Ok(());
+            }
             panic!("injected reader panic");
         }
     }
 
-    struct PanicSources(ReplicaRegistry);
+    struct PanicSources(ReplicaRegistry, Option<Arc<AtomicBool>>);
 
     impl ShardSources for PanicSources {
         fn slots(&self, _shard_index: usize) -> Vec<Arc<dyn ChunkSource>> {
-            vec![Arc::new(PanicSource)]
+            vec![Arc::new(PanicSource(self.1.clone()))]
         }
         fn slot(&self, shard_index: usize, replica_index: usize) -> &ReplicaSlot {
             self.0.slot(shard_index, replica_index)
@@ -1375,7 +1417,7 @@ mod tests {
     fn batch_after_reader_panic_reuses_clean_scratch() {
         let (_p0, reg0) = fixture(1, "panic-a");
         let (_p1, reg1) = fixture(1, "panic-b");
-        let panicky = PanicSources(reg0);
+        let panicky = PanicSources(reg0, None);
         let queue = Arc::new(ChunkQueue::new(1, None));
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut d = vec![0u8; 4096];
@@ -1407,6 +1449,151 @@ mod tests {
         });
         b.wait().unwrap();
         assert_eq!(d, pattern(0, 4096));
+    }
+
+    /// Two workers, one panics mid-chunk: the other (whose reads succeed)
+    /// must not wait forever on the never-settled chunk; the panic reaches
+    /// the caller and the next
+    /// drain on the same crews succeeds.
+    #[test]
+    fn two_worker_panic_aborts_drain_without_hang() {
+        let bytes = crate::stripe::CHUNK * 4;
+        let (_p0, reg0) = fixture(1, "panic2-a");
+        let (_p1, reg1) = fixture(1, "panic2-b");
+        // Only the first read panics: the surviving worker keeps serving
+        // chunks until it observes the abort.
+        let panicky = PanicSources(reg0, Some(Arc::new(AtomicBool::new(false))));
+        let queue = Arc::new(ChunkQueue::new(2, None));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut d = vec![0u8; bytes];
+            let mut b = queue.batch();
+            b.push(ReadJob {
+                shard_index: 0,
+                offset: 0,
+                len: bytes,
+                expected_crc: 0,
+                verify_crc: false,
+                prefetch: false,
+                sources: &panicky,
+                dst: &mut d,
+            });
+            let _ = b.wait();
+        }));
+        assert!(unwound.is_err(), "worker panic propagates to the caller");
+        assert_eq!(queue.readers.last_want(), 2);
+        let mut d = vec![0u8; 4096];
+        read_whole(&queue, &reg1_sources(reg1), &mut d)
+            .wait()
+            .unwrap();
+        assert_eq!(d, pattern(0, 4096));
+    }
+
+    fn reg1_sources(reg: ReplicaRegistry) -> TestSources {
+        TestSources {
+            reg,
+            fail: Vec::new(),
+            log: Arc::new(std::sync::Mutex::new(Vec::new())),
+            drives: Vec::new(),
+            delay_ms: 0,
+            delays_ms: Vec::new(),
+            conc: None,
+            wait_for_pair: None,
+            gates: Vec::new(),
+        }
+    }
+
+    /// Multi-chunk fixture over `drives.len()` replicas, one per fake drive.
+    fn multi_drive(tag: &str, drives: &[&str], chunks: usize) -> (TestSources, usize) {
+        let bytes = crate::stripe::CHUNK * chunks;
+        let root = std::env::temp_dir().join(format!("golem-store-queue-{tag}"));
+        let mut replicas = Vec::new();
+        for r in 0..drives.len() {
+            let dir = root.join(format!("r{r}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SHARD_FILE), pattern(0, bytes)).unwrap();
+            replicas.push(dir);
+        }
+        let manifest = crate::manifest::ModelManifest {
+            name: tag.to_owned(),
+            shards: vec![crate::manifest::ShardEntry {
+                file: SHARD_FILE.to_owned(),
+                bytes: bytes as u64,
+                sha256: "0".repeat(64),
+                replicas,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut s = reg1_sources(ReplicaRegistry::open(&manifest).unwrap());
+        s.drives = drives.iter().map(|d| (*d).to_owned()).collect();
+        (s, bytes)
+    }
+
+    fn drain_all(queue: &Arc<ChunkQueue>, sources: &TestSources, bytes: usize) {
+        let mut dst = vec![0u8; bytes];
+        queue
+            .enqueue(ReadJob {
+                shard_index: 0,
+                offset: 0,
+                len: bytes,
+                expected_crc: crc32c::crc32c(&pattern(0, bytes)),
+                verify_crc: true,
+                prefetch: false,
+                sources,
+                dst: &mut dst,
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(dst, pattern(0, bytes));
+    }
+
+    /// A crew first sized by a 1-drive drain grows for a later 2-drive drain
+    /// (2 drives × depth 2 = 4 workers), with no hang.
+    #[test]
+    fn crew_grows_from_one_drive_to_two() {
+        let queue = Arc::new(ChunkQueue::new(0, None));
+        let (one, b1) = multi_drive("grow-1", &["dA"], 4);
+        drain_all(&queue, &one, b1);
+        assert_eq!(queue.readers.last_want(), 2);
+        let (two, b2) = multi_drive("grow-2", &["dA", "dB"], 4);
+        assert_eq!(queue.readers.max_crew_threads(), 2);
+        drain_all(&queue, &two, b2);
+        assert_eq!(queue.readers.last_want(), 4);
+        assert_eq!(queue.readers.max_crew_threads(), 4);
+        assert_eq!(queue.serial_fallbacks(), 0);
+    }
+
+    /// Drain A holds a crew (blocked in its read) while drain B (2 drives)
+    /// runs on another; once both finish, a third 2-drive drain reuses A's
+    /// small crew grown to 4 workers.
+    #[test]
+    fn held_crew_grows_on_reuse() {
+        let queue = Arc::new(ChunkQueue::new(0, None));
+        let (mut one, b1) = multi_drive("held-1", &["dA"], 1);
+        let gate = Arc::new(Gate {
+            done: Arc::new(AtomicUsize::new(0)),
+            bump: false,
+            wait_until: Some(1),
+        });
+        one.gates = vec![Some(Arc::clone(&gate))];
+        let (two, b2) = multi_drive("held-2", &["dA", "dB"], 4);
+        std::thread::scope(|s| {
+            let a = s.spawn(|| drain_all(&queue, &one, b1));
+            // A is parked in its gated read, holding one crew.
+            while one.log.lock().unwrap().is_empty() {
+                std::thread::yield_now();
+            }
+            drain_all(&queue, &two, b2);
+            gate.done.store(1, Ordering::SeqCst);
+            a.join().unwrap();
+        });
+        // Popping order is LIFO: A's crew (2 threads: 1 drive × depth 2)
+        // is the top idle crew.
+        assert_eq!(queue.readers.top_idle_crew_threads(), 2);
+        drain_all(&queue, &two, b2);
+        assert_eq!(queue.readers.last_want(), 4);
+        assert_eq!(queue.readers.top_idle_crew_threads(), 4);
+        assert_eq!(queue.serial_fallbacks(), 0);
     }
 
     /// Interleaved batches: one batch's wait extracts only its own jobs, the
@@ -2366,5 +2553,75 @@ mod tests {
             rx.recv_timeout(left)
                 .expect("all drains completed before the deadline (no lost wakeups)");
         }
+    }
+
+    /// Zero-cost chunk source: the drain's pop/scan cost dominates.
+    struct NullSource;
+
+    impl ChunkSource for NullSource {
+        fn read_chunk(&self, _offset: u64, _buf: &mut [u8]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Two replicas on two fake drives, both served by [`NullSource`].
+    struct NullSources(ReplicaRegistry);
+
+    impl ShardSources for NullSources {
+        fn slots(&self, _shard_index: usize) -> Vec<Arc<dyn ChunkSource>> {
+            vec![Arc::new(NullSource), Arc::new(NullSource)]
+        }
+        fn slot(&self, shard_index: usize, replica_index: usize) -> &ReplicaSlot {
+            self.0.slot(shard_index, replica_index)
+        }
+        fn shard_name(&self, shard_index: usize) -> &str {
+            self.0.shard_name(shard_index)
+        }
+        fn replica_drive(&self, _shard_index: usize, replica_index: usize) -> &str {
+            ["d0", "d1"][replica_index]
+        }
+    }
+
+    /// Pop cost of the shared drain list (§5.2) under the worst scan: replica
+    /// 0 Degraded, so every job is exclusive to drive 1 and drive-0 workers
+    /// scan past all of it. One layer's misses = 288 experts × 3 planes = 864
+    /// chunks; one UD-IQ3_XXS plane ≈ 4–6 MB at ~3 GB/s ≈ 1.5 ms per read, so
+    /// per-drive queues are warranted only above 5 % of that = 75 µs/pop.
+    #[test]
+    #[ignore = "pop-cost bench; GOLEM_POP_BENCH=1 --ignored --nocapture"]
+    fn pop_cost_with_one_replica_degraded() {
+        assert_eq!(
+            std::env::var("GOLEM_POP_BENCH").as_deref(),
+            Ok("1"),
+            "set GOLEM_POP_BENCH=1"
+        );
+        const JOBS: usize = 288 * 3;
+        const LEN: usize = 4096;
+        let (_paths, reg) = fixture(2, "pop-bench");
+        let sources = NullSources(reg);
+        sources.slot(0, 0).mark_degraded();
+        let queue = Arc::new(ChunkQueue::new(0, None));
+        let mut dsts = vec![vec![0u8; LEN]; JOBS];
+        let start = std::time::Instant::now();
+        let mut b = queue.batch();
+        for dst in &mut dsts {
+            b.push(ReadJob {
+                shard_index: 0,
+                offset: 0,
+                len: LEN,
+                expected_crc: 0,
+                verify_crc: false,
+                prefetch: false,
+                sources: &sources,
+                dst,
+            });
+        }
+        b.wait().unwrap();
+        let ns_per_pop = start.elapsed().as_nanos() / JOBS as u128;
+        println!("pop_cost_with_one_replica_degraded: {ns_per_pop} ns/pop over {JOBS} chunks");
+        assert!(
+            ns_per_pop < 75_000,
+            "{ns_per_pop} ns/pop ≥ 75 µs: per-drive queues warranted"
+        );
     }
 }

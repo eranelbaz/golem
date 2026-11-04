@@ -5,8 +5,9 @@
 //! - §5.1 replica registry: per-slot health, same-drive detection
 //!   ([`replica`], [`ReplicaRegistry::shared_device_warnings`]).
 //! - §5.2 shared-queue striping ([`queue`], [`stripe`]): one queue of chunk
-//!   reads drained demand-first by per-drive scoped threads, with exclude-mask
-//!   requeue onto the drain-local work list.
+//!   reads drained demand-first by per-drive reader threads from persistent
+//!   crews ([`readers`]), with exclude-mask requeue onto the drain-local work
+//!   list.
 //! - §5.3 CRC32C validation against the caller-supplied per-plane digest
 //!   ([`PageRead::expected_crc`]); mismatch degrades the serving replicas and
 //!   surfaces [`StoreError::Crc`] (never silent corruption).
@@ -25,12 +26,16 @@ mod engine;
 pub mod health;
 mod manifest;
 /// §5.2 shared chunk queue: demand-first drain scheduling with per-drive
-/// scoped reader threads.
+/// reader threads.
 mod queue;
+/// §5.2 persistent reader crews; one lifetime-erasing `unsafe` (scope-style
+/// task hand-off), nothing public.
+#[allow(unsafe_code)]
+mod readers;
 mod replica;
 mod stripe;
 
-/// Raw syscall wrappers — the only `unsafe` in this crate.
+/// Raw syscall wrappers; with [`readers`] the only `unsafe` in this crate.
 #[allow(unsafe_code)]
 pub mod sys;
 

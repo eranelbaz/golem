@@ -575,6 +575,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "libc",
+ "loom",
  "serde",
  "serde_json",
  "sha2",

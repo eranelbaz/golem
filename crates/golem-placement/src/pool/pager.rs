@@ -47,6 +47,12 @@ impl SnapshotHandle {
     pub fn update(&self, snapshot: Arc<PolicySnapshot>) {
         *self.current.lock().unwrap() = snapshot;
     }
+
+    /// Publishes `snapshot` and returns the one it replaced, so the
+    /// publisher can recycle it once no reader holds it.
+    pub fn swap(&self, snapshot: Arc<PolicySnapshot>) -> Arc<PolicySnapshot> {
+        std::mem::replace(&mut *self.current.lock().unwrap(), snapshot)
+    }
 }
 
 /// Demand-path failure: a source read that failed after bounded retries
@@ -998,6 +1004,12 @@ impl ExpertPool {
     /// table) for the next compute's victim picks.
     pub fn publish_snapshot(&self, snapshot: Arc<PolicySnapshot>) {
         self.snapshots.update(snapshot);
+    }
+
+    /// [`Self::publish_snapshot`] returning the replaced snapshot (see
+    /// [`SnapshotHandle::swap`]).
+    pub fn swap_snapshot(&self, snapshot: Arc<PolicySnapshot>) -> Arc<PolicySnapshot> {
+        self.snapshots.swap(snapshot)
     }
 
     /// [`Self::try_new`] for callers that treat bad input as a bug.

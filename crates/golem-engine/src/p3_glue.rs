@@ -36,7 +36,7 @@ use std::ffi::{CStr, c_void};
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::stream::StreamState;
 
@@ -322,6 +322,9 @@ struct HookState {
     /// Per-eviction scratch the `evict_dest_batch` hook fills (expert, floor)
     /// once per layer — no per-expert allocation on the eviction path.
     evict_scratch: Mutex<Vec<(u32, f32)>>,
+    /// The snapshot `publish_scored_snapshot` replaced last step, recycled
+    /// by the next publish (decode-thread-only; mutex for `&self`).
+    spare_snapshot: Mutex<Option<Arc<PolicySnapshot>>>,
     /// CPU expert math leases (design §1 O1, ABI v16): locked once per
     /// `cpu_lease` layer call and once at `copy_done`, never per expert.
     cpu_lease: Mutex<CpuLease>,
@@ -744,6 +747,12 @@ impl OrderScratch {
 /// enable/drop cycle is legal, a concurrent second enable is refused.
 static CURRENT: Mutex<Vec<Arc<HookState>>> = Mutex::new(Vec::new());
 
+/// Serializes [`enable`]'s refuse check, construction and `CURRENT` push, so
+/// two concurrent enables cannot both pass the check. Distinct from `CURRENT`:
+/// a failed construction drops a partly built `SessionHooks`, whose unregister
+/// locks `CURRENT`.
+static ENABLE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Process-wide count of live [`crate::session::Session`]s. Off-then-on
 /// guard: once ANY session exists, [`enable`] refuses — a pool registered
 /// under a live session would retroactively route that session's decodes
@@ -833,34 +842,37 @@ fn current_states() -> Vec<Arc<HookState>> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Takes (swap-to-zero) the timing accumulators at a decode step boundary.
-/// No-op while hooks are unregistered: unmeasured fields come back `None`.
-pub(crate) fn take_step_io_stats() -> StepIoStats {
-    let mut out = StepIoStats::default();
-    for h in current_states() {
-        out.p3_wait_ns += h.p3_wait_ns.swap(0, Ordering::Relaxed);
-        out.policy_ns = Some(out.policy_ns.unwrap_or(0) + h.policy_ns.swap(0, Ordering::Relaxed));
-        let disk_wait: u64 = h
-            .ensure_disk_wait_ns
-            .iter()
-            .map(|a| a.swap(0, Ordering::Relaxed))
-            .sum();
-        out.ensure_disk_wait_ns = Some(out.ensure_disk_wait_ns.unwrap_or(0) + disk_wait);
-        if let Some(s) = &h.store {
-            let (ns, bytes) = s.take_disk_stats();
-            out.disk_ns = Some(out.disk_ns.unwrap_or(0) + ns);
-            out.disk_bytes = Some(out.disk_bytes.unwrap_or(0) + bytes);
+/// Takes (swap-to-zero) one session's timing accumulators at a decode step
+/// boundary. Reads only `h` and its ctx, so concurrent sessions never drain
+/// each other's counters. The victim-ring take runs only when `victim_ring`
+/// (the session configured ring slots); unmeasured fields come back `None`.
+fn take_io_stats(h: &HookState, victim_ring: bool) -> StepIoStats {
+    let mut out = StepIoStats {
+        p3_wait_ns: h.p3_wait_ns.swap(0, Ordering::Relaxed),
+        policy_ns: Some(h.policy_ns.swap(0, Ordering::Relaxed)),
+        ..Default::default()
+    };
+    let disk_wait: u64 = h
+        .ensure_disk_wait_ns
+        .iter()
+        .map(|a| a.swap(0, Ordering::Relaxed))
+        .sum();
+    out.ensure_disk_wait_ns = Some(disk_wait);
+    if let Some(s) = &h.store {
+        let (ns, bytes) = s.take_disk_stats();
+        out.disk_ns = Some(ns);
+        out.disk_bytes = Some(bytes);
+    }
+    let ctx = h.ctx_ptr.load(Ordering::SeqCst);
+    if !ctx.is_null() {
+        let (mut ms, mut bytes) = (0.0, 0);
+        // SAFETY: FFI on the live ctx between computes (the decode thread
+        // synchronized); the cs_* fields are decode-thread-only and it
+        // writes only the two out-params.
+        if unsafe { raw::golem_take_h2d_timing(ctx, &mut ms, &mut bytes) } == 1 {
+            out.h2d = Some((ms, bytes));
         }
-        let ctx = h.ctx_ptr.load(Ordering::SeqCst);
-        if !ctx.is_null() {
-            let (mut ms, mut bytes) = (0.0, 0);
-            // SAFETY: FFI on the live ctx between computes (the decode thread
-            // synchronized); the cs_* fields are decode-thread-only and it
-            // writes only the two out-params.
-            if unsafe { raw::golem_take_h2d_timing(ctx, &mut ms, &mut bytes) } == 1 {
-                let (m0, b0) = out.h2d.unwrap_or((0.0, 0));
-                out.h2d = Some((m0 + ms, b0 + bytes));
-            }
+        if victim_ring {
             let mut r = crate::timing::VictimRingStats::default();
             // SAFETY: as above; writes only the four out-params.
             match unsafe {
@@ -872,42 +884,42 @@ pub(crate) fn take_step_io_stats() -> StepIoStats {
                     &mut r.d2h_bytes,
                 )
             } {
-                1 => out.victim_ring.get_or_insert_with(Default::default).add(&r),
+                1 => out.victim_ring = Some(r),
                 -1 => out.victim_ring_off = true,
                 _ => {}
             }
-            let mut c = crate::timing::CpuExpertStats::default();
-            // SAFETY: as above; writes only the five out-params.
-            if unsafe {
-                raw::golem_take_cpu_expert_stats(
-                    ctx,
-                    &mut c.experts,
-                    &mut c.bytes,
-                    &mut c.ms,
-                    &mut c.join_wait_ms,
-                    &mut c.padded,
-                )
-            } == 1
-            {
-                out.cpu_expert.get_or_insert_with(Default::default).add(&c);
-            }
-            let mut g = crate::timing::SyncGapStats::default();
-            // SAFETY: as above; writes only the four out-params. The C side's
-            // `sg_*` fields are decode-thread-only: written by the compute
-            // and read/reset here, and this take runs on the decode thread
-            // between computes, so there is no concurrent access.
-            if unsafe {
-                raw::golem_take_sync_gap_stats(
-                    ctx,
-                    &mut g.sync_ms,
-                    &mut g.gap_ms,
-                    &mut g.gap_max_ms,
-                    &mut g.readbacks,
-                )
-            } == 1
-            {
-                out.sync_gap.get_or_insert_with(Default::default).add(&g);
-            }
+        }
+        let mut c = crate::timing::CpuExpertStats::default();
+        // SAFETY: as above; writes only the five out-params.
+        if unsafe {
+            raw::golem_take_cpu_expert_stats(
+                ctx,
+                &mut c.experts,
+                &mut c.bytes,
+                &mut c.ms,
+                &mut c.join_wait_ms,
+                &mut c.padded,
+            )
+        } == 1
+        {
+            out.cpu_expert = Some(c);
+        }
+        let mut g = crate::timing::SyncGapStats::default();
+        // SAFETY: as above; writes only the four out-params. The C side's
+        // `sg_*` fields are decode-thread-only: written by the compute
+        // and read/reset here, and this take runs on the decode thread
+        // between computes, so there is no concurrent access.
+        if unsafe {
+            raw::golem_take_sync_gap_stats(
+                ctx,
+                &mut g.sync_ms,
+                &mut g.gap_ms,
+                &mut g.gap_max_ms,
+                &mut g.readbacks,
+            )
+        } == 1
+        {
+            out.sync_gap = Some(g);
         }
     }
     out
@@ -1029,6 +1041,11 @@ pub struct SessionHooks {
 }
 
 impl SessionHooks {
+    /// This session's step I/O stats (swap-to-zero); see [`take_io_stats`].
+    pub(crate) fn take_step_io_stats(&self, victim_ring: bool) -> StepIoStats {
+        take_io_stats(&self.state, victim_ring)
+    }
+
     /// The raw ctx pointer while hooks are registered (the per-ctx P4 stats
     /// getter). Panics after drop — callers hold the session.
     pub fn ctx_ptr(&self) -> raw::golem_ctx_t {
@@ -1147,6 +1164,12 @@ impl SessionHooks {
     /// epoch gate (retried by publisher/flush).
     pub fn order_pushes_failed(&self) -> usize {
         self.state.order_pushes_failed.load(Ordering::Relaxed)
+    }
+    /// Whether any layer's eviction order awaits publishing. Cleared only
+    /// at the end of a publish pass, so `false` means the publisher has
+    /// nothing left to build.
+    pub fn orders_dirty(&self) -> bool {
+        self.state.policy.dirty_any.load(Ordering::Relaxed)
     }
     /// The pool's counters (test/observability seam).
     pub fn state_stats(&self) -> Arc<P3Stats> {
@@ -1866,10 +1889,11 @@ pub fn enable(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // live would silently re-route that session's subsequent decodes through
     // the new hooks (they fire per step regardless of which session owns
     // them).
+    // ENABLE_LOCK held from the check through the CURRENT push: concurrent
+    // enables serialize, so a second one sees the first's state and is
+    // refused, and no half-built state reaches the registry.
+    let _enable = ENABLE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     refuse_if_pool_session_live()?;
-    // CURRENT's lock held across construction: concurrent enables serialize
-    // (each on its own ctx; the multi-ctx capability the ABI v5 surface is
-    // built for) and never race a half-built state into the registry.
     let result = enable_inner(config);
     if let Ok(hooks) = &result {
         CURRENT
@@ -2220,6 +2244,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         },
         miss_scratch: Mutex::new(Vec::with_capacity(3 * k.min(geo.n_experts) as usize)),
         evict_scratch: Mutex::new(Vec::with_capacity(geo.n_experts as usize)),
+        spare_snapshot: Mutex::new(None),
         cpu_lease: Mutex::new(CpuLease {
             batch: LeaseBatch::new(&pool, (n_layers * n_expert_used) as usize),
             ids: Vec::with_capacity(geo.n_experts as usize),
@@ -3422,22 +3447,28 @@ impl HookState {
 
     /// Publishes the scored policy snapshot for the next compute's D2H floor
     /// decisions (exclusive residency, O10): every key's §6.2 decayed score
-    /// at the current step, built into one fresh snapshot. Once per decode
-    /// step (in `copy_done`), never per expert — the table-sized Vec is the
-    /// only allocation, and the previous snapshot stays alive until the
-    /// next step consumes it (an in-place scratch would need a third
-    /// buffer; not worth it at one alloc per step).
+    /// at the current step. Once per decode step (in `copy_done`), never per
+    /// expert. Two snapshots rotate: the one replaced here is still held by
+    /// the batch claims until the next `end_batch_step_exclusive`, so by the
+    /// next publish it is unshared and refilled in place — steady state
+    /// allocates nothing. A spare still shared falls back to a fresh one.
     fn publish_scored_snapshot(&self) {
         let step = self.policy.step.load(Ordering::Relaxed);
         let n = self.n_experts as usize;
         let keys = self.n_layers as usize * n;
-        let mut scores = Vec::with_capacity(keys);
-        for i in 0..keys {
-            scores.push(self.policy.decayed(i, step) as f32);
+        let scores = (0..keys).map(|i| self.policy.decayed(i, step) as f32);
+        let mut spare = self
+            .spare_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut snap = spare
+            .take()
+            .filter(|s| Arc::strong_count(s) == 1 && Arc::weak_count(s) == 0)
+            .unwrap_or_else(|| Arc::new(PolicySnapshot::empty()));
+        if let Some(m) = Arc::get_mut(&mut snap) {
+            m.fill_scores(n, scores);
         }
-        let mut snap = PolicySnapshot::empty();
-        snap.replace_scores(scores);
-        self.pool.publish_snapshot(Arc::new(snap));
+        *spare = Some(self.pool.swap_snapshot(snap));
     }
 
     /// Registered entry for `tensor`, registering it on first sight.
@@ -3582,6 +3613,24 @@ mod tests {
         let (recs, ids) = trace_caps(1024, 32, 42, 8, (1, 12));
         assert_eq!(recs, (1056 + 32) * 42);
         assert_eq!(ids, (1056 * 8 + 32 * 12) * 42);
+    }
+
+    #[test]
+    fn step_io_take_reads_only_its_own_session() {
+        // Two pooled states side by side (enable_inner bypasses enable's
+        // live-session refuse): a take on A must not drain B's counters.
+        let config = EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ram_experts_gib: 1,
+            ..EngineConfig::default()
+        };
+        let a = enable_inner(&config).unwrap_or_else(|e| panic!("enable A: {e}"));
+        let b = enable_inner(&config).unwrap_or_else(|e| panic!("enable B: {e}"));
+        b.state.p3_wait_ns.store(7, Ordering::Relaxed);
+        let io = a.take_step_io_stats(false);
+        assert_eq!(io.p3_wait_ns, 0, "A's take included B's wait");
+        assert_eq!(b.state.p3_wait_ns.load(Ordering::Relaxed), 7);
+        assert_eq!(b.take_step_io_stats(false).p3_wait_ns, 7);
     }
 
     #[test]
