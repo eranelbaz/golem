@@ -168,6 +168,11 @@ pub fn profile_table(knobs: Option<&crate::profile::Knobs>) -> toml::Table {
         k.cpu_expert_frac > 0.0,
         f64::from(k.cpu_expert_frac).into(),
     );
+    put(
+        "prefill_ubatch",
+        k.prefill_ubatch > 0,
+        i64::from(k.prefill_ubatch).into(),
+    );
     t
 }
 
@@ -277,6 +282,9 @@ impl Layers<'_> {
                     &p.fingerprint[..12]
                 );
                 self.profile = profile_table(p.knobs.as_ref());
+                if let Some(w) = self.shadowed_prefill_ubatch() {
+                    tracing::warn!("golem: {w}");
+                }
             }
             Err(why) => tracing::info!(
                 "golem: optimize profile {} ignored: {why}",
@@ -284,6 +292,22 @@ impl Layers<'_> {
             ),
         }
         Ok(self)
+    }
+
+    /// The profile's `prefill_ubatch` when env or `golem.toml` (incl. a
+    /// `[models.*]` table) sets another value and so overrides it (§9.4).
+    pub fn shadowed_prefill_ubatch(&self) -> Option<String> {
+        let saved = self.profile.get("prefill_ubatch")?.as_integer()?;
+        let (src, v) = match (self.env)("GOLEM_PREFILL_UBATCH") {
+            Some(v) => ("GOLEM_PREFILL_UBATCH", v),
+            None => ("golem.toml", toml_raw(self.file.get("prefill_ubatch")?)),
+        };
+        (v.trim().parse::<i64>().ok() != Some(saved)).then(|| {
+            format!(
+                "optimize profile prefill_ubatch {saved} overridden by {src} prefill_ubatch {v}; \
+                 remove it there to apply the measured winner"
+            )
+        })
     }
 
     /// No env, file or profile: flags and defaults only.

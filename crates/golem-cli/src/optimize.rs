@@ -39,6 +39,17 @@ const PROMPTS: [&str; 2] = [
     "Explain in two sentences why the sky is blue.",
     "Write a haiku about a lighthouse in winter.",
 ];
+/// Words of the long prefill prompt, capped at a quarter of ctx so the
+/// rendered prompt fits (≈ 1.3 tokens/word → ≈ 4k tokens at the cap, the
+/// #214 measurement shape).
+const PREFILL_WORDS: u32 = 3000;
+/// Warm long-prompt prefill runs (median).
+const PREFILL_RUNS: usize = 3;
+/// VRAM a prefill-ubatch candidate must leave unplanned on the whole card:
+/// the smallest headroom that has run reliably on the target (GLM-5.3-Flash
+/// UD-IQ3_XXS, ctx 262144, K = 8: ubatch 512 plans 1.28 GiB and runs,
+/// 1024 plans 0.15 GiB and OOMed with the desktop holding ≈ 1.4 GiB).
+const MIN_UBATCH_HEADROOM: u64 = 1200 << 20;
 
 /// Arguments of the `optimize` subcommand.
 #[derive(Debug, clap::Args)]
@@ -52,7 +63,7 @@ pub struct OptimizeArgs {
     pub max_minutes: u64,
     /// Override the swept axes: `knob=v1,v2;knob=...` over threads,
     /// numa_interleave, o_direct, io_threads, io_depth, vram_experts_frac,
-    /// async_h2d, cpu_expert_math, cpu_expert_frac.
+    /// async_h2d, cpu_expert_math, cpu_expert_frac, prefill_ubatch.
     #[arg(long)]
     pub axes: Option<String>,
     /// Internal: measure one knob set (JSON) and print its metrics.
@@ -61,6 +72,9 @@ pub struct OptimizeArgs {
     /// Internal: the parent's registry entry id.
     #[arg(long, hide = true)]
     pub parent_entry: Option<String>,
+    /// Internal: also time a long-prompt prefill (a prefill axis is swept).
+    #[arg(long, hide = true, requires = "measure_one")]
+    pub measure_prefill: bool,
     /// Test seam (debug builds only): admit against a machine whose RAM/VRAM
     /// hold the planned bytes once but not twice.
     #[cfg(debug_assertions)]
@@ -101,7 +115,17 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     let facts = config.model_facts.ok_or("model facts unresolved")?;
     let fp = profile::fingerprint(&model)?;
     let (free_vram, free_ram) = (profile::sysfs_vram().map_or(0, |(f, _)| f), mach.ram_free);
-    let eff = crate::serve::effective(&config, requested_snapshot)?;
+    let mut axes = match &args.axes {
+        Some(s) => parse_axes(s)?,
+        None => default_axes(&config, &facts, &mach),
+    };
+    fold_defaults(&mut axes, &config);
+    let prefill = axes.iter().any(Axis::is_prefill);
+    // The entry reserves the largest candidate ubatch's compute buffer, so a
+    // child never holds more VRAM than the registry admitted.
+    let mut reserved = config.clone();
+    apply(&mut reserved, &max_ubatch_knobs(&axes));
+    let eff = crate::serve::effective(&reserved, requested_snapshot)?;
     let model_name = model
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -110,7 +134,7 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         crate::serve::new_id(),
         "optimize",
         model_name,
-        &config,
+        &reserved,
         &eff,
         &mach,
     )?;
@@ -128,11 +152,6 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     let id = guard.instance().id;
 
     let base_plan = plan_for(&config, &facts, &mach, &Knobs::default());
-    let mut axes = match &args.axes {
-        Some(s) => parse_axes(s)?,
-        None => default_axes(&config),
-    };
-    fold_defaults(&mut axes, &config);
     let base = Knobs::default();
     let n_cand = 1 + 2 * axes
         .iter()
@@ -168,20 +187,22 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
         let t0 = Instant::now();
         let r = plan_check(&config, &facts, &mach, k, &base_plan).and_then(|()| {
             println!("plan ok: {}", serde_json::to_string(k)?);
-            run_child(&id, &guard, k, &model)
+            run_child(&id, &guard, k, &model, prefill)
         });
         let line = serde_json::to_string(k)?;
         match &r {
             Ok(m) => {
                 println!(
-                    "candidate {line}: warm {:.2} tok/s hit {:.1}% ttft p50 {:.0} ms p99 {:.0} ms | \
-                     cold {:.2} tok/s ttft {:.0} ms | load {:.1} s",
+                    "candidate {line}: warm {:.2} tok/s hit {:.1}% ttft p50 {:.0} ms p99 {:.0} ms \
+                     prefill {:.0} ms | cold {:.2} tok/s ttft {:.0} ms prefill {:.0} ms | load {:.1} s",
                     m.warm.tok_s,
                     m.warm.hit_rate * 100.0,
                     m.warm.ttft_p50_ms,
                     m.warm.ttft_p99_ms,
+                    m.warm.prefill_ms,
                     m.cold.tok_s,
                     m.cold.ttft_p50_ms,
+                    m.cold.prefill_ms,
                     m.load_s
                 );
                 if first {
@@ -247,11 +268,14 @@ pub fn optimize(args: &OptimizeArgs) -> Result<(), Box<dyn Error>> {
     };
     match result {
         Some((k, m)) => println!(
-            "winner {}: {:.2} tok/s vs baseline {:.2} ({:+.1}%); profile saved: {}",
+            "winner {}: {:.2} tok/s vs baseline {:.2} ({:+.1}%), prefill {:.0} ms vs {:.0} ms; \
+             profile saved: {}",
             serde_json::to_string(&k)?,
             m.tok_s,
             baseline.tok_s,
             (m.tok_s / baseline.tok_s - 1.0) * 100.0,
+            m.prefill_ms,
+            baseline.prefill_ms,
             path.display()
         ),
         None => match &kept {
@@ -351,10 +375,14 @@ fn plan_for(
     mach: &golem_plan::Machine,
     k: &Knobs,
 ) -> golem_plan::PlanReport {
+    let ubatch = match k.prefill_ubatch {
+        0 => effective_ubatch(config),
+        u => u,
+    };
     let mut input = golem_plan::PlanInput {
         ctx: config.n_ctx,
         parallel: config.parallel,
-        prefill_ubatch: config.prefill_ubatch.min(config.n_ctx),
+        prefill_ubatch: ubatch.min(config.n_ctx),
         prefill_stream: config.prefill_stream,
         vram_experts: 0,
         experts: golem_plan::ExpertResidency::Pooled {
@@ -376,7 +404,22 @@ fn plan_for(
     golem_plan::plan_at_frac(facts, mach, &input, frac)
 }
 
-/// A candidate must fit and plan no more than the baseline.
+/// The context ubatch the engine runs `config` at: the streamed prefill
+/// ubatch (0 = 2048), else `batch_tokens` (session.rs `plan_input`).
+fn effective_ubatch(config: &EngineConfig) -> u32 {
+    match (config.prefill_stream, config.prefill_ubatch) {
+        (false, _) => config.batch_tokens,
+        (true, 0) => 2048,
+        (true, u) => u,
+    }
+}
+
+/// A candidate must fit and plan no more than the baseline. A larger
+/// prefill ubatch always plans a larger compute buffer (`ws` ≈ 1.12 → 2.25
+/// GiB at 1024 → 2048, ctx 262144), so its VRAM gate is instead a minimum
+/// headroom on the whole card when the device cache is explicit; a derived
+/// cache absorbs the difference, which the decode guard in the win rule
+/// prices.
 fn plan_check(
     config: &EngineConfig,
     facts: &golem_plan::ModelFacts,
@@ -395,8 +438,30 @@ fn plan_check(
     if let Some(v) = r.violation() {
         return Err(format!("plan infeasible: {v}").into());
     }
-    let (v, b) = (golem_plan::total(&r.vram), golem_plan::total(&base.vram));
+    // Other axes stay gated against the baseline at the candidate's ubatch,
+    // so a ubatch winner never exempts later steps from the VRAM bound.
+    let same_ubatch = Knobs {
+        prefill_ubatch: k.prefill_ubatch,
+        ..Knobs::default()
+    };
+    let at_ubatch = plan_for(config, facts, mach, &same_ubatch);
+    let (v, b) = (
+        golem_plan::total(&r.vram),
+        golem_plan::total(&at_ubatch.vram),
+    );
     let (rv, rb) = (golem_plan::total(&r.ram), golem_plan::total(&base.ram));
+    if k.prefill_ubatch > 0 && config.device_cache_experts > 0 {
+        let min = i64::try_from(MIN_UBATCH_HEADROOM).unwrap_or(i64::MAX);
+        if r.vram_headroom < min {
+            return Err(format!(
+                "plan headroom {} MiB < {} MiB at prefill_ubatch {}",
+                r.vram_headroom >> 20,
+                MIN_UBATCH_HEADROOM >> 20,
+                k.prefill_ubatch
+            )
+            .into());
+        }
+    }
     if v > b || rv > rb {
         return Err(format!("plan above baseline: VRAM {v} > {b} B or RAM {rv} > {rb} B").into());
     }
@@ -410,6 +475,7 @@ fn run_child(
     guard: &golem_registry::Guard,
     k: &Knobs,
     model: &Path,
+    prefill: bool,
 ) -> Result<Measured, Box<dyn Error>> {
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.args(std::env::args_os().skip(1));
@@ -421,6 +487,7 @@ fn run_child(
     let mut child = cmd
         .args(["--measure-one", &serde_json::to_string(k)?])
         .args(["--parent-entry", parent])
+        .args(prefill.then_some("--measure-prefill"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -485,6 +552,7 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
                 "vram_experts_frac" => Axis::VramExpertsFrac(vals(v)?),
                 "cpu_expert_math" => Axis::CpuExpertMath(vals(v)?),
                 "cpu_expert_frac" => Axis::CpuExpertFrac(vals(v)?),
+                "prefill_ubatch" => Axis::PrefillUbatch(vals(v)?),
                 other => return Err(format!("unknown knob {other:?}").into()),
             })
         })
@@ -494,7 +562,11 @@ fn parse_axes(s: &str) -> Result<Vec<Axis>, Box<dyn Error>> {
 /// The swept axes for this machine. NUMA only with > 1 node, `O_DIRECT`
 /// and I/O only with a store-backed pool; `async_h2d` and
 /// `cpu_expert_*` are opt-in via `--axes` (no measured win yet). Target: 16 physical cores → threads {8, 12, 16}.
-fn default_axes(config: &EngineConfig) -> Vec<Axis> {
+fn default_axes(
+    config: &EngineConfig,
+    facts: &golem_plan::ModelFacts,
+    mach: &golem_plan::Machine,
+) -> Vec<Axis> {
     let phys = sysinfo::System::new().physical_core_count().unwrap_or(2) as u32;
     let mut threads = vec![(phys / 2).max(1), (phys * 3 / 4).max(1), phys.max(1)];
     threads.dedup();
@@ -516,7 +588,56 @@ fn default_axes(config: &EngineConfig) -> Vec<Axis> {
     if config.ram_experts_gib > 0 && config.device_cache_experts == 0 {
         axes.push(Axis::VramExpertsFrac(vec![1.0, 0.75, 0.5]));
     }
+    let ubatches = ubatch_candidates(config, facts, mach);
+    if ubatches.len() > 1 {
+        axes.push(Axis::PrefillUbatch(ubatches));
+    }
     axes
+}
+
+/// Powers of two from the configured streamed ubatch up to the largest that
+/// passes [`plan_check`] (ctx and the pinned device cache bound it: ctx
+/// 262144, K = 8 → 512; ctx 16384 → 2048 on the target). Empty without
+/// prefill streaming, where the ubatch is `batch_tokens`.
+fn ubatch_candidates(
+    config: &EngineConfig,
+    facts: &golem_plan::ModelFacts,
+    mach: &golem_plan::Machine,
+) -> Vec<u32> {
+    if !config.prefill_stream {
+        return Vec::new();
+    }
+    let base = plan_for(config, facts, mach, &Knobs::default());
+    let mut u = effective_ubatch(config).min(config.n_ctx);
+    let mut out = vec![u];
+    while u < 8192 && u * 2 <= config.n_ctx {
+        u *= 2;
+        let k = Knobs {
+            prefill_ubatch: u,
+            ..Knobs::default()
+        };
+        if plan_check(config, facts, mach, &k, &base).is_err() {
+            break;
+        }
+        out.push(u);
+    }
+    out
+}
+
+/// The largest prefill ubatch any axis may run, as knobs ([`Knobs::default`]
+/// when none is swept).
+fn max_ubatch_knobs(axes: &[Axis]) -> Knobs {
+    Knobs {
+        prefill_ubatch: axes
+            .iter()
+            .filter_map(|a| match a {
+                Axis::PrefillUbatch(v) => v.iter().copied().max(),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0),
+        ..Knobs::default()
+    }
 }
 
 /// Rewrites axis values equal to the baseline's effective setting as the
@@ -551,6 +672,7 @@ fn fold_defaults(axes: &mut [Axis], config: &EngineConfig) {
             Axis::AsyncH2d(v) => fold(v, |x| x == config.async_h2d, false),
             Axis::CpuExpertMath(v) => fold(v, |x| x == config.cpu_expert_math, false),
             Axis::CpuExpertFrac(v) => fold(v, |x| x == config.cpu_expert_frac, 0.0),
+            Axis::PrefillUbatch(v) => fold(v, |x| x == effective_ubatch(config), 0),
         }
     }
 }
@@ -575,6 +697,9 @@ fn apply(config: &mut EngineConfig, k: &Knobs) {
     config.cpu_expert_math |= k.cpu_expert_math;
     if k.cpu_expert_frac > 0.0 {
         config.cpu_expert_frac = k.cpu_expert_frac;
+    }
+    if k.prefill_ubatch > 0 {
+        config.prefill_ubatch = k.prefill_ubatch;
     }
 }
 
@@ -660,7 +785,29 @@ fn metrics(passes: &[Pass]) -> Metrics {
         ttft_p50_ms: percentile(&mut ttft, 0.5),
         ttft_p99_ms: percentile(&mut ttft, 0.99),
         greedy: Vec::new(),
+        prefill_ms: 0.0,
     }
+}
+
+/// One long-prompt turn generating a single token; `run` varies the
+/// prompt's first words so no state snapshot covers its prefix (§7.1).
+fn prefill_ms(s: &mut Session, n_ctx: u32, run: usize) -> Result<f64, Box<dyn Error>> {
+    let words = PREFILL_WORDS.min(n_ctx / 4) as usize;
+    let mut prompt = format!("Run {run}. Summarize:");
+    for i in 0..words {
+        prompt.push_str([" the", " lighthouse", " keeper", " counts", " waves"][i % 5]);
+    }
+    let messages = [ChatTurn {
+        role: "user",
+        content: &prompt,
+    }];
+    let req = golem_engine::slot::TurnRequest {
+        max_tokens: Some(1),
+        ..golem_engine::slot::TurnRequest::new(&messages)
+    };
+    let t0 = Instant::now();
+    s.turn(&req, &mut |_| {})?;
+    Ok(t0.elapsed().as_secs_f64() * 1e3)
 }
 
 /// Child: loads with `knobs`, measures cold (page cache evicted, fresh
@@ -702,7 +849,12 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
     let t = Instant::now();
     let mut s = Session::new(&config)?;
     let load_s = t.elapsed().as_secs_f64();
-    let cold = metrics(&[pass(&mut s)?]);
+    let mut cold = metrics(&[pass(&mut s)?]);
+    // After the cold decode pass so that stays cold; page cache evicted again.
+    if args.measure_prefill {
+        evict(&model)?;
+        cold.prefill_ms = prefill_ms(&mut s, config.n_ctx, 0)?;
+    }
     let mut last = cold.hit_rate;
     for _ in 0..MAX_WARMUP {
         let h = pass(&mut s)?.hit_rate;
@@ -716,6 +868,12 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
         .map(|_| pass(&mut s))
         .collect::<Result<Vec<_>, _>>()?;
     let mut warm = metrics(&passes);
+    if args.measure_prefill {
+        let mut runs = (1..=PREFILL_RUNS)
+            .map(|i| prefill_ms(&mut s, config.n_ctx, i))
+            .collect::<Result<Vec<_>, _>>()?;
+        warm.prefill_ms = percentile(&mut runs, 0.5);
+    }
     let mut steps = Vec::new();
     for prompt in PROMPTS {
         s.chat_turn_parity(
@@ -730,4 +888,84 @@ fn measure_one(args: &OptimizeArgs, knobs: &Knobs) -> Result<Measured, Box<dyn E
     }
     std::io::stdout().flush()?;
     Ok(Measured { warm, cold, load_s })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GLM-5.3-Flash UD-IQ3_XXS shape on the 24 GiB target, K = 8 pinned,
+    /// reserve 3 GiB, q8_0 KV (14,432 B/token).
+    fn glm() -> (golem_plan::ModelFacts, golem_plan::Machine) {
+        (
+            golem_plan::ModelFacts {
+                t_ne: 8_966_188_280,
+                shexp: 1_123_024_896,
+                n_expert: 288,
+                top_k: 8,
+                expert_layers: 42,
+                first_expert_block: 0,
+                max_plane_stride: 6_881_280,
+                expert_bytes_total: 42 * 288 * 3 * 2_400_000,
+                kv_per_token: 14_432,
+                rs_bytes: 152_633_344,
+                sparse_attn_layers: 11,
+                dense_below_ctx: 2_052,
+            },
+            golem_plan::Machine {
+                vram_total: 24 << 30,
+                ram_total: 93 << 30,
+                ram_free: 88 << 30,
+                rocm_overhead: golem_plan::ROCM_OVERHEAD,
+            },
+        )
+    }
+
+    fn config(ctx: u32) -> EngineConfig {
+        EngineConfig {
+            n_ctx: ctx,
+            prefill_stream: true,
+            prefill_ubatch: 512,
+            ram_experts_gib: 52,
+            device_cache_experts: 8,
+            vram_reserve_bytes: Some(3 << 30),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ubatch_candidates_stop_at_headroom_gate() {
+        let (f, mach) = glm();
+        let full = ubatch_candidates(&config(262_144), &f, &mach);
+        let small = ubatch_candidates(&config(16_384), &f, &mach);
+        assert_eq!(full.first(), Some(&512));
+        assert!(!full.contains(&2048), "{full:?}");
+        assert!(small.contains(&2048), "{small:?}");
+        let base = plan_for(&config(262_144), &f, &mach, &Knobs::default());
+        for &u in &full[1..] {
+            let k = Knobs {
+                prefill_ubatch: u,
+                ..Knobs::default()
+            };
+            let r = plan_for(&config(262_144), &f, &mach, &k);
+            assert!(r.vram_headroom >= MIN_UBATCH_HEADROOM as i64, "{u}");
+            assert!(plan_check(&config(262_144), &f, &mach, &k, &base).is_ok());
+        }
+        let off = EngineConfig {
+            prefill_stream: false,
+            ..config(16_384)
+        };
+        assert!(ubatch_candidates(&off, &f, &mach).is_empty());
+    }
+
+    #[test]
+    fn folded_ubatch_axis_and_reservation() {
+        let mut axes = vec![Axis::PrefillUbatch(vec![512, 1024, 2048])];
+        fold_defaults(&mut axes, &config(16_384));
+        assert!(matches!(&axes[0], Axis::PrefillUbatch(v) if v == &[0, 1024, 2048]));
+        assert_eq!(max_ubatch_knobs(&axes).prefill_ubatch, 2048);
+        let mut c = config(16_384);
+        apply(&mut c, &max_ubatch_knobs(&axes));
+        assert_eq!(c.prefill_ubatch, 2048);
+    }
 }

@@ -139,6 +139,9 @@ pub struct Knobs {
     /// Share of slab misses sent to the CPU (1.0, 0.7, 0.5); 0 = 0.7.
     #[serde(default)]
     pub cpu_expert_frac: f32,
+    /// Streamed prefill ubatch; 0 = the configured value.
+    #[serde(default)]
+    pub prefill_ubatch: u32,
 }
 
 /// One sweep dimension: the values coordinate descent tries for one knob.
@@ -162,6 +165,8 @@ pub enum Axis {
     CpuExpertMath(Vec<bool>),
     /// [`Knobs::cpu_expert_frac`].
     CpuExpertFrac(Vec<f32>),
+    /// [`Knobs::prefill_ubatch`]; judged by [`wins_prefill`].
+    PrefillUbatch(Vec<u32>),
 }
 
 impl Axis {
@@ -186,7 +191,13 @@ impl Axis {
             Axis::AsyncH2d(v) => each(v, |k, x| k.async_h2d = x, base),
             Axis::CpuExpertMath(v) => each(v, |k, x| k.cpu_expert_math = x, base),
             Axis::CpuExpertFrac(v) => each(v, |k, x| k.cpu_expert_frac = x, base),
+            Axis::PrefillUbatch(v) => each(v, |k, x| k.prefill_ubatch = x, base),
         }
+    }
+
+    /// Only moves prefill time, so it is judged on the long-prompt metric.
+    pub fn is_prefill(&self) -> bool {
+        matches!(self, Axis::PrefillUbatch(_))
     }
 }
 
@@ -205,6 +216,9 @@ pub struct Metrics {
     /// row per prompt of the fixed set (§12.3 parity, gated by [`greedy_matches`]).
     #[serde(default)]
     pub greedy: Vec<Vec<(i32, f32)>>,
+    /// Long-prompt prefill (time to first token), median; 0 = not measured.
+    #[serde(default)]
+    pub prefill_ms: f64,
 }
 
 /// Largest top-1/top-2 logit gap at which two settings may pick different
@@ -266,6 +280,7 @@ impl Profile {
             ttft_p50_ms: 0.0,
             ttft_p99_ms: 0.0,
             greedy: Vec::new(),
+            prefill_ms: 0.0,
         };
         Self {
             fingerprint: String::new(),
@@ -447,6 +462,24 @@ fn wins(c: &Metrics, incumbent: &Metrics, base: &Metrics) -> bool {
         && greedy_matches(c, base)
 }
 
+/// Prefill win rule: long-prompt prefill at least [`PREFILL_GAIN`] faster
+/// than the paired incumbent, decode tok/s within the decode rule's 3% and
+/// hit rate within 0.5 pp of it; TTFT and greedy output held against the
+/// baseline as in [`wins`].
+pub fn wins_prefill(c: &Metrics, incumbent: &Metrics, base: &Metrics) -> bool {
+    c.prefill_ms > 0.0
+        && c.prefill_ms <= incumbent.prefill_ms * (1.0 - PREFILL_GAIN)
+        && c.tok_s >= incumbent.tok_s * 0.97
+        && c.hit_rate >= incumbent.hit_rate - 0.005
+        && c.ttft_p50_ms <= base.ttft_p50_ms * 1.2
+        && c.ttft_p99_ms <= base.ttft_p99_ms * 1.2
+        && greedy_matches(c, base)
+}
+
+/// Smallest prefill-time drop a prefill axis must show (ubatch 512 → 1024
+/// measured −36% on GLM-5.3-Flash UD-IQ3_XXS, #214).
+pub const PREFILL_GAIN: f64 = 0.10;
+
 /// Bounded coordinate descent (max 2 passes) from `base` over `axes`. Each
 /// candidate is measured paired with the incumbent in randomized order; the
 /// winner is confirmed by a reverse-order rerun (winner, then baseline). A
@@ -469,6 +502,11 @@ pub fn sweep(
     'passes: for _ in 0..2 {
         let mut moved = false;
         for axis in axes {
+            let rule = if axis.is_prefill() {
+                wins_prefill
+            } else {
+                wins
+            };
             let start = best.0;
             let axis_drift = drift;
             for cand in axis.variants(&start) {
@@ -489,7 +527,7 @@ pub fn sweep(
                         // Beat both this axis's best so far and a fresh
                         // incumbent run.
                         let bar = if best.0 == start { &inc } else { &best.1 };
-                        if wins(&c, bar, &baseline) && wins(&c, &inc, &baseline) {
+                        if rule(&c, bar, &baseline) && rule(&c, &inc, &baseline) {
                             drift = axis_drift + (inc.hit_rate - c.hit_rate).max(0.0);
                             best = (cand, c);
                         }
@@ -526,9 +564,22 @@ pub fn sweep(
     if stopped {
         return Ok(unconfirmed(&"sweep stopped early"));
     }
+    // A winner is confirmed under the rule of every axis it moved.
+    let (prefill_moved, decode_moved) = (
+        best.0.prefill_ubatch != base.prefill_ubatch,
+        Knobs {
+            prefill_ubatch: base.prefill_ubatch,
+            ..best.0
+        } != *base,
+    );
     let confirm = measure(&best.0).and_then(|w| Ok((w, measure(base)?)));
     match confirm {
-        Ok((w, b)) if wins(&w, &b, &baseline) => Ok(Some((best.0, w))),
+        Ok((w, b))
+            if (!decode_moved || wins(&w, &b, &baseline))
+                && (!prefill_moved || wins_prefill(&w, &b, &baseline)) =>
+        {
+            Ok(Some((best.0, w)))
+        }
         Ok(_) => {
             eprintln!("golem optimize: winner not confirmed by the reverse-order rerun");
             Ok(None)
