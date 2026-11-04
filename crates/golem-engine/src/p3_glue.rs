@@ -3622,6 +3622,7 @@ mod tests {
         let config = EngineConfig {
             model_path: xtask::tiny_moe::cached_fixture(),
             ram_experts_gib: 1,
+            device_cache_experts: 4,
             ..EngineConfig::default()
         };
         let a = enable_inner(&config).unwrap_or_else(|e| panic!("enable A: {e}"));
