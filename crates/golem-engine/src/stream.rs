@@ -1,5 +1,5 @@
 //! Prefill-stream byte sources (design §7.6, ABI v10): the pinned staging
-//! ring, the reader thread, and the two stream trampolines C calls per
+//! ring, the reader threads, and the two stream trampolines C calls per
 //! plane. Decode hot set isolation (§7.6.4): pooled hits lease a resident
 //! slot WITHOUT scoring or paging in ([`ExpertPool::lease_resident`]);
 //! misses are read into staging slots, never into pool slots — a streamed
@@ -23,6 +23,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use golem_placement::pool::{
     Arena, DIRECT_ALIGN, ExpertKind, ExpertPool, ExpertSource, Lease, SlotClass,
 };
+use golem_store::recycle;
 
 use crate::p3_glue::p3_fatal;
 
@@ -30,6 +31,13 @@ use crate::p3_glue::p3_fatal;
 /// (two sourced planes still held until their slab reuse + up to three warm
 /// planes ahead of the copy loop), 6 leaves one spare.
 const STAGING_SLOTS: u32 = 6;
+
+/// Reader threads: one per warm plane in flight (≤ 3 ahead of the copy
+/// loop), so the next plane's drain starts while the previous one's tail
+/// still runs and the drives never drain to zero between planes. Regions
+/// are disjoint per expert and slots are counted per slot, so readers
+/// complete in any order.
+const READERS: usize = 3;
 
 /// Cumulative stream counters (§7.6/§11 observability).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -50,17 +58,15 @@ pub struct StreamStats {
     pub held: u64,
 }
 
+/// One warmed plane's misses, read as one batched drain so the plane's
+/// experts spread across every drive's reader threads (§5.2).
 struct Task {
     layer: u32,
     kind: ExpertKind,
-    expert: u32,
-    /// Staging destination: slot base + `expert × plane_len`; the plane
-    /// itself sits `head` bytes further.
-    dst: *mut u8,
-    /// Read region length: `head + plane_len` rounded up to a page, so the
-    /// source can land the aligned covering read in place (§5.4).
-    region: usize,
-    head: usize,
+    /// Slot base; expert `e` lands at `plane_at[row + e]` past it.
+    base: *mut u8,
+    /// Staged ids, ascending.
+    ids: Vec<u32>,
     slot: usize,
 }
 
@@ -104,8 +110,8 @@ pub enum StreamError {
 #[derive(Default)]
 struct Inner {
     free_slots: Vec<usize>,
-    /// Outstanding reader tasks per slot; a slot is only handed out when
-    /// its count is 0.
+    /// Outstanding reader tasks (plane batches) per slot; a slot is only
+    /// handed out when its count is 0.
     pending_reads: [usize; STAGING_SLOTS as usize],
     queue: VecDeque<Task>,
     holds: BTreeMap<u64, Hold>,
@@ -116,7 +122,7 @@ struct Inner {
 }
 
 /// The per-session stream state. Shared with C as part of the hook payload;
-/// the decode thread drives `warm`/`source`/`release`, the reader thread
+/// the decode thread drives `warm`/`source`/`release`, the reader threads
 /// consumes `queue` — the `Inner` mutex + condvar are the only shared state
 /// and the happens-before edges for the staging bytes.
 pub struct StreamState {
@@ -129,18 +135,20 @@ pub struct StreamState {
     slot_bytes: usize,
     /// Plane byte length per layer × kind (flat, from the geometry).
     plane_lens: Vec<u32>,
-    /// Plane file misalignment per layer × kind (`UnitLayout::head`): a
-    /// staged plane sits this far past `expert × plane_len` so its covering
-    /// read lands in place. Strides are page multiples whenever a head is
-    /// non-zero, so one head serves every expert of the plane.
-    heads: Vec<u32>,
+    /// Staged plane offset inside a slot per layer × kind × expert (flat,
+    /// see [`Self::row`]). Each expert owns a page-aligned region of
+    /// `head + plane_len` rounded up to a page, its plane `head` = file
+    /// offset mod page bytes in, so the covering read lands in place (§5.4)
+    /// and no two regions share a page: a plane batch's targets are
+    /// disjoint. `plane_at % DIRECT_ALIGN` is the expert's head.
+    plane_at: Vec<usize>,
     n_layers: u32,
     n_experts: u32,
     inner: Mutex<Inner>,
     cv: Condvar,
-    /// The reader holds an `Arc<Self>`, so `Drop` never runs while it lives:
-    /// `stop` joins it explicitly, releasing the pool and arena with the session.
-    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Each reader holds an `Arc<Self>`, so `Drop` never runs while one
+    /// lives: `stop` joins them, releasing the pool and arena with the session.
+    readers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// H2D expert bytes this module's pointers fed (the copy loop's copies).
     pub bytes: AtomicU64,
     /// Per-expert plane hits served from the pool.
@@ -154,12 +162,12 @@ pub struct StreamState {
     /// Mirror of `Inner::holds.len()`, stored under the lock at every
     /// insert/remove so `stats()` never takes it.
     held: AtomicU64,
-    /// Test seam: runs on the reader thread right before its next read.
+    /// Test seam: runs on a reader thread right before its next read.
     #[cfg(any(test, feature = "test-support"))]
     test_before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-// SAFETY: `Task.dst`/`Pending.base` point into the mlocked arena the state
+// SAFETY: `Task.base`/`Pending.base` point into the mlocked arena the state
 // owns (the `arena` field keeps it alive); no raw pointer dangles. All uses
 // are serialized by the seq protocol: a slot is handed out only when its
 // reads are done and its previous plane's H2D + compute completed under C's
@@ -168,9 +176,9 @@ unsafe impl Send for StreamState {}
 unsafe impl Sync for StreamState {}
 
 impl StreamState {
-    /// Builds the staging ring (`slot_bytes × STAGING_SLOTS`, mlocked, plus
-    /// one page per slot when any plane has a head) and spawns the reader
-    /// thread.
+    /// Builds the staging ring (`STAGING_SLOTS` slots, mlocked) and spawns
+    /// the reader threads. `slot_bytes` is a minimum: each slot grows to fit
+    /// the page-aligned per-expert regions of the largest plane.
     ///
     /// # Errors
     /// Arena mmap/mlock failure (no unlocked fallback, §5.4).
@@ -181,23 +189,31 @@ impl StreamState {
         slot_bytes: usize,
     ) -> Result<Arc<Self>, String> {
         let geo = &pool.geometry;
+        let page = DIRECT_ALIGN as usize;
         let mut plane_lens = Vec::with_capacity(geo.layers.len() * 3);
-        let mut heads = Vec::with_capacity(geo.layers.len() * 3);
-        for unit in &geo.layers {
+        let mut plane_at = Vec::with_capacity(geo.layers.len() * 3 * geo.n_experts as usize);
+        let mut need = 0usize;
+        for (layer, unit) in geo.layers.iter().enumerate() {
             for kind in [ExpertKind::Gate, ExpertKind::Up, ExpertKind::Down] {
                 let (_, stride) = unit.plane(kind);
                 plane_lens.push(u32::try_from(stride).map_err(|_| "plane stride > u32")?);
-                heads.push(unit.head[kind.ordinal()] as u32);
+                let mut at = 0usize;
+                for e in 0..geo.n_experts {
+                    let head = source
+                        .plane(layer as u32, kind, e)
+                        .map_or(unit.head[kind.ordinal()], |(off, _)| off % DIRECT_ALIGN)
+                        as usize;
+                    plane_at.push(at + head);
+                    at += (head + stride as usize).next_multiple_of(page);
+                }
+                need = need.max(at);
             }
         }
-        // The last expert's covering read runs up to one page past
-        // `n_experts × plane_len`; page-rounded so every slot stays aligned.
-        // GLM-5.3-Flash UD-IQ3_XXS: +4 KiB on 288 × 4.46 MB = 1.28 GB.
-        let slot_bytes = if heads.iter().any(|&h| h != 0) {
-            (slot_bytes + DIRECT_ALIGN as usize).next_multiple_of(DIRECT_ALIGN as usize)
-        } else {
-            slot_bytes
-        };
+        // Each region costs at most two pages over its plane. DeepSeek-V4.1-
+        // Flash UD-IQ2_XXS: ≤ 384 × 8 KiB = 3 MiB per slot on 384 × 4.52 MB
+        // = 1.74 GB, × 6 slots ≤ 18 MiB; GLM-5.3-Flash UD-IQ3_XXS (page-
+        // multiple strides): 288 × 4 KiB = 1.1 MiB per slot.
+        let slot_bytes = slot_bytes.max(need).next_multiple_of(page);
         let arena = Arena::new(&[SlotClass {
             slot_size: slot_bytes,
             slots: STAGING_SLOTS,
@@ -212,7 +228,7 @@ impl StreamState {
             arena: Arc::new(arena),
             slot_bytes,
             plane_lens,
-            heads,
+            plane_at,
             inner: Mutex::new(Inner {
                 free_slots: (0..STAGING_SLOTS as usize).collect(),
                 pending_reads: [0; STAGING_SLOTS as usize],
@@ -223,7 +239,7 @@ impl StreamState {
                 stop: false,
             }),
             cv: Condvar::new(),
-            reader: Mutex::new(None),
+            readers: Mutex::new(Vec::with_capacity(READERS)),
             bytes: AtomicU64::new(0),
             pool_hits: AtomicU64::new(0),
             staged: AtomicU64::new(0),
@@ -233,7 +249,7 @@ impl StreamState {
             #[cfg(any(test, feature = "test-support"))]
             test_before_read: Mutex::new(None),
         });
-        state.spawn_reader();
+        state.spawn_readers();
         Ok(state)
     }
 
@@ -248,16 +264,23 @@ impl StreamState {
         self.slot_bytes * STAGING_SLOTS as usize
     }
 
-    fn spawn_reader(self: &Arc<Self>) {
-        let state = self.clone();
-        let handle = std::thread::Builder::new()
-            .name("golem-stream-reader".into())
-            .spawn(move || state.reader_loop())
-            .expect("spawn stream reader");
-        *self.reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    fn spawn_readers(self: &Arc<Self>) {
+        let mut readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..READERS {
+            let state = self.clone();
+            readers.push(
+                std::thread::Builder::new()
+                    .name("golem-stream-reader".into())
+                    .spawn(move || state.reader_loop())
+                    .expect("spawn stream reader"),
+            );
+        }
     }
 
     fn reader_loop(self: Arc<Self>) {
+        let page = DIRECT_ALIGN as usize;
+        let mut batch: Vec<(ExpertKind, u32)> = Vec::new();
+        let mut targets_buf: Vec<(&mut [u8], usize)> = Vec::new();
         loop {
             let task = {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -272,17 +295,29 @@ impl StreamState {
                 }
             };
             // Read OUTSIDE the lock: the disk pass is the pipeline's bound.
-            // SAFETY: `dst..dst+region` is inside the slot (slot_bytes =
-            // n_experts × max stride + one page ≥ expert × plane_len +
-            // region); the slot is exclusively the reader's until pending
-            // hits 0, and C reads the bytes only after that. Adjacent
-            // experts' regions overlap by one page; the single reader runs a
-            // slot's tasks in ascending id order, so a read's tail only
-            // precedes the next expert's own verified plane bytes, and its
-            // head bytes (unverified, §5.3) are restored below.
-            let plane = unsafe { std::slice::from_raw_parts_mut(task.dst, task.region) };
-            let mut saved = [0u8; DIRECT_ALIGN as usize];
-            saved[..task.head].copy_from_slice(&plane[..task.head]);
+            let plane_len = self.plane_len(task.layer, task.kind);
+            let at = &self.plane_at[self.row(task.layer, task.kind)..];
+            batch.clear();
+            let mut targets: Vec<(&mut [u8], usize)> = recycle(std::mem::take(&mut targets_buf));
+            for &id in &task.ids {
+                let off = at[id as usize];
+                let head = off % page;
+                batch.push((task.kind, id));
+                // SAFETY: the region `off - head .. + (head + plane_len)
+                // rounded to a page` is inside the slot (`new` sized the slot
+                // to the furthest region end) and no two experts' regions
+                // overlap (`plane_at` lays them out ascending, page-aligned),
+                // so the slices are disjoint. The slot is exclusively the
+                // readers' until pending hits 0; C reads only after that.
+                // Other readers write other slots or other experts' regions.
+                let region = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        task.base.add(off - head),
+                        (head + plane_len).next_multiple_of(page),
+                    )
+                };
+                targets.push((region, head));
+            }
             #[cfg(any(test, feature = "test-support"))]
             if let Some(f) = self
                 .test_before_read
@@ -294,27 +329,34 @@ impl StreamState {
             }
             // A panicking source must not strand pending_reads (every
             // waiter would hang): it counts as a fatal read. The store
-            // degrades replicas inside `read_expert`, so its health is final
-            // by the time it returns.
+            // degrades replicas inside the drain, so its health is final by
+            // the time it returns.
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match self
                     .source
-                    .read_expert(task.layer, task.kind, task.expert, plane, task.head)
+                    .read_expert_batched(task.layer, &batch, &mut targets)
                 {
-                    Ok(()) => {
-                        plane[..task.head].copy_from_slice(&saved[..task.head]);
-                        ReadState::Ok
-                    }
+                    Ok(()) => ReadState::Ok,
                     Err(_) if (self.storage_lost)() => ReadState::StorageLost,
                     Err(_) => ReadState::Fatal,
                 }
             }))
             .unwrap_or(ReadState::Fatal);
+            targets_buf = recycle(targets);
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.read = inner.read.max(read);
             inner.pending_reads[task.slot] -= 1;
             self.cv.notify_all();
         }
+    }
+
+    fn plane_len(&self, layer: u32, kind: ExpertKind) -> usize {
+        self.plane_lens[(layer as usize) * 3 + kind as usize] as usize
+    }
+
+    /// First `plane_at` index of `(layer, kind)`.
+    fn row(&self, layer: u32, kind: ExpertKind) -> usize {
+        ((layer as usize) * 3 + kind as usize) * self.n_experts as usize
     }
 
     /// The routing-readback read-ahead (decode thread, once per layer per
@@ -354,10 +396,6 @@ impl StreamState {
     fn warm_plane(&self, layer: u32, kind: ExpertKind, ids: &[u32]) -> Result<(), StreamError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         check_read(inner.read)?;
-        let plane_len = self.plane_lens[(layer as usize) * 3 + kind as usize] as usize;
-        let head = self.heads[(layer as usize) * 3 + kind as usize] as usize;
-        let region =
-            (head + plane_len).next_multiple_of(if head == 0 { 1 } else { DIRECT_ALIGN as usize });
         let mut ids = ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
@@ -371,20 +409,17 @@ impl StreamState {
         } else {
             let (guard, slot, base) = self.take_slot(inner)?;
             inner = guard;
-            inner.pending_reads[slot] = staged_ids.len();
-            for &id in &staged_ids {
-                // SAFETY: id × plane_len stays inside the slot.
-                inner.queue.push_back(Task {
-                    layer,
-                    kind,
-                    expert: id,
-                    dst: unsafe { base.add(id as usize * plane_len) },
-                    region,
-                    head,
-                    slot,
-                });
-            }
-            self.cv.notify_one();
+            inner.pending_reads[slot] = 1;
+            inner.queue.push_back(Task {
+                layer,
+                kind,
+                base,
+                ids: staged_ids.clone(),
+                slot,
+            });
+            // The condvar is shared with decode-thread waiters: wake every
+            // waiter so a reader is never the one passed over.
+            self.cv.notify_all();
             (slot, base)
         };
         inner.warm.insert(
@@ -452,8 +487,8 @@ impl StreamState {
             ));
         }
         let layer = blk as u32;
-        let plane_len = self.plane_lens[(layer as usize) * 3 + kind as usize] as usize;
-        let head = self.heads[(layer as usize) * 3 + kind as usize] as usize;
+        let plane_len = self.plane_len(layer, kind);
+        let row = self.row(layer, kind);
         self.planes.fetch_add(1, Ordering::Relaxed);
 
         // Fallback: no warm plane (first layer's gate, or C reordered the
@@ -512,8 +547,11 @@ impl StreamState {
         // resident nor staged lost residency after warm: fatal, never stale.
         let mut leases: Vec<Lease> = Vec::with_capacity(ids.len());
         for (i, &id) in ids.iter().enumerate() {
-            if id < 0 {
-                p3_fatal(format!("stream_source: negative expert id {id}"));
+            if id < 0 || id as u32 >= self.n_experts {
+                p3_fatal(format!(
+                    "stream_source: expert id {id} outside 0..{}",
+                    self.n_experts
+                ));
             }
             let id = id as u32;
             let staged =
@@ -526,9 +564,9 @@ impl StreamState {
             } else if staged {
                 self.staged.fetch_add(1, Ordering::Relaxed);
                 self.bytes.fetch_add(plane_len as u64, Ordering::Relaxed);
-                // SAFETY: id × plane_len + head inside the slot (slot_bytes bound).
+                // SAFETY: `plane_at` offsets lie inside the slot (`new`).
                 out[i] =
-                    unsafe { pending.base.add(id as usize * plane_len + head) } as *const c_void;
+                    unsafe { pending.base.add(self.plane_at[row + id as usize]) } as *const c_void;
             } else if pending.warmed_ids.binary_search(&id).is_err() {
                 // A whole fill over a routed-only warm with no misses has no
                 // slot yet: take one with no reads for the stale pointers.
@@ -541,7 +579,7 @@ impl StreamState {
                 // SAFETY: as above; the bytes are stale (never staged this
                 // plane) but finite, and the id is unrouted.
                 out[i] =
-                    unsafe { pending.base.add(id as usize * plane_len + head) } as *const c_void;
+                    unsafe { pending.base.add(self.plane_at[row + id as usize]) } as *const c_void;
             } else {
                 // A warmed id lost residency after warm (the pause protocol
                 // forbids it): fatal, never stale.
@@ -594,7 +632,7 @@ impl StreamState {
     /// Releases everything and drops unconsumed warm planes (the copy_done
     /// backstop between stream chunks). A dropped warm plane's reads may
     /// still be in flight: its slot is reclaimed only once they finish
-    /// (bounded by one plane read) so the bytes can never be overwritten
+    /// (bounded by one plane drain) so the bytes can never be overwritten
     /// mid-read.
     pub fn release_all(&self) {
         let seq = {
@@ -635,7 +673,7 @@ impl StreamState {
         }
     }
 
-    /// Test seam: `f` runs on the reader thread before its next read.
+    /// Test seam: `f` runs on a reader thread before its next read.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn before_next_read_for_test(&self, f: Box<dyn FnOnce() + Send>) {
         *self
@@ -644,7 +682,7 @@ impl StreamState {
             .unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
-    /// Stops and joins the reader thread (session teardown; holds are empty
+    /// Stops and joins the reader threads (session teardown; holds are empty
     /// once the hooks are unregistered and copy_done ran).
     pub fn stop(&self) {
         {
@@ -652,11 +690,11 @@ impl StreamState {
             inner.stop = true;
             self.cv.notify_all();
         }
-        let handle = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(h) = handle
-            && h.thread().id() != std::thread::current().id()
-        {
-            let _ = h.join();
+        let handles = std::mem::take(&mut *self.readers.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in handles {
+            if h.thread().id() != std::thread::current().id() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -1019,10 +1057,10 @@ mod tests {
     }
 
     /// Staged planes sit at their file head so the store reads them in place
-    /// (§5.4), and staged pointers stay `plane_len` apart for C's coalesced
-    /// H2D runs even though neighbouring regions overlap by the tail page.
+    /// (§5.4), each in its own page-aligned region: no two experts' covering
+    /// reads share a page.
     #[test]
-    fn staged_planes_sit_at_their_head_and_stay_contiguous() {
+    fn staged_planes_sit_at_their_head_in_disjoint_regions() {
         const HEAD: u64 = 288;
         let source = Arc::new(HeadSource(Mutex::new(Vec::new())));
         let dyn_source: Arc<dyn ExpertSource> = source.clone();
@@ -1051,14 +1089,14 @@ mod tests {
             N_EXPERTS as usize * PAGE_STRIDE as usize,
         )
         .unwrap();
+        let region = (HEAD + PAGE_STRIDE).next_multiple_of(DIRECT_ALIGN) as usize;
         assert_eq!(
             s.staged_bytes(),
-            STAGING_SLOTS as usize * (N_EXPERTS as usize + 1) * PAGE_STRIDE as usize
+            STAGING_SLOTS as usize * N_EXPERTS as usize * region
         );
         let ids = [0, 1, 2, 3];
         let mut out = [std::ptr::null(); N_EXPERTS as usize];
         s.source(0, 1, 1, &ids, &mut out).unwrap();
-        let region = (HEAD + PAGE_STRIDE).next_multiple_of(DIRECT_ALIGN) as usize;
         assert_eq!(
             *source.0.lock().unwrap(),
             vec![(HEAD as usize, region); N_EXPERTS as usize]
@@ -1066,12 +1104,313 @@ mod tests {
         for (i, &p) in out.iter().enumerate() {
             assert_eq!(p as usize % DIRECT_ALIGN as usize, HEAD as usize);
             if i > 0 {
-                assert_eq!(p as usize - out[i - 1] as usize, PAGE_STRIDE as usize);
+                assert_eq!(p as usize - out[i - 1] as usize, region);
             }
             // SAFETY: the pointer covers one staged plane, held under seq 1.
             let plane = unsafe { std::slice::from_raw_parts(p as *const u8, PAGE_STRIDE as usize) };
             assert!(plane.iter().all(|&b| b == i as u8), "expert {i}");
         }
+        s.release_all();
+        assert!(all_slots_free(&s));
+        s.stop();
+    }
+
+    /// One prefill plane batch over the real store source spreads across
+    /// both replicas' drives, byte-identical to the serial GGUF pread path.
+    /// Fixture: a 2-shard split GGUF, Q4_K gate/up and Q6_K down planes of
+    /// non-page strides (every expert's head differs, as in DeepSeek-V4.1-
+    /// Flash UD-IQ2_XXS), one replica under the temp dir and one in
+    /// `/dev/shm` (distinct `st_dev`s, so distinct drives to the queue).
+    #[test]
+    fn plane_batch_reads_from_both_drives_byte_identical_to_serial() {
+        use golem_placement::pool::{GgufPreadSource, StoreExpertSource};
+        use golem_store::ChunkQueue;
+        use xtask::gguf::{GgufKv, GgufTensorMeta, GgufValue, write_gguf};
+
+        const N: u64 = 16;
+        const NE0: u64 = 2560;
+        const ROWS: u64 = 211;
+        // (shard, stem, ggml type, block bytes per 256 elems)
+        let planes = [
+            (0usize, "ffn_gate_exps", 12u32, 144u64),
+            (0, "ffn_up_exps", 12, 144),
+            (1, "ffn_down_exps", 14, 210),
+        ];
+        let byte = |k: usize, e: u64, i: u64| (k as u64 * 89 + e * 13 + i % 251) as u8;
+        let tag = format!("golem-stream-2drv-{}", std::process::id());
+        let dirs = [
+            std::env::temp_dir().join(&tag),
+            std::path::Path::new("/dev/shm").join(&tag),
+        ];
+        struct RmDirs<'a>(&'a [std::path::PathBuf]);
+        impl Drop for RmDirs<'_> {
+            fn drop(&mut self) {
+                for d in self.0 {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+            }
+        }
+        let _cleanup = RmDirs(&dirs);
+        assert!(
+            std::path::Path::new("/dev/shm").is_dir(),
+            "precondition: /dev/shm hosts the second replica"
+        );
+        let names = ["m-00001-of-00002.gguf", "m-00002-of-00002.gguf"];
+        let mut lens = [0u64; 2];
+        for shard in 0..2 {
+            let mut kvs = vec![
+                GgufKv {
+                    key: "split.count".into(),
+                    value: GgufValue::U32(2),
+                },
+                GgufKv {
+                    key: "split.no".into(),
+                    value: GgufValue::U32(shard as u32),
+                },
+            ];
+            if shard == 0 {
+                kvs.insert(
+                    0,
+                    GgufKv {
+                        key: "general.architecture".into(),
+                        value: GgufValue::Str("glm4moe".into()),
+                    },
+                );
+                kvs.push(GgufKv {
+                    key: "glm4moe.leading_dense_block_count".into(),
+                    value: GgufValue::U32(1),
+                });
+            }
+            // A small leading tensor pushes the expert bases off the page.
+            let mut tensors = vec![(
+                GgufTensorMeta {
+                    name: format!("blk.0.attn_norm_{shard}.weight"),
+                    dims: vec![8, 1, 1],
+                    ggml_type: 0,
+                },
+                vec![0u8; 32],
+            )];
+            for (k, &(_, stem, ty, blk)) in planes.iter().enumerate().filter(|p| p.1.0 == shard) {
+                let stride = NE0 / 256 * blk * ROWS;
+                let payload = (0..N)
+                    .flat_map(|e| (0..stride).map(move |i| byte(k, e, i)))
+                    .collect();
+                tensors.push((
+                    GgufTensorMeta {
+                        name: format!("blk.1.{stem}.weight"),
+                        dims: vec![NE0, ROWS, N],
+                        ggml_type: ty,
+                    },
+                    payload,
+                ));
+            }
+            let mut buf = Vec::new();
+            write_gguf(&mut buf, &kvs, &tensors).unwrap();
+            buf.resize(buf.len().next_multiple_of(4096) + 4096, 0);
+            lens[shard] = buf.len() as u64;
+            for d in &dirs {
+                std::fs::create_dir_all(d).unwrap();
+                std::fs::write(d.join(names[shard]), &buf).unwrap();
+            }
+        }
+        let first = dirs[0].join(names[0]);
+        let gguf = GgufPreadSource::open(&first, 1).unwrap();
+        let mut index = Vec::new();
+        for (shard, name) in names.iter().enumerate() {
+            let mut f = std::fs::File::open(dirs[0].join(name)).unwrap();
+            for e in golem_gguf::tensor_entries(&mut f).unwrap() {
+                if e.expert_kind().is_none() {
+                    continue;
+                }
+                let stride = planes.iter().find(|p| e.name.contains(p.1)).unwrap();
+                assert_eq!(stride.0, shard);
+                let stride = NE0 / 256 * stride.3 * ROWS;
+                index.push(serde_json::json!({
+                    "tensor": e.name, "layer": 1, "experts": N, "bytes_per_expert": stride,
+                    "offsets_bytes": (0..N).map(|i| i * stride).collect::<Vec<_>>(),
+                }));
+            }
+        }
+        let manifest = dirs[0].join("manifest.json");
+        let shards: Vec<_> = (0..2)
+            .map(|s| {
+                serde_json::json!({"file": names[s], "bytes": lens[s],
+                    "sha256": "0".repeat(64), "replicas": dirs})
+            })
+            .collect();
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"name": "stream-2drv", "shards": shards, "expert_index": index})
+                .to_string(),
+        )
+        .unwrap();
+
+        let geo = gguf.geometry().unwrap().unwrap();
+        let store = Arc::new(
+            StoreExpertSource::open(&manifest, Arc::new(ChunkQueue::new(0, None))).unwrap(),
+        );
+        let reg = store.registry();
+        for shard in reg.shards() {
+            assert_ne!(
+                shard.replicas[0].drive, shard.replicas[1].drive,
+                "precondition: replicas must sit on distinct devices"
+            );
+        }
+        let mut heads = std::collections::BTreeSet::new();
+        for kind in ExpertKind::ALL {
+            for e in 0..N as u32 {
+                heads.insert(store.plane(0, kind, e).unwrap().0 % DIRECT_ALIGN);
+            }
+        }
+        assert!(
+            heads.len() > 3 && !heads.contains(&0),
+            "mixed heads: {heads:?}"
+        );
+        let source: Arc<dyn ExpertSource> = store.clone();
+        let arena = Arena::new(&[SlotClass {
+            slot_size: geo.layers[0].slot_bytes() as usize,
+            slots: 1,
+        }])
+        .unwrap();
+        let pool = ExpertPool::new(
+            arena,
+            source.clone(),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            geo.clone(),
+            vec![0],
+        );
+        let max_stride = geo.layers[0].stride.iter().copied().max().unwrap();
+        let s = StreamState::new(
+            pool,
+            source,
+            Box::new(|| false),
+            N as usize * max_stride as usize,
+        )
+        .unwrap();
+        let served = |shard: usize| {
+            reg.shards()[shard]
+                .replicas
+                .iter()
+                .map(|r| r.served_chunks())
+                .collect::<Vec<_>>()
+        };
+        let ids: Vec<i32> = (0..N as i32).collect();
+        for (k, code) in [1, 2, 3].into_iter().enumerate() {
+            let kind = ExpertKind::ALL[k];
+            let shard = planes[k].0;
+            let before = served(shard);
+            let mut out = vec![std::ptr::null(); N as usize];
+            s.source(0, code, k as u64 + 1, &ids, &mut out).unwrap();
+            let after = served(shard);
+            assert!(
+                (0..2).all(|r| after[r] > before[r]),
+                "kind {code}: one plane batch must use both drives: {before:?} → {after:?}"
+            );
+            let stride = geo.layers[0].stride[k] as usize;
+            let mut serial = vec![0u8; stride];
+            for (e, &p) in out.iter().enumerate() {
+                gguf.read_expert(0, kind, e as u32, &mut serial, 0).unwrap();
+                // SAFETY: one staged plane, held under seq k + 1.
+                let plane = unsafe { std::slice::from_raw_parts(p as *const u8, stride) };
+                assert_eq!(plane, &serial[..], "kind {code} expert {e}");
+                assert!(
+                    serial
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == byte(k, e as u64, i as u64))
+                );
+            }
+        }
+        assert_eq!(store.scratch_by_reason(), [0; 3], "a staged plane bounced");
+        s.release_all();
+        s.stop();
+    }
+
+    /// Blocks reads until `want` are in flight at once (or a timeout),
+    /// recording the peak; later reads pass straight through.
+    struct GateSource {
+        live: Mutex<usize>,
+        cv: Condvar,
+        peak: AtomicU64,
+        want: usize,
+    }
+
+    impl ExpertSource for GateSource {
+        fn read_expert(
+            &self,
+            _layer: u32,
+            _kind: ExpertKind,
+            expert: u32,
+            into: &mut [u8],
+            head: usize,
+        ) -> std::io::Result<()> {
+            let mut live = self.live.lock().unwrap();
+            *live += 1;
+            self.peak.fetch_max(*live as u64, Ordering::SeqCst);
+            self.cv.notify_all();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.peak.load(Ordering::SeqCst) < self.want as u64
+                && std::time::Instant::now() < deadline
+            {
+                live = self
+                    .cv
+                    .wait_timeout(live, deadline - std::time::Instant::now())
+                    .unwrap()
+                    .0;
+            }
+            *live -= 1;
+            drop(live);
+            into[head..].fill(expert as u8);
+            Ok(())
+        }
+
+        fn plane(&self, _layer: u32, _kind: ExpertKind, _expert: u32) -> Option<(u64, u64)> {
+            None
+        }
+    }
+
+    /// The warm set's planes drain concurrently, one per reader: a plane
+    /// batch never waits for the previous plane's drain to finish.
+    #[test]
+    fn warm_planes_drain_concurrently() {
+        let gate = Arc::new(GateSource {
+            live: Mutex::new(0),
+            cv: Condvar::new(),
+            peak: AtomicU64::new(0),
+            want: READERS,
+        });
+        let source: Arc<dyn ExpertSource> = gate.clone();
+        let layout = UnitLayout::new([STRIDE; 3], [None; 3]).unwrap();
+        let arena = Arena::new(&[SlotClass {
+            slot_size: layout.slot_bytes() as usize,
+            slots: 1,
+        }])
+        .unwrap();
+        let pool = ExpertPool::new(
+            arena,
+            source.clone(),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            PoolGeometry {
+                layers: vec![layout; 2],
+                n_experts: N_EXPERTS,
+                expert_bytes: 0,
+            },
+            vec![0, 0],
+        );
+        let s = StreamState::new(
+            pool,
+            source,
+            Box::new(|| false),
+            N_EXPERTS as usize * STRIDE as usize,
+        )
+        .unwrap();
+        // Layer 0 up + down routed, layer 1 gate whole: three planes.
+        s.warm(0, &[1]);
+        let mut out = [std::ptr::null(); 1];
+        s.source(0, 2, 1, &[1], &mut out).unwrap();
+        assert_eq!(gate.peak.load(Ordering::SeqCst), READERS as u64);
         s.release_all();
         assert!(all_slots_free(&s));
         s.stop();
