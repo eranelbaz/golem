@@ -23,6 +23,7 @@ fn m(tok_s: f64) -> Metrics {
         ttft_p50_ms: 100.0,
         ttft_p99_ms: 200.0,
         greedy: vec![vec![(1, 5.0), (2, 5.0)]],
+        prefill_ms: 1000.0,
     }
 }
 
@@ -199,6 +200,73 @@ fn unconfirmed_winner_bounds_compounded_hit_rate_drift() {
     assert_eq!(run(5), None);
     // Baseline + 1 pair: one 0.4 pp step stays within bound and is kept.
     assert_eq!(run(3).map(|b| b.0.io_threads), Some(4));
+}
+
+/// #214: prefill time halves per ubatch doubling while decode holds, so the
+/// sweep walks to the largest candidate the plan gate admits; one that does
+/// not fit (`measure` refuses it, as `plan_check` does) is never chosen.
+#[test]
+fn prefill_sweep_picks_largest_feasible_ubatch() {
+    let axes = [Axis::PrefillUbatch(vec![0, 1024, 2048, 4096])];
+    let measure = |fits: u32| {
+        move |k: &Knobs| -> Result<Metrics, Box<dyn std::error::Error>> {
+            let u = if k.prefill_ubatch == 0 {
+                512
+            } else {
+                k.prefill_ubatch
+            };
+            if u > fits {
+                return Err(format!("plan headroom below minimum at {u}").into());
+            }
+            Ok(Metrics {
+                prefill_ms: 100_000.0 * 512.0 / f64::from(u),
+                ..m(10.0)
+            })
+        }
+    };
+    let best = sweep(&Knobs::default(), &axes, &mut measure(2048)).unwrap();
+    assert_eq!(best.map(|b| b.0.prefill_ubatch), Some(2048));
+    let none = sweep(&Knobs::default(), &axes, &mut measure(512)).unwrap();
+    assert!(none.is_none(), "nothing above the configured value fits");
+}
+
+/// The prefill rule still guards decode tok/s, greedy output and the 10%
+/// prefill gain.
+#[test]
+fn prefill_rule_guards_decode_and_greedy() {
+    let axes = [Axis::PrefillUbatch(vec![1024])];
+    let run = |c: Metrics| {
+        sweep(&Knobs::default(), &axes, &mut |k| {
+            Ok(if k.prefill_ubatch == 1024 {
+                c.clone()
+            } else {
+                m(10.0)
+            })
+        })
+        .unwrap()
+    };
+    let fast = |base: Metrics| Metrics {
+        prefill_ms: 600.0,
+        ..base
+    };
+    assert!(run(fast(m(10.0))).is_some());
+    assert!(run(fast(m(9.5))).is_none(), "decode −5%");
+    assert!(
+        run(fast(Metrics {
+            greedy: vec![vec![(1, 5.0), (3, 5.0)]],
+            ..m(10.0)
+        }))
+        .is_none(),
+        "greedy drift"
+    );
+    assert!(
+        run(Metrics {
+            prefill_ms: 950.0,
+            ..m(10.0)
+        })
+        .is_none(),
+        "−5% < 10% gain"
+    );
 }
 
 #[test]
@@ -511,6 +579,24 @@ fn explicit_flag_beats_profile() {
         ..with(none, Some(&knobs))
     };
     assert_eq!(l.get(None, "threads", 2u32).unwrap(), 9);
+    // A saved ubatch shadowed by golem.toml is reported.
+    let ub = Knobs {
+        prefill_ubatch: 2048,
+        ..Knobs::default()
+    };
+    let l = config::Layers {
+        file: toml::from_str("prefill_ubatch = 512").unwrap(),
+        ..with(none, Some(&ub))
+    };
+    let w = l.shadowed_prefill_ubatch().unwrap();
+    assert!(w.contains("2048") && w.contains("512"), "{w}");
+    assert!(with(none, Some(&ub)).shadowed_prefill_ubatch().is_none());
+    assert_eq!(
+        with(none, Some(&ub))
+            .get(None, "prefill_ubatch", 512u32)
+            .unwrap(),
+        2048
+    );
     // Unset knobs (0) leave lower layers alone.
     assert_eq!(
         with(none, Some(&knobs))
