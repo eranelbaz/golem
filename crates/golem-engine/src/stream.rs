@@ -1569,17 +1569,16 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let ids: Vec<i32> = (0..N as i32).collect();
+        let total = || {
+            (0..2)
+                .map(served)
+                .fold([0, 0], |a, s| [a[0] + s[0], a[1] + s[1]])
+        };
+        let before = total();
         for (k, code) in [1, 2, 3].into_iter().enumerate() {
             let kind = ExpertKind::ALL[k];
-            let shard = planes[k].0;
-            let before = served(shard);
             let mut out = vec![std::ptr::null(); N as usize];
             s.source(0, code, k as u64 + 1, &ids, &mut out).unwrap();
-            let after = served(shard);
-            assert!(
-                (0..2).all(|r| after[r] > before[r]),
-                "kind {code}: one plane batch must use both drives: {before:?} → {after:?}"
-            );
             let stride = geo.layers[0].stride[k] as usize;
             let mut serial = vec![0u8; stride];
             for (e, &p) in out.iter().enumerate() {
@@ -1595,6 +1594,14 @@ mod tests {
                 );
             }
         }
+        // §5.2 striping across the planes; one small plane may be drained
+        // entirely by the faster (tmpfs) replica's worker under self-selection.
+        // Per-chunk striping is the store's `healthy_reads_stripe_across_drives`.
+        let after = total();
+        assert!(
+            (0..2).all(|r| after[r] > before[r]),
+            "the plane batches must use both drives: {before:?} → {after:?}"
+        );
         assert_eq!(store.scratch_by_reason(), [0; 3], "a staged plane bounced");
         s.release_all();
         s.stop();
