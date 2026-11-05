@@ -26,6 +26,8 @@ pub struct MetricsSnapshot {
     pub device_cache: Option<(u64, u64, u64)>,
     /// Expert planes copied host→device: device-cache fills, streamed prefill.
     pub h2d_copies: Option<(u64, u64)>,
+    /// §7.6 streamed prefill counters; `None` without a stream session.
+    pub stream: Option<golem_engine::stream::StreamStats>,
     /// Expert units whose H2D was issued at the RAM-hit hand-off, ahead of
     /// the ensure's blocking disk reads.
     pub early_h2d_units: Option<u64>,
@@ -70,6 +72,7 @@ impl MetricsSnapshot {
         self.victim_ring_full = dc.as_ref().map(|d| d.victim_ring_full);
         self.victim_ring_units = dc.as_ref().map(|d| d.victim_ring_units);
         self.h2d_copies = dc.map(|d| (d.cache_copies, d.stream_copies));
+        self.stream = s.p3_hooks().and_then(|h| h.stream_stats());
         self.p3 = s.p3_stats().map(|p| {
             [
                 p.demand_slow_pageins.load(Ordering::Relaxed),
@@ -163,6 +166,57 @@ pub(crate) fn render(h: &HealthState) -> String {
             "# HELP golem_expert_h2d_copies_total expert planes copied host→device, by device-cache fill or streamed prefill (stream counts whole-tensor fills, which can exceed routed demand)\n# TYPE golem_expert_h2d_copies_total counter\n\
              golem_expert_h2d_copies_total{{path=\"cache\"}} {cache}\n\
              golem_expert_h2d_copies_total{{path=\"stream\"}} {stream}"
+        );
+    }
+    if let Some(st) = m.stream {
+        g(
+            "golem_stream_read_bytes_total",
+            "counter",
+            "Streamed-prefill bytes read from disk into staging (page-rounded, incl. warmed planes never sourced)",
+            st.read_bytes as f64,
+        );
+        g(
+            "golem_stream_pool_bytes_total",
+            "counter",
+            "Streamed-prefill plane bytes served from the RAM pool",
+            st.pool_bytes as f64,
+        );
+        g(
+            "golem_stream_gate_missed_total",
+            "counter",
+            "Routed gate ids a predicted gate warm missed, staged at their own layer's readback",
+            st.gate_missed as f64,
+        );
+        g(
+            "golem_stream_bytes_total",
+            "counter",
+            "Streamed-prefill pooled and staged plane bytes handed to the device copy",
+            st.bytes as f64,
+        );
+        g(
+            "golem_stream_planes_total",
+            "counter",
+            "Streamed-prefill stream_source calls (one per layer plane per ubatch)",
+            st.planes as f64,
+        );
+        g(
+            "golem_stream_ids_total",
+            "counter",
+            "Expert ids sourced by streamed prefill (n_expert per plane under whole fill)",
+            st.sourced_ids as f64,
+        );
+        g(
+            "golem_stream_held_planes",
+            "gauge",
+            "Streamed planes holding pool leases or staging slots (0 between turns)",
+            st.held as f64,
+        );
+        let _ = writeln!(
+            labeled,
+            "# HELP golem_stream_expert_ranges_total Streamed-prefill per-expert ranges by source\n# TYPE golem_stream_expert_ranges_total counter\n\
+             golem_stream_expert_ranges_total{{source=\"pool\"}} {}\n\
+             golem_stream_expert_ranges_total{{source=\"staged\"}} {}",
+            st.pool_hits, st.staged
         );
     }
     if let Some(early) = m.early_h2d_units {
@@ -406,5 +460,42 @@ mod tests {
                 | ErrorCode::InvalidRequest => {}
             }
         }
+    }
+
+    #[test]
+    fn stream_counters_render_when_streaming() {
+        let h = HealthState::new();
+        h.metrics.lock().unwrap().stream = Some(golem_engine::stream::StreamStats {
+            bytes: 7,
+            pool_hits: 3,
+            staged: 5,
+            planes: 2,
+            sourced_ids: 8,
+            held: 1,
+            read_bytes: 9,
+            pool_bytes: 4,
+            gate_missed: 6,
+        });
+        let body = render(&h);
+        for line in [
+            "golem_stream_read_bytes_total 9\n",
+            "golem_stream_pool_bytes_total 4\n",
+            "golem_stream_gate_missed_total 6\n",
+            "golem_stream_bytes_total 7\n",
+            "golem_stream_planes_total 2\n",
+            "golem_stream_ids_total 8\n",
+            "golem_stream_held_planes 1\n",
+            "golem_stream_expert_ranges_total{source=\"pool\"} 3\n",
+            "golem_stream_expert_ranges_total{source=\"staged\"} 5\n",
+        ] {
+            assert!(body.contains(line), "{line}: {body}");
+        }
+        assert_eq!(
+            body.matches("# TYPE golem_stream_expert_ranges_total counter")
+                .count(),
+            1
+        );
+        h.metrics.lock().unwrap().stream = None;
+        assert!(!render(&h).contains("golem_stream_"));
     }
 }

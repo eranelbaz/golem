@@ -12,7 +12,7 @@
 
 mod common;
 
-use golem_engine::config::EngineConfig;
+use golem_engine::config::{EngineConfig, PrefillGate};
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::stream::StreamStats;
 use std::sync::atomic::Ordering;
@@ -115,6 +115,42 @@ fn streamed_prefill_matches_per_token_and_spares_the_pool() {
         "gated tail streamed"
     );
     assert_eq!(out, out_token, "gated output must match");
+}
+
+/// §7.6.3: the predicted gate warm (previous chunk's routing, misses topped up
+/// at the router) produces the same greedy output as the whole warm and
+/// reads no more staging bytes; chunks 2+ run on a prediction.
+#[test]
+fn predicted_gate_matches_whole_and_reads_no_more() {
+    let run = |gate: PrefillGate| {
+        let mut session = Session::new(&EngineConfig {
+            prefill_gate: gate,
+            ..config(true, 8)
+        })
+        .expect("session");
+        let mut out = String::new();
+        session
+            .chat_turn(&TURNS, &mut |piece| out.push_str(piece))
+            .expect("turn");
+        let stats = session
+            .p3_hooks()
+            .expect("pooled session")
+            .stream_stats()
+            .expect("stream stats");
+        let dc = stream_copies(&session);
+        (out, stats, dc)
+    };
+    let (out_whole, whole, _) = run(PrefillGate::Whole);
+    let (out_pred, pred, dc) = run(PrefillGate::Predicted);
+    assert!(!out_pred.is_empty(), "expected non-empty output");
+    assert_eq!(out_pred, out_whole, "greedy output must match");
+    assert_eq!(pred.planes, whole.planes, "same planes streamed");
+    assert_eq!(dc, pred.sourced_ids, "stream copies vs {pred:?}");
+    assert_eq!(whole.gate_missed, 0);
+    assert!(
+        pred.read_bytes <= whole.read_bytes,
+        "predicted {pred:?} vs whole {whole:?}"
+    );
 }
 
 /// #135: after a streamed prefill, decode runs at `k_decode` with the

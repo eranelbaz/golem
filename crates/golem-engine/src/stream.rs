@@ -6,10 +6,12 @@
 //! ubatch changes no pool residency or score.
 //!
 //! Pipeline (§7.6.3): the routing readback of layer L WARMS its up/down
-//! planes (routed-only) and layer L+1's whole gate plane (its ids are not
-//! known before its router runs — the design keeps the gate whole, ruling
-//! R2 defers prediction). The copy loop's `stream_source` consumes the warm
-//! plane and parks on its completion only when the disk is the bound. Slots
+//! planes (routed-only) and layer L+1's gate plane (its ids are not known
+//! before its router runs): whole under [`PrefillGate::Whole`]; under
+//! [`PrefillGate::Predicted`] the previous ubatch's layer-L+1 routed set,
+//! with L+1's own readback staging the misses into the same slot. The copy
+//! loop's `stream_source` consumes the warm plane and parks on its
+//! completion only when the disk is the bound. Slots
 //! recycle through `stream_release(seq)` (C releases seq−2 after the slab's
 //! event sync) and the `copy_done` backstop releases everything left.
 #![allow(unsafe_code)]
@@ -25,6 +27,7 @@ use golem_placement::pool::{
 };
 use golem_store::recycle;
 
+use crate::config::PrefillGate;
 use crate::p3_glue::p3_fatal;
 
 /// Staging slots (§7.6.2: ≥ 2 max planes of RAM). Peak concurrent use is 5
@@ -56,6 +59,15 @@ pub struct StreamStats {
     /// Planes currently holding pool leases or a staging slot (sourced and
     /// not yet released).
     pub held: u64,
+    /// Bytes the stream readers read into staging (page-rounded regions,
+    /// including warmed planes C never sourced); failed reads excluded.
+    pub read_bytes: u64,
+    /// Plane bytes of per-expert ranges served from the pool (a subset of
+    /// `bytes`).
+    pub pool_bytes: u64,
+    /// Routed gate ids a predicted gate warm missed (resident or staged at
+    /// the layer's own readback; 0 under [`PrefillGate::Whole`]).
+    pub gate_missed: u64,
 }
 
 /// One warmed plane's misses, read as one batched drain so the plane's
@@ -87,6 +99,9 @@ struct Pending {
     staged_ids: Vec<u32>,
     /// Every id warmed for this plane (routed set), ascending.
     warmed_ids: Vec<u32>,
+    /// A predicted gate whose routed misses are not staged yet: `source`
+    /// tops it up with C's ids, so a routed id is never handed stale bytes.
+    needs_top_up: bool,
 }
 
 /// Reader outcome since the last `release_all`; the worst failure wins.
@@ -117,6 +132,9 @@ struct Inner {
     holds: BTreeMap<u64, Hold>,
     /// Keyed (pool layer, kind code − 1).
     warm: HashMap<(u32, u8), Pending>,
+    /// Per layer, the last streamed ubatch's routed ids, ascending (the
+    /// predicted gate set; empty = no history yet).
+    last_routed: Vec<Vec<u32>>,
     read: ReadState,
     stop: bool,
 }
@@ -144,6 +162,9 @@ pub struct StreamState {
     plane_at: Vec<usize>,
     n_layers: u32,
     n_experts: u32,
+    gate: PrefillGate,
+    /// C's routed-share switch: a predicted set above it warms whole.
+    routed_max: f32,
     inner: Mutex<Inner>,
     cv: Condvar,
     /// Each reader holds an `Arc<Self>`, so `Drop` never runs while one
@@ -153,8 +174,14 @@ pub struct StreamState {
     pub bytes: AtomicU64,
     /// Per-expert plane hits served from the pool.
     pub pool_hits: AtomicU64,
+    /// Plane bytes of pool hits.
+    pool_bytes: AtomicU64,
     /// Per-expert ranges served from staging.
     pub staged: AtomicU64,
+    /// Bytes successfully read into staging.
+    read_bytes: AtomicU64,
+    /// Routed gate ids a predicted warm missed.
+    gate_missed: AtomicU64,
     /// stream_source calls (one per streamed plane).
     pub planes: AtomicU64,
     /// Σ ids over successfully sourced planes.
@@ -187,6 +214,8 @@ impl StreamState {
         source: Arc<dyn ExpertSource>,
         storage_lost: Box<dyn Fn() -> bool + Send + Sync>,
         slot_bytes: usize,
+        gate: PrefillGate,
+        routed_max: f32,
     ) -> Result<Arc<Self>, String> {
         let geo = &pool.geometry;
         let page = DIRECT_ALIGN as usize;
@@ -219,9 +248,14 @@ impl StreamState {
             slots: STAGING_SLOTS,
         }])
         .map_err(|e| e.to_string())?;
+        let last_routed = (0..geo.layers.len())
+            .map(|_| Vec::with_capacity(geo.n_experts as usize))
+            .collect();
         let state = Arc::new(Self {
             n_experts: geo.n_experts,
             n_layers: geo.layers.len() as u32,
+            gate,
+            routed_max,
             pool,
             source,
             storage_lost,
@@ -235,6 +269,7 @@ impl StreamState {
                 queue: VecDeque::new(),
                 holds: BTreeMap::new(),
                 warm: HashMap::new(),
+                last_routed,
                 read: ReadState::Ok,
                 stop: false,
             }),
@@ -242,7 +277,10 @@ impl StreamState {
             readers: Mutex::new(Vec::with_capacity(READERS)),
             bytes: AtomicU64::new(0),
             pool_hits: AtomicU64::new(0),
+            pool_bytes: AtomicU64::new(0),
             staged: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            gate_missed: AtomicU64::new(0),
             planes: AtomicU64::new(0),
             sourced_ids: AtomicU64::new(0),
             held: AtomicU64::new(0),
@@ -318,6 +356,7 @@ impl StreamState {
                 };
                 targets.push((region, head));
             }
+            let task_bytes: u64 = targets.iter().map(|(r, _)| r.len() as u64).sum();
             #[cfg(any(test, feature = "test-support"))]
             if let Some(f) = self
                 .test_before_read
@@ -342,6 +381,9 @@ impl StreamState {
                 }
             }))
             .unwrap_or(ReadState::Fatal);
+            if read == ReadState::Ok {
+                self.read_bytes.fetch_add(task_bytes, Ordering::Relaxed);
+            }
             targets_buf = recycle(targets);
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.read = inner.read.max(read);
@@ -361,35 +403,127 @@ impl StreamState {
 
     /// The routing-readback read-ahead (decode thread, once per layer per
     /// streamed chunk): warms `layer`'s up/down planes routed-only and the
-    /// NEXT layer's whole gate plane (its ids are unknown until its router
-    /// runs — §7.6 keeps the gate whole). Resident experts are skipped (the
-    /// pool copy is authoritative and `source` will lease it); no lease is
-    /// taken here — the prefetcher is paused for the chunk and no demand
-    /// claims run, so nothing can evict between warm and source.
+    /// NEXT layer's gate plane (its ids are unknown until its router runs):
+    /// whole, or under [`PrefillGate::Predicted`] the previous ubatch's
+    /// routed set for that layer (whole without history or above the
+    /// routed-share switch), this layer's gate misses topped up first.
+    /// Resident experts are skipped (the pool copy is authoritative and
+    /// `source` will lease it); no lease is taken here — the prefetcher is
+    /// paused for the chunk and no demand claims run, so nothing can evict
+    /// between warm and source.
     /// A failed read stops the warm-up; the next `source` reports it.
     pub fn warm(&self, layer: u32, routed_ids: &[i32]) {
         if layer >= self.n_layers {
             return;
         }
-        let routed: Vec<u32> = routed_ids
+        let mut routed: Vec<u32> = routed_ids
             .iter()
             .filter(|&&id| id >= 0 && (id as u32) < self.n_experts)
             .map(|&id| id as u32)
             .collect();
-        // This layer's id-dependent planes, routed-only. Errors are dropped:
-        // `source` reports them and `release_all` reclaims warmed planes.
-        let _ = self
-            .warm_plane(layer, ExpertKind::Up, &routed)
-            .and_then(|()| self.warm_plane(layer, ExpertKind::Down, &routed))
-            .and_then(|()| {
-                // Next layer's gate, whole.
-                if layer + 1 < self.n_layers {
-                    let whole: Vec<u32> = (0..self.n_experts).collect();
-                    self.warm_plane(layer + 1, ExpertKind::Gate, &whole)
+        let predicted = self.gate == PrefillGate::Predicted;
+        let whole = || (0..self.n_experts).collect::<Vec<u32>>();
+        let next = if !predicted {
+            (layer + 1 < self.n_layers).then(whole)
+        } else {
+            routed.sort_unstable();
+            routed.dedup();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mine = &mut inner.last_routed[layer as usize];
+            mine.clear();
+            mine.extend_from_slice(&routed);
+            (layer + 1 < self.n_layers).then(|| {
+                let guess = &inner.last_routed[layer as usize + 1];
+                if guess.is_empty() || guess.len() as f32 / self.n_experts as f32 > self.routed_max
+                {
+                    whole()
                 } else {
-                    Ok(())
+                    guess.clone()
                 }
+            })
+        };
+        // Errors are dropped: `source` reports them and `release_all`
+        // reclaims warmed planes. This layer's gate misses go first: its
+        // gate is sourced before up/down.
+        let _ = (if predicted {
+            self.top_up_gate(layer, &routed)
+        } else {
+            Ok(())
+        })
+        .and_then(|()| self.warm_plane(layer, ExpertKind::Up, &routed))
+        .and_then(|()| self.warm_plane(layer, ExpertKind::Down, &routed))
+        .and_then(|()| match &next {
+            Some(ids) => {
+                self.warm_plane(layer + 1, ExpertKind::Gate, ids)?;
+                if predicted && ids.len() < self.n_experts as usize {
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(p) = inner.warm.get_mut(&(layer + 1, ExpertKind::Gate as u8)) {
+                        p.needs_top_up = true;
+                    }
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        });
+    }
+
+    /// Stages `layer`'s routed gate ids its predicted warm missed into the
+    /// same slot (regions are per expert, so the second batch is disjoint
+    /// from the first). With no predicted warm (layer 0, first ubatch) the
+    /// gate is warmed routed-only now.
+    fn top_up_gate(&self, layer: u32, routed: &[u32]) -> Result<(), StreamError> {
+        let key = (layer, ExpertKind::Gate as u8);
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        check_read(inner.read)?;
+        let Some(pending) = inner.warm.get(&key) else {
+            drop(inner);
+            return self.warm_plane(layer, ExpertKind::Gate, routed);
+        };
+        let missed: Vec<u32> = routed
+            .iter()
+            .copied()
+            .filter(|id| pending.warmed_ids.binary_search(id).is_err())
+            .collect();
+        if missed.is_empty() {
+            if let Some(p) = inner.warm.get_mut(&key) {
+                p.needs_top_up = false;
+            }
+            return Ok(());
+        }
+        self.gate_missed
+            .fetch_add(missed.len() as u64, Ordering::Relaxed);
+        let staged: Vec<u32> = missed
+            .iter()
+            .copied()
+            .filter(|&id| !self.pool.is_resident(layer, id))
+            .collect();
+        let (slot, base) = if staged.is_empty() || pending.slot != usize::MAX {
+            (pending.slot, pending.base)
+        } else {
+            let (guard, slot, base) = self.take_slot(inner)?;
+            inner = guard;
+            (slot, base)
+        };
+        if !staged.is_empty() {
+            inner.pending_reads[slot] += 1;
+            inner.queue.push_back(Task {
+                layer,
+                kind: ExpertKind::Gate,
+                base,
+                ids: staged.clone(),
+                slot,
             });
+            self.cv.notify_all();
+        }
+        let pending = inner.warm.get_mut(&key).expect("checked above");
+        pending.slot = slot;
+        pending.base = base;
+        pending.staged_ids.extend_from_slice(&staged);
+        pending.staged_ids.sort_unstable();
+        pending.warmed_ids.extend_from_slice(&missed);
+        pending.warmed_ids.sort_unstable();
+        pending.needs_top_up = false;
+        Ok(())
     }
 
     /// Errors only before a staging slot is popped: nothing to give back.
@@ -409,7 +543,7 @@ impl StreamState {
         } else {
             let (guard, slot, base) = self.take_slot(inner)?;
             inner = guard;
-            inner.pending_reads[slot] = 1;
+            inner.pending_reads[slot] += 1;
             inner.queue.push_back(Task {
                 layer,
                 kind,
@@ -429,6 +563,7 @@ impl StreamState {
                 base,
                 staged_ids,
                 warmed_ids: ids,
+                needs_top_up: false,
             },
         );
         Ok(())
@@ -503,6 +638,16 @@ impl StreamState {
                     .map(|&id| id as u32)
                     .collect();
                 self.warm_plane(layer, kind, &ids)?;
+            } else if inner.warm[&(layer, kind as u8)].needs_top_up {
+                // The layer's readback never topped this gate up: C's ids
+                // are its routed set (or whole, above the share switch).
+                drop(inner);
+                let ids: Vec<u32> = ids
+                    .iter()
+                    .filter(|&&id| id >= 0 && (id as u32) < self.n_experts)
+                    .map(|&id| id as u32)
+                    .collect();
+                self.top_up_gate(layer, &ids)?;
             }
         }
         let mut pending = {
@@ -559,6 +704,8 @@ impl StreamState {
             if let Some((ptr, lease)) = self.pool.lease_resident(layer, kind, id) {
                 leases.push(lease);
                 self.pool_hits.fetch_add(1, Ordering::Relaxed);
+                self.pool_bytes
+                    .fetch_add(plane_len as u64, Ordering::Relaxed);
                 self.bytes.fetch_add(plane_len as u64, Ordering::Relaxed);
                 out[i] = ptr as *const c_void;
             } else if staged {
@@ -670,6 +817,9 @@ impl StreamState {
             planes: self.planes.load(Ordering::Relaxed),
             sourced_ids: self.sourced_ids.load(Ordering::Relaxed),
             held: self.held.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            pool_bytes: self.pool_bytes.load(Ordering::Relaxed),
+            gate_missed: self.gate_missed.load(Ordering::Relaxed),
         }
     }
 
@@ -759,6 +909,10 @@ mod tests {
     }
 
     fn state(fail: (u32, u32)) -> Arc<StreamState> {
+        state_with(fail, PrefillGate::Whole)
+    }
+
+    fn state_with(fail: (u32, u32), gate: PrefillGate) -> Arc<StreamState> {
         let lost = Arc::new(AtomicBool::new(false));
         let source: Arc<dyn ExpertSource> = Arc::new(FailSource {
             fail,
@@ -787,6 +941,8 @@ mod tests {
             source,
             storage_lost,
             N_EXPERTS as usize * STRIDE as usize,
+            gate,
+            0.85,
         )
         .unwrap()
     }
@@ -849,6 +1005,80 @@ mod tests {
         s.stop();
     }
 
+    /// Bytes `id` of a sourced pointer: `FailSource` fills each staged
+    /// plane with its expert id.
+    fn staged_byte(p: *const c_void) -> u8 {
+        // SAFETY: test-only; `p` points into the live staging arena.
+        unsafe { *(p as *const u8) }
+    }
+
+    #[test]
+    fn predicted_gate_warms_last_routing_and_tops_up_misses() {
+        let s = state_with((9, 9), PrefillGate::Predicted);
+        let mut out = [std::ptr::null(); 2];
+        // First ubatch: no history, layer 1's gate warms whole. Regions:
+        // gate0 {1} + up0/down0 {1} + gate1 whole (4) + up1/down1 {2} = 9.
+        s.warm(0, &[1]);
+        s.warm(1, &[2]);
+        s.source(1, 1, 1, &[2], &mut out[..1]).unwrap();
+        assert_eq!(staged_byte(out[0]), 2);
+        s.release_all();
+        let region = s.stats().read_bytes / 9;
+        assert_eq!(s.stats().read_bytes, 9 * region);
+        assert_eq!(s.stats().gate_missed, 0);
+
+        // Same routing: layer 1's gate warms {2} only — 6 regions.
+        s.warm(0, &[1]);
+        s.warm(1, &[2]);
+        s.release_all();
+        assert_eq!(s.stats().read_bytes, 15 * region);
+
+        // 3 is a miss, staged at layer 1's own readback into the same slot:
+        // gate0 + up0/down0 + gate1 {2} + miss {3} + up1/down1 {2, 3} = 9.
+        s.warm(0, &[1]);
+        s.warm(1, &[2, 3]);
+        s.source(1, 1, 2, &[2, 3], &mut out).unwrap();
+        assert_eq!((staged_byte(out[0]), staged_byte(out[1])), (2, 3));
+        assert_eq!(s.stats().gate_missed, 1);
+        s.release_all();
+        assert_eq!(s.stats().read_bytes, 24 * region);
+        assert!(all_slots_free(&s));
+        s.stop();
+    }
+
+    #[test]
+    fn predicted_gate_without_its_readback_tops_up_in_source() {
+        let s = state_with((9, 9), PrefillGate::Predicted);
+        s.warm(0, &[0]);
+        s.warm(1, &[2]);
+        s.release_all();
+        // Layer 1's readback never fires: source stages the miss itself.
+        s.warm(0, &[0]);
+        let mut out = [std::ptr::null(); 1];
+        s.source(1, 1, 1, &[3], &mut out).unwrap();
+        assert_eq!(staged_byte(out[0]), 3);
+        assert_eq!(s.stats().gate_missed, 1);
+        s.release_all();
+        assert!(all_slots_free(&s));
+        s.stop();
+    }
+
+    #[test]
+    fn predicted_gate_over_the_share_switch_warms_whole() {
+        let s = state_with((9, 9), PrefillGate::Predicted);
+        s.warm(0, &[0]);
+        s.warm(1, &[0, 1, 2, 3]);
+        s.release_all();
+        s.warm(0, &[0]);
+        {
+            let inner = s.inner.lock().unwrap();
+            let p = &inner.warm[&(1, ExpertKind::Gate as u8)];
+            assert_eq!(p.warmed_ids, vec![0, 1, 2, 3]);
+        }
+        s.release_all();
+        s.stop();
+    }
+
     #[test]
     fn stats_held_mirrors_holds_len() {
         let s = state((9, 9));
@@ -877,6 +1107,7 @@ mod tests {
         let arena = lo as usize..lo as usize + len;
         assert!(out[1..].iter().all(|&p| arena.contains(&(p as usize))));
         assert_eq!((s.stats().pool_hits, s.stats().staged), (1, 0));
+        assert_eq!(s.stats().pool_bytes, s.plane_len(0, ExpertKind::Up) as u64);
         assert_eq!(s.stats().held, 1);
         s.release(1);
         assert_eq!(s.stats().held, 0);
@@ -1033,6 +1264,8 @@ mod tests {
             source,
             Box::new(|| false),
             N as usize * stride as usize,
+            PrefillGate::Whole,
+            0.85,
         )
         .unwrap();
         let ids = [0, 1, 2, 3];
@@ -1087,6 +1320,8 @@ mod tests {
             dyn_source,
             Box::new(|| false),
             N_EXPERTS as usize * PAGE_STRIDE as usize,
+            PrefillGate::Whole,
+            0.85,
         )
         .unwrap();
         let region = (HEAD + PAGE_STRIDE).next_multiple_of(DIRECT_ALIGN) as usize;
@@ -1097,6 +1332,8 @@ mod tests {
         let ids = [0, 1, 2, 3];
         let mut out = [std::ptr::null(); N_EXPERTS as usize];
         s.source(0, 1, 1, &ids, &mut out).unwrap();
+        assert_eq!(s.stats().read_bytes, (N_EXPERTS as usize * region) as u64);
+        assert_eq!(s.stats().pool_bytes, 0);
         assert_eq!(
             *source.0.lock().unwrap(),
             vec![(HEAD as usize, region); N_EXPERTS as usize]
@@ -1286,6 +1523,8 @@ mod tests {
             source,
             Box::new(|| false),
             N as usize * max_stride as usize,
+            PrefillGate::Whole,
+            0.85,
         )
         .unwrap();
         let served = |shard: usize| {
@@ -1404,6 +1643,8 @@ mod tests {
             source,
             Box::new(|| false),
             N_EXPERTS as usize * STRIDE as usize,
+            PrefillGate::Whole,
+            0.85,
         )
         .unwrap();
         // Layer 0 up + down routed, layer 1 gate whole: three planes.
