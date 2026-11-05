@@ -13,7 +13,9 @@ use golem_engine::FinishReason;
 use golem_engine::ParityStep;
 use golem_engine::TurnRequest;
 use golem_engine::atomic::write_atomic;
-use golem_engine::config::{DeviceWait, EngineConfig, PrefetchMode, Residency, VramOrder};
+use golem_engine::config::{
+    DeviceWait, EngineConfig, PrefetchMode, PrefillGate, Residency, VramOrder,
+};
 use golem_engine::gguf::read_metadata;
 use golem_engine::session::{ChatTurn, Session};
 use golem_engine::timing::TimingRecorder;
@@ -236,6 +238,11 @@ pub struct EngineArgs {
     /// of routed-only (hidden measurement knob).
     #[arg(long, hide = true)]
     pub prefill_stream_routed_max: Option<f32>,
+    /// Streamed-prefill gate warm: `whole` (default) or `predicted` (the
+    /// previous ubatch's routing, misses staged at the router; hidden
+    /// measurement knob).
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub prefill_gate: Option<PrefillGate>,
     /// State-snapshot arena in GiB (§7.1: turn N+1 restores turn N's prompt
     /// state and prefills only the delta). 0 disables snapshots; omitted =
     /// `max(2 GiB, 2 × floor)`, shrunk toward the floor (one full-context
@@ -351,6 +358,7 @@ impl EngineArgs {
                 "prefill_stream_routed_max",
                 d.prefill_stream_routed_max,
             )?,
+            prefill_gate: l.get(self.prefill_gate, "prefill_gate", d.prefill_gate)?,
             snapshot_ram_bytes: snapshot_ram_gib.map(|g| (g * (1u64 << 30) as f64) as u64),
             full_verify: l.get(flag(self.full_verify), "full_verify", false)?,
             decode_cpuset,

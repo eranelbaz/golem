@@ -154,6 +154,9 @@ pub struct EngineConfig {
     /// of the ubatch's routed experts a plane streams whole instead of
     /// routed-only (BMoE's 0.85; Golem measures its own crossover).
     pub prefill_stream_routed_max: f32,
+    /// Gate-plane warm for streamed prefill (`--prefill-gate`): `Whole` (the
+    /// default) until `Predicted` measurably wins on disk bytes per ubatch.
+    pub prefill_gate: PrefillGate,
     /// State-snapshot arena bytes (§7.1): `Some(0)` disables snapshots (and
     /// the floor rule); `None` = planner default `max(2 GiB, 2 × floor)`;
     /// any other value must be ≥ the floor `parallel × snapshot_bytes(n_ctx)`
@@ -194,6 +197,28 @@ pub enum Residency {
     /// At most one tier holds an expert: promotion releases the pool slot,
     /// VRAM eviction copies back into the pool or drops.
     Exclusive,
+}
+
+/// Streamed-prefill gate-plane warm (§7.6.3, `--prefill-gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrefillGate {
+    /// Layer L's readback warms layer L+1's whole gate plane.
+    #[default]
+    Whole,
+    /// Layer L's readback warms layer L+1's gate with the previous ubatch's
+    /// L+1 routed set; L+1's own readback stages the misses.
+    Predicted,
+}
+
+impl std::str::FromStr for PrefillGate {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "whole" => Ok(Self::Whole),
+            "predicted" => Ok(Self::Predicted),
+            _ => Err(format!("want whole or predicted, got {s:?}")),
+        }
+    }
 }
 
 /// Device-side landed wait mode (`--device-wait`).
@@ -282,6 +307,7 @@ impl Default for EngineConfig {
             prefill_ubatch: 2048,
             prefill_stream_min: 256,
             prefill_stream_routed_max: 0.85,
+            prefill_gate: PrefillGate::default(),
             // Off by default: only the CLI asks for the planner-sized arena.
             snapshot_ram_bytes: Some(0),
             model_facts: None,

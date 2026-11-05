@@ -2110,8 +2110,15 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
                 .as_ref()
                 .is_some_and(|s| s.health() == golem_store::InstanceHealth::FatalIo)
         });
-        let st = StreamState::new(pool.clone(), source.clone(), storage_lost, slot_bytes)
-            .map_err(|e| EngineError::PoolInit(format!("stream staging ring: {e}")))?;
+        let st = StreamState::new(
+            pool.clone(),
+            source.clone(),
+            storage_lost,
+            slot_bytes,
+            config.prefill_gate,
+            config.prefill_stream_routed_max,
+        )
+        .map_err(|e| EngineError::PoolInit(format!("stream staging ring: {e}")))?;
         Some(st)
     } else {
         None
@@ -3414,7 +3421,8 @@ pub extern "C" fn routing(
             t.record(h.policy.step.load(Ordering::Relaxed), phase, blk, ids);
         }
         // Prefill-stream read-ahead (§7.6.3): this layer's ids are known —
-        // warm its up/down planes and the next layer's whole gate plane.
+        // warm its up/down planes and the next layer's gate plane (whole or
+        // predicted, `PrefillGate`).
         if h.stream_armed.load(Ordering::Relaxed)
             && let Some(s) = &h.stream
         {
