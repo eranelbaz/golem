@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use golem_placement::pool::{
     Arena, DIRECT_ALIGN, ExpertKind, ExpertPool, ExpertSource, Lease, SlotClass,
@@ -68,6 +69,16 @@ pub struct StreamStats {
     /// Routed gate ids a predicted gate warm missed (resident or staged at
     /// the layer's own readback; 0 under [`PrefillGate::Whole`]).
     pub gate_missed: u64,
+    /// Σ ns reader threads spent in plane reads.
+    pub reader_read_ns: u64,
+    /// Σ ns the decode thread (`warm` or `source`) waited for a free
+    /// staging slot.
+    pub slot_wait_ns: u64,
+    /// Σ ns the copy loop waited in `source` for its plane's reads.
+    pub source_wait_ns: u64,
+    /// Store-wide drains (stream, decode and prefetch) run serially on the
+    /// caller because every crew was busy (0 without a store).
+    pub serial_fallbacks: u64,
 }
 
 /// One warmed plane's misses, read as one batched drain so the plane's
@@ -182,6 +193,9 @@ pub struct StreamState {
     read_bytes: AtomicU64,
     /// Routed gate ids a predicted warm missed.
     gate_missed: AtomicU64,
+    reader_read_ns: AtomicU64,
+    slot_wait_ns: AtomicU64,
+    source_wait_ns: AtomicU64,
     /// stream_source calls (one per streamed plane).
     pub planes: AtomicU64,
     /// Σ ids over successfully sourced planes.
@@ -281,6 +295,9 @@ impl StreamState {
             staged: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
             gate_missed: AtomicU64::new(0),
+            reader_read_ns: AtomicU64::new(0),
+            slot_wait_ns: AtomicU64::new(0),
+            source_wait_ns: AtomicU64::new(0),
             planes: AtomicU64::new(0),
             sourced_ids: AtomicU64::new(0),
             held: AtomicU64::new(0),
@@ -370,6 +387,7 @@ impl StreamState {
             // waiter would hang): it counts as a fatal read. The store
             // degrades replicas inside the drain, so its health is final by
             // the time it returns.
+            let reading = Instant::now();
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match self
                     .source
@@ -381,6 +399,7 @@ impl StreamState {
                 }
             }))
             .unwrap_or(ReadState::Fatal);
+            add_ns(&self.reader_read_ns, reading);
             if read == ReadState::Ok {
                 self.read_bytes.fetch_add(task_bytes, Ordering::Relaxed);
             }
@@ -576,13 +595,15 @@ impl StreamState {
         &self,
         mut inner: std::sync::MutexGuard<'a, Inner>,
     ) -> Result<(std::sync::MutexGuard<'a, Inner>, usize, *mut u8), StreamError> {
+        let start = Instant::now();
         loop {
-            check_read(inner.read)?;
+            check_read(inner.read).inspect_err(|_| add_ns(&self.slot_wait_ns, start))?;
             if inner.stop {
                 p3_fatal("stream slot after stop".into());
             }
             if let Some(s) = inner.free_slots.pop() {
                 debug_assert_eq!(inner.pending_reads[s], 0);
+                add_ns(&self.slot_wait_ns, start);
                 // Slots are indexed 0..STAGING_SLOTS in the arena.
                 let base = self.arena.slot_base(s as u32);
                 return Ok((inner, s, base));
@@ -664,11 +685,13 @@ impl StreamState {
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if pending.slot != usize::MAX {
+                let start = Instant::now();
                 // `read` is store-global on purpose: any plane's loss ends
                 // this wait, not just this slot's reads.
                 while inner.pending_reads[pending.slot] > 0 && inner.read == ReadState::Ok {
                     inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
                 }
+                add_ns(&self.source_wait_ns, start);
             }
             if let Err(e) = check_read(inner.read) {
                 debug_assert!(!inner.holds.contains_key(&seq));
@@ -820,6 +843,10 @@ impl StreamState {
             read_bytes: self.read_bytes.load(Ordering::Relaxed),
             pool_bytes: self.pool_bytes.load(Ordering::Relaxed),
             gate_missed: self.gate_missed.load(Ordering::Relaxed),
+            reader_read_ns: self.reader_read_ns.load(Ordering::Relaxed),
+            slot_wait_ns: self.slot_wait_ns.load(Ordering::Relaxed),
+            source_wait_ns: self.source_wait_ns.load(Ordering::Relaxed),
+            serial_fallbacks: 0,
         }
     }
 
@@ -847,6 +874,13 @@ impl StreamState {
             }
         }
     }
+}
+
+fn add_ns(counter: &AtomicU64, since: Instant) {
+    counter.fetch_add(
+        u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 fn check_read(read: ReadState) -> Result<(), StreamError> {
@@ -1535,17 +1569,16 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let ids: Vec<i32> = (0..N as i32).collect();
+        let total = || {
+            (0..2)
+                .map(served)
+                .fold([0, 0], |a, s| [a[0] + s[0], a[1] + s[1]])
+        };
+        let before = total();
         for (k, code) in [1, 2, 3].into_iter().enumerate() {
             let kind = ExpertKind::ALL[k];
-            let shard = planes[k].0;
-            let before = served(shard);
             let mut out = vec![std::ptr::null(); N as usize];
             s.source(0, code, k as u64 + 1, &ids, &mut out).unwrap();
-            let after = served(shard);
-            assert!(
-                (0..2).all(|r| after[r] > before[r]),
-                "kind {code}: one plane batch must use both drives: {before:?} → {after:?}"
-            );
             let stride = geo.layers[0].stride[k] as usize;
             let mut serial = vec![0u8; stride];
             for (e, &p) in out.iter().enumerate() {
@@ -1561,6 +1594,14 @@ mod tests {
                 );
             }
         }
+        // §5.2 striping across the planes; one small plane may be drained
+        // entirely by the faster (tmpfs) replica's worker under self-selection.
+        // Per-chunk striping is the store's `healthy_reads_stripe_across_drives`.
+        let after = total();
+        assert!(
+            (0..2).all(|r| after[r] > before[r]),
+            "the plane batches must use both drives: {before:?} → {after:?}"
+        );
         assert_eq!(store.scratch_by_reason(), [0; 3], "a staged plane bounced");
         s.release_all();
         s.stop();
