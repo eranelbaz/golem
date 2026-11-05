@@ -492,6 +492,11 @@ impl StoreExpertSource {
         self.queue.take_disk_stats()
     }
 
+    /// Drains the shared queue ran serially on the caller (every crew busy).
+    pub fn serial_fallbacks(&self) -> u64 {
+        self.queue.serial_fallbacks()
+    }
+
     /// Total pageable expert bytes (Σ `stride × n_experts` over live planes;
     /// each product was checked at open).
     pub fn expert_bytes(&self) -> u64 {

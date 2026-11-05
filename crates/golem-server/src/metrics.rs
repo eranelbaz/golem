@@ -205,6 +205,31 @@ pub(crate) fn render(h: &HealthState) -> String {
             "Expert ids sourced by streamed prefill (n_expert per plane under whole fill)",
             st.sourced_ids as f64,
         );
+        for (name, help, ns) in [
+            (
+                "golem_stream_reader_read_seconds_total",
+                "Σ time stream reader threads spent in plane reads",
+                st.reader_read_ns,
+            ),
+            (
+                "golem_stream_slot_wait_seconds_total",
+                "Time the decode thread waited for a free stream staging slot",
+                st.slot_wait_ns,
+            ),
+            (
+                "golem_stream_source_wait_seconds_total",
+                "Time the copy loop waited for its plane's reads",
+                st.source_wait_ns,
+            ),
+        ] {
+            g(name, "counter", help, ns as f64 / 1e9);
+        }
+        g(
+            "golem_store_serial_fallbacks_total",
+            "counter",
+            "Store drains (stream, decode and prefetch) run serially on the caller because every reader crew was busy; emitted while streaming is configured",
+            st.serial_fallbacks as f64,
+        );
         g(
             "golem_stream_held_planes",
             "gauge",
@@ -475,6 +500,10 @@ mod tests {
             read_bytes: 9,
             pool_bytes: 4,
             gate_missed: 6,
+            reader_read_ns: 2_000_000_000,
+            slot_wait_ns: 250_000_000,
+            source_wait_ns: 500_000_000,
+            serial_fallbacks: 3,
         });
         let body = render(&h);
         for line in [
@@ -485,6 +514,10 @@ mod tests {
             "golem_stream_planes_total 2\n",
             "golem_stream_ids_total 8\n",
             "golem_stream_held_planes 1\n",
+            "golem_stream_reader_read_seconds_total 2\n",
+            "golem_stream_slot_wait_seconds_total 0.25\n",
+            "golem_stream_source_wait_seconds_total 0.5\n",
+            "golem_store_serial_fallbacks_total 3\n",
             "golem_stream_expert_ranges_total{source=\"pool\"} 3\n",
             "golem_stream_expert_ranges_total{source=\"staged\"} 5\n",
         ] {

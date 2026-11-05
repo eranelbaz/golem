@@ -1551,7 +1551,14 @@ impl SessionHooks {
 
     /// Cumulative stream counters (test/observability seam).
     pub fn stream_stats(&self) -> Option<crate::stream::StreamStats> {
-        self.stream.as_ref().map(|s| s.stats())
+        self.stream.as_ref().map(|s| crate::stream::StreamStats {
+            serial_fallbacks: self
+                .state
+                .store
+                .as_ref()
+                .map_or(0, |q| q.serial_fallbacks()),
+            ..s.stats()
+        })
     }
 
     /// The substrate's device cache was reset between turns (session.rs
