@@ -59,12 +59,20 @@ pub(crate) struct Progress {
     pub failed: bool,
     /// First terminal error of the read.
     pub error: Option<StoreError>,
+    /// Per chunk, the §5.3 CRC32C of its slice of the logical window and
+    /// that slice's length, computed by the worker that landed it (hot in
+    /// cache, in parallel across the drain) and combined in `finish_read`.
+    pub chunk_crcs: Vec<(u32, usize)>,
 }
 
 impl ReadState {
-    /// Records a settled chunk; `Err` fails the whole read.
-    pub fn settle(&self, result: Result<(), StoreError>) {
+    /// Records a settled chunk; `Err` fails the whole read. `crc` is the
+    /// landed chunk's `(index, (crc, len))` window part.
+    pub fn settle(&self, result: Result<(), StoreError>, crc: Option<(usize, (u32, usize))>) {
         let mut p = self.lock_progress();
+        if let Some((i, part)) = crc {
+            p.chunk_crcs[i] = part;
+        }
         if let Err(e) = result {
             if p.error.is_none() {
                 p.error = Some(e);
@@ -342,7 +350,11 @@ impl ChunkQueue {
         s.expected_crc = job.expected_crc;
         s.verify_crc = job.verify_crc;
         s.progress.clear_poison();
-        *s.progress.get_mut().unwrap_or_else(PoisonError::into_inner) = Progress::default();
+        let p = s.progress.get_mut().unwrap_or_else(PoisonError::into_inner);
+        p.failed = false;
+        p.error = None;
+        p.chunk_crcs.clear();
+        p.chunk_crcs.resize(s.chunks.len(), (0, 0));
         *s.served.get_mut() = 0;
         {
             let mut q = self.lock();
@@ -650,7 +662,15 @@ fn finish_read(
         return Ok(());
     }
     let replica_count = sources.replica_count(shard);
-    let crc = crc32c::crc32c(&dst[read.crc_at..read.crc_at + read.crc_len]);
+    let crc = read
+        .lock_progress()
+        .chunk_crcs
+        .iter()
+        .fold(0, |acc, &(c, len)| crc32c::crc32c_combine(acc, c, len));
+    debug_assert_eq!(
+        crc,
+        crc32c::crc32c(&dst[read.crc_at..read.crc_at + read.crc_len])
+    );
     if crc != read.expected_crc {
         // §5.3: treat as a corrupted replica, same path as EIO.
         let served = read.served.load(Ordering::Relaxed);
@@ -1022,7 +1042,21 @@ fn run_chunk<'a>(
                     .disk_bytes
                     .fetch_add(job.dst.len() as u64, Ordering::Relaxed);
                 read.served.fetch_or(1 << replica, Ordering::Relaxed);
-                settle(shared, read, Ok(()));
+                // §5.3 CRC of this chunk's slice of the logical window, on
+                // the worker while the bytes are hot: a plane's hash runs
+                // in parallel across the drain instead of serially after it.
+                let crc = read.verify_crc.then(|| {
+                    let at = (offset - read.chunks[0].0) as usize;
+                    let lo = read.crc_at.max(at);
+                    let hi = (read.crc_at + read.crc_len).min(at + job.dst.len());
+                    let part = if lo < hi {
+                        (crc32c::crc32c(&job.dst[lo - at..hi - at]), hi - lo)
+                    } else {
+                        (0, 0)
+                    };
+                    (job.job.chunk_index, part)
+                });
+                settle_with(shared, read, Ok(()), crc);
             }
             Err(e) => {
                 sources.slot(shard, replica).mark_degraded();
@@ -1052,7 +1086,17 @@ fn run_chunk<'a>(
 
 /// Records a settled chunk and releases its share of the drain.
 fn settle(shared: &(Mutex<Shared<'_>>, Condvar), read: &ReadState, result: Result<(), StoreError>) {
-    read.settle(result);
+    settle_with(shared, read, result, None);
+}
+
+/// [`settle`] recording a landed chunk's CRC part under the same lock.
+fn settle_with(
+    shared: &(Mutex<Shared<'_>>, Condvar),
+    read: &ReadState,
+    result: Result<(), StoreError>,
+    crc: Option<(usize, (u32, usize))>,
+) {
+    read.settle(result, crc);
     let (lock, cv) = shared;
     lock.lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1065,7 +1109,7 @@ fn settle(shared: &(Mutex<Shared<'_>>, Condvar), read: &ReadState, result: Resul
 mod tests {
     use super::*;
     use crate::replica::{ReplicaRegistry, ReplicaSlot};
-    use crate::stripe::plan_aligned;
+    use crate::stripe::{CHUNK, plan_aligned};
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -1113,19 +1157,24 @@ mod tests {
 
     /// Fixture files over `n` replica dirs; returns (paths, registry).
     fn fixture(n: usize, tag: &str) -> (Vec<PathBuf>, ReplicaRegistry) {
+        fixture_sized(n, tag, SHARD_BYTES)
+    }
+
+    /// [`fixture`] with a `bytes`-long shard.
+    fn fixture_sized(n: usize, tag: &str, bytes: usize) -> (Vec<PathBuf>, ReplicaRegistry) {
         let root = std::env::temp_dir().join(format!("golem-store-queue-{tag}"));
         let mut replicas = Vec::with_capacity(n);
         for r in 0..n {
             let dir = root.join(format!("r{r}"));
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(SHARD_FILE), pattern(0, SHARD_BYTES)).unwrap();
+            std::fs::write(dir.join(SHARD_FILE), pattern(0, bytes)).unwrap();
             replicas.push(dir);
         }
         let manifest = crate::manifest::ModelManifest {
             name: tag.to_owned(),
             shards: vec![crate::manifest::ShardEntry {
                 file: SHARD_FILE.to_owned(),
-                bytes: SHARD_BYTES as u64,
+                bytes: bytes as u64,
                 sha256: "0".repeat(64),
                 replicas: replicas.clone(),
                 ..Default::default()
@@ -2493,6 +2542,64 @@ mod tests {
             sources.slot(0, 1).health(),
             crate::replica::ReplicaHealth::Healthy
         );
+    }
+
+    /// §5.3 over a multi-chunk read: an unaligned head, a full middle
+    /// chunk and a partial tail. The per-chunk CRC parts fold to the window
+    /// CRC, a flipped byte inside the window fails it, and bytes outside the
+    /// window (head padding, past the end) are not hashed.
+    #[test]
+    fn multi_chunk_crc_detects_a_corrupt_middle_chunk_only_inside_the_window() {
+        const OFF: usize = 1000;
+        const LEN: usize = 2 * CHUNK + 5000;
+        let bytes = 2 * CHUNK + 3 * 4096 + 777;
+        let read = |tag: &str, flip: Option<usize>| {
+            let (paths, reg) = fixture_sized(2, tag, bytes);
+            if let Some(at) = flip {
+                for p in &paths {
+                    let mut data = std::fs::read(p.join(SHARD_FILE)).unwrap();
+                    data[at] ^= 0xff;
+                    std::fs::write(p.join(SHARD_FILE), data).unwrap();
+                }
+            }
+            let sources = TestSources {
+                reg,
+                fail: Vec::new(),
+                log: Arc::new(std::sync::Mutex::new(Vec::new())),
+                drives: Vec::new(),
+                delay_ms: 0,
+                delays_ms: Vec::new(),
+                conc: None,
+                gates: Vec::new(),
+                wait_for_pair: None,
+            };
+            let queue = Arc::new(ChunkQueue::new(2, None));
+            let plan = plan_aligned(OFF as u64, LEN);
+            assert_eq!(plan.len(), 3, "head, middle, tail");
+            let mut dst = vec![0u8; plan.iter().map(|c| c.1).sum()];
+            let result = queue
+                .enqueue(ReadJob {
+                    shard_index: 0,
+                    offset: OFF as u64,
+                    len: LEN,
+                    expected_crc: crc32c::crc32c(&pattern(OFF, LEN)),
+                    verify_crc: true,
+                    prefetch: false,
+                    sources: &sources,
+                    dst: &mut dst,
+                })
+                .wait();
+            (result, dst)
+        };
+        let (ok, dst) = read("crc-multi-clean", None);
+        ok.unwrap();
+        assert!(dst[OFF..OFF + LEN] == pattern(OFF, LEN)[..]);
+        match read("crc-multi-middle", Some(CHUNK + 4096)).0 {
+            Err(StoreError::Crc { .. }) => {}
+            other => panic!("expected Crc, got {other:?}"),
+        }
+        read("crc-multi-head-pad", Some(OFF - 1)).0.unwrap();
+        read("crc-multi-tail-pad", Some(OFF + LEN)).0.unwrap();
     }
 
     #[test]
