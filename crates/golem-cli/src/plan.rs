@@ -53,8 +53,9 @@ pub struct PlanArgs {
     /// like `serve`, else max(1.5 GiB, 6 % of device VRAM).
     #[arg(long, value_name = "GIB", value_parser = crate::run::parse_gib)]
     pub vram_reserve_gib: Option<f64>,
-    /// Host expert-pool cap, floored to whole GiB as `serve` does; resolved
-    /// like `serve`, else min(0.75 · free RAM, Σ expert bytes).
+    /// Host expert-pool cap, floored to whole GiB as `serve` does (so [0, 1)
+    /// is rejected); resolved like `serve`, else min(0.75 · free RAM, Σ
+    /// expert bytes).
     #[arg(long, value_name = "GIB", value_parser = crate::run::parse_gib)]
     pub ram_experts_gib: Option<f64>,
     /// State-snapshot arena; resolved like `serve`, else the §7.1 default
@@ -185,6 +186,19 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
         Some(Gib(g)) => bytes(Some(g)),
         None => golem_plan::snapshot_arena(&m, parallel, ctx).1,
     };
+    let ram_experts = l.opt(args.ram_experts_gib.map(Gib), "ram_experts_gib")?;
+    // `serve` floors to whole GiB, so [0, 1) runs with no pool, which the
+    // assumed prefill stream needs; `Pooled { 0 }` would price the default.
+    if let Some(Gib(g)) = ram_experts
+        && g < 1.0
+    {
+        return Err(format!(
+            "ram_experts_gib {g} (--ram-experts-gib / GOLEM_RAM_EXPERTS_GIB / \
+             golem.toml) floors to 0 GiB: no expert pool, but plan assumes \
+             prefill streaming, which needs one; use >= 1 or leave it unset"
+        )
+        .into());
+    }
     let mut input = PlanInput {
         ctx,
         parallel,
@@ -194,10 +208,7 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
         prefill_stream: true,
         vram_experts: bytes(args.vram_experts_gib),
         experts: golem_plan::ExpertResidency::Pooled {
-            ram_experts: bytes(
-                l.opt(args.ram_experts_gib.map(Gib), "ram_experts_gib")?
-                    .map(|Gib(g)| g.floor()),
-            ),
+            ram_experts: bytes(ram_experts.map(|Gib(g)| g.floor())),
         },
         snapshot_ram,
         vram_reserve: l

@@ -156,3 +156,31 @@ fn model_name_selects_a_models_table_and_its_overrides() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("names no [models.*] entry"));
 }
+
+/// `serve` floors `ram_experts_gib` to whole GiB, so [0, 1) means no pool;
+/// plan refuses it from any layer rather than pricing the default pool, and
+/// prices the floored pool otherwise.
+#[test]
+fn sub_gib_ram_experts_is_refused() {
+    for g in ["0", "0.5"] {
+        let out = plan(&["--json", "--vram-gib", "24", "--ram-experts-gib", g]);
+        assert!(!out.status.success(), "{g}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("floors to 0 GiB"));
+    }
+    let rt = common::tempdir_env();
+    let dir = rt.join("config/golem");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("golem.toml"), "ram_experts_gib = 0.5\n").unwrap();
+    let out = common::golem_cmd(&rt)
+        .args(["plan", "--json", "--vram-gib", "24"])
+        .arg(common::tiny_moe_path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("floors to 0 GiB"));
+    let out = plan(&["--json", "--vram-gib", "24", "--ram-experts-gib", "1.5"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["input"]["experts"]["Pooled"]["ram_experts"], 1u64 << 30);
+}
