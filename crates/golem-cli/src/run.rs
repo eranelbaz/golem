@@ -543,7 +543,7 @@ fn fit_ram(
 /// A [`parse_gib`]-checked GiB value, so env and `golem.toml` layers are
 /// held to the same rule as the flag.
 #[derive(Clone, Copy)]
-struct Gib(f64);
+pub(crate) struct Gib(pub(crate) f64);
 
 impl std::str::FromStr for Gib {
     type Err = String;

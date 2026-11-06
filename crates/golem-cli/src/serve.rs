@@ -186,6 +186,69 @@ fn served_models<'a>(
         .collect()
 }
 
+/// The model `serve` loads at start, and the layers it resolves under.
+pub struct StartModel<'a> {
+    /// GGUF path.
+    pub path: PathBuf,
+    /// Its `[models.*]` name; `None` when it came from `model`.
+    pub name: Option<String>,
+    /// Layers for this model (its `[models.*]` keys and profile applied).
+    pub layers: crate::config::Layers<'a>,
+    /// The other `[models.*]` entries.
+    pub extra: Vec<(String, PathBuf, crate::config::Layers<'a>)>,
+}
+
+/// The start model (§8.1), shared by `serve` and `plan`: `model` (flag >
+/// env > file) if set; else the `[models.*]` entry named by `model_name`
+/// (flag > env > file); else the first entry.
+pub fn start_model<'a>(
+    base: &crate::config::Layers<'a>,
+    model: Option<PathBuf>,
+    model_name: Option<String>,
+    no_profile: bool,
+    cache_types: crate::config::CacheTypeFlags,
+) -> Result<StartModel<'a>, Box<dyn Error>> {
+    let mut extra = served_models(base, no_profile, cache_types)?;
+    match base.model(model) {
+        Ok(path) => {
+            let mut file = base.file.clone();
+            file.remove("models");
+            let layers = crate::config::Layers {
+                file,
+                profile: toml::Table::new(),
+                path: base.path.clone(),
+                env: base.env,
+            }
+            .with_profile(&path, no_profile, cache_types)?;
+            Ok(StartModel {
+                path,
+                name: None,
+                layers,
+                extra,
+            })
+        }
+        Err(e) => {
+            if extra.is_empty() {
+                return Err(e);
+            }
+            let i = match base.opt(model_name, "model_name")? {
+                Some(w) => extra
+                    .iter()
+                    .position(|(n, _, _)| *n == w)
+                    .ok_or_else(|| format!("model_name `{w}` names no [models.*] entry"))?,
+                None => 0,
+            };
+            let (name, path, layers) = extra.remove(i);
+            Ok(StartModel {
+                path,
+                name: Some(name),
+                layers,
+                extra,
+            })
+        }
+    }
+}
+
 /// The requested (pre-RAM-fit) configuration identity; `snapshot_ram_bytes`
 /// is the resolved request, since the fitted arena tracks free RAM.
 pub fn effective(
@@ -300,7 +363,17 @@ pub fn explicit_cache_bytes(
     mach: &golem_plan::Machine,
     input: &golem_plan::PlanInput,
 ) -> u64 {
-    let k = u64::from(config.device_cache_experts);
+    device_cache_k_bytes(config.device_cache_experts, facts, mach, input)
+}
+
+/// [`explicit_cache_bytes`] for a bare device cache K.
+pub fn device_cache_k_bytes(
+    k: u32,
+    facts: &golem_plan::ModelFacts,
+    mach: &golem_plan::Machine,
+    input: &golem_plan::PlanInput,
+) -> u64 {
+    let k = u64::from(k);
     let k =
         golem_plan::clamp_device_cache_k(facts, mach, input, k).unwrap_or(u64::from(facts.top_k));
     facts.device_cache_bytes(k)
@@ -336,46 +409,14 @@ pub fn serve(
     ready: impl FnOnce(&str) + Send,
 ) -> Result<(), Box<dyn Error>> {
     let base = crate::config::Layers::from_process()?;
-    let mut extra = served_models(
+    let start = start_model(
         &base,
+        args.model.clone(),
+        args.model_name.clone(),
         args.engine.no_optimize_profile,
         (args.engine.cache_type_k, args.engine.cache_type_v),
     )?;
-    // No `model` anywhere: the `[models.*]` entry named by `model_name`
-    // loads at start, with its own keys.
-    // No `model` and none named: start idle on the first entry.
-    let (model, first_name, layers) = match base.model(args.model.clone()) {
-        Ok(m) => {
-            let mut file = base.file.clone();
-            file.remove("models");
-            let l = crate::config::Layers {
-                file,
-                profile: toml::Table::new(),
-                path: base.path.clone(),
-                env: base.env,
-            }
-            .with_profile(
-                &m,
-                args.engine.no_optimize_profile,
-                (args.engine.cache_type_k, args.engine.cache_type_v),
-            )?;
-            (m, None, l)
-        }
-        Err(e) => {
-            if extra.is_empty() {
-                return Err(e);
-            }
-            let i = match listen(args, &base)?.model_name {
-                Some(w) => extra
-                    .iter()
-                    .position(|(n, _, _)| *n == w)
-                    .ok_or_else(|| format!("model_name `{w}` names no [models.*] entry"))?,
-                None => 0,
-            };
-            let (n, p, l) = extra.remove(i);
-            (p, Some(n), l)
-        }
-    };
+    let (model, first_name, layers, extra) = (start.path, start.name, start.layers, start.extra);
     let l = listen(args, &layers)?;
     check_parallel(
         l.parallel,

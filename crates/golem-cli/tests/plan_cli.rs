@@ -106,3 +106,53 @@ fn cache_types_price_the_kv_term() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a multiple of the type's block"));
 }
+
+/// No `model`: `model_name` picks a `[models.*]` entry whose keys override the
+/// shared ones, as `serve` resolves them; flags still win.
+#[test]
+fn model_name_selects_a_models_table_and_its_overrides() {
+    let rt = common::tempdir_env();
+    let dir = rt.join("config/golem");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tiny = common::tiny_moe_path().display().to_string();
+    std::fs::write(
+        dir.join("golem.toml"),
+        format!(
+            "model_name = \"b\"\nctx = 512\nprefill_ubatch = 64\n\
+             [models.a]\npath = \"/nonexistent.gguf\"\n\
+             [models.b]\npath = {tiny:?}\nctx = 384\nvram_reserve_gib = 2\n"
+        ),
+    )
+    .unwrap();
+    let run = |extra: &[&str]| {
+        common::golem_cmd(&rt)
+            .args([
+                "plan",
+                "--json",
+                "--vram-gib",
+                "24",
+                "--no-optimize-profile",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let out = run(&[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["input"]["ctx"], 384);
+    assert_eq!(v["input"]["prefill_ubatch"], 64);
+    assert_eq!(v["input"]["vram_reserve"], 2u64 << 30);
+    let out = run(&["--ctx", "256"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["input"]["ctx"], 256);
+    let out = run(&["--model-name", "zzz"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("names no [models.*] entry"));
+}

@@ -33,7 +33,8 @@ pub enum ConfigError {
 /// No layer supplies the model path.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "no model: pass it as an argument, set GOLEM_MODEL, or set `model` in {}",
+    "no model: pass it as an argument, set GOLEM_MODEL, or set `model` or a \
+     `[models.<name>]` table with `path` in {}",
     .0.as_deref().map_or("golem.toml".into(), |p| p.display().to_string())
 )]
 pub struct NoModel(pub Option<std::path::PathBuf>);
