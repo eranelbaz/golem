@@ -26,9 +26,8 @@ pub struct ServerConfig {
     pub host: IpAddr,
     /// Bind port; 0 picks a free one.
     pub port: u16,
-    /// Model id clients must send and `/v1/models` lists.
-    pub model_name: String,
-    /// Further served models (§8.1), loaded on demand by the worker.
+    /// Served model ids (§8.1), in the worker's model order: a request must
+    /// name one, `/v1/models` lists them, `/health` reports the loaded one.
     pub models: Vec<String>,
     /// When set, `/v1/*` and `/metrics` require `Authorization: Bearer <key>`
     /// (`/health` stays open).
@@ -46,7 +45,6 @@ impl std::fmt::Debug for ServerConfig {
         f.debug_struct("ServerConfig")
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("model_name", &self.model_name)
             .field("models", &self.models)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("reasoning", &self.reasoning)
@@ -435,8 +433,7 @@ pub mod test_support {
         ServerConfig {
             host: IpAddr::from([127, 0, 0, 1]),
             port: 0,
-            model_name: "tiny-moe".into(),
-            models: Vec::new(),
+            models: vec!["tiny-moe".into()],
             api_key: None,
             reasoning: ReasoningMode::Separate,
             // Shutdown tests exercise the cancel path; drain tests set it.

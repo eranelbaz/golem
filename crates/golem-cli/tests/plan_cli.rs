@@ -107,7 +107,7 @@ fn cache_types_price_the_kv_term() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a multiple of the type's block"));
 }
 
-/// No `model`: `model_name` picks a `[models.*]` entry whose keys override the
+/// No `model`: `--model-name` picks a `[models.*]` entry whose keys override the
 /// shared ones, as `serve` resolves them; flags still win.
 #[test]
 fn model_name_selects_a_models_table_and_its_overrides() {
@@ -118,7 +118,7 @@ fn model_name_selects_a_models_table_and_its_overrides() {
     std::fs::write(
         dir.join("golem.toml"),
         format!(
-            "model_name = \"b\"\nctx = 512\nprefill_ubatch = 64\n\
+            "ctx = 512\nprefill_ubatch = 64\n\
              [models.a]\npath = \"/nonexistent.gguf\"\n\
              [models.b]\npath = {tiny:?}\nctx = 384\nvram_reserve_gib = 2\n"
         ),
@@ -137,14 +137,14 @@ fn model_name_selects_a_models_table_and_its_overrides() {
             .output()
             .unwrap()
     };
-    let out = run(&[]);
+    let out = run(&["--model-name", "b"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["input"]["ctx"], 384);
     assert_eq!(v["input"]["prefill_ubatch"], 64);
     assert_eq!(v["input"]["vram_reserve"], 2u64 << 30);
-    let out = run(&["--ctx", "256"]);
+    let out = run(&["--model-name", "b", "--ctx", "256"]);
     assert!(
         out.status.success(),
         "{}",
@@ -155,6 +155,14 @@ fn model_name_selects_a_models_table_and_its_overrides() {
     let out = run(&["--model-name", "zzz"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("names no [models.*] entry"));
+    std::fs::write(
+        dir.join("golem.toml"),
+        format!("[models.b]\npath = {tiny:?}\nmodel_name = \"x\"\n"),
+    )
+    .unwrap();
+    let out = run(&[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("models.b.model_name"));
 }
 
 /// `serve` floors `ram_experts_gib` to whole GiB, so [0, 1) means no pool;

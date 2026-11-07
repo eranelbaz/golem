@@ -25,6 +25,7 @@ async fn app(idle: Option<Duration>) -> (axum::Router, golem_server::WorkerHandl
                 ("tiny-hybrid".into(), hybrid),
             ],
             idle,
+            true,
             TurnSinks::default(),
         )
     })
@@ -33,7 +34,7 @@ async fn app(idle: Option<Duration>) -> (axum::Router, golem_server::WorkerHandl
     .expect("worker starts");
     let app = router(AppState {
         cfg: Arc::new(ServerConfig {
-            models: vec!["tiny-hybrid".into()],
+            models: vec!["tiny-moe".into(), "tiny-hybrid".into()],
             ..test_server_config()
         }),
         jobs: w.jobs.clone(),
@@ -58,6 +59,18 @@ async fn ask(app: &axum::Router, model: &str) -> (u16, Value) {
     let s = r.status().as_u16();
     let b = axum::body::to_bytes(r.into_body(), 1 << 22).await.unwrap();
     (s, serde_json::from_slice(&b).unwrap())
+}
+
+async fn health_model(app: &axum::Router) -> Value {
+    let r = app
+        .clone()
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let b: Value =
+        serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap())
+            .unwrap();
+    b["model"].clone()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -95,17 +108,40 @@ async fn request_for_the_other_model_swaps_it_in() {
         (s, b["error"]["code"].as_str()),
         (400, Some("golem_model_mismatch"))
     );
+    let msg = b["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("tiny-moe, tiny-hybrid"), "{b}");
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"messages": []}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let s = r.status().as_u16();
+    let b: Value =
+        serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        (s, b["error"]["code"].as_str()),
+        (400, Some("golem_model_mismatch"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_unload_starts_empty_and_reloads_on_request() {
     let (app, w) = app(Some(Duration::from_millis(300))).await;
     assert_eq!(w.health.get().as_str(), "idle");
+    assert_eq!(health_model(&app).await, Value::Null);
     let (s, b) = ask(&app, "tiny-hybrid").await;
     assert_eq!((s, b["model"].as_str()), (200, Some("tiny-hybrid")), "{b}");
     assert_eq!(w.health.get().as_str(), "healthy");
+    assert_eq!(health_model(&app).await, "tiny-hybrid");
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert_eq!(w.health.get().as_str(), "idle", "model not unloaded");
+    assert_eq!(health_model(&app).await, Value::Null);
     let (s, b) = ask(&app, "tiny-moe").await;
     assert_eq!((s, b["model"].as_str()), (200, Some("tiny-moe")), "{b}");
 }

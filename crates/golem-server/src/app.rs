@@ -352,28 +352,35 @@ fn merge_tool_call(calls: &mut Vec<ToolCall>, d: ToolCall) {
     calls[i].function.arguments.push_str(&d.function.arguments);
 }
 
-/// Validates `raw` against §8.2 for whichever served model it names (§8.1).
+/// Validates `raw` against §8.2 for the served model it names (§8.1); there
+/// is no default, so a missing or unknown `model` is refused before any load.
 pub(crate) fn resolve_model(
     cfg: &ServerConfig,
     raw: serde_json::Value,
 ) -> Result<golem_api::ChatCompletionRequest, ErrorEnvelope> {
-    let name = raw
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default();
-    let served = cfg
-        .models
-        .iter()
-        .find(|m| *m == name)
-        .unwrap_or(&cfg.model_name);
+    let name = raw.get("model").and_then(|m| m.as_str());
+    let Some(served) = name.and_then(|n| cfg.models.iter().find(|m| *m == n)) else {
+        return Err(ErrorEnvelope::new(
+            ErrorCode::ModelMismatch,
+            format!(
+                "{}; this instance serves: {}",
+                name.map_or("`model` is required".into(), |n| format!(
+                    "model `{n}` is not served"
+                )),
+                cfg.models.join(", ")
+            ),
+        ));
+    };
     golem_api::policy::validate(&raw, served)
 }
 
 async fn models(State(st): State<AppState>) -> Result<Json<ModelList>, ApiError> {
-    let names = std::iter::once(&st.cfg.model_name).chain(&st.cfg.models);
     Ok(Json(ModelList {
         object: "list".into(),
-        data: names
+        data: st
+            .cfg
+            .models
+            .iter()
             .map(|n| ModelCard {
                 id: n.clone(),
                 object: "model".into(),
@@ -408,7 +415,7 @@ async fn health(State(st): State<AppState>) -> Response {
         "state": state.as_str(),
         "tiers": { "vram_fill": m.vram_fill(), "ram_fill": m.ram_fill },
         "degraded": degraded,
-        "model": st.cfg.model_name,
+        "model": st.health.loaded().and_then(|i| st.cfg.models.get(i)),
         "turns": snap.turns,
         "device_cache_skip_ratio": snap.device_cache_skip_ratio,
     });
@@ -589,7 +596,7 @@ pub(crate) mod tests {
     #[test]
     fn requests_route_to_any_served_model() {
         let cfg = ServerConfig {
-            models: vec!["tiny-two".into()],
+            models: vec!["tiny-moe".into(), "tiny-two".into()],
             ..crate::test_support::test_server_config()
         };
         let msgs = serde_json::json!([{"role": "user", "content": "hi"}]);
@@ -603,5 +610,9 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert_eq!(e.error.code, ErrorCode::ModelMismatch);
+        assert!(e.error.message.contains("tiny-moe, tiny-two"), "{e:?}");
+        let e = resolve_model(&cfg, serde_json::json!({"messages": msgs})).unwrap_err();
+        assert_eq!(e.error.code, ErrorCode::ModelMismatch);
+        assert!(e.error.message.contains("`model` is required"), "{e:?}");
     }
 }

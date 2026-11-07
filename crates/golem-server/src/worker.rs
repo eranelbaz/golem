@@ -3,7 +3,7 @@
 //! on a `sync_channel(parallel − 1)`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -141,6 +141,8 @@ const WARM_SAVE_EVERY: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 pub struct HealthState {
     state: AtomicU8,
+    /// Index of the loaded served model; `usize::MAX` when none is.
+    loaded: AtomicUsize,
     snapshot: Mutex<HealthSnapshot>,
     /// Worker-published counters (`/metrics`, `/health` tiers).
     pub(crate) metrics: Mutex<MetricsSnapshot>,
@@ -164,6 +166,7 @@ impl HealthState {
     pub(crate) fn new() -> Self {
         Self {
             state: AtomicU8::new(ServeState::Loading as u8),
+            loaded: AtomicUsize::new(usize::MAX),
             snapshot: Mutex::new(HealthSnapshot::default()),
             metrics: Mutex::new(MetricsSnapshot::default()),
             errors: Default::default(),
@@ -180,6 +183,11 @@ impl HealthState {
     /// Current state.
     pub fn get(&self) -> ServeState {
         ServeState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    /// Index of the loaded served model, in the worker's model order.
+    pub fn loaded(&self) -> Option<usize> {
+        Some(self.loaded.load(Ordering::SeqCst)).filter(|i| *i != usize::MAX)
     }
 
     /// Sets the state; `fatal*` is terminal.
@@ -355,32 +363,41 @@ pub struct TurnSinks {
 /// Loads `cfg` on a new thread (the `Session` never leaves it) and returns
 /// once the model is loaded, or the load error.
 pub fn spawn_worker(cfg: EngineConfig, sinks: TurnSinks) -> Result<WorkerHandle, EngineError> {
-    spawn(vec![(String::new(), cfg)], None, HealthState::new(), sinks)
+    spawn(
+        vec![(String::new(), cfg)],
+        None,
+        true,
+        HealthState::new(),
+        sinks,
+    )
 }
 
 /// [`spawn_worker`] serving several named models, at most one loaded (§8.1).
 /// A job naming an unloaded model drops the loaded one, loads it, then runs.
-/// `idle_unload` set: nothing loads at start, and the loaded model is
-/// dropped after that long with no job. Several models need `parallel` 1 (a
+/// `idle_unload` set or `preload` false: nothing loads at start. With
+/// `idle_unload` set the loaded model is dropped after that long with no job. Several models need `parallel` 1 (a
 /// job is dequeued only with the slot idle, so a swap never cuts a turn), no
 /// turn sinks (one per session), and agreeing expert offload (the first load
 /// fixes the process-wide op-offload threshold, `init_backend`).
 pub fn spawn_worker_models(
     models: Vec<(String, EngineConfig)>,
     idle_unload: Option<Duration>,
+    preload: bool,
     sinks: TurnSinks,
 ) -> Result<WorkerHandle, EngineError> {
     let Some((_, first)) = models.first() else {
         return Err(EngineError::InvalidConfig("no model to serve".into()));
     };
-    let lazy = models.len() > 1 || idle_unload.is_some();
+    let lazy = models.len() > 1 || idle_unload.is_some() || !preload;
     if lazy
         && (models.iter().any(|(_, c)| c.parallel != 1)
             || sinks.timing.is_some()
             || sinks.trace.is_some())
     {
         return Err(EngineError::InvalidConfig(
-            "several models or idle unload need parallel 1 and no timing_csv/routing_trace".into(),
+            "several models, idle unload or no top-level `model` need parallel 1 and no \
+             timing_csv/routing_trace"
+                .into(),
         ));
     }
     let offload =
@@ -390,7 +407,7 @@ pub fn spawn_worker_models(
             "served models must agree on setting ram_experts_gib/cpu_moe_layers".into(),
         ));
     }
-    spawn(models, idle_unload, HealthState::new(), sinks)
+    spawn(models, idle_unload, preload, HealthState::new(), sinks)
 }
 
 /// [`spawn_worker`] with fault injection scoped to this worker.
@@ -403,6 +420,7 @@ pub fn spawn_worker_with_hooks(
     spawn(
         vec![(String::new(), cfg)],
         None,
+        true,
         HealthState {
             hooks,
             ..HealthState::new()
@@ -426,6 +444,7 @@ pub fn check_sinks(parallel: u32, recording: bool) -> Result<(), EngineError> {
 fn spawn(
     models: Vec<(String, EngineConfig)>,
     idle_unload: Option<Duration>,
+    preload: bool,
     health: HealthState,
     mut sinks: TurnSinks,
 ) -> Result<WorkerHandle, EngineError> {
@@ -456,7 +475,7 @@ fn spawn(
             let names: Vec<&str> = models.iter().map(|(n, _)| n.as_str()).collect();
             let mut cur: Option<(usize, Scheduler)> = None;
             let mut first = None;
-            if idle_unload.is_some() {
+            if idle_unload.is_some() || !preload {
                 h.set(ServeState::Idle);
                 let _ = loaded_tx.send(Ok(None));
             } else {
@@ -474,6 +493,7 @@ fn spawn(
                     });
                 match loaded {
                     Ok(mut s) => {
+                        h.loaded.store(0, Ordering::SeqCst);
                         h.set(ServeState::Healthy);
                         let _ = loaded_tx.send(Ok(s.session().device_cache_experts()));
                         cur = Some((0, s));
@@ -489,7 +509,7 @@ fn spawn(
                 let Some((i, sch)) = cur.as_mut() else {
                     // Nothing loaded: the next job picks the model.
                     let Ok(job) = rx.recv() else { return };
-                    let next = names.iter().position(|n| *n == job.req.model).unwrap_or(0);
+                    let next = model_index(&names, &job);
                     if job.cancel.load(Ordering::SeqCst) {
                         h.queued.fetch_sub(1, Ordering::SeqCst);
                         continue;
@@ -523,11 +543,15 @@ fn spawn(
                         save_warm_state(sch);
                         return;
                     }
-                    Exit::Fatal => return,
+                    Exit::Fatal => {
+                        h.loaded.store(usize::MAX, Ordering::SeqCst);
+                        return;
+                    }
                     exit => {
                         save_warm_state(sch);
                         // Dropped before any next load: two never fit.
                         cur = None;
+                        h.loaded.store(usize::MAX, Ordering::SeqCst);
                         // `/health` tiers and `/metrics` must not report the
                         // dropped model's residency.
                         *h.metrics.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -538,7 +562,7 @@ fn spawn(
                             _ => tracing::info!("idle: model unloaded"),
                         }
                         if let Some(job) = first.take() {
-                            let next = names.iter().position(|n| *n == job.req.model).unwrap_or(0);
+                            let next = model_index(&names, &job);
                             if let Some(s) = load_for(&models, next, &job, &h) {
                                 cur = Some((next, s));
                                 first = Some(job);
@@ -610,6 +634,12 @@ impl SlotRun {
     }
 }
 
+/// The served model `job` names; `resolve_model` admits only served names,
+/// and a single unnamed model (`spawn_worker`) serves every job.
+fn model_index(names: &[&str], job: &Job) -> usize {
+    names.iter().position(|n| *n == job.req.model).unwrap_or(0)
+}
+
 /// Loads `models[next]` for `job`; on failure answers it (it leaves the
 /// queue) and stays `idle`.
 fn load_for(
@@ -623,6 +653,7 @@ fn load_for(
     match Session::new(&models[next].1).and_then(Scheduler::new) {
         // A drain begun mid-load: `admit` refuses the job, `run` then exits.
         Ok(s) => {
+            h.loaded.store(next, Ordering::SeqCst);
             h.swap_state(ServeState::Healthy);
             Some(s)
         }
