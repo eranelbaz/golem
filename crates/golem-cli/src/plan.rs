@@ -5,6 +5,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 
+use crate::run::Gib;
 use golem_api::{ErrorCode, ErrorEnvelope};
 use golem_plan::{Machine, ModelFacts, PlanInput, PlanReport, Term, WS_MEASURED, total};
 
@@ -18,33 +19,48 @@ const GIB: f64 = (1u64 << 30) as f64;
 #[derive(Debug, clap::Args)]
 pub struct PlanArgs {
     /// Path to the GGUF model file (first shard of a split); else
-    /// `GOLEM_MODEL`, else `model` in `golem.toml`.
+    /// `GOLEM_MODEL`, else `model` in `golem.toml`, else the `[models.*]`
+    /// entry named by `--model-name` (as `serve`).
     pub model: Option<PathBuf>,
-    /// Context length per sequence.
-    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(2..))]
-    pub ctx: u32,
-    /// Concurrent sequences.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    pub parallel: u32,
+    /// `[models.<NAME>]` entry of `golem.toml` to plan when no `model` is
+    /// set; flag > `GOLEM_MODEL_NAME` > `model_name` > the first entry.
+    #[arg(long, value_name = "NAME")]
+    pub model_name: Option<String>,
+    /// Context length per sequence; resolved like `serve --ctx` (flag > env >
+    /// `[models.*]` > golem.toml > engine default 256).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..))]
+    pub ctx: Option<u32>,
+    /// Concurrent sequences [default: 1].
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub parallel: Option<u32>,
     /// Streamed prefill ubatch; prefill streaming (§7.6) is assumed on.
-    #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..))]
-    pub prefill_ubatch: u32,
-    /// Device expert-cache cap; omitted = what the other VRAM terms leave.
-    #[arg(long, value_name = "GIB")]
+    /// Resolved like `serve --prefill-ubatch` [default: 2048].
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub prefill_ubatch: Option<u32>,
+    /// Device expert-cache cap; omitted = `--device-cache-experts`, else what
+    /// the other VRAM terms leave.
+    #[arg(long, value_name = "GIB", conflicts_with = "device_cache_experts")]
     pub vram_experts_gib: Option<f64>,
+    /// Pinned per-layer device expert-cache size, priced as `serve` clamps
+    /// it; resolved like `serve --device-cache-experts` (0 = derived).
+    #[arg(long, value_name = "EXPERTS")]
+    pub device_cache_experts: Option<u32>,
     /// Fraction (0, 1] of the derived device expert-cache allowance; same knob
-    /// as `run --vram-experts-frac`.
-    #[arg(long, default_value_t = 1.0, value_parser = frac, conflicts_with = "vram_experts_gib")]
-    pub vram_experts_frac: f32,
-    /// VRAM held back for other GPU clients (compositor, browsers); omitted =
-    /// max(1.5 GiB, 6 % of device VRAM), the `run` default.
+    /// as `run --vram-experts-frac` [default: 1].
+    #[arg(long, value_parser = frac, conflicts_with = "vram_experts_gib")]
+    pub vram_experts_frac: Option<f32>,
+    /// VRAM held back for other GPU clients (compositor, browsers); resolved
+    /// like `serve`, else max(1.5 GiB, 6 % of device VRAM).
     #[arg(long, value_name = "GIB", value_parser = crate::run::parse_gib)]
     pub vram_reserve_gib: Option<f64>,
-    /// Host expert-pool cap; omitted = min(0.75 · free RAM, Σ expert bytes).
-    #[arg(long, value_name = "GIB")]
+    /// Host expert-pool cap, floored to whole GiB as `serve` does (so [0, 1)
+    /// is rejected); resolved like `serve`, else min(0.75 · free RAM, Σ
+    /// expert bytes).
+    #[arg(long, value_name = "GIB", value_parser = crate::run::parse_gib)]
     pub ram_experts_gib: Option<f64>,
-    /// State-snapshot arena; omitted = the §7.1 default max(2 GiB, 2 × floor).
-    #[arg(long, value_name = "GIB")]
+    /// State-snapshot arena; resolved like `serve`, else the §7.1 default
+    /// max(2 GiB, 2 × floor).
+    #[arg(long, value_name = "GIB", value_parser = crate::run::parse_gib)]
     pub snapshot_ram_gib: Option<f64>,
     /// Device VRAM; omitted = the HIP device's total (HIP builds), else 24.
     #[arg(long, value_name = "GIB")]
@@ -60,6 +76,9 @@ pub struct PlanArgs {
     /// flag > golem.toml `victim_ring_slots` > 0 = off).
     #[arg(long, value_name = "N")]
     pub victim_ring: Option<u32>,
+    /// Ignore the saved `golem optimize` profile for this model (as `serve`).
+    #[arg(long)]
+    pub no_optimize_profile: bool,
     /// Machine-readable report on stdout.
     #[arg(long)]
     pub json: bool,
@@ -147,37 +166,70 @@ pub fn machine(vram_gib: Option<f64>) -> Machine {
 
 /// Runs `golem plan`; returns the process exit code (0 fits, 2 infeasible).
 pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
-    let model = crate::config::Layers::from_process()?.model(args.model.clone())?;
-    let l = crate::config::Layers::from_process()?;
-    let f16 = golem_plan::KvCacheType::F16;
-    let m = ModelFacts::from_gguf_kv(
-        &model,
-        l.get(args.cache_type_k, "cache_type_k", f16)?,
-        l.get(args.cache_type_v, "cache_type_v", f16)?,
+    let base = crate::config::Layers::from_process()?;
+    let cache_flags = (args.cache_type_k, args.cache_type_v);
+    let start = crate::serve::start_model(
+        &base,
+        args.model.clone(),
+        args.model_name.clone(),
+        args.no_optimize_profile,
+        cache_flags,
     )?;
+    let (model, l) = (start.path, start.layers);
+    let d = golem_engine::config::EngineConfig::default();
+    let (k, v) = l.cache_types(cache_flags)?;
+    let m = ModelFacts::from_gguf_kv(&model, k, v)?;
     let mach = machine(args.vram_gib);
-    let snapshot_ram = match args.snapshot_ram_gib {
-        Some(g) => bytes(Some(g)),
-        None => golem_plan::snapshot_arena(&m, args.parallel, args.ctx).1,
+    let ctx = l.get(args.ctx, "ctx", d.n_ctx)?;
+    let parallel = l.get(args.parallel, "parallel", 1)?;
+    let snapshot_ram = match l.opt(args.snapshot_ram_gib.map(Gib), "snapshot_ram_gib")? {
+        Some(Gib(g)) => bytes(Some(g)),
+        None => golem_plan::snapshot_arena(&m, parallel, ctx).1,
     };
-    let input = PlanInput {
-        ctx: args.ctx,
-        parallel: args.parallel,
-        prefill_ubatch: args.prefill_ubatch.min(args.ctx),
+    let ram_experts = l.opt(args.ram_experts_gib.map(Gib), "ram_experts_gib")?;
+    // `serve` floors to whole GiB, so [0, 1) runs with no pool, which the
+    // assumed prefill stream needs; `Pooled { 0 }` would price the default.
+    if let Some(Gib(g)) = ram_experts
+        && g < 1.0
+    {
+        return Err(format!(
+            "ram_experts_gib {g} (--ram-experts-gib / GOLEM_RAM_EXPERTS_GIB / \
+             golem.toml) floors to 0 GiB: no expert pool, but plan assumes \
+             prefill streaming, which needs one; use >= 1 or leave it unset"
+        )
+        .into());
+    }
+    let mut input = PlanInput {
+        ctx,
+        parallel,
+        prefill_ubatch: l
+            .get(args.prefill_ubatch, "prefill_ubatch", d.prefill_ubatch)?
+            .min(ctx),
         prefill_stream: true,
         vram_experts: bytes(args.vram_experts_gib),
         experts: golem_plan::ExpertResidency::Pooled {
-            ram_experts: bytes(args.ram_experts_gib),
+            ram_experts: bytes(ram_experts.map(|Gib(g)| g.floor())),
         },
         snapshot_ram,
-        vram_reserve: args.vram_reserve_gib.map_or_else(
-            || golem_plan::default_vram_reserve(mach.vram_total),
-            |g| bytes(Some(g)),
-        ),
+        vram_reserve: l
+            .opt(args.vram_reserve_gib.map(Gib), "vram_reserve_gib")?
+            .map_or_else(
+                || golem_plan::default_vram_reserve(mach.vram_total),
+                |Gib(g)| bytes(Some(g)),
+            ),
         victim_ring_slots: l.get(args.victim_ring, "victim_ring_slots", 0)?,
         ws: WS_MEASURED,
     };
-    let r = golem_plan::plan_at_frac(&m, &mach, &input, args.vram_experts_frac);
+    if args.vram_experts_gib.is_none() {
+        let k = l.get(args.device_cache_experts, "device_cache_experts", 0)?;
+        input.vram_experts = crate::serve::device_cache_k_bytes(k, &m, &mach, &input);
+    }
+    let frac = l.get(
+        args.vram_experts_frac,
+        "vram_experts_frac",
+        d.vram_experts_frac,
+    )?;
+    let r = golem_plan::plan_at_frac(&m, &mach, &input, frac);
     let g = governing(&m, &r);
     if args.json {
         println!(
