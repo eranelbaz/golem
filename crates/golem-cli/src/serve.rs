@@ -165,6 +165,16 @@ fn served_models<'a>(
             let path = t.get("path").and_then(toml::Value::as_str).ok_or_else(|| {
                 invalid(format!("{key}.path"), t.to_string(), "missing GGUF path")
             })?;
+            if let Some(k) = ["model", "model_name"]
+                .into_iter()
+                .find(|k| t.contains_key(*k))
+            {
+                return Err(invalid(
+                    format!("{key}.{k}"),
+                    t[k].to_string(),
+                    "not allowed: the table name is the served name, `path` its GGUF",
+                ));
+            }
             let path = crate::config::expand_tilde(PathBuf::from(path), layers.env);
             let mut file = layers.file.clone();
             file.remove("models");
@@ -200,7 +210,8 @@ pub struct StartModel<'a> {
 
 /// The start model (§8.1), shared by `serve` and `plan`: `model` (flag >
 /// env > file) if set; else the `[models.*]` entry named by `model_name`
-/// (flag > env > file); else the first entry.
+/// (the caller's pick; in `golem.toml` it only names `model`); else the
+/// first entry, which `serve` only prices and never preloads (no default).
 pub fn start_model<'a>(
     base: &crate::config::Layers<'a>,
     model: Option<PathBuf>,
@@ -231,7 +242,7 @@ pub fn start_model<'a>(
             if extra.is_empty() {
                 return Err(e);
             }
-            let i = match base.opt(model_name, "model_name")? {
+            let i = match model_name {
                 Some(w) => extra
                     .iter()
                     .position(|(n, _, _)| *n == w)
@@ -409,10 +420,12 @@ pub fn serve(
     ready: impl FnOnce(&str) + Send,
 ) -> Result<(), Box<dyn Error>> {
     let base = crate::config::Layers::from_process()?;
+    // `--model-name` names the `model` path; it never picks a [models.*]
+    // entry, so with only those every request names its model.
     let start = start_model(
         &base,
         args.model.clone(),
-        args.model_name.clone(),
+        None,
         args.engine.no_optimize_profile,
         (args.engine.cache_type_k, args.engine.cache_type_v),
     )?;
@@ -452,9 +465,18 @@ pub fn serve(
             .transpose()?,
     };
     let api_key = layers.opt(args.api_key.clone(), "api_key")?;
-    let model_name = match l.model_name.or(first_name) {
-        Some(n) => n,
-        None => read_metadata(&model)?
+    let preload = first_name.is_none();
+    let model_name = match (first_name, l.model_name) {
+        (Some(_), Some(n)) => {
+            return Err(format!(
+                "model_name `{n}` (--model-name / GOLEM_MODEL_NAME / golem.toml) \
+                 names the `model` path, which is unset; there is no default \
+                 model: requests name a [models.*] entry"
+            )
+            .into());
+        }
+        (Some(n), None) | (None, Some(n)) => n,
+        (None, None) => read_metadata(&model)?
             .kv_str("general.name")
             .map(str::to_owned)
             .unwrap_or_else(|| {
@@ -510,7 +532,7 @@ pub fn serve(
         .opt::<u64>(None, "idle_unload_min")?
         .filter(|m| *m > 0)
         .map(|m| std::time::Duration::from_secs(m * 60));
-    let worker = spawn_worker_models(models, idle_unload, sinks)?;
+    let worker = spawn_worker_models(models, idle_unload, preload, sinks)?;
     tracing::info!(
         device_cache_experts = worker.device_cache_experts,
         "resolved device expert cache K"
@@ -533,8 +555,9 @@ pub fn serve(
     let cfg = ServerConfig {
         host: l.host,
         port: l.port,
-        models: extra.into_iter().map(|(n, _, _)| n).collect(),
-        model_name,
+        models: std::iter::once(model_name)
+            .chain(extra.into_iter().map(|(n, _, _)| n))
+            .collect(),
         api_key,
         drain_grace: golem_server::DRAIN_GRACE,
         reasoning: match l.reasoning {

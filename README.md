@@ -127,12 +127,15 @@ path = "~/models/ds/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-0000
 snapshot_ram_gib = 0   # any engine key here overrides golem.toml for this model
 ```
 
-With `idle_unload_min` set, `serve` starts with nothing loaded
-(`/health` → `idle`), the first request loads its model, and the model is
-unloaded again after that many idle minutes. Without a top-level `model`,
-the `[models.*]` entry named by `model_name` (else the first by name) is the
-default. Each model gets its own `golem optimize` profile. Several models or
-idle unload need `parallel = 1` and no `timing_csv`/`routing_trace`, and all
+There is no default model: every request must name a served one, and a
+missing or unknown `model` is refused with the served names, loading nothing.
+`model_name` only names the top-level `model` path. `/health` reports the
+loaded model, or `null` when none is. With `idle_unload_min` set, or without
+a top-level `model`, `serve` starts with nothing loaded (`/health` → `idle`)
+and the first request loads its model (`/health` reports `null` while it
+loads); with `idle_unload_min` the model is unloaded again after that many
+idle minutes. Each model gets its own `golem optimize` profile. Several models, idle
+unload or no top-level `model` need `parallel = 1` and no `timing_csv`/`routing_trace`, and all
 models must agree on setting `ram_experts_gib`/`cpu_moe_layers`. Engine
 flags and `GOLEM_*` env apply to every model and beat per-model keys.
 

@@ -20,10 +20,10 @@ const GIB: f64 = (1u64 << 30) as f64;
 pub struct PlanArgs {
     /// Path to the GGUF model file (first shard of a split); else
     /// `GOLEM_MODEL`, else `model` in `golem.toml`, else the `[models.*]`
-    /// entry named by `--model-name` (as `serve`).
+    /// entry named by `--model-name`.
     pub model: Option<PathBuf>,
     /// `[models.<NAME>]` entry of `golem.toml` to plan when no `model` is
-    /// set; flag > `GOLEM_MODEL_NAME` > `model_name` > the first entry.
+    /// set; flag > `GOLEM_MODEL_NAME` > the first entry.
     #[arg(long, value_name = "NAME")]
     pub model_name: Option<String>,
     /// Context length per sequence; resolved like `serve --ctx` (flag > env >
@@ -171,7 +171,9 @@ pub fn plan(args: &PlanArgs) -> Result<i32, Box<dyn Error>> {
     let start = crate::serve::start_model(
         &base,
         args.model.clone(),
-        args.model_name.clone(),
+        args.model_name
+            .clone()
+            .or_else(|| (base.env)("GOLEM_MODEL_NAME")),
         args.no_optimize_profile,
         cache_flags,
     )?;
