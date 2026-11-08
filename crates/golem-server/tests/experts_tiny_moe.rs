@@ -56,6 +56,7 @@ async fn experts_lists_decode_tiers_then_prefill_then_idle() {
             vec![("tiny-moe".into(), cfg)],
             Some(Duration::from_millis(500)),
             true,
+            false,
             TurnSinks::default(),
         )
     })

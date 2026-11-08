@@ -26,6 +26,7 @@ async fn app(idle: Option<Duration>) -> (axum::Router, golem_server::WorkerHandl
             ],
             idle,
             true,
+            false,
             TurnSinks::default(),
         )
     })
@@ -159,6 +160,7 @@ async fn idle_unload_serves_parallel_2_and_unloads_when_all_slots_free() {
             )],
             Some(Duration::from_millis(300)),
             true,
+            false,
             TurnSinks::default(),
         )
     })
@@ -185,22 +187,91 @@ async fn idle_unload_serves_parallel_2_and_unloads_when_all_slots_free() {
     assert_eq!((s, b["model"].as_str()), (200, Some("tiny-moe")), "{b}");
 }
 
-#[test]
-fn several_models_refuse_parallel_2() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_2_models_hold_swap_job_until_slots_drain() {
     let two = EngineConfig {
         parallel: 2,
         ..test_engine_config()
     };
-    let e = spawn_worker_models(
-        vec![("a".into(), two.clone()), ("b".into(), two)],
-        None,
-        true,
-        TurnSinks::default(),
-    )
-    .err()
-    .expect("refused");
-    assert!(
-        e.to_string().contains("several models need parallel 1"),
-        "{e}"
+    let hybrid = EngineConfig {
+        model_path: xtask::tiny_hybrid::cached_fixture(),
+        n_ctx: 4096,
+        parallel: 2,
+        ..Default::default()
+    };
+    let w = tokio::task::spawn_blocking(move || {
+        spawn_worker_models(
+            vec![("tiny-moe".into(), two), ("tiny-hybrid".into(), hybrid)],
+            None,
+            true,
+            false,
+            TurnSinks::default(),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("several models accept parallel 2");
+    let app = router(AppState {
+        cfg: Arc::new(ServerConfig {
+            models: vec!["tiny-moe".into(), "tiny-hybrid".into()],
+            ..test_server_config()
+        }),
+        jobs: w.jobs.clone(),
+        health: w.health.clone(),
+    });
+    let (a, b, c) = tokio::join!(
+        ask(&app, "tiny-moe"),
+        ask(&app, "tiny-hybrid"),
+        ask(&app, "tiny-moe")
+    );
+    for (s, b, m) in [
+        (a.0, a.1, "tiny-moe"),
+        (b.0, b.1, "tiny-hybrid"),
+        (c.0, c.1, "tiny-moe"),
+    ] {
+        assert_eq!((s, b["model"].as_str()), (200, Some(m)), "{b}");
+    }
+    assert!(!w.health.pending());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coresident_models_stay_loaded_across_switches() {
+    let hybrid = EngineConfig {
+        model_path: xtask::tiny_hybrid::cached_fixture(),
+        n_ctx: 4096,
+        ..Default::default()
+    };
+    let base = golem_engine::p3_glue::live_sessions();
+    let w = tokio::task::spawn_blocking(move || {
+        spawn_worker_models(
+            vec![
+                ("tiny-moe".into(), test_engine_config()),
+                ("tiny-hybrid".into(), hybrid),
+            ],
+            None,
+            true,
+            true,
+            TurnSinks::default(),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("worker starts");
+    let app = router(AppState {
+        cfg: Arc::new(ServerConfig {
+            models: vec!["tiny-moe".into(), "tiny-hybrid".into()],
+            ..test_server_config()
+        }),
+        jobs: w.jobs.clone(),
+        health: w.health.clone(),
+    });
+    for m in ["tiny-moe", "tiny-hybrid", "tiny-moe", "tiny-hybrid"] {
+        let (s, b) = ask(&app, m).await;
+        assert_eq!((s, b["model"].as_str()), (200, Some(m)), "{b}");
+    }
+    assert_eq!(
+        golem_engine::p3_glue::live_sessions(),
+        base + 2,
+        "both stay resident"
     );
 }

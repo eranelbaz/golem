@@ -135,8 +135,10 @@ a top-level `model`, `serve` starts with nothing loaded (`/health` → `idle`)
 and the first request loads its model (`/health` reports `null` while it
 loads); with `idle_unload_min` the model is unloaded again after that many
 idle minutes (only with every slot free and nothing queued, so any `parallel`
-works). Each model gets its own `golem optimize` profile. Several models need
-`parallel = 1`; several models, idle unload or no top-level `model` need no
+works).
+With `coresident = true` (top level) the models stay loaded together and a switch costs no load; it is refused with `ram_experts_gib`/`cpu_moe_layers` (one pooled session per process), and a failed load drops the others and retries once. Each model gets its own `golem optimize` profile. `parallel` applies to every model; a request for another
+model waits (strict arrival order) until the running turns finish, then the
+model swaps; several models, idle unload or no top-level `model` need no
 `timing_csv`/`routing_trace`, and all models must agree on setting `ram_experts_gib`/`cpu_moe_layers`. Engine
 flags and `GOLEM_*` env apply to every model and beat per-model keys.
 
