@@ -90,6 +90,41 @@ fn ctx_lifecycle_roundtrip() {
 }
 
 #[test]
+fn layer_resident_is_zero_in_range_and_refused_outside() {
+    let ctx = golem_llama_sys::GolemCtx::create(2, 8).expect("ctx create");
+    // SAFETY: FFI queries with a live ctx, then the documented NULL refusal.
+    unsafe {
+        assert_eq!(golem_device_cache_layer_resident(ctx.as_ptr(), 0), 0);
+        assert_eq!(golem_device_cache_layer_resident(ctx.as_ptr(), 1), 0);
+        assert_eq!(golem_device_cache_layer_resident(ctx.as_ptr(), 2), -1);
+        assert_eq!(golem_device_cache_layer_resident(ctx.as_ptr(), -1), -1);
+        golem_reset_device_cache(ctx.as_ptr());
+        assert_eq!(golem_device_cache_layer_resident(ctx.as_ptr(), 1), 0);
+        assert_eq!(
+            golem_device_cache_layer_resident(std::ptr::null_mut(), 0),
+            -1
+        );
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn slot_valid_is_zero_unassigned_and_refused_outside() {
+    let ctx = golem_llama_sys::GolemCtx::create(2, 8).expect("ctx create");
+    // SAFETY: FFI test-seam queries with a live ctx, then the NULL refusal.
+    unsafe {
+        assert_eq!(golem_device_cache_slot_valid(ctx.as_ptr(), 1, 7), 0);
+        assert_eq!(golem_device_cache_slot_valid(ctx.as_ptr(), 1, 8), -1);
+        assert_eq!(golem_device_cache_slot_valid(ctx.as_ptr(), 2, 0), -1);
+        assert_eq!(golem_device_cache_slot_valid(ctx.as_ptr(), 0, -1), -1);
+        assert_eq!(
+            golem_device_cache_slot_valid(std::ptr::null_mut(), 0, 0),
+            -1
+        );
+    }
+}
+
+#[test]
 fn hooked_guard_unregisters_and_recovers_payload() {
     extern "C" fn nop(
         _payload: *mut std::ffi::c_void,

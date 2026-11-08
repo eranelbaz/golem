@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use golem_api::chat::{FunctionCall, ToolCall};
 use golem_api::{ChatCompletionRequest, ErrorCode, ErrorEnvelope, MessageContent};
 use golem_engine::config::EngineConfig;
+use golem_engine::p3_glue::ExpertTierView;
 use golem_engine::{
     ChatTurn, EngineError, FinishReason, OutputParser, SamplingParams, Scheduler, Session,
     SlotEvent, SlotJob, TurnOutcome,
@@ -158,6 +159,9 @@ pub struct HealthState {
     /// Drain grace over: admitted and queued jobs are cancelled. Set before
     /// the published flags are swept; Draining alone refuses only new HTTP.
     cancelling: AtomicBool,
+    /// The loaded model's expert tier table (§8.1 `/v1/golem/experts`);
+    /// `None` when nothing is loaded or the worker exited.
+    pub(crate) experts: Mutex<Option<ExpertTierView>>,
     #[cfg(any(test, feature = "test-support"))]
     hooks: TestHooks,
 }
@@ -175,9 +179,24 @@ impl HealthState {
             last_progress: AtomicU64::new(0),
             in_flight: Mutex::new(Vec::new()),
             cancelling: AtomicBool::new(false),
+            experts: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             hooks: TestHooks::default(),
         }
+    }
+
+    /// Publishes (or, with `None`, clears) the loaded model's tier view,
+    /// named as served.
+    fn set_experts(&self, sch: Option<(&mut Scheduler, &str)>) {
+        let view = sch.and_then(|(s, name)| {
+            let mut v = s.session().expert_tier_view()?;
+            // A single unnamed model keeps the session's file stem.
+            if !name.is_empty() {
+                v.model = name.to_owned();
+            }
+            Some(v)
+        });
+        *self.experts.lock().unwrap_or_else(|p| p.into_inner()) = view;
     }
 
     /// Current state.
@@ -494,11 +513,13 @@ fn spawn(
                 match loaded {
                     Ok(mut s) => {
                         h.loaded.store(0, Ordering::SeqCst);
+                        h.set_experts(Some((&mut s, names[0])));
                         h.set(ServeState::Healthy);
                         let _ = loaded_tx.send(Ok(s.session().device_cache_experts()));
                         cur = Some((0, s));
                     }
                     Err(e) => {
+                        h.set_experts(None);
                         h.set(ServeState::Fatal);
                         let _ = loaded_tx.send(Err(e));
                         return;
@@ -540,16 +561,20 @@ fn spawn(
                     // Graceful only (jobs channel closed after the drain): a
                     // fatal exit's policy state is not trusted.
                     Exit::Graceful => {
+                        h.set_experts(None);
                         save_warm_state(sch);
                         return;
                     }
                     Exit::Fatal => {
                         h.loaded.store(usize::MAX, Ordering::SeqCst);
+                        h.set_experts(None);
                         return;
                     }
                     exit => {
                         save_warm_state(sch);
-                        // Dropped before any next load: two never fit.
+                        // Dropped before any next load: two never fit; the
+                        // endpoint must not report the dropped model.
+                        h.set_experts(None);
                         cur = None;
                         h.loaded.store(usize::MAX, Ordering::SeqCst);
                         // `/health` tiers and `/metrics` must not report the
@@ -652,12 +677,14 @@ fn load_for(
     tracing::info!("loading model `{}`", models[next].0);
     match Session::new(&models[next].1).and_then(Scheduler::new) {
         // A drain begun mid-load: `admit` refuses the job, `run` then exits.
-        Ok(s) => {
+        Ok(mut s) => {
             h.loaded.store(next, Ordering::SeqCst);
+            h.set_experts(Some((&mut s, &models[next].0)));
             h.swap_state(ServeState::Healthy);
             Some(s)
         }
         Err(e) => {
+            h.set_experts(None);
             tracing::error!("loading `{}`: {e}", models[next].0);
             h.queued.fetch_sub(1, Ordering::SeqCst);
             let _ = job.events.try_send(Event::Failed(ErrorEnvelope::new(

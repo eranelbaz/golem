@@ -8,8 +8,8 @@
 use golem_placement::pool::primitives::arc_dyn;
 use golem_placement::pool::primitives::{self, Arc};
 use golem_placement::pool::{
-    Arena, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, PoolError, PoolGeometry, SlotClass,
-    SnapshotHandle, StepClaims, UnitLayout,
+    Arena, DownJobRunner, ExpertKind, ExpertPool, P3Stats, PolicySnapshot, PoolError, PoolGeometry,
+    SlotClass, SnapshotHandle, StepClaims, UnitLayout,
 };
 
 use golem_placement::pool::primitives::Ordering;
@@ -386,4 +386,123 @@ fn t6_resident_take_and_release_race_a_demand_claim() {
 fn _lease_batch_is_send() {
     fn send<T: Send>() {}
     send::<golem_placement::pool::LeaseBatch>();
+}
+
+/// 2 unit slots over 2 experts of one layer, role-major page-in with a
+/// one-unit split cap.
+fn role_major_pool(
+    source: std::sync::Arc<dyn golem_placement::pool::ExpertSource>,
+) -> Arc<ExpertPool> {
+    let plane = 8u64;
+    let arena = Arena::new(&[SlotClass {
+        slot_size: 3 * plane as usize,
+        slots: 2,
+    }])
+    .unwrap();
+    ExpertPool::try_new_role_major(
+        arena,
+        arc_dyn(source),
+        Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+        Arc::new(P3Stats::new()),
+        PoolGeometry {
+            layers: vec![UnitLayout::new([plane; 3], [None; 3]).unwrap()],
+            n_experts: 2,
+            expert_bytes: 0,
+        },
+        vec![0],
+        1,
+    )
+    .unwrap()
+}
+
+/// Role-major page-in (§3.4 P3), one job: the decode thread splits unit 1
+/// (gate handed out, down queued), the reader body runs that single job on
+/// its own thread, a concurrent claimer on the same key gets `Busy` or parks
+/// on the fill gate, and the decode thread joins before releasing. Every
+/// interleaving: the claimer never reads a half-written unit, the unit ends
+/// resident in one slot, and no lease leaks.
+#[test]
+fn t6_role_major_down_join_vs_concurrent_claim() {
+    primitives::model(|| {
+        let pool = role_major_pool(std::sync::Arc::new(ProvenanceSource));
+        let runner = DownJobRunner::attach(&pool).unwrap();
+        let mut out = [std::ptr::null()];
+        pool.ensure_batch(0, &[(ExpertKind::Gate, 1)], &mut out)
+            .unwrap();
+        assert_eq!(pool.stats.split_units.load(Ordering::Relaxed), 1);
+        let reader = primitives::spawn(move || assert!(runner.run_one()));
+        let p = pool.clone();
+        let claimer = primitives::spawn(move || {
+            let mut copy = |down: &[u8]| {
+                assert!(
+                    down.iter().all(|&b| b == plane_byte(ExpertKind::Down, 1)),
+                    "claimer read a down plane still being written"
+                );
+            };
+            match p.ensure_range(false, 0, ExpertKind::Down, 1, 1, &mut copy) {
+                Ok(()) | Err(PoolError::Busy) => {}
+                Err(e) => panic!("unexpected pool error: {e}"),
+            }
+        });
+        pool.join_split().unwrap();
+        pool.end_batch_step();
+        reader.join().unwrap();
+        claimer.join().unwrap();
+        assert!(pool.is_resident(0, 1));
+        assert_eq!(pool.outstanding_leases(0, 1), 0, "lease leaked");
+    });
+}
+
+/// [`ProvenanceSource`] whose down-plane reads fail.
+struct DownFailSource;
+
+impl golem_placement::pool::ExpertSource for DownFailSource {
+    fn read_expert(
+        &self,
+        layer: u32,
+        kind: ExpertKind,
+        expert: u32,
+        into: &mut [u8],
+        head: usize,
+    ) -> io::Result<()> {
+        if kind == ExpertKind::Down {
+            return Err(io::Error::other("down read failed"));
+        }
+        ProvenanceSource.read_expert(layer, kind, expert, into, head)
+    }
+
+    fn plane(&self, _layer: u32, _kind: ExpertKind, _expert: u32) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+/// Role-major page-in (§3.4 P3), failing down read: the decode thread
+/// splits unit 1, the reader's down read fails, and a concurrent prefetch
+/// claim on the key gets `Busy`, parks on the fill gate, or (after the
+/// cancel) fills the unit itself and hits the same failure. The decode
+/// thread's idle settle poisons and cancels the claim, which wakes the
+/// parked claimer. Every interleaving: the claimer returns, the key ends
+/// non-resident and no lease leaks.
+#[test]
+fn t6_role_major_failed_down_settle_wakes_claimer() {
+    primitives::model(|| {
+        let pool = role_major_pool(std::sync::Arc::new(DownFailSource));
+        let runner = DownJobRunner::attach(&pool).unwrap();
+        let mut out = [std::ptr::null()];
+        pool.ensure_batch(0, &[(ExpertKind::Gate, 1)], &mut out)
+            .unwrap();
+        let reader = primitives::spawn(move || assert!(runner.run_one()));
+        let p = pool.clone();
+        let claimer = primitives::spawn(move || match p.ensure_unit(false, 0, 1) {
+            Err(PoolError::Busy | PoolError::Source { .. }) => {}
+            other => panic!("claim on a failed unit: {other:?}"),
+        });
+        reader.join().unwrap();
+        pool.settle_split().unwrap();
+        claimer.join().unwrap();
+        pool.end_batch_step();
+        assert!(!pool.is_resident(0, 1), "no ghost residency");
+        assert_eq!(pool.outstanding_leases(0, 1), 0, "lease leaked");
+        assert_eq!(pool.fill(), 0.0, "slot back on the free list");
+    });
 }

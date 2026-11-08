@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use super::primitives::{AtomicU64, Condvar, Mutex};
+use super::primitives::{AtomicU32, AtomicU64, Condvar, Mutex, Ordering};
 
 // One expert-name matcher shared by C and Rust semantics (design §6.6; the C
 // side mirrors the rule in golem_expert_stem_kind).
@@ -131,6 +131,9 @@ struct Shard {
 struct ShardLock {
     shard: Mutex<Shard>,
     fill_cv: Condvar,
+    /// Popcount of `shard.bits` (claimed keys, mid-fill included). Written
+    /// only under `shard` on every residency-bit flip; read lock-free.
+    resident: AtomicU32,
 }
 
 /// A class's wake channel for `claim_for`'s no-victim park: a generation
@@ -288,6 +291,83 @@ impl FillClaim<'_> {
         self.settled = true;
         self.map.cancel_claim(self.layer, self.expert);
     }
+
+    /// The same claim as an owned token that outlives the `&ResidencyMap`
+    /// borrow (a fill settled by a later call). `map` must be the map that
+    /// granted the claim.
+    pub(crate) fn into_owned(
+        mut self,
+        map: super::primitives::Arc<ResidencyMap>,
+    ) -> OwnedFillClaim {
+        debug_assert!(std::ptr::eq(self.map, &*map), "claim of another map");
+        self.settled = true;
+        OwnedFillClaim {
+            map,
+            layer: self.layer,
+            expert: self.expert,
+            slot: self.slot,
+            settled: false,
+        }
+    }
+}
+
+/// [`FillClaim`] holding its map by `Arc`: identical finish/cancel/drop
+/// semantics (dropping it unsettled cancels), so a fill whose last plane
+/// lands after the granting call returns still owns the key's only lease
+/// and keeps the fill gate closed until it settles.
+pub(crate) struct OwnedFillClaim {
+    map: super::primitives::Arc<ResidencyMap>,
+    layer: u32,
+    expert: u32,
+    slot: u32,
+    settled: bool,
+}
+
+impl OwnedFillClaim {
+    /// The slot this claim exclusively fills.
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    /// The claimed expert.
+    pub(crate) fn expert(&self) -> u32 {
+        self.expert
+    }
+
+    /// The claimed layer.
+    pub(crate) fn layer(&self) -> u32 {
+        self.layer
+    }
+
+    /// See [`FillClaim::finish`].
+    pub(crate) fn finish(mut self) {
+        self.settled = true;
+        self.map.finish_fill(self.layer, self.expert);
+    }
+
+    /// See [`FillClaim::cancel`].
+    pub(crate) fn cancel(mut self) {
+        self.settled = true;
+        self.map.cancel_claim(self.layer, self.expert);
+    }
+}
+
+impl Drop for OwnedFillClaim {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.map.cancel_claim(self.layer, self.expert);
+        }
+    }
+}
+
+impl fmt::Debug for OwnedFillClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedFillClaim")
+            .field("layer", &self.layer)
+            .field("expert", &self.expert)
+            .field("slot", &self.slot)
+            .finish()
+    }
 }
 
 impl Drop for FillClaim<'_> {
@@ -381,6 +461,7 @@ impl ResidencyMap {
                     protected: vec![0; filling_words],
                 }),
                 fill_cv: Condvar::new(),
+                resident: AtomicU32::new(0),
             })
             .collect();
         // pop() allocates each class's lowest slot first.
@@ -445,6 +526,13 @@ impl ResidencyMap {
     pub fn is_resident(&self, layer: u32, expert: u32) -> bool {
         let sh = self.shards[layer as usize].shard.lock().unwrap();
         Self::bit_test(&sh.bits, self.local(expert))
+    }
+
+    /// Claimed keys of `layer` (filled or mid-fill), lock-free: the
+    /// counter moves with every residency-bit flip under the shard lock, so
+    /// a read between flips equals Σ`is_resident` over the layer's experts.
+    pub fn resident_count(&self, layer: u32) -> u32 {
+        self.shards[layer as usize].resident.load(Ordering::Relaxed)
     }
 
     /// Claims a key under ONE shard-lock critical section (§6.6):
@@ -622,6 +710,9 @@ impl ResidencyMap {
             Self::bit_set(&mut sh.filling, i);
             sh.slot_of[i] = slot as i32;
             Self::bit_set(&mut sh.bits, i);
+            self.shards[layer as usize]
+                .resident
+                .fetch_add(1, Ordering::Relaxed);
             if demand {
                 Self::bit_clear(&mut sh.prefetched, i);
             } else {
@@ -724,6 +815,7 @@ impl ResidencyMap {
             }
             let slot = sh.slot_of[c] as u32;
             Self::bit_clear(&mut sh.bits, c);
+            self.shards[li].resident.fetch_sub(1, Ordering::Relaxed);
             sh.slot_of[c] = -1;
             let prefetched = Self::bit_test(&sh.prefetched, c);
             Self::bit_clear(&mut sh.prefetched, c);
@@ -941,6 +1033,7 @@ impl ResidencyMap {
             sh.leases[i] = sh.leases[i].saturating_sub(1);
             debug_assert_eq!(sh.leases[i], 0, "cancel_claim holds the only lease");
             Self::bit_clear(&mut sh.bits, i);
+            self.shards[li].resident.fetch_sub(1, Ordering::Relaxed);
             Self::bit_clear(&mut sh.prefetched, i);
             let s = sh.slot_of[i];
             sh.slot_of[i] = -1;
@@ -979,6 +1072,7 @@ impl ResidencyMap {
                 return false;
             }
             Self::bit_clear(&mut sh.bits, i);
+            self.shards[li].resident.fetch_sub(1, Ordering::Relaxed);
             Self::bit_clear(&mut sh.ref_bits, i);
             Self::bit_clear(&mut sh.prefetched, i);
             sh.slot_of[i] = -1;
@@ -1056,6 +1150,7 @@ impl ResidencyMap {
             );
             Self::bit_clear(&mut sh.filling, i);
             Self::bit_clear(&mut sh.bits, i);
+            self.shards[li].resident.fetch_sub(1, Ordering::Relaxed);
             Self::bit_clear(&mut sh.prefetched, i);
             let s = sh.slot_of[i];
             sh.slot_of[i] = -1;
@@ -1115,6 +1210,9 @@ pub struct P3Stats {
     /// Policy-snapshot mutex reads: once per compute on the decode path,
     /// once per call on `ensure_range`/`ensure_unit`.
     pub snapshot_reads: AtomicU64,
+    /// Units paged in role-major: gate/up handed to the caller before the
+    /// down plane landed (one per split unit).
+    pub split_units: AtomicU64,
 }
 
 impl P3Stats {

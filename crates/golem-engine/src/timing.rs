@@ -142,6 +142,10 @@ pub struct TimingRecorder {
     cap: usize,
     /// Rows rejected because the fixed capacity was full; reported by flush.
     dropped: usize,
+    /// The turn's prefill `(wall ms, tokens prefilled)`, written by flush as
+    /// a trailer. A replay prefill overwrites it; with `parallel > 1` only
+    /// slot 0 records it.
+    prefill: Option<(f64, u32)>,
 }
 
 /// Renders one ms column: NaN → `unmeasured`, else one decimal place.
@@ -160,7 +164,16 @@ impl TimingRecorder {
             rows: Vec::with_capacity(cap),
             cap,
             dropped: 0,
+            prefill: None,
         }
+    }
+
+    /// Records the turn's prefill: wall ms from the first chunk's start to
+    /// the last chunk's end, and the tokens actually prefilled (prompt minus
+    /// any restored prefix). Must be set after the turn-start flush, which
+    /// clears it.
+    pub fn set_prefill(&mut self, ms: f64, prompt_tokens: u32) {
+        self.prefill = Some((ms, prompt_tokens));
     }
 
     /// Writes the two header lines: a `#`-comment carrying the engine
@@ -264,6 +277,9 @@ impl TimingRecorder {
         }
         if self.dropped > 0 {
             writeln!(w, "# dropped_rows={}", self.dropped)?;
+        }
+        if let Some((pms, n)) = self.prefill.take() {
+            writeln!(w, "# prefill_ms={pms:.1} prompt_tokens={n}")?;
         }
         self.rows.clear();
         self.dropped = 0;
@@ -385,6 +401,25 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("# dropped_rows=2"), "{s}");
         // The counter resets with the rows for the next turn.
+        let mut out = Vec::new();
+        rec.flush(&mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().is_empty());
+    }
+
+    /// The prefill trailer follows `# dropped_rows` and is cleared by flush.
+    #[test]
+    fn prefill_trailer_after_dropped_rows_and_cleared() {
+        let mut rec = TimingRecorder::new(1);
+        rec.row(row(0, 1.0, 0.0));
+        rec.row(row(1, 1.0, 0.0));
+        rec.set_prefill(12.34, 17);
+        let mut out = Vec::new();
+        rec.flush(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[1], "# dropped_rows=1", "{s}");
+        assert_eq!(lines[2], "# prefill_ms=12.3 prompt_tokens=17", "{s}");
+        assert_eq!(lines.len(), 3, "{s}");
         let mut out = Vec::new();
         rec.flush(&mut out).unwrap();
         assert!(String::from_utf8(out).unwrap().is_empty());

@@ -35,8 +35,9 @@ pub struct MetricsSnapshot {
     pub victim_ring_full: Option<u64>,
     /// Eviction planes copied through the victim ring (§6.3 O10).
     pub victim_ring_units: Option<u64>,
-    /// P3: demand page-ins, fast hits, evictions, bytes paged, source errors.
-    pub p3: Option<[u64; 5]>,
+    /// P3: demand page-ins, fast hits, evictions, bytes paged, source errors,
+    /// role-major split units (§3.4).
+    pub p3: Option<[u64; 6]>,
     /// §6.5: prefetch page-ins, hits, wasted bytes, demand stand-downs.
     pub prefetch: Option<(u64, u64, u64, u64)>,
     /// §7.1 snapshot cache: hits, misses, restore failures, evictions,
@@ -80,6 +81,7 @@ impl MetricsSnapshot {
                 p.evictions.load(Ordering::Relaxed),
                 p.bytes_paged.load(Ordering::Relaxed),
                 p.source_errors.load(Ordering::Relaxed),
+                p.split_units.load(Ordering::Relaxed),
             ]
         });
         self.prefetch = s.prefetch_stats().map(|p| {
@@ -268,7 +270,7 @@ pub(crate) fn render(h: &HealthState) -> String {
             units as f64,
         );
     }
-    if let Some([demand, fast, ev, paged, errs]) = m.p3 {
+    if let Some([demand, fast, ev, paged, errs, split]) = m.p3 {
         g(
             "golem_pool_demand_pageins_total",
             "counter",
@@ -298,6 +300,12 @@ pub(crate) fn render(h: &HealthState) -> String {
             "counter",
             "P3 source read failures",
             errs as f64,
+        );
+        g(
+            "golem_pool_split_units_total",
+            "counter",
+            "Units paged in role-major (gate/up handed out before down landed)",
+            split as f64,
         );
     }
     if let Some((pageins, hits, wasted, standdowns)) = m.prefetch {
@@ -530,5 +538,18 @@ mod tests {
         );
         h.metrics.lock().unwrap().stream = None;
         assert!(!render(&h).contains("golem_stream_"));
+    }
+
+    #[test]
+    fn pool_counters_render_split_units() {
+        let h = HealthState::new();
+        h.metrics.lock().unwrap().p3 = Some([1, 2, 3, 4, 5, 6]);
+        let body = render(&h);
+        for line in [
+            "golem_pool_source_errors_total 5\n",
+            "golem_pool_split_units_total 6\n",
+        ] {
+            assert!(body.contains(line), "{line}: {body}");
+        }
     }
 }

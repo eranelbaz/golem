@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -128,6 +129,11 @@ struct golem_ctx {
     std::mutex dc_mutex;
     std::unordered_map<const void *, golem::GolemSlabEntry> dc;
     std::unordered_map<int, golem::GolemLayerSlots> layers;
+    // Per-blk count of slots whose three planes are all valid, stored after
+    // each slab step and zeroed with `layers`; read lock-free by
+    // golem_device_cache_layer_resident. Sized once at construction.
+    const int32_t n_blk;
+    std::unique_ptr<std::atomic<int32_t>[]> slab_assigned;
 
     // --- per-(blk, kind) triple-buffered eviction orders ---
     // Publisher (off the decode thread) fills a FREE slot and swaps it in
@@ -304,12 +310,37 @@ struct golem_ctx {
     }
 
     golem_ctx(int32_t n_layers, int32_t n_experts_)
-        : orders((size_t) (n_layers > 0 ? n_layers : 1) * 3), n_experts(n_experts_) {
+        : n_blk(n_layers > 0 ? n_layers : 0), slab_assigned(new std::atomic<int32_t>[n_layers > 0 ? n_layers : 1]),
+          orders((size_t) (n_layers > 0 ? n_layers : 1) * 3), n_experts(n_experts_) {
+        for (int32_t b = 0; b < n_blk; ++b) {
+            slab_assigned[b].store(0, std::memory_order_relaxed);
+        }
         for (auto &e : orders) {
             for (auto &s : e.slots) {
                 s.buf.resize(n_experts);
             }
         }
+    }
+
+    // Slots of L with valid[0..3] all set; caller holds the lock that guards L.
+    // Cost: next_free <= K + 1 slots x 3 bit tests per (blk, kind) slab step;
+    // GLM: 42 blks x 3 kinds x K <= 288 slots x 3 tests per step.
+    void store_slab_assigned(int32_t blk, const golem::GolemLayerSlots &L) {
+        if (blk < 0 || blk >= n_blk) {
+            return;
+        }
+        int32_t n = 0;
+        for (int32_t s = 0; s < L.next_free; ++s) {
+            bool all = true;
+            for (int k = 0; k < 3; ++k) {
+                if (L.valid[k].empty() || !ggml_bitset_get(L.valid[k].data(), s)) {
+                    all = false;
+                    break;
+                }
+            }
+            n += all ? 1 : 0;
+        }
+        slab_assigned[blk].store(n, std::memory_order_relaxed);
     }
 
     order_entry *order_at(int32_t blk, int32_t kind) {

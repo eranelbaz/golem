@@ -10,6 +10,9 @@
 use std::io;
 use std::num::NonZeroUsize;
 
+use super::primitives::Arc;
+use super::residency::OwnedFillClaim;
+
 /// One run of equal slots inside the arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotClass {
@@ -265,6 +268,59 @@ impl Arena {
         unsafe { std::slice::from_raw_parts_mut(self.ptr().add(self.offset_of(i)), n) }
     }
 
+    /// Splits a claimed slot at `at` for a role-major page-in (§3.4),
+    /// consuming the claim: the head (gate/up regions) stays with the
+    /// returned [`SplitClaim`], the tail (down region) goes to the down
+    /// reader thread as a [`DownWindow`]. The claim can be settled only
+    /// after [`SplitClaim::rejoin`] takes the window back, so no settle can
+    /// recycle the slot while its window lives.
+    ///
+    /// `at <= slot size` is validated once at pool construction
+    /// (`ExpertPool::try_new_role_major`); both bounds are debug-asserted.
+    pub(crate) fn split_down(
+        arena: &Arc<Arena>,
+        claim: OwnedFillClaim,
+        at: usize,
+    ) -> (SplitClaim, DownWindow) {
+        let slot = claim.slot();
+        debug_assert!(slot < arena.slots, "slot {slot} out of range");
+        let n = arena.slot_size_of(slot);
+        debug_assert!(at <= n, "split point {at} leaves slot {slot}");
+        // SAFETY: `slot < slots` and `at <= n` keep `[at, n)` inside the
+        // slot's bytes of the live mapping; the claim (moved into the split
+        // claim) is the slot's only lease and keeps it mid-fill, so nothing
+        // else views these bytes.
+        let ptr = unsafe { arena.ptr().add(arena.offset_of(slot) + at) };
+        let window = DownWindow {
+            ptr,
+            len: n - at,
+            slot,
+            _arena: arena.clone(),
+        };
+        let split = SplitClaim {
+            claim: Some(claim),
+            at,
+            arena: arena.clone(),
+        };
+        (split, window)
+    }
+
+    /// Copies `len` bytes at `ptr` (a plane pointer this arena handed out)
+    /// for test assertions.
+    ///
+    /// # Panics
+    /// Panics when `[ptr, ptr + len)` leaves the mapping.
+    #[cfg(test)]
+    pub(crate) fn bytes_at_for_test(&self, ptr: *const u8, len: usize) -> Vec<u8> {
+        let start = (ptr as usize)
+            .checked_sub(self.base.get())
+            .expect("pointer below the arena");
+        assert!(start + len <= self.len, "range leaves the arena");
+        // SAFETY: the range is inside the live mapping (checked above); test
+        // callers read only planes whose writer finished (joined reads).
+        unsafe { std::slice::from_raw_parts(self.ptr().add(start), len).to_vec() }
+    }
+
     /// Raw pointer `slot_bytes + offset` into one slot. The exclusive-D2H
     /// path (§6.3 O10) hands these to the substrate: the residency claim's
     /// fill gate for the slot's key is closed from claim to commit, which
@@ -328,6 +384,131 @@ impl Arena {
     fn offset_of(&self, i: u32) -> usize {
         let c = &self.classes[self.class_of(i)];
         c.offset + (i - c.first) as usize * c.slot_size
+    }
+}
+
+/// The down-plane region of one slot claimed for a role-major page-in,
+/// written by the down reader thread while the decode thread reads the
+/// slot's gate/up regions through raw pointers (§3.4).
+///
+/// Invariant: built only by [`Arena::split_down`], which moves the claim
+/// into the paired [`SplitClaim`]; that claim keeps the key mid-fill (no
+/// other lease, no `slot`/`slot_mut` view of the slot) and cannot settle
+/// until [`SplitClaim::rejoin`] consumes this window. So the window is its
+/// region's only writer and nothing reads the region while it lives. It
+/// owns an `Arc<Arena>`, so the mapping outlives it.
+pub(crate) struct DownWindow {
+    ptr: *mut u8,
+    len: usize,
+    /// The split slot, checked against the claim at rejoin.
+    slot: u32,
+    _arena: Arc<Arena>,
+}
+
+// SAFETY: the window is a unique handle to a disjoint arena region (see the
+// type invariant); moving it to the reader thread moves that exclusive
+// access with it, and the `Arc<Arena>` it owns is itself `Send`.
+unsafe impl Send for DownWindow {}
+
+impl DownWindow {
+    /// The down region, for the reader's one write.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr..ptr + len` is inside a live mapping (`_arena`), and
+        // by the type invariant this window is the region's only accessor;
+        // the view borrows `self` mutably, so it cannot alias itself.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+/// A role-major fill claim split by [`Arena::split_down`]: owns the claim
+/// (the key's only lease, mid-fill) and the slot's head view, while its
+/// [`DownWindow`] is out. The claim is reachable only through
+/// [`Self::rejoin`], which takes the window back, so reaching the claim
+/// with the window still alive does not compile:
+///
+/// ```compile_fail,E0616
+/// fn settle(split: golem_placement::pool::arena::SplitClaim) {
+///     drop(split.claim);
+/// }
+/// ```
+///
+/// Dropping it without a rejoin leaks the claim (the key stays mid-fill
+/// and its slot off the free list) rather than recycle a slot the window
+/// may still be writing.
+pub struct SplitClaim {
+    claim: Option<OwnedFillClaim>,
+    at: usize,
+    arena: Arc<Arena>,
+}
+
+impl SplitClaim {
+    /// The claimed expert.
+    pub(crate) fn expert(&self) -> u32 {
+        self.claim.as_ref().map_or(u32::MAX, OwnedFillClaim::expert)
+    }
+
+    /// The slot this claim fills.
+    pub(crate) fn slot(&self) -> u32 {
+        self.claim.as_ref().map_or(u32::MAX, OwnedFillClaim::slot)
+    }
+
+    /// The gate/up regions (`[0, at)` of the slot) for the call's read.
+    pub(crate) fn head_mut(&mut self) -> &mut [u8] {
+        let Some(claim) = &self.claim else {
+            return &mut [];
+        };
+        let slot = claim.slot();
+        // SAFETY: `split_down` checked `slot < slots` and `at <= slot size`,
+        // so `[0, at)` is inside the live mapping (`arena`); the owned claim
+        // excludes every other view of the slot, the paired window covers
+        // only `[at, ..)`, and the view borrows `self` mutably.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.arena.ptr().add(self.arena.offset_of(slot)),
+                self.at,
+            )
+        }
+    }
+
+    /// Takes the window back (the reader is done with it: the join proof)
+    /// and returns the claim, now free to settle. `None` when `window` is
+    /// not this claim's: the claim then stays leaked (see the type docs).
+    pub(crate) fn rejoin(mut self, window: DownWindow) -> Option<OwnedFillClaim> {
+        let claim = self.claim.take()?;
+        let ours = window.slot == claim.slot() && std::ptr::eq(&*window._arena, &*self.arena);
+        drop(window);
+        if ours {
+            Some(claim)
+        } else {
+            std::mem::forget(claim);
+            None
+        }
+    }
+}
+
+impl Drop for SplitClaim {
+    fn drop(&mut self) {
+        // Never settle here: the window may still be live.
+        if let Some(claim) = self.claim.take() {
+            std::mem::forget(claim);
+        }
+    }
+}
+
+impl std::fmt::Debug for SplitClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitClaim")
+            .field("claim", &self.claim)
+            .field("at", &self.at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for DownWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownWindow")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
     }
 }
 

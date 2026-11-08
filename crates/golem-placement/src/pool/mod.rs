@@ -23,8 +23,11 @@ mod source;
 mod store_source;
 
 pub use arena::{Arena, SlotClass};
+#[cfg(any(loom, test, feature = "test-support"))]
+pub use pager::DownJobRunner;
 pub use pager::{
-    D2hIncoming, ExpertPool, Lease, LeaseBatch, PoolError, SnapshotHandle, StepClaims,
+    D2hIncoming, DOWN_JOIN_TIMEOUT, DownReaderHandle, ExpertPool, Lease, LeaseBatch, PoolError,
+    SnapshotHandle, StepClaims, spawn_down_reader,
 };
 pub use prefetch::{AccessFeed, PredictionQueue, PrefetchHandle, WarmFeed, spawn_prefetch};
 pub use residency::{ExpertKind, P3Stats, PolicySnapshot, PoolConfigError};

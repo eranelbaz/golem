@@ -510,6 +510,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "golem-gguf",
+ "golem-placement",
  "golem-store",
  "libc",
  "loom",
