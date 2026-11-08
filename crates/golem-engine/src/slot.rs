@@ -469,7 +469,8 @@ impl SlotState {
 }
 
 /// Advances the active slots by exactly one `llama_decode` (the batching
-/// invariant): either (a) every generating slot's next token plus at most one
+/// invariant): either (a) up to `gen_cap` generating slots' next tokens
+/// (round-robin) plus at most one
 /// joiner's prefill chunk below `--prefill-stream-min` (routed-only fill), or
 /// (b) one streamed joiner chunk alone — never a streamed ubatch carrying
 /// decode tokens. (b) runs only when no slot is generating or after
@@ -526,7 +527,31 @@ pub(crate) fn step(
     session.batch_clear();
     let mut n_gen = 0u32;
     if !stream_mode {
-        for (i, s) in slots.iter_mut().enumerate() {
+        // Generating slots past `gen_cap` keep their pending token for a
+        // later step; the cursor rotates so none starves. A routed-only
+        // joiner the full cap would leave no room gets one token of it
+        // (alternate steps at gen_cap 1).
+        let mut gen_cap = session.gen_cap();
+        let joiner_blocked = joiner.is_some_and(|j| match &slots[j].phase {
+            Phase::Prefill(a) => session.next_chunk(&a.ffi, gen_cap.min(n_dec)).0 == 0,
+            _ => false,
+        });
+        if joiner_blocked && n_dec > 0 {
+            if gen_cap > 1 {
+                gen_cap -= 1;
+            } else {
+                session.joiner_turn = !session.joiner_turn;
+                if session.joiner_turn {
+                    gen_cap = 0;
+                }
+            }
+        }
+        let start = session.gen_rr;
+        for i in (0..n).map(|k| (start + k) % n) {
+            if n_gen as usize >= gen_cap {
+                break;
+            }
+            let s = &mut slots[i];
             if !matches!(s.phase, Phase::Decode(_)) {
                 continue;
             }
@@ -540,6 +565,7 @@ pub(crate) fn step(
             s.chunk = 0;
             s.in_batch = true;
             n_gen += 1;
+            session.gen_rr = (i + 1) % n;
         }
     }
     let mut stream: Option<Option<Arc<AtomicBool>>> = None;
@@ -564,6 +590,16 @@ pub(crate) fn step(
     if !slots.iter().any(|s| s.in_batch) {
         return Ok(());
     }
+    debug_assert!(
+        stream_mode
+            || slots
+                .iter()
+                .filter(|s| s.in_batch)
+                .map(|s| s.chunk.max(1))
+                .sum::<usize>()
+                <= session.gen_cap(),
+        "batch routes more tokens than the slab holds"
+    );
 
     let t0 = std::time::Instant::now();
     let step_no = slots
