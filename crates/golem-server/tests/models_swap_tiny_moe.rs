@@ -145,3 +145,62 @@ async fn idle_unload_starts_empty_and_reloads_on_request() {
     let (s, b) = ask(&app, "tiny-moe").await;
     assert_eq!((s, b["model"].as_str()), (200, Some("tiny-moe")), "{b}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_unload_serves_parallel_2_and_unloads_when_all_slots_free() {
+    let w = tokio::task::spawn_blocking(|| {
+        spawn_worker_models(
+            vec![(
+                "tiny-moe".into(),
+                EngineConfig {
+                    parallel: 2,
+                    ..test_engine_config()
+                },
+            )],
+            Some(Duration::from_millis(300)),
+            true,
+            TurnSinks::default(),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("idle unload accepts parallel 2");
+    let app = router(AppState {
+        cfg: Arc::new(ServerConfig {
+            models: vec!["tiny-moe".into()],
+            ..test_server_config()
+        }),
+        jobs: w.jobs.clone(),
+        health: w.health.clone(),
+    });
+    assert_eq!(w.health.get().as_str(), "idle");
+    let (a, b) = tokio::join!(ask(&app, "tiny-moe"), ask(&app, "tiny-moe"));
+    for (s, b) in [a, b] {
+        assert_eq!((s, b["model"].as_str()), (200, Some("tiny-moe")), "{b}");
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(w.health.get().as_str(), "idle", "model not unloaded");
+    assert_eq!(w.health.loaded(), None);
+    let (s, b) = ask(&app, "tiny-moe").await;
+    assert_eq!((s, b["model"].as_str()), (200, Some("tiny-moe")), "{b}");
+}
+
+#[test]
+fn several_models_refuse_parallel_2() {
+    let two = EngineConfig {
+        parallel: 2,
+        ..test_engine_config()
+    };
+    let e = spawn_worker_models(
+        vec![("a".into(), two.clone()), ("b".into(), two)],
+        None,
+        true,
+        TurnSinks::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(
+        e.to_string().contains("several models need parallel 1"),
+        "{e}"
+    );
+}

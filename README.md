@@ -134,9 +134,10 @@ loaded model, or `null` when none is. With `idle_unload_min` set, or without
 a top-level `model`, `serve` starts with nothing loaded (`/health` → `idle`)
 and the first request loads its model (`/health` reports `null` while it
 loads); with `idle_unload_min` the model is unloaded again after that many
-idle minutes. Each model gets its own `golem optimize` profile. Several models, idle
-unload or no top-level `model` need `parallel = 1` and no `timing_csv`/`routing_trace`, and all
-models must agree on setting `ram_experts_gib`/`cpu_moe_layers`. Engine
+idle minutes (only with every slot free and nothing queued, so any `parallel`
+works). Each model gets its own `golem optimize` profile. Several models need
+`parallel = 1`; several models, idle unload or no top-level `model` need no
+`timing_csv`/`routing_trace`, and all models must agree on setting `ram_experts_gib`/`cpu_moe_layers`. Engine
 flags and `GOLEM_*` env apply to every model and beat per-model keys.
 
 Anthropic clients:

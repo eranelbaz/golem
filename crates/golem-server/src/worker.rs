@@ -394,10 +394,13 @@ pub fn spawn_worker(cfg: EngineConfig, sinks: TurnSinks) -> Result<WorkerHandle,
 /// [`spawn_worker`] serving several named models, at most one loaded (§8.1).
 /// A job naming an unloaded model drops the loaded one, loads it, then runs.
 /// `idle_unload` set or `preload` false: nothing loads at start. With
-/// `idle_unload` set the loaded model is dropped after that long with no job. Several models need `parallel` 1 (a
-/// job is dequeued only with the slot idle, so a swap never cuts a turn), no
-/// turn sinks (one per session), and agreeing expert offload (the first load
-/// fixes the process-wide op-offload threshold, `init_backend`).
+/// `idle_unload` set the loaded model is dropped after that long with every
+/// slot free and no job queued, so any `parallel` works. Several models need
+/// `parallel` 1 (a job is dequeued only with the slot idle, so a swap never
+/// cuts a turn). Several models, idle unload or lazy load need no turn sinks
+/// (one per session, header written at preload), and served models must
+/// agree on expert offload (the first load fixes the process-wide
+/// op-offload threshold, `init_backend`).
 pub fn spawn_worker_models(
     models: Vec<(String, EngineConfig)>,
     idle_unload: Option<Duration>,
@@ -407,14 +410,15 @@ pub fn spawn_worker_models(
     let Some((_, first)) = models.first() else {
         return Err(EngineError::InvalidConfig("no model to serve".into()));
     };
-    let lazy = models.len() > 1 || idle_unload.is_some() || !preload;
-    if lazy
-        && (models.iter().any(|(_, c)| c.parallel != 1)
-            || sinks.timing.is_some()
-            || sinks.trace.is_some())
-    {
+    if models.len() > 1 && models.iter().any(|(_, c)| c.parallel != 1) {
         return Err(EngineError::InvalidConfig(
-            "several models, idle unload or no top-level `model` need parallel 1 and no \
+            "several models need parallel 1".into(),
+        ));
+    }
+    let lazy = models.len() > 1 || idle_unload.is_some() || !preload;
+    if lazy && (sinks.timing.is_some() || sinks.trace.is_some()) {
+        return Err(EngineError::InvalidConfig(
+            "several models, idle unload or no top-level `model` need no \
              timing_csv/routing_trace"
                 .into(),
         ));
@@ -540,7 +544,7 @@ fn spawn(
                         let _ = job.events.try_send(Event::Failed(draining()));
                         continue;
                     }
-                    if let Some(s) = load_for(&models, next, &job, &h) {
+                    if let Some(s) = load_for(&models, next, &job, &rx, &h) {
                         cur = Some((next, s));
                         first = Some(job);
                     }
@@ -588,7 +592,7 @@ fn spawn(
                         }
                         if let Some(job) = first.take() {
                             let next = model_index(&names, &job);
-                            if let Some(s) = load_for(&models, next, &job, &h) {
+                            if let Some(s) = load_for(&models, next, &job, &rx, &h) {
                                 cur = Some((next, s));
                                 first = Some(job);
                             }
@@ -665,12 +669,14 @@ fn model_index(names: &[&str], job: &Job) -> usize {
     names.iter().position(|n| *n == job.req.model).unwrap_or(0)
 }
 
-/// Loads `models[next]` for `job`; on failure answers it (it leaves the
-/// queue) and stays `idle`.
+/// Loads `models[next]` for `job`; on failure answers it and every job
+/// already queued behind it (they leave the queue, so `parallel` > 1 never
+/// retries a minutes-long failing load per job) and stays `idle`.
 fn load_for(
     models: &[(String, EngineConfig)],
     next: usize,
     job: &Job,
+    rx: &Receiver<Job>,
     h: &HealthState,
 ) -> Option<Scheduler> {
     h.swap_state(ServeState::Loading);
@@ -686,11 +692,16 @@ fn load_for(
         Err(e) => {
             h.set_experts(None);
             tracing::error!("loading `{}`: {e}", models[next].0);
-            h.queued.fetch_sub(1, Ordering::SeqCst);
-            let _ = job.events.try_send(Event::Failed(ErrorEnvelope::new(
+            let err = ErrorEnvelope::new(
                 ErrorCode::BackendUnavailable,
                 format!("loading model `{}`: {e}", models[next].0),
-            )));
+            );
+            h.queued.fetch_sub(1, Ordering::SeqCst);
+            let _ = job.events.try_send(Event::Failed(err.clone()));
+            while let Ok(queued) = rx.try_recv() {
+                h.queued.fetch_sub(1, Ordering::SeqCst);
+                let _ = queued.events.try_send(Event::Failed(err.clone()));
+            }
             h.swap_state(ServeState::Idle);
             None
         }
