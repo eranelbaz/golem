@@ -19,7 +19,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
-OUT="${M7_OUT:-$REPO/.ab-work/m7-$(date +%Y%m%d-%H%M)}"
+OUT="${M7_OUT:-$REPO/.ab-work/m7-$(date +%Y%m%d-%H%M%S)}"
 REPS="${M7_REPS:-4}"
 STAGES="${M7_STAGES:-200 197 196 198}"
 GIB="${M7_GIB:-63}"
@@ -30,8 +30,14 @@ STOCK_BIN="$REPO/vendor/llama.cpp/build/bin/llama-cli"
 PROMPT_SHA=17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283
 has() { [[ " $STAGES " == *" $1 "* ]]; }
 
+[[ $EUID -ne 0 ]] || { echo "FATAL: run as your user, not via sudo; it asks for sudo itself"; exit 2; }
+[[ "$(ulimit -l)" == unlimited ]] || { echo "FATAL: RLIMIT_MEMLOCK=$(ulimit -l), need unlimited (ulimit -l unlimited)"; exit 2; }
+if pgrep -x golem >/dev/null; then
+  echo "FATAL: a golem process is running (stop golem serve first):"; pgrep -ax golem; exit 2
+fi
 [[ $OUT != *" "* ]] || { echo "FATAL: M7_OUT must not contain spaces"; exit 2; }
-if [[ -d $OUT && -n "$(ls -A "$OUT" | rg -v '^golem-(new|base)$')" ]]; then
+# A run that stopped in preflight leaves only its driver.log behind.
+if [[ -d $OUT && -n "$(ls -A "$OUT" | rg -v '^(golem-(new|base)|driver\.log)$')" ]]; then
   echo "FATAL: $OUT is not empty (set M7_OUT to a new dir)"; exit 2
 fi
 mkdir -p "$OUT"
@@ -49,11 +55,6 @@ on_exit() {
 }
 trap on_exit EXIT
 
-[[ $EUID -ne 0 ]] || { echo "FATAL: run as your user, not via sudo; it asks for sudo itself"; exit 2; }
-[[ "$(ulimit -l)" == unlimited ]] || { echo "FATAL: RLIMIT_MEMLOCK=$(ulimit -l), need unlimited (ulimit -l unlimited)"; exit 2; }
-if pgrep -x golem >/dev/null; then
-  echo "FATAL: a golem process is running (stop golem serve first):"; pgrep -ax golem; exit 2
-fi
 sudo -v || { echo "FATAL: cold legs need sudo (drop_caches)"; exit 2; }
 ( warned=0; while kill -0 $$ 2>/dev/null; do
     sudo -n -v 2>/dev/null || { ((warned)) || echo "WARN: sudo ticket lapsed; cold legs will fail"; warned=1; }
