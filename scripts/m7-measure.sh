@@ -124,8 +124,10 @@ run_leg() { # <stage> <spec> <temp> <rep>
       sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null || rc=2
     fi
     if ((rc == 0)); then
+      # --simple-io + no stdin: llama-cli otherwise draws its UI on /dev/tty
+      # (the log, and so its t/s line, stays empty) and puts it in raw mode.
       GOLEM_M0_WORK="$OUT/$1/stock" scripts/glm-run.sh "$leg" "$GOLEM_MODEL" "${STOCK_ARGS[@]}" \
-        | tee -a "$OUT/$1/stock.txt" || rc=$?
+        < /dev/null | tee -a "$OUT/$1/stock.txt" || rc=$?
     fi
   else
     # shellcheck disable=SC2086
@@ -267,7 +269,7 @@ for stage in $STAGES; do
       threads=$(sed -n 's/.* threads=\([0-9]*\) .*/\1/p' <<<"$hdr")
       kv=$(sed -n 's/.* kv=\([^ ]*\) .*/\1/p' <<<"$hdr")
       echo "golem resolved: threads=${threads:-?} kv=${kv:-?}"
-      STOCK_ARGS=(-f "$P" -st -n 256 -c 1024 -ngl 99 --cpu-moe --ignore-eos --temp 0 -fa on)
+      STOCK_ARGS=(--simple-io -f "$P" -st -n 256 -c 1024 -ngl 99 --cpu-moe --ignore-eos --temp 0 -fa on)
       [[ -n $threads ]] && STOCK_ARGS+=(-t "$threads")
       [[ $kv == */* ]] && STOCK_ARGS+=(-ctk "${kv%/*}" -ctv "${kv#*/}")
       echo "stock args: ${STOCK_ARGS[*]}"
