@@ -7,7 +7,7 @@
 // links the crate), so declare the cfg name known here.
 
 #[cfg(loom)]
-pub use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+pub use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 #[cfg(loom)]
 pub use loom::sync::{Arc, Condvar, Mutex};
 /// Thread handle from [`spawn`] (modeled under loom).
@@ -74,7 +74,7 @@ pub fn wait_timeout<'a, T>(
 }
 
 #[cfg(not(loom))]
-pub use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+pub use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 pub use std::sync::{Arc, Condvar, Mutex};
 #[cfg(not(loom))]

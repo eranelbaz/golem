@@ -109,7 +109,8 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// `/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/metrics` and unknown `/v1/*`
+/// `/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/v1/golem/experts`,
+/// `/metrics` and unknown `/v1/*`
 /// (behind the API key when set; no route probing without it), `/health`
 /// (always open); everything else 404.
 pub fn router(state: AppState) -> Router {
@@ -117,6 +118,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(crate::anthropic::messages))
         .route("/v1/models", get(models))
+        .route("/v1/golem/experts", get(experts))
         .route("/v1/{*rest}", any(not_found))
         .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
@@ -420,6 +422,23 @@ async fn health(State(st): State<AppState>) -> Response {
         "device_cache_skip_ratio": snap.device_cache_skip_ratio,
     });
     (status, Json(body)).into_response()
+}
+
+/// §8.1/§11: the last decode step's routed experts per layer with their
+/// tier, or `{"state": <serve state>}` (`"idle"` with no model loaded)
+/// without a tier view or before its first decode step. Reads atomics
+/// only; never waits on the decode thread.
+async fn experts(State(st): State<AppState>) -> Response {
+    let view = st
+        .health
+        .experts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    match view.and_then(|v| v.snapshot()) {
+        Some(t) => Json(t).into_response(),
+        None => Json(serde_json::json!({ "state": st.health.get().as_str() })).into_response(),
+    }
 }
 
 async fn metrics(State(st): State<AppState>) -> Response {

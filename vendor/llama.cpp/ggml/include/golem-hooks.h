@@ -25,6 +25,11 @@
 //   v20 device-side landed wait: golem_set_device_wait,
 //       golem_device_wait_mode, golem_device_wait_ring, golem_device_wait_serve,
 //       golem_device_wait_stats.
+//   v21 golem_take_victim_ring_stats returns -1 when a setup failure disabled
+//       the armed ring; golem_set_victim_ring refuses at load without a copy
+//       stream backend.
+//   v22 golem_device_cache_layer_resident: per-layer count of slab slots
+//       with all three planes valid (lock-free, zeroed on reset).
 // Part of the vendored ggml include tree; the ABI is versioned -- a change
 // updates the Rust bindings and both sides together.
 // Hook STATE lives in a per-model `golem_ctx` (created by the engine, attached
@@ -60,7 +65,7 @@ typedef struct golem_hook_handle *golem_hook_handle_t;
 /* Hook ABI revision: bump on any change to the hook signatures or to the
  * golem_* queries; the Rust bindings assert their header constant equals the
  * compiled library's golem_hooks_abi_version(). */
-#define GOLEM_HOOKS_ABI_VERSION 21
+#define GOLEM_HOOKS_ABI_VERSION 22
 GOLEM_API int golem_hooks_abi_version(void);
 
 /* Hook: ensure the listed expert-plane misses are resident in the host expert
@@ -307,6 +312,10 @@ GOLEM_API uint64_t golem_slab_alloc_failures(golem_ctx_t ctx);
 GOLEM_API void golem_inject_slab_alloc_failure(golem_ctx_t ctx, int32_t n);
 /* Test seam (ABI v21): the next victim-ring device allocation fails. */
 GOLEM_API void golem_inject_victim_ring_alloc_failure(golem_ctx_t ctx);
+/* Test seam (ABI v22): 1 when expert id of blk has an assigned device slab
+ * slot with gate, up and down all valid, 0 otherwise; -1 for a NULL ctx or
+ * blk/id out of range. Takes dc_mutex: call between computes. */
+GOLEM_API int32_t golem_device_cache_slot_valid(golem_ctx_t ctx, int32_t blk, int32_t id);
 #endif
 /* ABI v14: device bytes currently allocated by the ctx — expert slabs plus
  * remapped-ids tensors (*slab_bytes) and prefill-stream slabs
@@ -314,6 +323,11 @@ GOLEM_API void golem_inject_victim_ring_alloc_failure(golem_ctx_t ctx);
  * the K + 1 reservation. Call between computes (stream slabs are mutated
  * outside dc_mutex). Zeros for a NULL ctx; either out pointer may be NULL. */
 GOLEM_API void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t *slab_bytes, uint64_t *stream_bytes);
+/* ABI v22: slots of blk's device slab table whose gate, up and down planes
+ * are all valid, as of the last slab step (0 after golem_reset_device_cache).
+ * One relaxed load, never takes dc_mutex; callable from any thread. -1 for a
+ * NULL ctx or blk outside [0, n_layers given to golem_ctx_create). */
+GOLEM_API int32_t golem_device_cache_layer_resident(golem_ctx_t ctx, int32_t blk);
 
 /* Clear the ctx's device cache maps — the invalidation seam (also the
  * cold-start lever). Also frees the prefill-stream slabs. */

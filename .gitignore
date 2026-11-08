@@ -15,6 +15,7 @@ vendor/llama.cpp/build/
 
 # Local scratch
 .m0-work/
+.m7-logs/
 .m1-work/
 *.local.toml
 

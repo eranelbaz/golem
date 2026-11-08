@@ -21,8 +21,11 @@ tracing = { workspace = true }
 
 [features]
 loom = ["dep:loom"]
+# Exposes test-only seams (`DownJobRunner`) to integration tests.
+test-support = []
 
 [dev-dependencies]
+golem-placement = { path = ".", features = ["test-support"] }
 xtask = { path = "../../xtask" }
 crc32c = { workspace = true }
 

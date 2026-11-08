@@ -419,6 +419,65 @@ async fn health_reports_tiers_and_degraded_list() {
     assert_eq!(v["degraded"], serde_json::json!([]));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn experts_reports_state_without_a_pool_and_keyed() {
+    // Non-pooled session: no tier table, even after a decode.
+    let app = router_for_test(golem_server::test_engine_config()).await;
+    assert_eq!(
+        app.clone().oneshot(chat(hi(4))).await.unwrap().status(),
+        200
+    );
+    let r = app
+        .oneshot(
+            Request::get("/v1/golem/experts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(json(r).await, serde_json::json!({"state": "healthy"}));
+
+    let w = tokio::task::spawn_blocking(|| {
+        golem_server::spawn_worker(
+            golem_server::test_engine_config(),
+            golem_server::TurnSinks::default(),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("worker starts");
+    let app = golem_server::router(golem_server::AppState {
+        cfg: std::sync::Arc::new(golem_server::ServerConfig {
+            api_key: Some("s3cret".into()),
+            ..golem_server::test_support::test_server_config()
+        }),
+        jobs: w.jobs.clone(),
+        health: w.health.clone(),
+    });
+    let r = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/golem/experts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "behind the API key");
+    let r = app
+        .oneshot(
+            Request::get("/v1/golem/experts")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(json(r).await, serde_json::json!({"state": "healthy"}));
+}
+
 /// Graceful drain (§9.2): the in-flight stream finishes with `[DONE]`, a
 /// request arriving during the drain gets 503, and serve returns < 35 s.
 #[tokio::test(flavor = "multi_thread")]

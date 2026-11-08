@@ -1,6 +1,5 @@
 //! §11 per-step timing CSV format tests (pure formatting; no GPU, no model).
 
-#[cfg(feature = "hip-tests")]
 mod common;
 
 use golem_engine::timing::{CpuExpertStats, StepTiming, TimingRecorder, VictimRingStats};
@@ -162,6 +161,40 @@ fn compute_is_wall_minus_p3_h2d_policy_not_disk_worker() {
     r.flush(&mut out).unwrap();
     let line = std::str::from_utf8(&out).unwrap().lines().last().unwrap();
     assert!(line.contains("35.5"), "row: {line}");
+}
+
+/// A real session turn's CSV ends with the prefill trailer; on a fresh
+/// session (no restored prefix) it counts every prompt token.
+#[test]
+fn turn_csv_ends_with_prefill_trailer() {
+    use golem_engine::config::EngineConfig;
+    use golem_engine::session::{ChatTurn, Session};
+    let cfg = EngineConfig {
+        n_predict: 4,
+        timing_csv: Some(
+            std::env::temp_dir().join(format!("golem-unused-pf-{}.csv", std::process::id())),
+        ),
+        ..common::tiny_moe_config()
+    };
+    let mut s = Session::new(&cfg).unwrap();
+    s.chat_turn(
+        &[ChatTurn {
+            role: "user",
+            content: "hello",
+        }],
+        &mut |_| {},
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    s.write_timing(&mut out).unwrap();
+    let csv = String::from_utf8(out).unwrap();
+    let last = csv.lines().last().unwrap();
+    let rest = last.strip_prefix("# prefill_ms=").expect(&csv);
+    let (ms, n) = rest.split_once(" prompt_tokens=").expect(last);
+    assert!(ms.parse::<f64>().unwrap() >= 0.0, "{last}");
+    let n: usize = n.parse().unwrap();
+    assert!(n > 0, "{last}");
+    assert_eq!(n, s.last_prompt_tokens().len(), "{last}");
 }
 
 /// HIP, pooled offload: `h2d_ms` is a measured number with async_h2d (the

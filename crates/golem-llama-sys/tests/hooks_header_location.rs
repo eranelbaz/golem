@@ -19,8 +19,8 @@ fn hooks_header_resolves_from_vendor_tree() {
         "hook registration missing"
     );
     assert!(
-        text.contains("#define GOLEM_HOOKS_ABI_VERSION 21"),
-        "hook ABI must be v21 (v12 slab alloc failure + v13 ensure failure + v14 resident bytes + v15 test-only inject + stream storage loss + v16 CPU expert math + v17 ensure hits_ready + v18 victim ring + v19 sync-gap stats + v20 device-side landed wait + v21 victim ring setup-failure code)"
+        text.contains("#define GOLEM_HOOKS_ABI_VERSION 22"),
+        "hook ABI must be v22 (v12 slab alloc failure + v13 ensure failure + v14 resident bytes + v15 test-only inject + stream storage loss + v16 CPU expert math + v17 ensure hits_ready + v18 victim ring + v19 sync-gap stats + v20 device-side landed wait + v21 victim ring setup-failure code + v22 per-layer slab residency getter)"
     );
     for sym in [
         "golem_evict_abandon_fn",

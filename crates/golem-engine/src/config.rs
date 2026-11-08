@@ -67,6 +67,12 @@ pub struct EngineConfig {
     /// Pooled expert H2D on a dedicated copy stream overlapping compute.
     /// Not implemented by the vendored scheduler: `true` is refused at load.
     pub async_h2d: bool,
+    /// Role-major expert page-in (§3.4 P3): a disk-missed unit whose down
+    /// plane is not needed by the current split segment gets gate/up read
+    /// and handed to the H2D first, its down plane read on a background
+    /// reader thread and joined before the down segment or the step end.
+    /// Off: no thread, single-phase page-in.
+    pub role_major_pagein: bool,
     /// Device-side landed wait (ABI v20): decode MoE layers publish
     /// their routed ids to a mapped ring and the GPU waits on device for the
     /// experts to land, served by a controller thread instead of a host sync
@@ -178,6 +184,10 @@ pub struct EngineConfig {
     /// R-8 start check: full SHA-256 of every shard instead of the sampled
     /// windows (`--full-verify`). The check runs only with a manifest.
     pub full_verify: bool,
+    /// End-of-generation tokens are never sampled: the sampler chain starts
+    /// with a −∞ logit bias on every EOG token, so a turn runs to its token
+    /// limit (fixed-length benchmarks). `false` stops at EOG as usual.
+    pub ignore_eos: bool,
 }
 
 /// R-15 default CPU threadpool: physical cores / 2 (min 1), logical / 2
@@ -288,6 +298,7 @@ impl Default for EngineConfig {
             numa_interleave: false,
             o_direct: false,
             async_h2d: false,
+            role_major_pagein: false,
             device_wait: DeviceWait::Off,
             vram_experts_frac: 1.0,
             vram_reserve_bytes: None,
@@ -316,6 +327,7 @@ impl Default for EngineConfig {
             decode_cpuset: None,
             pin_auto: false,
             full_verify: false,
+            ignore_eos: false,
         }
     }
 }

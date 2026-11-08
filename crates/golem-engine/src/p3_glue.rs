@@ -32,9 +32,10 @@ use golem_placement::pool::SlotClass;
 use golem_placement::{HALF_LIFE_STEPS, decay_factor};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-#[cfg(test)]
 use std::sync::atomic::AtomicI32;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -44,9 +45,9 @@ use golem_gguf::blk_of;
 use golem_llama_sys::raw;
 use golem_llama_sys::{CtxRaw, GolemCtx, HookFns, Hooked};
 use golem_placement::pool::{
-    AccessFeed, D2hIncoming, ExpertKind, ExpertPool, ExpertSource, GgufPreadSource, LeaseBatch,
-    P3Stats, PolicySnapshot, PredictionQueue, PrefetchHandle, SnapshotHandle, StoreExpertSource,
-    WarmFeed, spawn_prefetch,
+    AccessFeed, D2hIncoming, DownReaderHandle, ExpertKind, ExpertPool, ExpertSource,
+    GgufPreadSource, LeaseBatch, P3Stats, PolicySnapshot, PredictionQueue, PrefetchHandle,
+    SnapshotHandle, StoreExpertSource, WarmFeed, spawn_down_reader, spawn_prefetch,
 };
 use golem_placement::scores::WarmShape;
 use golem_store::ChunkQueue;
@@ -330,6 +331,8 @@ struct HookState {
     cpu_lease: Mutex<CpuLease>,
     /// §6.5 P5 prediction state (mode `Off`: never touched).
     pred: PredState,
+    /// §11 expert tiers of the last decode step (read by [`ExpertTierView`]).
+    tiers: Arc<TierTable>,
     /// Prefill-stream state (§7.6, ABI v10); `None` when streaming is off
     /// or the derivation dropped it (ruling R3).
     stream: Option<Arc<StreamState>>,
@@ -478,6 +481,411 @@ impl PredState {
         self.routed.fetch_add(ids.len() as u64, Ordering::Relaxed);
         self.hits.fetch_add(hits as u64, Ordering::Relaxed);
         true
+    }
+}
+
+/// Where a routed unit's bytes came from on its step (§11 expert tiers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Already assigned in the device slab: no host copy this step.
+    Vram,
+    /// Copied from the RAM pool (resident before the step).
+    Ram,
+    /// Read from disk into the RAM pool, then copied.
+    Disk,
+    /// Computed on the CPU from the RAM pool (CPU expert math).
+    Cpu,
+}
+
+impl Tier {
+    const fn code(self) -> u32 {
+        self as u32
+    }
+
+    fn from_code(c: u32) -> Self {
+        match c & 3 {
+            0 => Self::Vram,
+            1 => Self::Ram,
+            2 => Self::Disk,
+            _ => Self::Cpu,
+        }
+    }
+}
+
+/// The last decode step's routed units per expert layer, with the tier
+/// each was served from (§11 expert tiers). Fixed at enable: `layers ×
+/// slots` words (`slots = parallel × top_k`; GLM 42 × 8 × 4 B = 1.3 KiB at
+/// parallel 1), twice. Writers are the hooks — on the decode thread, or on
+/// the device-wait controller thread when its serve runs the routing hook —
+/// and the step close on the decode thread; readers are any thread,
+/// lock-free.
+///
+/// The hooks write a working row per layer that readers never see:
+/// routing opens it, the ensure and `cpu_lease` marks refine it, and the
+/// step close copies each opened working row into the published row under
+/// that row's seqlock (`stamp` odd → Release fence → data → Release even
+/// `2·step + 2`; 0 = never published). A reader accepts a published row
+/// only if it reads the same even stamp before and after the data, so a
+/// read mid-generation returns the previous closed step. Rows are written
+/// only while the step is armed (pure generation batch); prefill and mixed
+/// batches set `step_kind` only. A failed step discards its working rows.
+pub(crate) struct TierTable {
+    n_layers: usize,
+    slots: usize,
+    /// Tier code a routed unit starts with before any mark: `vram` when
+    /// the device slab serves this session, else `ram` (§11).
+    default: u32,
+    /// Set by `Session` for a pure generation batch, before `llama_decode`.
+    armed: AtomicBool,
+    /// Working rows (hook threads, see above): `layer × slots` words, `id
+    /// << 2 | tier`, `EMPTY` past `len`.
+    w_ids: Box<[AtomicU32]>,
+    w_len: Box<[AtomicU32]>,
+    w_truncated: Box<[AtomicBool]>,
+    /// The working row was opened this step. `open` stores it with Release
+    /// after the row; `word` and `close` take it with Acquire, so a close on
+    /// another thread sees the complete opened row. Marks written after the
+    /// open are not ordered by it: they reach the published row when the
+    /// compute's own join orders them before the close (best-effort §11
+    /// telemetry, never a correctness input).
+    w_open: Box<[AtomicBool]>,
+    /// Published rows, same layout, guarded by `stamp`.
+    ids: Box<[AtomicU32]>,
+    len: Box<[AtomicU32]>,
+    truncated: Box<[AtomicBool]>,
+    stamp: Box<[AtomicU64]>,
+    /// Device slab slots with all three planes valid at the step end; -1
+    /// when the substrate gave no reading.
+    vram: Box<[AtomicI32]>,
+    /// Pool-claimed units at the step end.
+    ram: Box<[AtomicU32]>,
+    /// The decode step the next opened row belongs to (closed steps so far;
+    /// decode thread only).
+    step: AtomicU64,
+    /// Kind of the last hooked compute: 0 none, 1 prefill, 2 decode.
+    step_kind: AtomicU8,
+}
+
+const TIER_EMPTY: u32 = u32::MAX;
+const STEP_PREFILL: u8 = 1;
+const STEP_DECODE: u8 = 2;
+
+fn atomics<T>(n: usize, f: impl Fn() -> T) -> Box<[T]> {
+    (0..n).map(|_| f()).collect()
+}
+
+impl TierTable {
+    pub(crate) fn new(n_layers: u32, slots: u32, default: Tier) -> Self {
+        let (n_layers, slots) = (n_layers as usize, slots.max(1) as usize);
+        Self {
+            n_layers,
+            slots,
+            default: default.code(),
+            armed: AtomicBool::new(false),
+            w_ids: atomics(n_layers * slots, || AtomicU32::new(TIER_EMPTY)),
+            w_len: atomics(n_layers, || AtomicU32::new(0)),
+            w_truncated: atomics(n_layers, || AtomicBool::new(false)),
+            w_open: atomics(n_layers, || AtomicBool::new(false)),
+            ids: atomics(n_layers * slots, || AtomicU32::new(TIER_EMPTY)),
+            len: atomics(n_layers, || AtomicU32::new(0)),
+            truncated: atomics(n_layers, || AtomicBool::new(false)),
+            stamp: atomics(n_layers, || AtomicU64::new(0)),
+            vram: atomics(n_layers, || AtomicI32::new(-1)),
+            ram: atomics(n_layers, || AtomicU32::new(0)),
+            step: AtomicU64::new(0),
+            step_kind: AtomicU8::new(0),
+        }
+    }
+
+    /// Arms (or disarms) row writes for the next compute: `Session` arms a
+    /// batch made only of generation tokens.
+    fn arm(&self, on: bool) {
+        self.armed.store(on, Ordering::Relaxed);
+    }
+
+    fn armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
+    }
+
+    /// Records a prefill (or mixed) compute: only `step_kind` moves.
+    fn prefill(&self) {
+        self.step_kind.store(STEP_PREFILL, Ordering::Relaxed);
+    }
+
+    /// Whether a routing readback of `n_ids` ids opens a row: the step is
+    /// armed and no more ids than the row holds.
+    fn is_decode(&self, n_ids: usize) -> bool {
+        self.armed() && n_ids <= self.slots
+    }
+
+    /// Opens `layer`'s working row for this step with `ids` deduplicated
+    /// (first occurrence wins) at the default tier; distinct ids past
+    /// `slots` set `truncated`. At most `slots` compares per id, no
+    /// allocation.
+    fn open(&self, layer: usize, ids: &[i32]) {
+        if layer >= self.n_layers {
+            return;
+        }
+        let row = &self.w_ids[layer * self.slots..(layer + 1) * self.slots];
+        let (mut n, mut truncated) = (0usize, false);
+        for &id in ids {
+            if id < 0 {
+                continue;
+            }
+            let id = id as u32;
+            if row[..n]
+                .iter()
+                .any(|w| w.load(Ordering::Relaxed) >> 2 == id)
+            {
+                continue;
+            }
+            if n == self.slots {
+                truncated = true;
+                continue;
+            }
+            row[n].store(id << 2 | self.default, Ordering::Relaxed);
+            n += 1;
+        }
+        for w in &row[n..] {
+            w.store(TIER_EMPTY, Ordering::Relaxed);
+        }
+        self.w_truncated[layer].store(truncated, Ordering::Relaxed);
+        self.w_len[layer].store(n as u32, Ordering::Relaxed);
+        self.w_open[layer].store(true, Ordering::Release);
+        self.step_kind.store(STEP_DECODE, Ordering::Relaxed);
+    }
+
+    /// The working-row word of `id` in `layer`'s row opened this step.
+    fn word(&self, layer: usize, id: u32) -> Option<&AtomicU32> {
+        if layer >= self.n_layers || !self.w_open[layer].load(Ordering::Acquire) {
+            return None;
+        }
+        let n = (self.w_len[layer].load(Ordering::Relaxed) as usize).min(self.slots);
+        self.w_ids[layer * self.slots..layer * self.slots + n]
+            .iter()
+            .find(|w| w.load(Ordering::Relaxed) >> 2 == id)
+    }
+
+    /// Marks a page-in miss: `ram` or `disk`, never a downgrade across
+    /// segments (only `vram` → any, `ram` → `disk`).
+    fn mark_host(&self, layer: usize, id: u32, tier: Tier) {
+        if let Some(w) = self.word(layer, id) {
+            let cur = Tier::from_code(w.load(Ordering::Relaxed));
+            if cur == Tier::Vram || (cur == Tier::Ram && tier == Tier::Disk) {
+                w.store(id << 2 | tier.code(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Marks a CPU-leased unit (masked out of the slab step, so ensure
+    /// never saw it).
+    fn mark_cpu(&self, layer: usize, id: u32) {
+        if let Some(w) = self.word(layer, id) {
+            w.store(id << 2 | Tier::Cpu.code(), Ordering::Relaxed);
+        }
+    }
+
+    /// Publishes every working row opened this step with its resident
+    /// counts, then advances the step if any row was opened. Per published
+    /// row: ≤ `slots` words + len, truncated, vram, ram; GLM 42 × 8 = 336
+    /// words per step at parallel 1, no allocation. `vram(l)` `None` keeps
+    /// the last reading.
+    fn close(&self, vram: impl Fn(usize) -> Option<i32>, ram: impl Fn(usize) -> u32) {
+        let step = self.step.load(Ordering::Relaxed);
+        let mut opened = false;
+        for l in 0..self.n_layers {
+            if !self.w_open[l].swap(false, Ordering::Acquire) {
+                continue;
+            }
+            let v = vram(l);
+            let r = ram(l);
+            self.stamp[l].store(2 * step + 1, Ordering::Relaxed);
+            fence(Ordering::Release);
+            let n = (self.w_len[l].load(Ordering::Relaxed) as usize).min(self.slots);
+            let range = l * self.slots..l * self.slots + n;
+            for (d, s) in self.ids[range.clone()].iter().zip(&self.w_ids[range]) {
+                d.store(s.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            self.len[l].store(n as u32, Ordering::Relaxed);
+            self.truncated[l].store(
+                self.w_truncated[l].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            if let Some(v) = v {
+                self.vram[l].store(v, Ordering::Relaxed);
+            }
+            self.ram[l].store(r, Ordering::Relaxed);
+            self.stamp[l].store(2 * step + 2, Ordering::Release);
+            opened = true;
+        }
+        if opened {
+            self.step.store(step + 1, Ordering::Relaxed);
+        }
+    }
+
+    /// Drops this step's working rows unpublished (a failed or aborted
+    /// compute): the step does not advance and the next open starts clean.
+    fn discard(&self) {
+        for o in &self.w_open {
+            o.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// One published row; `None` when torn by a concurrent close.
+    fn read_row(&self, layer: usize, routed: &mut Vec<RoutedUnit>) -> Option<LayerTiers> {
+        let s1 = self.stamp[layer].load(Ordering::Acquire);
+        if s1 % 2 == 1 {
+            return None;
+        }
+        routed.clear();
+        let n = (self.len[layer].load(Ordering::Relaxed) as usize).min(self.slots);
+        for w in &self.ids[layer * self.slots..layer * self.slots + n] {
+            let w = w.load(Ordering::Relaxed);
+            if w != TIER_EMPTY {
+                routed.push(RoutedUnit {
+                    id: w >> 2,
+                    tier: Tier::from_code(w),
+                });
+            }
+        }
+        let vram = self.vram[layer].load(Ordering::Relaxed);
+        let ram = self.ram[layer].load(Ordering::Relaxed);
+        let truncated = self.truncated[layer].load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if self.stamp[layer].load(Ordering::Relaxed) != s1 {
+            return None;
+        }
+        Some(LayerTiers {
+            layer: layer as u32,
+            step: (s1 >= 2).then(|| s1 / 2 - 1),
+            open: false,
+            vram_resident: (vram >= 0).then_some(vram as u32),
+            ram_resident: ram,
+            truncated,
+            routed: std::mem::take(routed),
+        })
+    }
+
+    /// Reads every published row (retrying a torn one a few times); `None`
+    /// before any decode step closed. The top-level step is the newest
+    /// row's step.
+    fn snapshot(&self) -> Option<(Option<u64>, u8, Vec<LayerTiers>)> {
+        if self.stamp.iter().all(|s| s.load(Ordering::Acquire) == 0) {
+            return None;
+        }
+        let kind = self.step_kind.load(Ordering::Relaxed);
+        let mut scratch = Vec::with_capacity(self.slots);
+        let layers: Vec<LayerTiers> = (0..self.n_layers)
+            .map(|l| {
+                (0..4)
+                    .find_map(|_| self.read_row(l, &mut scratch))
+                    .unwrap_or(LayerTiers {
+                        layer: l as u32,
+                        step: None,
+                        open: true,
+                        vram_resident: None,
+                        ram_resident: 0,
+                        truncated: false,
+                        routed: Vec::new(),
+                    })
+            })
+            .collect();
+        let step = layers.iter().filter_map(|l| l.step).max();
+        Some((step, kind, layers))
+    }
+}
+
+/// One routed unit of a layer row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RoutedUnit {
+    /// Expert id within the layer.
+    pub id: u32,
+    /// Where its bytes came from this step.
+    pub tier: Tier,
+}
+
+/// One expert layer's last decode step (pool layer index: the dense lead
+/// excluded).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LayerTiers {
+    /// Expert layer (pool index).
+    pub layer: u32,
+    /// The decode step this row belongs to; `None` when unreadable.
+    pub step: Option<u64>,
+    /// The row was mid-write (open or torn): `routed` is empty.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub open: bool,
+    /// Device slab slots with gate, up and down valid at the step end.
+    pub vram_resident: Option<u32>,
+    /// RAM pool units claimed (filled or mid-fill) at the step end.
+    pub ram_resident: u32,
+    /// More distinct ids were routed than the row holds.
+    pub truncated: bool,
+    /// Distinct routed units, first-routed order.
+    pub routed: Vec<RoutedUnit>,
+}
+
+/// A point-in-time read of the tier table (§8.1 `GET /v1/golem/experts`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExpertTiers {
+    /// Model file stem.
+    pub model: String,
+    /// Newest published row's decode step; `None` when no row was readable.
+    pub step: Option<u64>,
+    /// `"prefill"`, `"decode"` or `"none"`: the last hooked compute.
+    pub step_kind: &'static str,
+    /// Expert layers (dense lead excluded).
+    pub n_layers: u32,
+    /// Experts per layer.
+    pub n_experts: u32,
+    /// Routed experts per token.
+    pub top_k: u32,
+    /// One row per expert layer.
+    pub layers: Vec<LayerTiers>,
+}
+
+/// A read handle on a session's tier table: atomics only, no pool or ctx
+/// reference, so it may outlive the session (reads then stay frozen).
+#[derive(Clone)]
+pub struct ExpertTierView {
+    table: Arc<TierTable>,
+    /// Model file stem.
+    pub model: String,
+    /// Expert layers (dense lead excluded).
+    pub n_layers: u32,
+    /// Experts per layer.
+    pub n_experts: u32,
+    /// Routed experts per token.
+    pub top_k: u32,
+}
+
+impl std::fmt::Debug for ExpertTierView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertTierView")
+            .field("model", &self.model)
+            .field("n_layers", &self.n_layers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExpertTierView {
+    /// The table as of now; `None` before the first decode step.
+    pub fn snapshot(&self) -> Option<ExpertTiers> {
+        let (step, kind, layers) = self.table.snapshot()?;
+        Some(ExpertTiers {
+            model: self.model.clone(),
+            step,
+            step_kind: match kind {
+                STEP_PREFILL => "prefill",
+                STEP_DECODE => "decode",
+                _ => "none",
+            },
+            n_layers: self.n_layers,
+            n_experts: self.n_experts,
+            top_k: self.top_k,
+            layers,
+        })
     }
 }
 
@@ -981,6 +1389,9 @@ pub struct SessionHooks {
     /// §6.3 warm-up pre-fill thread (restored warm state only); exits once
     /// its one-shot feed is drained. Stopped/paused beside `prefetch`.
     warm: Option<PrefetchHandle>,
+    /// Role-major down reader (`role_major_pagein` only). Stopped in drop
+    /// after the idle settle and before the pool and arena drop.
+    down_reader: Option<DownReaderHandle>,
     /// Pre-fill inputs held from enable until [`Self::start_warm_fill`]
     /// (K is final only after the post-load fit).
     warm_fill: Option<WarmFill>,
@@ -1111,6 +1522,14 @@ impl SessionHooks {
         self.state
             .test_fail_decode_page_in
             .store(true, Ordering::Relaxed);
+    }
+
+    /// Test seam: the next role-major down read fails (no-op with
+    /// `role_major_pagein` off).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_next_down_read_for_test(&self) {
+        self.state.pool.fail_next_down_read_for_test();
     }
 
     /// Test seam: the stream reader kills every replica right before its
@@ -1532,6 +1951,17 @@ impl SessionHooks {
         if let Some(s) = &self.stream {
             s.release_all();
         }
+        self.settle_split();
+    }
+
+    /// Idle settle of role-major page-in (decode idle, every DMA drained):
+    /// joins every down read, cancels the poisoned ones (waking claimers
+    /// parked on them). A down read stuck past the join bound is fatal, as
+    /// a stuck device wait is. No-op with the flag off.
+    pub(crate) fn settle_split(&self) {
+        if let Err(e) = self.state.pool.settle_split() {
+            p3_fatal(format!("P3 role-major settle: {e}"));
+        }
     }
 
     /// Leases the CPU expert worker holds until the next `copy_done`.
@@ -1569,6 +1999,7 @@ impl SessionHooks {
     /// of units whose slab entries no longer exist and set stale VRAM bits —
     /// a unit in neither tier.
     pub fn device_cache_reset(&self) {
+        self.settle_split();
         self.state.release_cpu_leases();
         self.state.pool.reset_exclusive_batch();
         self.state.pool.clear_all_vram();
@@ -1595,12 +2026,56 @@ impl SessionHooks {
         (served, computes)
     }
 
+    /// Arms the §11 tier rows for the next compute: `Session` passes `true`
+    /// only for a batch made entirely of generation tokens, so a mixed
+    /// generation + prefill batch writes no row.
+    pub(crate) fn arm_tier_step(&self, on: bool) {
+        self.state.tiers.arm(on);
+    }
+
+    /// Drops the tier rows a failed or aborted compute opened, unpublished.
+    pub(crate) fn discard_tier_step(&self) {
+        self.state.tiers.discard();
+    }
+
     /// The live ctx pointer while hooks are registered (or before the Drop
     /// clears it): the Session teardown's slab-reclamation seam —
     /// `golem_reset_device_cache` must run while the substrate backend is
     /// still alive, i.e. before `llama_free`.
     pub(crate) fn live_ctx_ptr(&self) -> raw::golem_ctx_t {
         self.state.ctx_ptr.load(Ordering::SeqCst)
+    }
+
+    /// Publishes the decode step's tier rows (§11): each opened layer gets its
+    /// device slab count (lock-free getter, skipped once the ctx is gone)
+    /// and its pool-claimed count. Call on the decode thread after a
+    /// successful generation `llama_decode` + `llama_synchronize`.
+    pub(crate) fn close_tier_step(&self) {
+        let ctx = self.live_ctx_ptr();
+        let lead = self.state.dense_lead as i32;
+        self.state.tiers.close(
+            |l| {
+                if ctx.is_null() {
+                    return None;
+                }
+                // SAFETY: `ctx` is the registered, live ctx (cleared before
+                // free); the getter is lock-free and bounds-checks `blk`.
+                let v = unsafe { raw::golem_device_cache_layer_resident(ctx, lead + l as i32) };
+                (v >= 0).then_some(v)
+            },
+            |l| self.state.pool.resident_count(l as u32),
+        );
+    }
+
+    /// A read handle on this session's tier table (§8.1 experts endpoint).
+    pub fn tier_view(&self) -> ExpertTierView {
+        ExpertTierView {
+            table: self.state.tiers.clone(),
+            model: String::new(),
+            n_layers: self.state.n_layers,
+            n_experts: self.state.n_experts,
+            top_k: self.top_k,
+        }
     }
 
     /// Unregisters the hooks and joins in-flight callbacks (idempotent; the
@@ -1711,6 +2186,17 @@ impl SessionHooks {
         self.state.pool.is_resident(layer, expert)
     }
 
+    /// Test seam: whether `(layer, expert)` has a device slab slot with all
+    /// three planes valid (1), not (0), or no reading (-1). Between computes.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn slot_valid_for_test(&self, layer: u32, expert: u32) -> i32 {
+        let blk = (self.state.dense_lead + layer) as i32;
+        // SAFETY: the ctx is live (or NULL, refused) and no compute is in
+        // flight: `&self` callers sit between `Session` computes.
+        unsafe { raw::golem_device_cache_slot_valid(self.live_ctx_ptr(), blk, expert as i32) }
+    }
+
     /// Flushes this turn's routing-trace records into `w` (header on first
     /// call, then one line per record; the ring clears for the next turn).
     /// No-op when the routing trace is disabled.
@@ -1743,6 +2229,13 @@ impl Drop for SessionHooks {
         //    clearing before the ctx free makes a subsequent enable() see a
         //    clean slate.
         self.unregister();
+        // Role-major: every down read lands and every poisoned claim is
+        // cancelled first — that wakes a prefetcher parked on one — then
+        // the reader stops, before the prefetch/warm threads and the pool.
+        self.settle_split();
+        if let Some(r) = self.down_reader.as_mut() {
+            r.stop();
+        }
         self.state.release_cpu_leases();
         // 2. Stop the publisher thread FIRST (it reads the ctx pointer
         //    window), then clear the pointer (post-join: no reader left).
@@ -2097,15 +2590,34 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // Empty policy snapshot (nothing pinned/protected) until a
     // placement-backed snapshot builder feeds the pool (§6.6).
     let snapshots = Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty())));
-    let pool = ExpertPool::try_new(
-        arena,
-        source.clone(),
-        snapshots,
-        Arc::new(P3Stats::new()),
-        geo.clone(),
-        class_of_layer.clone(),
-    )
+    let pool = if config.role_major_pagein {
+        // Per-layer down-job state sized once here: one decode step routes
+        // ≤ K units per layer into the slab. Per (layer, unit): 48 B job
+        // window + 40 B split claim + 24 B poisoned-claim slot = 112 B.
+        // GLM: 42 layers × min(K, 288) × 112 B ≤ 42 × 288 × 112 ≈ 1.35 MB.
+        ExpertPool::try_new_role_major(
+            arena,
+            source.clone(),
+            snapshots,
+            Arc::new(P3Stats::new()),
+            geo.clone(),
+            class_of_layer.clone(),
+            k.min(geo.n_experts),
+        )
+    } else {
+        ExpertPool::try_new(
+            arena,
+            source.clone(),
+            snapshots,
+            Arc::new(P3Stats::new()),
+            geo.clone(),
+            class_of_layer.clone(),
+        )
+    }
     .map_err(|e| EngineError::PoolInit(e.to_string()))?;
+    // Role-major down reader: spawned only with the flag (None otherwise).
+    let down_reader = spawn_down_reader(&pool)
+        .map_err(|e| EngineError::PoolInit(format!("spawn golem-down-reader thread: {e}")))?;
 
     // Prefill-stream state (§7.6, ruling R3 kept streaming on): the pinned
     // staging ring + reader thread (GPU-registered with the pool arena below).
@@ -2201,6 +2713,16 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         ));
     }
 
+    // §11 unmarked tier: the device slab serves routed units only on the
+    // GPU split (HIP build, layers offloaded, K > 0 slots); otherwise the
+    // substrate reads every unit from the host pool, so an unmarked unit
+    // came from RAM.
+    let slab_tier = if cfg!(golem_backend_hip) && config.n_gpu_layers > 0 && k_start > 0 {
+        Tier::Vram
+    } else {
+        Tier::Ram
+    };
+
     // P2 state: per-expert recency and §6.2 decayed score; the evict-first
     // order sorts by `config.vram_order`.
     let policy = PolicyState::new(n_layers, geo.n_experts, config.vram_order);
@@ -2281,6 +2803,11 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
             2 * (config.prefetch_lookahead * (n_expert_used + PREDICT_MARGIN)) as usize
                 * n_layers as usize,
         ),
+        tiers: Arc::new(TierTable::new(
+            n_layers,
+            config.parallel.max(1) * n_expert_used,
+            slab_tier,
+        )),
         stream: stream.clone(),
         stream_armed: AtomicBool::new(false),
         abort: AtomicPtr::new(std::ptr::null_mut()),
@@ -2438,6 +2965,7 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         _pinned: pinned,
         prefetch,
         warm: None,
+        down_reader,
         warm_fill,
         warm_file,
         #[cfg(any(test, feature = "test-support"))]
@@ -2890,9 +3418,17 @@ pub extern "C" fn cpu_lease(
                 .map(|&id| id as u32)
                 .take(cap),
         );
-        h.pool
-            .lease_resident_take(layer as u32, scratch, frac, out_ids, out_ptrs3, batch)
-            as i32
+        let taken =
+            h.pool
+                .lease_resident_take(layer as u32, scratch, frac, out_ids, out_ptrs3, batch);
+        if h.tiers.armed() {
+            for &id in &out_ids[..taken.min(n)] {
+                h.tiers.mark_cpu(layer as usize, id as u32);
+            }
+        } else {
+            h.tiers.prefill();
+        }
+        taken as i32
     })
 }
 
@@ -2985,21 +3521,37 @@ pub extern "C" fn ensure_host_resident(
         let t0 = std::time::Instant::now();
         // Disk span start: after the hits hand-off, else the ensure start.
         let mut t_disk = t0;
-        let paged = h
-            .pool
-            .ensure_batch_with(entry.layer, &scratch, out, |hits| {
-                if let Some(f) = hits_ready {
-                    // SAFETY: C passes `hits_ud` with `hits_ready` and keeps it
-                    // alive for this call (golem-hooks.h v17); `hits` is the
-                    // `n_miss`-long out array (`*const u8` and `*const c_void`
-                    // share layout), valid for the duration of the callback.
-                    // `hits` is a shared reborrow of `out`; C only reads
-                    // through it (golem-hooks.h), so nothing writes through
-                    // the live `&mut` during the call.
-                    unsafe { f(hits_ud, hits.as_ptr().cast()) }
+        let decode = h.tiers.armed();
+        let misses: &[(ExpertKind, u32)] = &scratch;
+        let mut hits_seen = false;
+        let paged = h.pool.ensure_batch_with(entry.layer, misses, out, |hits| {
+            hits_seen = true;
+            if decode {
+                for (&(_, id), &p) in misses.iter().zip(hits) {
+                    let t = if p.is_null() { Tier::Disk } else { Tier::Ram };
+                    h.tiers.mark_host(entry.layer as usize, id, t);
                 }
-                t_disk = std::time::Instant::now();
-            });
+            }
+            if let Some(f) = hits_ready {
+                // SAFETY: C passes `hits_ud` with `hits_ready` and keeps it
+                // alive for this call (golem-hooks.h v17); `hits` is the
+                // `n_miss`-long out array (`*const u8` and `*const c_void`
+                // share layout), valid for the duration of the callback.
+                // `hits` is a shared reborrow of `out`; C only reads
+                // through it (golem-hooks.h), so nothing writes through
+                // the live `&mut` during the call.
+                unsafe { f(hits_ud, hits.as_ptr().cast()) }
+            }
+            t_disk = std::time::Instant::now();
+        });
+        if !decode {
+            h.tiers.prefill();
+        } else if paged.is_ok() && !hits_seen {
+            // No hit view: every miss was read from disk.
+            for &(_, id) in misses {
+                h.tiers.mark_host(entry.layer as usize, id, Tier::Disk);
+            }
+        }
         drop(scratch);
         let t_end = std::time::Instant::now();
         h.p3_wait_ns
@@ -3053,6 +3605,11 @@ pub extern "C" fn copy_done(payload: *mut c_void) {
         h.copy_done_calls.fetch_add(1, Ordering::Relaxed);
         // C joined the CPU expert worker before this hook; releasing its
         // leases BEFORE the exclusive release keeps that release unblocked.
+        // Role-major: join every down read before any lease drain or D2H
+        // commit (a failed one stays poisoned until the step end below).
+        if let Err(e) = h.pool.join_split() {
+            p3_fatal(format!("P3 role-major join: {e}"));
+        }
         h.release_cpu_leases();
         if h.exclusive {
             // Exclusive residency (O10): the eviction D2Hs issued last
@@ -3408,6 +3965,11 @@ pub extern "C" fn routing(
         let layer = (blk - h.dense_lead as i32) as usize;
         // SAFETY: C passes `n_ids` gathered ids it read this step.
         let ids = unsafe { std::slice::from_raw_parts(ids_dense, n_ids as usize) };
+        if h.tiers.is_decode(ids.len()) {
+            h.tiers.open(layer, ids);
+        } else {
+            h.tiers.prefill();
+        }
         {
             let _policy = PolicyTimer(&h.policy_ns, std::time::Instant::now());
             h.policy.book_routed(layer, ids);
@@ -3617,6 +4179,306 @@ impl HookState {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn row(t: &TierTable, layer: usize) -> Vec<(u32, Tier)> {
+        let (_, _, layers) = t.snapshot().expect("a row was published");
+        assert!(!layers[layer].open, "row {layer} readable");
+        layers[layer]
+            .routed
+            .iter()
+            .map(|u| (u.id, u.tier))
+            .collect()
+    }
+
+    fn armed(n_layers: u32, slots: u32) -> TierTable {
+        let t = TierTable::new(n_layers, slots, Tier::Vram);
+        t.arm(true);
+        t
+    }
+
+    #[test]
+    fn tier_row_dedups_and_truncates() {
+        let t = armed(1, 3);
+        t.open(0, &[5, 2, 5, -1, 7, 2, 9, 7]);
+        t.close(|_| Some(2), |_| 4);
+        assert_eq!(
+            row(&t, 0),
+            [(5, Tier::Vram), (2, Tier::Vram), (7, Tier::Vram)]
+        );
+        let (step, kind, layers) = t.snapshot().unwrap();
+        assert_eq!((step, kind), (Some(0), STEP_DECODE));
+        assert!(layers[0].truncated, "9 did not fit");
+        assert_eq!(layers[0].step, Some(0));
+        assert_eq!(
+            (layers[0].vram_resident, layers[0].ram_resident),
+            (Some(2), 4)
+        );
+        // The next step's shorter row clears the tail, and truncation.
+        t.open(0, &[1]);
+        t.close(|_| None, |_| 0);
+        assert_eq!(row(&t, 0), [(1, Tier::Vram)]);
+        let (step, _, layers) = t.snapshot().unwrap();
+        assert_eq!(step, Some(1));
+        assert!(!layers[0].truncated);
+        assert_eq!(
+            layers[0].vram_resident,
+            Some(2),
+            "None keeps the last reading"
+        );
+    }
+
+    #[test]
+    fn tier_default_is_ram_without_a_slab() {
+        let t = TierTable::new(1, 2, Tier::Ram);
+        t.arm(true);
+        t.open(0, &[3, 4]);
+        t.mark_host(0, 4, Tier::Disk);
+        t.close(|_| None, |_| 2);
+        assert_eq!(row(&t, 0), [(3, Tier::Ram), (4, Tier::Disk)]);
+    }
+
+    #[test]
+    fn tier_marks_ram_disk_cpu_without_downgrade() {
+        let t = armed(2, 4);
+        t.open(1, &[1, 2, 3, 4]);
+        t.mark_host(1, 1, Tier::Ram);
+        t.mark_host(1, 2, Tier::Disk);
+        t.mark_cpu(1, 3);
+        // A later segment never downgrades: disk stays disk, ram may become disk.
+        t.mark_host(1, 2, Tier::Ram);
+        t.mark_host(1, 1, Tier::Disk);
+        t.mark_host(1, 3, Tier::Ram);
+        t.mark_host(1, 9, Tier::Disk); // not routed: ignored
+        t.mark_host(0, 1, Tier::Disk); // row never opened: ignored
+        t.close(|_| Some(0), |_| 0);
+        assert_eq!(
+            row(&t, 1),
+            [
+                (1, Tier::Disk),
+                (2, Tier::Disk),
+                (3, Tier::Cpu),
+                (4, Tier::Vram)
+            ]
+        );
+        let (_, _, layers) = t.snapshot().unwrap();
+        assert_eq!(layers[0].step, None, "never-opened row has no step");
+        assert!(layers[0].routed.is_empty());
+        // Marks after the close belong to no open row.
+        t.mark_cpu(1, 4);
+        assert_eq!(row(&t, 1)[3], (4, Tier::Vram));
+    }
+
+    #[test]
+    fn tier_prefill_leaves_the_row_untouched() {
+        let t = armed(1, 2);
+        t.open(0, &[3, 4]);
+        t.mark_host(0, 4, Tier::Ram);
+        t.close(|_| Some(1), |_| 1);
+        let before = t.snapshot().unwrap().2;
+        assert!(t.is_decode(2));
+        assert!(!t.is_decode(3), "more ids than slots never opens a row");
+        t.arm(false);
+        assert!(!t.is_decode(1), "unarmed is prefill");
+        t.prefill();
+        // A prefill ensure/cpu_lease reaches no row: the next step is not open.
+        t.mark_host(0, 3, Tier::Disk);
+        t.mark_cpu(0, 3);
+        t.close(|_| Some(9), |_| 9);
+        let (step, kind, after) = t.snapshot().unwrap();
+        assert_eq!((step, kind), (Some(0), STEP_PREFILL));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn tier_unarmed_scoring_batch_leaves_rows_untouched() {
+        // A mixed generation + prefill batch keeps scoring on but is not
+        // armed: the real routing, ensure and cpu_lease trampolines write no
+        // row, and the close publishes nothing.
+        use xtask::tiny_moe::dims;
+        let state = enable_inner(&EngineConfig {
+            model_path: xtask::tiny_moe::cached_fixture(),
+            ram_experts_gib: 1,
+            device_cache_experts: 4,
+            ..EngineConfig::default()
+        })
+        .unwrap_or_else(|e| panic!("enable: {e}"));
+        state.set_scoring(true);
+        state.arm_tier_step(false);
+        let t = &state.state.tiers;
+        assert!(!t.is_decode(1), "scoring on, unarmed: no row opens");
+
+        // The tiny-moe gate tensor (blk.1), expert 0's plane copied from the
+        // fixture so the first-sight byte cross-check passes.
+        let (n_embd, n_ff, n_exp) = (
+            dims::N_EMBD as i64,
+            dims::N_FF_EXP as i64,
+            dims::N_EXPERT as i64,
+        );
+        // SAFETY: plain ggml scratch allocation, freed at the end of the test.
+        let ctx = unsafe {
+            raw::ggml_init(raw::ggml_init_params {
+                mem_size: 4 * 1024 * 1024,
+                mem_buffer: std::ptr::null_mut(),
+                no_alloc: false,
+            })
+        };
+        assert!(!ctx.is_null());
+        let name = std::ffi::CString::new("blk.1.ffn_gate_exps.weight").unwrap();
+        // SAFETY: `ctx` outlives the tensor; the name fits GGML_MAX_NAME.
+        let gate = unsafe {
+            let g =
+                raw::ggml_new_tensor_3d(ctx, raw::ggml_type::GGML_TYPE_F32, n_embd, n_ff, n_exp);
+            assert!(!g.is_null());
+            raw::ggml_set_name(g, name.as_ptr());
+            g
+        };
+        // SAFETY: `data` is an in-context buffer of ne0·ne1·ne2 f32.
+        let host = unsafe {
+            std::slice::from_raw_parts_mut(
+                (*gate).data.cast::<u8>(),
+                (n_embd * n_ff * n_exp * 4) as usize,
+            )
+        };
+        let src =
+            GgufPreadSource::open(&xtask::tiny_moe::cached_fixture(), dims::N_LAYER_DENSE_LEAD)
+                .expect("open fixture");
+        let (_, stride) = src.plane(0, ExpertKind::Gate, 0).expect("gate plane");
+        src.read_expert(0, ExpertKind::Gate, 0, &mut host[..stride as usize], 0)
+            .expect("pread gate plane");
+
+        let payload = state.payload_ptr();
+        let blk = dims::N_LAYER_DENSE_LEAD as i32;
+        let ids: [i32; 2] = [3, 5];
+        routing(
+            payload,
+            blk,
+            std::ptr::null(),
+            ids.as_ptr(),
+            2,
+            dims::N_EXPERT as i32,
+        );
+        let mut out: [*const u8; 3] = [std::ptr::null(); 3];
+        let rc = ensure_host_resident(
+            payload,
+            gate.cast(),
+            [1, 2, 3].as_ptr(),
+            [3, 3, 3].as_ptr(),
+            3,
+            out.as_mut_ptr().cast(),
+            None,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, 0, "ensure paged in");
+        let mut lease_ids = [-1i32; 2];
+        let mut lease_ptrs = [std::ptr::null::<c_void>(); 6];
+        cpu_lease(
+            payload,
+            blk,
+            ids.as_ptr(),
+            2,
+            1.0,
+            lease_ids.as_mut_ptr(),
+            lease_ptrs.as_mut_ptr(),
+        );
+        copy_done(payload);
+        state.close_tier_step();
+        assert!(t.snapshot().is_none(), "no row was published");
+        assert_eq!(t.step.load(Ordering::Relaxed), 0);
+        assert_eq!(t.step_kind.load(Ordering::Relaxed), STEP_PREFILL);
+        state.arm_tier_step(true);
+        assert!(t.is_decode(1));
+        drop(state);
+        // SAFETY: matches the ggml_init above; the hooks are gone.
+        unsafe { raw::ggml_free(ctx) };
+    }
+
+    #[test]
+    fn tier_rows_stay_readable_while_a_step_is_open() {
+        let t = armed(2, 2);
+        assert!(t.snapshot().is_none(), "nothing before the first close");
+        t.open(0, &[1]);
+        assert!(
+            t.snapshot().is_none(),
+            "an open working row is not published"
+        );
+        t.close(|_| Some(0), |_| 0);
+        // Mid-generation: the next step's working row is open and marked.
+        t.open(0, &[2]);
+        t.mark_host(0, 2, Tier::Disk);
+        let (step, _, layers) = t.snapshot().unwrap();
+        assert_eq!(step, Some(0));
+        assert!(!layers[0].open);
+        assert_eq!(row(&t, 0), [(1, Tier::Vram)], "the last closed step");
+        t.close(|_| Some(0), |_| 0);
+        assert_eq!(row(&t, 0), [(2, Tier::Disk)]);
+    }
+
+    #[test]
+    fn tier_failed_step_publishes_nothing() {
+        let t = armed(1, 2);
+        t.open(0, &[1]);
+        t.close(|_| Some(1), |_| 1);
+        t.open(0, &[2]);
+        t.mark_host(0, 2, Tier::Disk);
+        t.discard();
+        // The next step opens clean at the same step number.
+        t.close(|_| Some(5), |_| 5);
+        assert_eq!(t.step.load(Ordering::Relaxed), 1, "no advance");
+        t.open(0, &[3]);
+        t.mark_host(0, 2, Tier::Disk); // not routed this step
+        t.close(|_| Some(2), |_| 2);
+        let (step, _, layers) = t.snapshot().unwrap();
+        assert_eq!(step, Some(1));
+        assert_eq!(
+            layers[0].routed,
+            [RoutedUnit {
+                id: 3,
+                tier: Tier::Vram
+            }]
+        );
+    }
+
+    #[test]
+    fn tier_reader_never_sees_a_mixed_closed_row() {
+        // Each step writes one value v into every word and both counts; a
+        // published row read by the other thread must be uniform.
+        let t = Arc::new(armed(1, 8));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (t, stop) = (t.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut checked = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let Some((_, _, layers)) = t.snapshot() else {
+                        continue;
+                    };
+                    let l = &layers[0];
+                    if l.open {
+                        continue;
+                    }
+                    let v = l.ram_resident;
+                    assert_eq!(l.routed.len(), 8);
+                    for (i, u) in l.routed.iter().enumerate() {
+                        assert_eq!(u.id, v * 8 + i as u32, "mixed row at step {:?}", l.step);
+                    }
+                    assert_eq!(l.vram_resident, Some(v));
+                    assert_eq!(l.step, Some(u64::from(v)));
+                    checked += 1;
+                }
+                checked
+            })
+        };
+        let mut ids = [0i32; 8];
+        for v in 0..20_000u32 {
+            for (i, id) in ids.iter_mut().enumerate() {
+                *id = (v * 8 + i as u32) as i32;
+            }
+            t.open(0, &ids);
+            t.close(|_| Some(v as i32), |_| v);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0, "reader checked closed rows");
+    }
 
     #[test]
     fn trace_caps_cover_every_layer_of_every_token() {

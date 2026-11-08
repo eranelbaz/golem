@@ -668,6 +668,9 @@ pub(crate) struct SessionInner {
     /// Session-cumulative victim ring counters (§6.3 O10); zero when the
     /// ring is off.
     victim_ring_total: crate::timing::VictimRingStats,
+    /// −∞ logit biases on every EOG token when `config.ignore_eos`, else
+    /// empty; built once at load, copied into each turn's sampler chain.
+    eog_bias: Vec<raw::llama_logit_bias>,
 }
 
 impl Drop for Session {
@@ -758,6 +761,11 @@ impl Session {
         if config.async_h2d && config.ram_experts_gib == 0 {
             return Err(EngineError::InvalidConfig(
                 "async_h2d: needs the RAM expert pool (ram_experts_gib > 0)".into(),
+            ));
+        }
+        if config.role_major_pagein && config.ram_experts_gib == 0 {
+            return Err(EngineError::InvalidConfig(
+                "role_major_pagein: needs the RAM expert pool (ram_experts_gib > 0)".into(),
             ));
         }
         // The victim ring (§6.3 O10) moves exclusive-residency eviction D2H
@@ -910,6 +918,7 @@ impl Session {
             p.start_warm_fill();
         }
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
+        let eog_bias = eog_bias(&loaded, config);
 
         Ok({
             p3_glue::session_opened();
@@ -942,6 +951,7 @@ impl Session {
                     test_fail_gen_step: 0,
                     cpu_expert_total: Default::default(),
                     victim_ring_total: Default::default(),
+                    eog_bias,
                 },
             }
         })
@@ -960,6 +970,7 @@ impl Session {
         let loaded = load_with_hooks(config, Some(ctx))?;
         let chat = probe_templates(&loaded, config)?;
         let (batch, batch_cap, abort) = shared_batch(&loaded, config);
+        let eog_bias = eog_bias(&loaded, config);
         Ok({
             p3_glue::session_opened();
             Session {
@@ -991,6 +1002,7 @@ impl Session {
                     test_fail_gen_step: 0,
                     cpu_expert_total: Default::default(),
                     victim_ring_total: Default::default(),
+                    eog_bias,
                 },
             }
         })
@@ -1008,6 +1020,21 @@ impl Session {
     /// is off.
     pub fn p3_hooks(&self) -> Option<&crate::p3_glue::SessionHooks> {
         self.inner.p3.as_ref()
+    }
+
+    /// A read handle on the last decode step's per-layer expert tiers
+    /// (§8.1 `GET /v1/golem/experts`); `None` when the pool is off. Holds
+    /// no session state: it stays readable (frozen) after the session drops.
+    pub fn expert_tier_view(&self) -> Option<crate::p3_glue::ExpertTierView> {
+        let mut v = self.inner.p3.as_ref()?.tier_view();
+        v.model = self
+            .inner
+            .config
+            .model_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(v)
     }
 
     /// Test seam: mutable hooks (between turns only).
@@ -1437,6 +1464,13 @@ pub(crate) struct TurnFfi {
     traffic_before: u64,
     /// Re-prefill of `prompt ++ generated` after a failed batch: no snapshot.
     pub(crate) replay: bool,
+    /// Start of this prefill's first chunk and the tokens it prefills (prompt
+    /// minus the restored prefix); set by `prefill_begin`.
+    pub(crate) prefill_t0: Option<std::time::Instant>,
+    /// First chunk → last chunk, frozen at `prefill_end` (the prompt
+    /// snapshot that follows is not prefill).
+    pub(crate) prefill_ms: Option<f64>,
+    prefill_tokens: u32,
 }
 
 /// Aggregate cancel for the session's `llama_set_abort_callback`: a step's
@@ -1632,7 +1666,7 @@ impl SessionInner {
             _ => None,
         };
         let armed = slot::Armed {
-            sampler: Sampler::from_params(sampling, n_vocab, grammar)?,
+            sampler: Sampler::from_params(sampling, n_vocab, &self.eog_bias, grammar)?,
             ffi: TurnFfi {
                 prompt,
                 n_past: restored,
@@ -1645,6 +1679,9 @@ impl SessionInner {
                 placement_before: ExpertPlacement::default(),
                 traffic_before: 0,
                 replay: false,
+                prefill_t0: None,
+                prefill_ms: None,
+                prefill_tokens: 0,
             },
         };
         slot.start(stop, cancel, sampling, prompt_len, limit, armed);
@@ -1738,6 +1775,8 @@ impl SessionInner {
             && substrate_backend() == Backend::Hip;
         ffi.placement_before = expert_placement();
         ffi.traffic_before = self.p3.as_ref().map_or(0, prefill_traffic);
+        ffi.prefill_t0 = Some(std::time::Instant::now());
+        ffi.prefill_tokens = (ffi.prompt.len() - ffi.n_past) as u32;
         if let Some(p3) = self.p3.as_ref() {
             p3.drain_routing_trace();
         }
@@ -1869,6 +1908,11 @@ impl SessionInner {
             }
         }
         let _scope = (n_gen == 0).then(p3_glue::PrefillScope::enter);
+        // §11 tier rows record pure generation steps only: a mixed batch
+        // scores (§6.2) but must not open a row.
+        if let Some(p3) = self.p3.as_ref() {
+            p3.arm_tier_step(n_gen as usize == n);
+        }
         // Stream chunks arm the C flag + read-ahead and pause the prefetcher;
         // the guard disarms/resumes on every exit path (§7.6.4).
         struct StreamGuard<'a>(&'a p3_glue::SessionHooks);
@@ -1897,6 +1941,12 @@ impl SessionInner {
             // whose expert-copy leases release only at the next compute.
             // SAFETY: ctx is live.
             unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+            // Role-major page-in: settle the failed compute's down reads
+            // (no DMA in flight after the synchronize).
+            if let Some(p3) = self.p3.as_ref() {
+                p3.discard_tier_step();
+                p3.settle_split();
+            }
             // A ring disabled by this compute is reported before any reset
             // (recovery, next turn) clears a non-sticky `vr_off`.
             if self.config.victim_ring_slots > 0 {
@@ -1930,6 +1980,11 @@ impl SessionInner {
         // The lease-release contract: synchronize before the next compute.
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+        if n_gen as usize == n
+            && let Some(p3) = self.p3.as_ref()
+        {
+            p3.close_tier_step();
+        }
         if self.timing.is_some() || self.config.cpu_expert_math || self.config.victim_ring_slots > 0
         {
             // §11 step boundary: snapshot (and reset) the P3/store
@@ -2039,6 +2094,14 @@ impl SessionInner {
         Ok(())
     }
 
+    /// Hands the finished prefill's wall time and token count to the timing
+    /// recorder. Must follow `start_decode` (its flush clears the value).
+    pub(crate) fn record_prefill(&mut self, ffi: &TurnFfi) {
+        if let (Some(t), Some(ms)) = (self.timing.as_mut(), ffi.prefill_ms) {
+            t.set_prefill(ms, ffi.prefill_tokens);
+        }
+    }
+
     /// Samples from logits row `idx`, recording a [`ParityStep`] at
     /// `position` when `parity` is set.
     pub(crate) fn sample(
@@ -2066,7 +2129,8 @@ impl SessionInner {
         if let Some(steps) = parity {
             // Pure read of the same row — no decode behavior change.
             // SAFETY: row idx holds n_vocab logits (as above).
-            let (top1, top2) = unsafe { parity::top2_logits_ith(ctx.as_ptr(), idx, ffi.n_vocab) };
+            let (top1, top2) =
+                unsafe { parity::top2_logits_ith(ctx.as_ptr(), idx, ffi.n_vocab, &self.eog_bias) };
             steps.push(ParityStep {
                 position,
                 token,
@@ -2105,13 +2169,15 @@ pub(crate) struct Sampler {
 }
 
 impl Sampler {
-    /// Chain per `p`: penalties (when either is nonzero — applied in greedy
-    /// mode too), the request's tool-call `grammar` (owned sampler, moved
-    /// into the chain), then greedy for `temperature <= 0`, else
-    /// top_k (if > 0) → top_p → temp → dist(seed).
+    /// Chain per `p`: the `eog_bias` logit biases first (when non-empty, so
+    /// no later stage can pick a suppressed token), penalties (when either
+    /// is nonzero — applied in greedy mode too), the request's tool-call
+    /// `grammar` (owned sampler, moved into the chain), then greedy for
+    /// `temperature <= 0`, else top_k (if > 0) → top_p → temp → dist(seed).
     pub(crate) fn from_params(
         p: &SamplingParams,
         n_vocab: i32,
+        eog_bias: &[raw::llama_logit_bias],
         grammar: Option<*mut raw::llama_sampler>,
     ) -> Result<Self, EngineError> {
         // SAFETY: returns llama.cpp's default sampler-chain params by value.
@@ -2131,6 +2197,12 @@ impl Sampler {
             // to the chain (freed with it).
             unsafe { raw::llama_sampler_chain_add(chain, smpl) }
         };
+        if !eog_bias.is_empty() {
+            let n = i32::try_from(eog_bias.len()).unwrap_or(i32::MAX);
+            // SAFETY: `eog_bias` holds `n` valid entries for this call; the
+            // sampler copies them, ownership passes to the chain.
+            add(unsafe { raw::llama_sampler_init_logit_bias(n_vocab, n, eog_bias.as_ptr()) });
+        }
         if p.frequency_penalty != 0.0 || p.presence_penalty != 0.0 {
             // SAFETY: plain constructor; ownership passes to the chain.
             add(unsafe {
@@ -2628,6 +2700,25 @@ fn snapshot_cache(config: &EngineConfig) -> Result<Option<SnapshotCache>, Engine
         p3_glue::PinnedArena::new(len)?,
         config.n_ctx as usize,
     )))
+}
+
+/// The `ignore_eos` bias list: −∞ on every token `llama_vocab_is_eog`
+/// reports, empty when the flag is off.
+fn eog_bias(loaded: &LoadedModel, config: &EngineConfig) -> Vec<raw::llama_logit_bias> {
+    if !config.ignore_eos {
+        return Vec::new();
+    }
+    let vocab = loaded.model().vocab();
+    // SAFETY: vocab is live (the model outlives this call).
+    let n_vocab = unsafe { raw::llama_vocab_n_tokens(vocab) };
+    (0..n_vocab)
+        // SAFETY: as above; every id in 0..n_vocab is a valid token.
+        .filter(|&t| unsafe { raw::llama_vocab_is_eog(vocab, t) })
+        .map(|token| raw::llama_logit_bias {
+            token,
+            bias: f32::NEG_INFINITY,
+        })
+        .collect()
 }
 
 /// The session's one batch: `llama_n_batch` token slots (≥ every chunk and

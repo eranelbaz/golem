@@ -50,8 +50,8 @@ fn hook_abi_types_generated() {
     // constant the bindings came from matches the compiled substrate.
     // ABI v9 adds the abandoned-D2H hook (parked evictions whose plane
     // copies were not all issued must be reported, not committed).
-    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 21);
-    assert_eq!(golem_llama_sys::hooks_abi_version(), 21);
+    assert_eq!(raw::GOLEM_HOOKS_ABI_VERSION, 22);
+    assert_eq!(golem_llama_sys::hooks_abi_version(), 22);
     // v20: device-side landed wait; a NULL ctx is refused / reports off.
     // SAFETY: NULL ctx is the documented refusal path of each entry point.
     unsafe {

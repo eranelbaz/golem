@@ -24,10 +24,16 @@ pub struct ParityStep {
 
 /// The two largest values of `logits` as a `(top1, top2)` pair with
 /// `top1 >= top2`. Ties count twice (`[5, 5, 3]` → `(5.0, 5.0)`); fewer than
-/// two entries yield `0.0` in the vacant slots; NaN entries never rank.
-pub(crate) fn top2_of(logits: &[f32]) -> (f32, f32) {
+/// two entries yield `0.0` in the vacant slots; NaN entries and the `skip`
+/// token ids (the sampler's suppressed EOG tokens, so the record matches
+/// what it can emit) never rank.
+pub(crate) fn top2_of(logits: &[f32], skip: &[raw::llama_logit_bias]) -> (f32, f32) {
     let mut top = [f32::NEG_INFINITY; 2];
-    for &v in logits {
+    let ranked = logits
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !skip.iter().any(|b| b.token as usize == *i));
+    for (_, &v) in ranked {
         if v > top[0] {
             top[1] = top[0];
             top[0] = v;
@@ -50,10 +56,12 @@ pub(crate) fn top2_of(logits: &[f32]) -> (f32, f32) {
 /// # Safety
 /// `ctx` must be a live `llama_context` whose most recent decode succeeded and
 /// emitted logits for slot `ith`, and `n_vocab` must be that row's length.
+/// Tokens in `skip` (the `ignore_eos` biases) never rank.
 pub(crate) unsafe fn top2_logits_ith(
     ctx: *mut raw::llama_context,
     ith: i32,
     n_vocab: usize,
+    skip: &[raw::llama_logit_bias],
 ) -> (f32, f32) {
     // SAFETY: ctx is live and its last decode emitted logits for slot ith
     // (caller contract, llama.h); a null return would be a broken FFI
@@ -65,32 +73,41 @@ pub(crate) unsafe fn top2_logits_ith(
     }
     // SAFETY: ptr is non-null and valid for n_vocab f32 values (llama.h contract).
     let logits = unsafe { std::slice::from_raw_parts(ptr, n_vocab) };
-    top2_of(logits)
+    top2_of(logits, skip)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::top2_of;
+    use super::{raw, top2_of};
 
     #[test]
     fn two_largest_in_order() {
-        assert_eq!(top2_of(&[1.0, 7.0, 3.0]), (7.0, 3.0));
-        assert_eq!(top2_of(&[-1.0, -5.0]), (-1.0, -5.0));
+        assert_eq!(top2_of(&[1.0, 7.0, 3.0], &[]), (7.0, 3.0));
+        assert_eq!(top2_of(&[-1.0, -5.0], &[]), (-1.0, -5.0));
     }
 
     #[test]
     fn ties_count_twice() {
-        assert_eq!(top2_of(&[5.0, 5.0, 3.0]), (5.0, 5.0));
+        assert_eq!(top2_of(&[5.0, 5.0, 3.0], &[]), (5.0, 5.0));
     }
 
     #[test]
     fn fewer_than_two_entries_zero_fill() {
-        assert_eq!(top2_of(&[4.25]), (4.25, 0.0));
-        assert_eq!(top2_of(&[]), (0.0, 0.0));
+        assert_eq!(top2_of(&[4.25], &[]), (4.25, 0.0));
+        assert_eq!(top2_of(&[], &[]), (0.0, 0.0));
     }
 
     #[test]
     fn nan_never_ranks() {
-        assert_eq!(top2_of(&[f32::NAN, 2.0, 9.0, f32::NAN]), (9.0, 2.0));
+        assert_eq!(top2_of(&[f32::NAN, 2.0, 9.0, f32::NAN], &[]), (9.0, 2.0));
+    }
+
+    #[test]
+    fn skipped_tokens_never_rank() {
+        let eog = [raw::llama_logit_bias {
+            token: 1,
+            bias: f32::NEG_INFINITY,
+        }];
+        assert_eq!(top2_of(&[1.0, 9.0, 3.0], &eog), (3.0, 1.0));
     }
 }

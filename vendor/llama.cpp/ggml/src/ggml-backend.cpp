@@ -742,6 +742,7 @@ int32_t golem_device_wait_serve(golem_ctx_t ctx, int32_t blk, uint32_t seq) {
             const golem::GolemSlabCounters c = golem::golem_slab_step_ev(L, k, routed, dense.data(), n_used, order,
                 B.K, n_expert, st.remap, nullptr,
                 [&](int32_t slot, int32_t id) { ctx->dw_pending.emplace_back(slot, id); }, nullptr);
+            ctx->store_slab_assigned(blk, L);
             GGML_ASSERT((int32_t) st.remap.size() == n_used);
             uint32_t * remap = ctx->dw_remap(blk, k);
             for (int32_t i = 0; i < n_used; ++i) {
@@ -846,6 +847,7 @@ int32_t golem_device_wait_serve(golem_ctx_t ctx, int32_t blk, uint32_t seq) {
                     land[ctx->dw_miss_k[m]] |= 1u << ctx->dw_miss_j[m];
                 }
             }
+            ctx->store_slab_assigned(blk, L);
             for (int k = 0; k < 3; ++k) {
                 golem_dw_land_host(ctx, blk, k, land[k], seq);
             }
@@ -1091,6 +1093,9 @@ void golem_reset_device_cache(golem_ctx_t ctx) {
     }
     ctx->dc.clear();
     ctx->layers.clear();
+    for (int32_t b = 0; b < ctx->n_blk; ++b) {
+        ctx->slab_assigned[b].store(0, std::memory_order_relaxed);
+    }
 }
 
 #ifdef __APPLE__
@@ -3981,6 +3986,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 ggml_bitset_clear(L.valid[kind - 1].data(), plan.pending[k].first);
                             }
                         }
+                        gctx->store_slab_assigned(blk, L);
                     }
                 };
                 for (int j = input_id; j < split->n_inputs; ++j) {
@@ -4096,6 +4102,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 [&](int32_t slot, int32_t id5) { plan.pending.emplace_back(slot, id5); },
                                 golem_cem_blk_mask);
                             gctx->cem_padded += plan.dc.padded;
+                            gctx->store_slab_assigned(blk, L);
                             GGML_ASSERT((int64_t) st.remap.size() == ggml_nelements(st.ids_dev));
                             GGML_ASSERT(ggml_backend_buffer_is_host(st.ids_pin_buf));
                             GGML_ASSERT(ggml_backend_buffer_get_type(st.ids_pin_buf) == st.ids_pin_buft);
@@ -5892,7 +5899,36 @@ void golem_inject_victim_ring_alloc_failure(golem_ctx_t ctx) {
         ctx->vr_fail_inject.store(true, std::memory_order_relaxed);
     }
 }
+
+int32_t golem_device_cache_slot_valid(golem_ctx_t ctx, int32_t blk, int32_t id) {
+    if (ctx == NULL || blk < 0 || blk >= ctx->n_blk || id < 0 || id >= ctx->n_experts) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(ctx->dc_mutex);
+    const auto it = ctx->layers.find(blk);
+    if (it == ctx->layers.end() || (size_t) id >= it->second.slot_of.size()) {
+        return 0;
+    }
+    const golem::GolemLayerSlots & L = it->second;
+    const int32_t s = L.slot_of[id];
+    if (s < 0) {
+        return 0;
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (L.valid[k].empty() || !ggml_bitset_get(L.valid[k].data(), s)) {
+            return 0;
+        }
+    }
+    return 1;
+}
 #endif
+
+int32_t golem_device_cache_layer_resident(golem_ctx_t ctx, int32_t blk) {
+    if (ctx == NULL || blk < 0 || blk >= ctx->n_blk) {
+        return -1;
+    }
+    return ctx->slab_assigned[blk].load(std::memory_order_relaxed);
+}
 
 void golem_device_cache_resident_bytes(golem_ctx_t ctx, uint64_t * slab_bytes, uint64_t * stream_bytes) {
     uint64_t slab = 0;

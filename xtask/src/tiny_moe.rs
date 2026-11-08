@@ -47,6 +47,30 @@ pub fn cached_fixture() -> PathBuf {
     p
 }
 
+/// End-of-generation token of [`cached_eos_fixture`]: `<eoln>`, which
+/// greedy decoding of the default fixture emits early.
+pub const EARLY_EOS_TOKEN: u32 = 5;
+
+/// [`cached_fixture`] with `tokenizer.ggml.eos_token_id` =
+/// [`EARLY_EOS_TOKEN`]; same weights and vocab, so tokenization matches.
+pub fn cached_eos_fixture() -> PathBuf {
+    let cache = repo_root().join(".test-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let p = cache.join(format!("tiny-moe-320-eos{EARLY_EOS_TOKEN}.gguf"));
+    if !p.exists() {
+        let tmp = cache.join(format!("tiny-moe-320-eos-{}.gguf.tmp", std::process::id()));
+        let f = std::fs::File::create(&tmp).unwrap();
+        generate_with_eos(
+            &mut std::io::BufWriter::new(f),
+            DEFAULT_SEED,
+            Some(EARLY_EOS_TOKEN),
+        )
+        .unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p
+}
+
 pub(crate) fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -158,6 +182,16 @@ pub(crate) fn token_table() -> Vec<(String, i32, f32)> {
 
 /// Returns the byte offset of the GGUF tensor-data section.
 pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<u64> {
+    generate_with_eos(out, seed, None)
+}
+
+/// [`generate`] with an explicit `tokenizer.ggml.eos_token_id` when `eos`
+/// is set (else the tokenizer default applies).
+pub fn generate_with_eos(
+    out: &mut impl Write,
+    seed: u64,
+    eos: Option<u32>,
+) -> std::io::Result<u64> {
     let mut rng = Xorshift::new(seed);
     let u = |v: u32| GgufValue::U32(v);
     let f = |v: f32| GgufValue::F32(v);
@@ -200,6 +234,10 @@ pub fn generate(out: &mut impl Write, seed: u64) -> std::io::Result<u64> {
             GgufValue::ArrI32(toks.iter().map(|(_, ttype, _)| *ttype).collect()),
         ),
     ];
+    let kvs: Vec<_> = kvs
+        .into_iter()
+        .chain(eos.map(|e| kv("tokenizer.ggml.eos_token_id", u(e))))
+        .collect();
 
     let ne = u64::from(n_embd_k_gqa());
     let ne_full = u64::from(dims::N_EMBD);

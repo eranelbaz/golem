@@ -9,11 +9,11 @@
 
 // cfg(loom) is set via RUSTFLAGS by the T6 leg; see primitives.rs.
 
-use super::arena::Arena;
-use super::primitives::{Arc, AtomicU64, AtomicUsize, Mutex, Ordering};
+use super::arena::{Arena, DownWindow, SplitClaim};
+use super::primitives::{Arc, AtomicU64, AtomicUsize, Condvar, Mutex, Ordering};
 use super::residency::{
-    Claim, ClaimError, ExpertKind, FillClaim, P3Stats, PolicySnapshot, PoolConfigError,
-    ResidencyMap,
+    Claim, ClaimError, ExpertKind, FillClaim, OwnedFillClaim, P3Stats, PolicySnapshot,
+    PoolConfigError, ResidencyMap,
 };
 use super::source::{ExpertSource, PoolGeometry, UnitLayout};
 use golem_store::recycle;
@@ -80,7 +80,20 @@ pub enum PoolError {
         /// What the caller violated.
         reason: String,
     },
+    /// A role-major down read did not complete within the pool's join
+    /// bound ([`DOWN_JOIN_TIMEOUT`] in production): its slots are still
+    /// being written, so nothing may settle them — fatal for the caller,
+    /// like a stuck device wait.
+    #[error("role-major down read of layer {layer} still pending after the join bound")]
+    DownStalled {
+        /// The layer whose down job is stuck.
+        layer: u32,
+    },
 }
+
+/// Default bound on one role-major join, shared by every layer it waits on
+/// (the device-wait bound).
+pub const DOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// In-flight lease for one (layer, expert) unit; `Drop` releases it. Held
 /// across the copy-under-lease; the slot cannot be refilled or evicted while
@@ -207,6 +220,11 @@ const UNCLAIMED: u32 = u32::MAX;
 /// `BatchClaims::lease_of` entry of a unit with a fill pending in the
 /// current `ensure_batch` call; never survives the call.
 const PENDING: u32 = u32::MAX - 1;
+/// `BatchClaims::lease_of` entry of a role-major unit whose gate/up landed
+/// and whose down read is queued or failed: its owned claim sits in
+/// `BatchClaims::split_claims` (or `poisoned`) until a join settles it.
+/// `reset_pending` leaves it untouched.
+const SPLIT: u32 = u32::MAX - 2;
 
 /// The decode thread's claim table for one scheduler compute (§6.6, §3.4
 /// P3): the first plane of a `(layer, expert)` unit claims and leases it
@@ -328,10 +346,35 @@ struct BatchClaims {
     fills: Vec<(u32, u32, FillClaim<'static>)>,
     planes: Vec<(ExpertKind, u32)>,
     targets: Vec<(&'static mut [u8], usize)>,
+    /// Role-major scratch beside `fills`: the call's split units, and their
+    /// down windows before they move into the layer's [`DownJob`].
+    splits: Vec<(u32, u32, FillClaim<'static>)>,
+    windows: Vec<DownUnit>,
+    /// Per layer: the split claims of units whose down read is queued
+    /// (`SPLIT` in `lease_of`), in the order of the job's windows. Each
+    /// holds the unit's only lease; only the decode thread settles them, at
+    /// a join, after taking their windows back.
+    split_claims: Vec<Vec<SplitClaim>>,
+    /// Claims whose down read failed: still mid-fill (slot leased, off the
+    /// free list) until `end_batch_step*` or an idle settle cancels them,
+    /// after C drained every gate/up DMA from their slots.
+    poisoned: Vec<OwnedFillClaim>,
 }
 
 impl BatchClaims {
-    fn new(n_experts: u32, n_layers: usize) -> Self {
+    /// `split_cap` units per layer of role-major state (0 = off: nothing
+    /// allocated).
+    fn new(n_experts: u32, n_layers: usize, split_cap: usize) -> Self {
+        let (split_claims, poisoned) = if split_cap == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                (0..n_layers)
+                    .map(|_| Vec::with_capacity(split_cap))
+                    .collect(),
+                Vec::with_capacity(n_layers * split_cap),
+            )
+        };
         Self {
             lease_of: vec![UNCLAIMED; n_layers * n_experts as usize],
             leases: Vec::new(),
@@ -339,6 +382,10 @@ impl BatchClaims {
             fills: Vec::new(),
             planes: Vec::new(),
             targets: Vec::new(),
+            splits: Vec::with_capacity(split_cap),
+            windows: Vec::with_capacity(split_cap),
+            split_claims,
+            poisoned,
         }
     }
 
@@ -351,6 +398,14 @@ impl BatchClaims {
     }
 }
 
+/// The error a failed role-major down read surfaces as (the store already
+/// logged the underlying I/O error).
+fn down_failed() -> PoolError {
+    PoolError::Source {
+        source: std::io::Error::other("role-major down read failed"),
+    }
+}
+
 fn reset_pending(lease_of: &mut [u32], base: usize, misses: &[(ExpertKind, u32)]) {
     for &(_, expert) in misses {
         let at = &mut lease_of[base + expert as usize];
@@ -358,6 +413,274 @@ fn reset_pending(lease_of: &mut [u32], base: usize, misses: &[(ExpertKind, u32)]
             *at = UNCLAIMED;
         }
     }
+}
+
+/// One split unit's down plane, queued for the reader thread.
+struct DownUnit {
+    expert: u32,
+    /// The plane's offset inside its region (`UnitLayout::head[2]`).
+    head: usize,
+    window: DownWindow,
+}
+
+/// Lifecycle of one layer's down job: the decode thread queues it, the
+/// reader moves it to `Done`/`Failed`, the decode thread's join returns it
+/// to `Idle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobState {
+    Idle,
+    Queued,
+    Done,
+    Failed,
+}
+
+struct DownJobInner {
+    state: JobState,
+    /// Preallocated to the split cap; handed to the reader by value while
+    /// it reads (`mem::take`, no allocation) and returned before the state
+    /// leaves `Queued`.
+    units: Vec<DownUnit>,
+}
+
+/// One layer's down job: state + windows behind a per-layer mutex, and the
+/// completion latch the decode thread's join waits on.
+struct DownJob {
+    inner: Mutex<DownJobInner>,
+    done: Condvar,
+}
+
+/// Role-major state shared by the pool (decode thread) and the down reader
+/// thread: per-layer jobs (preallocated at pool creation, never resized)
+/// and the reader's wake queue (at most one queued job per layer, so the
+/// preallocated `n_layers` capacity never grows).
+pub(crate) struct DownShared {
+    jobs: Vec<DownJob>,
+    queue: Mutex<std::collections::VecDeque<u32>>,
+    wake: Condvar,
+    stop: super::primitives::AtomicBool,
+    source: Arc<dyn ExpertSource>,
+    /// Attached readers ([`spawn_down_reader`] threads and job runners). A
+    /// join that sees 0 knows no reader will take its job's windows and
+    /// fails the job at once instead of waiting out the bound.
+    readers: AtomicUsize,
+    /// One join's bound, shared by every layer it waits on.
+    join_timeout: std::time::Duration,
+    /// Test seam: the next down job fails without reading.
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next: super::primitives::AtomicBool,
+}
+
+/// Counts one attached reader until dropped (every exit, panics included).
+struct ReaderGuard(Arc<DownShared>);
+
+impl ReaderGuard {
+    fn attach(shared: Arc<DownShared>) -> Self {
+        shared.readers.fetch_add(1, Ordering::AcqRel);
+        Self(shared)
+    }
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.0.readers.fetch_sub(1, Ordering::AcqRel);
+        // A join checks the count under its job lock and parks atomically
+        // with releasing it: taking each lock before the wake means every
+        // parked join is woken after the decrement and re-checks.
+        for job in &self.0.jobs {
+            let _g = job.inner.lock().unwrap_or_else(|e| e.into_inner());
+            job.done.notify_all();
+        }
+    }
+}
+
+impl DownShared {
+    fn new(
+        n_layers: usize,
+        cap: usize,
+        source: Arc<dyn ExpertSource>,
+        join_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            jobs: (0..n_layers)
+                .map(|_| DownJob {
+                    inner: Mutex::new(DownJobInner {
+                        state: JobState::Idle,
+                        units: Vec::with_capacity(cap),
+                    }),
+                    done: Condvar::new(),
+                })
+                .collect(),
+            queue: Mutex::new(std::collections::VecDeque::with_capacity(n_layers)),
+            wake: Condvar::new(),
+            stop: super::primitives::AtomicBool::new(false),
+            source,
+            readers: AtomicUsize::new(0),
+            join_timeout,
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next: super::primitives::AtomicBool::new(false),
+        }
+    }
+
+    /// Next queued layer, parking while the queue is empty; `None` once
+    /// stopped with nothing queued (a queued job is always run first).
+    fn next(&self) -> Option<u32> {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(layer) = q.pop_front() {
+                return Some(layer);
+            }
+            if self.stop.load(Ordering::Acquire) {
+                return None;
+            }
+            q = self.wake.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Runs `layer`'s queued down job: one batched read of every unit's
+    /// down plane into its window, then `Done`/`Failed` and a latch wake.
+    /// The reader touches only the windows and the job state — never a
+    /// claim, the batch table or residency. A panicking source fails the
+    /// job instead of leaving the decode thread waiting.
+    fn run_job(&self, layer: u32, scratch: &mut DownScratch) {
+        let job = &self.jobs[layer as usize];
+        let mut units = {
+            let mut g = job.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // A join that found no reader already failed this job.
+            if g.state != JobState::Queued {
+                return;
+            }
+            std::mem::take(&mut g.units)
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        let failed = self.fail_next.swap(false, Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let failed = false;
+        let ok = !failed
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut targets: Vec<(&mut [u8], usize)> =
+                    recycle(std::mem::take(&mut scratch.targets));
+                scratch.planes.clear();
+                for u in units.iter_mut() {
+                    scratch.planes.push((ExpertKind::Down, u.expert));
+                    targets.push((u.window.as_mut_slice(), u.head));
+                }
+                let read = self
+                    .source
+                    .read_expert_batched(layer, &scratch.planes, &mut targets);
+                scratch.targets = recycle(targets);
+                read.is_ok()
+            }))
+            .unwrap_or(false);
+        let mut g = job.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.units = units;
+        g.state = if ok { JobState::Done } else { JobState::Failed };
+        drop(g);
+        job.done.notify_all();
+    }
+}
+
+/// The reader thread's reused read scratch (allocated once per thread).
+#[derive(Default)]
+struct DownScratch {
+    planes: Vec<(ExpertKind, u32)>,
+    targets: Vec<(&'static mut [u8], usize)>,
+}
+
+/// The role-major down reader thread (§3.4 P3): a stop flag plus the
+/// thread, following [`super::prefetch::PrefetchHandle`]. Holds the shared
+/// job table and the source, nothing that owns the pool. [`Self::stop`]
+/// (and `Drop`) runs any queued job to completion before joining.
+pub struct DownReaderHandle {
+    shared: Arc<DownShared>,
+    thread: Option<super::primitives::JoinHandle<()>>,
+}
+
+impl DownReaderHandle {
+    /// Signals the thread and joins it; queued jobs complete first.
+    pub fn stop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        {
+            let _q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.wake.notify_all();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for DownReaderHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl std::fmt::Debug for DownReaderHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownReaderHandle").finish_non_exhaustive()
+    }
+}
+
+/// An attached reader driven by the caller, one job per
+/// [`Self::run_one`] — the reader body without the loop, for models that
+/// own the thread (loom). Counts as a live reader until dropped.
+#[cfg(any(loom, test, feature = "test-support"))]
+pub struct DownJobRunner(ReaderGuard);
+
+#[cfg(any(loom, test, feature = "test-support"))]
+impl DownJobRunner {
+    /// Attaches a runner to `pool`; `None` without role-major page-in.
+    pub fn attach(pool: &ExpertPool) -> Option<Self> {
+        Some(Self(ReaderGuard::attach(pool.down.clone()?)))
+    }
+
+    /// Runs one queued down job on the calling thread; `false` when
+    /// nothing is queued.
+    pub fn run_one(&self) -> bool {
+        let down = &self.0.0;
+        let layer = down
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        let Some(layer) = layer else {
+            return false;
+        };
+        down.run_job(layer, &mut DownScratch::default());
+        true
+    }
+}
+
+/// Spawns `pool`'s down reader thread (`golem-down-reader`); `Ok(None)` when
+/// the pool was built without role-major page-in (no thread exists then).
+///
+/// # Errors
+/// The OS refused to spawn the thread.
+pub fn spawn_down_reader(pool: &ExpertPool) -> std::io::Result<Option<DownReaderHandle>> {
+    let Some(shared) = pool.down.clone() else {
+        return Ok(None);
+    };
+    // Attached before the spawn: a join between spawn and first park must
+    // not see the reader as absent.
+    let guard = ReaderGuard::attach(shared.clone());
+    let body = move || {
+        let guard = guard;
+        let body = &guard.0;
+        let mut scratch = DownScratch::default();
+        while let Some(layer) = body.next() {
+            body.run_job(layer, &mut scratch);
+        }
+    };
+    #[cfg(not(loom))]
+    let thread = std::thread::Builder::new()
+        .name("golem-down-reader".into())
+        .spawn(body)?;
+    #[cfg(loom)]
+    let thread = super::primitives::spawn(body);
+    Ok(Some(DownReaderHandle {
+        shared,
+        thread: Some(thread),
+    }))
 }
 
 struct DemandGuard<'a>(&'a AtomicUsize);
@@ -398,6 +721,11 @@ pub struct ExpertPool {
     /// steers the prefetcher off VRAM-resident experts (no disk read while a
     /// VRAM copy exists). Best-effort; a stale bit only skips a prefetch.
     vram: VramBits,
+    /// Role-major page-in state shared with the down reader thread; `None`
+    /// keeps every fill single-phase.
+    down: Option<Arc<DownShared>>,
+    /// Units one layer's down job holds (`min(K, n_experts)`).
+    split_cap: usize,
 }
 
 /// One claimed-but-not-yet-committed VRAM-eviction D2H.
@@ -469,6 +797,16 @@ impl VramBits {
     }
 }
 
+impl Drop for ExpertPool {
+    /// Pool shutdown join: every down read lands (the reader handle is
+    /// stopped first, which runs queued jobs) before the owned claims drop.
+    fn drop(&mut self) {
+        if self.down.is_some() {
+            let _ = self.settle_split();
+        }
+    }
+}
+
 impl std::fmt::Debug for ExpertPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExpertPool")
@@ -496,6 +834,30 @@ impl ExpertPool {
         geometry: PoolGeometry,
         class_of_layer: Vec<u8>,
     ) -> Result<Arc<Self>, PoolConfigError> {
+        Self::build(
+            arena,
+            source,
+            snapshots,
+            stats,
+            geometry,
+            class_of_layer,
+            0,
+            DOWN_JOIN_TIMEOUT,
+        )
+    }
+
+    /// Shared constructor; `split_cap == 0` builds no role-major state.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        arena: Arena,
+        source: Arc<dyn ExpertSource>,
+        snapshots: Arc<SnapshotHandle>,
+        stats: Arc<P3Stats>,
+        geometry: PoolGeometry,
+        class_of_layer: Vec<u8>,
+        split_cap: usize,
+        join_timeout: std::time::Duration,
+    ) -> Result<Arc<Self>, PoolConfigError> {
         if class_of_layer.len() != geometry.layers.len() {
             return Err(PoolConfigError::new(format!(
                 "{} layer classes for {} geometry layers",
@@ -516,11 +878,20 @@ impl ExpertPool {
             .map(|c| arena.class_range(c))
             .collect();
         let residency = ResidencyMap::new(class_of_layer, geometry.n_experts, class_slots)?;
-        let batch_claims = BatchClaims::new(geometry.n_experts, geometry.layers.len());
+        let batch_claims = BatchClaims::new(geometry.n_experts, geometry.layers.len(), split_cap);
         let vram = VramBits::new(geometry.layers.len(), geometry.n_experts as usize);
         // One compute stages at most K units per layer into the slab; evicted
         // units per compute are bounded by the same number.
         let d2h_pending = Vec::with_capacity(geometry.layers.len() * 64);
+        let n_layers = geometry.layers.len();
+        let down = (split_cap > 0).then(|| {
+            Arc::new(DownShared::new(
+                n_layers,
+                split_cap,
+                source.clone(),
+                join_timeout,
+            ))
+        });
         Ok(Arc::new(Self {
             arena: Arc::new(arena),
             geometry,
@@ -534,7 +905,97 @@ impl ExpertPool {
             exclusive_scratch: super::primitives::Mutex::new(Vec::new()),
             exclusive_triples: super::primitives::Mutex::new(Vec::new()),
             vram,
+            down,
+            split_cap,
         }))
+    }
+
+    /// [`Self::try_new`] with role-major page-in (§3.4 P3): a disk-missed
+    /// unit whose down plane is not in the current miss list gets its
+    /// gate/up read and handed out first, its down plane read by the down
+    /// reader thread ([`spawn_down_reader`], which the caller must run)
+    /// and joined before the down plane is needed or the step ends. Per
+    /// layer, `min(max_k, n_experts)` units of job state are allocated
+    /// here, never on the decode path.
+    ///
+    /// A join waits at most [`DOWN_JOIN_TIMEOUT`] in total; with no reader
+    /// running it fails at once.
+    ///
+    /// # Errors
+    /// As [`Self::try_new`]; `max_k == 0` is rejected.
+    pub fn try_new_role_major(
+        arena: Arena,
+        source: Arc<dyn ExpertSource>,
+        snapshots: Arc<SnapshotHandle>,
+        stats: Arc<P3Stats>,
+        geometry: PoolGeometry,
+        class_of_layer: Vec<u8>,
+        max_k: u32,
+    ) -> Result<Arc<Self>, PoolConfigError> {
+        Self::try_new_role_major_bounded(
+            arena,
+            source,
+            snapshots,
+            stats,
+            geometry,
+            class_of_layer,
+            max_k,
+            DOWN_JOIN_TIMEOUT,
+        )
+    }
+
+    /// [`Self::try_new_role_major`] with an explicit bound on one join
+    /// (shared by every layer the join waits on).
+    ///
+    /// # Errors
+    /// As [`Self::try_new_role_major`]; a zero bound is rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_role_major_bounded(
+        arena: Arena,
+        source: Arc<dyn ExpertSource>,
+        snapshots: Arc<SnapshotHandle>,
+        stats: Arc<P3Stats>,
+        geometry: PoolGeometry,
+        class_of_layer: Vec<u8>,
+        max_k: u32,
+        join_timeout: std::time::Duration,
+    ) -> Result<Arc<Self>, PoolConfigError> {
+        if join_timeout.is_zero() {
+            return Err(PoolConfigError::new(
+                "role-major page-in needs a join bound > 0".to_string(),
+            ));
+        }
+        if max_k == 0 {
+            return Err(PoolConfigError::new(
+                "role-major page-in needs a per-layer unit cap > 0".to_string(),
+            ));
+        }
+        // `split_down` cuts each slot at `region[0] + region[1]`: the cut
+        // must stay inside every slot of the layer's class.
+        for (l, (unit, &c)) in geometry.layers.iter().zip(&class_of_layer).enumerate() {
+            let c = usize::from(c);
+            if c >= arena.class_count() {
+                continue; // `build` rejects it.
+            }
+            let slot_size = arena.slot_size_of(arena.class_range(c).start) as u64;
+            if unit.region[0] + unit.region[1] > slot_size {
+                return Err(PoolConfigError::new(format!(
+                    "layer {l}: gate/up regions {} B exceed slot size {slot_size} B",
+                    unit.region[0] + unit.region[1]
+                )));
+            }
+        }
+        let cap = max_k.min(geometry.n_experts) as usize;
+        Self::build(
+            arena,
+            source,
+            snapshots,
+            stats,
+            geometry,
+            class_of_layer,
+            cap,
+            join_timeout,
+        )
     }
 
     /// Claims and page-ins the whole `(kind, expert)` miss list of ONE layer
@@ -623,18 +1084,43 @@ impl ExpertPool {
         let batch = &mut *guard;
         let _inflight = self.demand_guard(true);
         let base = layer as usize * n as usize;
+        if self.down.is_some()
+            && misses
+                .iter()
+                .any(|&(_, e)| batch.lease_of[base + e as usize] == SPLIT)
+        {
+            // Join point: a miss names a unit whose down read is queued. A
+            // poisoned unit (its down read failed) stays SPLIT until the
+            // step ends: fail this call (its read failure was counted at
+            // the join that poisoned it).
+            self.join_layer(layer, batch, self.join_deadline())?;
+            if misses
+                .iter()
+                .any(|&(_, e)| batch.lease_of[base + e as usize] == SPLIT)
+            {
+                return Err(down_failed());
+            }
+        }
         // A PENDING left by an unwind through a previous call is stale.
         reset_pending(&mut batch.lease_of, base, misses);
         let mut fills: Vec<(u32, u32, FillClaim<'_>)> = recycle(std::mem::take(&mut batch.fills));
+        let mut splits: Vec<(u32, u32, FillClaim<'_>)> = recycle(std::mem::take(&mut batch.splits));
         let claimed = self.claim_misses(layer, misses, batch, &mut fills);
         let result = claimed.and_then(|()| {
+            let fill = |batch: &mut BatchClaims, fills: &mut _, splits: &mut _| {
+                if self.down.is_some() {
+                    self.fill_batch_role_major(layer, misses, batch, fills, splits)
+                } else {
+                    self.fill_batch(layer, batch, fills)
+                }
+            };
             let Some(hits_ready) = hits_ready else {
-                return self.fill_batch(layer, batch, &mut fills);
+                return fill(batch, &mut fills, &mut splits);
             };
             let mut hits = 0;
             for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
                 let lease_at = batch.lease_of[base + expert as usize];
-                *dst = if lease_at == UNCLAIMED || lease_at == PENDING {
+                *dst = if lease_at == UNCLAIMED || lease_at == PENDING || lease_at == SPLIT {
                     std::ptr::null()
                 } else {
                     hits += 1;
@@ -645,18 +1131,34 @@ impl ExpertPool {
             if hits > 0 {
                 hits_ready(&*out);
             }
-            self.fill_batch(layer, batch, &mut fills)
+            fill(batch, &mut fills, &mut splits)
         });
         batch.fills = recycle(fills);
+        batch.splits = recycle(splits);
         if result.is_err() {
             reset_pending(&mut batch.lease_of, base, misses);
         }
         result?;
         for (&(kind, expert), dst) in misses.iter().zip(out.iter_mut()) {
-            let lease_at = batch.lease_of[base + expert as usize] as usize;
-            *dst = self
-                .plane_bytes(layer, &batch.leases[lease_at], kind)
-                .as_ptr();
+            let lease_at = batch.lease_of[base + expert as usize];
+            *dst = if lease_at == SPLIT {
+                // Gate/up of a unit whose down read is queued: the owned
+                // claim holds the slot (mid-fill, leased) until the join.
+                // ≤ K owned claims per layer: a short scan, no map.
+                let Some(claim) = batch.split_claims[layer as usize]
+                    .iter()
+                    .find(|c| c.expert() == expert)
+                else {
+                    return Err(PoolError::Contract {
+                        reason: format!("unit ({layer}, {expert}) split without its claim"),
+                    });
+                };
+                let (off, _) = self.geometry.layers[layer as usize].plane(kind);
+                self.arena.slot_ptr_at(claim.slot(), off).cast_const()
+            } else {
+                self.plane_bytes(layer, &batch.leases[lease_at as usize], kind)
+                    .as_ptr()
+            };
         }
         Ok(())
     }
@@ -707,6 +1209,273 @@ impl ExpertPool {
             }
         }
         Ok(())
+    }
+
+    /// Phase 2 of [`Self::ensure_batch`] with role-major page-in: a pending
+    /// unit whose down plane is not in `misses` (up to the layer's cap) is
+    /// split — its gate/up regions join the call's one batched read, its
+    /// down region goes to the layer's down job for the reader thread. The
+    /// rest read all three planes in the same drain. Success settles the
+    /// whole units as [`Self::fill_batch`] does and marks the split units
+    /// `SPLIT`, their owned claims (each holding the unit's only lease)
+    /// kept until a join; failure cancels every fill of the call before any
+    /// pointer is handed out.
+    fn fill_batch_role_major<'m>(
+        &'m self,
+        layer: u32,
+        misses: &[(ExpertKind, u32)],
+        batch: &mut BatchClaims,
+        fills: &mut Vec<(u32, u32, FillClaim<'m>)>,
+        splits: &mut Vec<(u32, u32, FillClaim<'m>)>,
+    ) -> Result<(), PoolError> {
+        if fills.is_empty() {
+            return Ok(());
+        }
+        let mut i = 0;
+        while i < fills.len() {
+            let expert = fills[i].0;
+            let wants_down = misses
+                .iter()
+                .any(|&(k, e)| e == expert && k == ExpertKind::Down);
+            if !wants_down && splits.len() < self.split_cap {
+                splits.push(fills.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let Some(down) = self.down.as_deref().filter(|_| !splits.is_empty()) else {
+            fills.append(splits);
+            return self.fill_batch(layer, batch, fills);
+        };
+        // A new split queues on this layer's job: join an unjoined one first.
+        self.join_layer(layer, batch, self.join_deadline())?;
+        let unit = &self.geometry.layers[layer as usize];
+        let (r0, r1) = (unit.region[0] as usize, unit.region[1] as usize);
+        let mut planes = std::mem::take(&mut batch.planes);
+        let mut targets: Vec<(&mut [u8], usize)> = recycle(std::mem::take(&mut batch.targets));
+        for (expert, _, claim) in fills.iter_mut() {
+            planes.extend(ExpertKind::ALL.map(|k| (k, *expert)));
+            let (t0, rest) = self.arena.slot_mut(claim).split_at_mut(r0);
+            let (t1, t2) = rest.split_at_mut(r1);
+            targets.push((t0, unit.head[0] as usize));
+            targets.push((t1, unit.head[1] as usize));
+            targets.push((t2, unit.head[2] as usize));
+        }
+        // The split claims sit in the layer's (joined, so empty) list from
+        // here on, each paired by index with its window in `windows`.
+        let split_claims = &mut batch.split_claims[layer as usize];
+        for (expert, _, claim) in splits.drain(..) {
+            let owned = claim.into_owned(self.residency.clone());
+            let (split, window) = Arena::split_down(&self.arena, owned, r0 + r1);
+            split_claims.push(split);
+            batch.windows.push(DownUnit {
+                expert,
+                head: unit.head[2] as usize,
+                window,
+            });
+        }
+        for split in split_claims.iter_mut() {
+            planes.push((ExpertKind::Gate, split.expert()));
+            planes.push((ExpertKind::Up, split.expert()));
+            let (t0, t1) = split.head_mut().split_at_mut(r0);
+            targets.push((t0, unit.head[0] as usize));
+            targets.push((t1, unit.head[1] as usize));
+        }
+        let read = self
+            .source
+            .read_expert_batched(layer, &planes, &mut targets);
+        planes.clear();
+        batch.planes = planes;
+        batch.targets = recycle(targets);
+        let base = layer as usize * self.geometry.n_experts as usize;
+        if let Err(source) = read {
+            // No pointer was handed out and no window reached the reader:
+            // every window is taken back, then every claim is cancelled
+            // (slots recycled, no ghost residency).
+            for (split, w) in batch.split_claims[layer as usize]
+                .drain(..)
+                .zip(batch.windows.drain(..))
+            {
+                if let Some(claim) = split.rejoin(w.window) {
+                    claim.cancel();
+                }
+            }
+            for (_, _, claim) in fills.drain(..) {
+                self.settle_fill(true, unit, claim, false);
+            }
+            self.stats.source_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(PoolError::Source { source });
+        }
+        for (expert, slot, claim) in fills.drain(..) {
+            self.settle_fill(true, unit, claim, true);
+            self.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
+            batch.lease_of[base + expert as usize] = batch.leases.len() as u32;
+            batch.leases.push(self.lease(layer, expert, slot));
+        }
+        for split in &batch.split_claims[layer as usize] {
+            batch.lease_of[base + split.expert() as usize] = SPLIT;
+            self.stats.split_units.fetch_add(1, Ordering::Relaxed);
+        }
+        let job = &down.jobs[layer as usize];
+        {
+            let mut g = job.inner.lock().unwrap_or_else(|e| e.into_inner());
+            debug_assert_eq!(g.state, JobState::Idle, "split queued on an unjoined job");
+            g.units.append(&mut batch.windows);
+            g.state = JobState::Queued;
+        }
+        down.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(layer);
+        down.wake.notify_one();
+        Ok(())
+    }
+
+    /// The deadline of a join starting now (one per join, shared by every
+    /// layer it waits on).
+    fn join_deadline(&self) -> std::time::Instant {
+        let bound = self
+            .down
+            .as_deref()
+            .map_or(DOWN_JOIN_TIMEOUT, |d| d.join_timeout);
+        std::time::Instant::now() + bound
+    }
+
+    /// Joins `layer`'s down job (decode thread, under `batch_claims`):
+    /// waits until `deadline` for the reader — failing the job at once when
+    /// no reader is attached — then takes every window back and settles
+    /// the layer's split units: `Done` finishes each claim and leases the
+    /// unit in claim order; `Failed` moves the claims to `poisoned` (still
+    /// mid-fill and leased, so no slot is recycled under an in-flight
+    /// gate/up DMA) and returns [`PoolError::Source`]. Idle: no-op.
+    fn join_layer(
+        &self,
+        layer: u32,
+        batch: &mut BatchClaims,
+        deadline: std::time::Instant,
+    ) -> Result<(), PoolError> {
+        let Some(down) = self.down.as_deref() else {
+            return Ok(());
+        };
+        let job = &down.jobs[layer as usize];
+        let mut g = job.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let landed = loop {
+            match g.state {
+                JobState::Idle => return Ok(()),
+                JobState::Done => break true,
+                JobState::Failed => break false,
+                JobState::Queued => {}
+            }
+            // No reader can take the windows: they are still in `units`,
+            // so failing here leaves no writer behind.
+            if down.readers.load(Ordering::Acquire) == 0 {
+                break false;
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(PoolError::DownStalled { layer });
+            };
+            // Loom models no timed wait (primitives::wait_timeout is a
+            // yield there): park on the latch; the attached reader always
+            // settles or detaches, and both notify.
+            #[cfg(loom)]
+            let _ = left;
+            #[cfg(loom)]
+            {
+                g = job.done.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            #[cfg(not(loom))]
+            {
+                g = super::primitives::wait_timeout(&job.done, g, left);
+            }
+        };
+        g.state = JobState::Idle;
+        let base = layer as usize * self.geometry.n_experts as usize;
+        let unit = &self.geometry.layers[layer as usize];
+        // Each split claim takes its window back (by index) before it can
+        // settle; one left unpaired stays leaked rather than recycled.
+        let splits = batch.split_claims[layer as usize].drain(..);
+        let claims = splits
+            .zip(g.units.drain(..))
+            .filter_map(|(split, u)| split.rejoin(u.window));
+        if landed {
+            for claim in claims {
+                let (expert, slot) = (claim.expert(), claim.slot());
+                claim.finish();
+                self.stats
+                    .demand_slow_pageins
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .bytes_paged
+                    .fetch_add(unit.bytes(), Ordering::Relaxed);
+                self.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
+                batch.lease_of[base + expert as usize] = batch.leases.len() as u32;
+                batch.leases.push(self.lease(layer, expert, slot));
+            }
+            Ok(())
+        } else {
+            batch.poisoned.extend(claims);
+            self.stats.source_errors.fetch_add(1, Ordering::Relaxed);
+            Err(down_failed())
+        }
+    }
+
+    /// Joins every layer's down job under one shared deadline, stopping at
+    /// the first stall (the stalled layer and those after it keep their
+    /// claims and slots). A failed down read is not an error here.
+    fn join_all(&self, batch: &mut BatchClaims) -> Result<(), PoolError> {
+        if self.down.is_none() {
+            return Ok(());
+        }
+        let deadline = self.join_deadline();
+        for layer in 0..self.geometry.layers.len() as u32 {
+            if let Err(e @ PoolError::DownStalled { .. }) = self.join_layer(layer, batch, deadline)
+            {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Cancels every poisoned claim (caller: C drained every DMA from
+    /// their slots) and clears their `SPLIT` entries.
+    fn cancel_poisoned(&self, batch: &mut BatchClaims) {
+        let n = self.geometry.n_experts as usize;
+        for claim in batch.poisoned.drain(..) {
+            batch.lease_of[claim.layer() as usize * n + claim.expert() as usize] = UNCLAIMED;
+            claim.cancel();
+        }
+    }
+
+    /// Idle settle of the role-major state (decode idle, every DMA drained:
+    /// a failed decode, a device-cache reset, teardown): joins every down
+    /// job, leases the units whose down landed (released at the next
+    /// `end_batch_step*`) and cancels the poisoned ones — which also wakes
+    /// any claimer parked on their fill gate. No-op without role-major.
+    ///
+    /// # Errors
+    /// [`PoolError::DownStalled`] when a down read outlived the join bound.
+    pub fn settle_split(&self) -> Result<(), PoolError> {
+        if self.down.is_none() {
+            return Ok(());
+        }
+        let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        let joined = self.join_all(&mut batch);
+        self.cancel_poisoned(&mut batch);
+        joined
+    }
+
+    /// Joins every queued down read (the step-end join point: `copy_done`
+    /// runs it before any lease drain or D2H commit). A failed down read
+    /// is not an error here — its units stay poisoned until the step end.
+    ///
+    /// # Errors
+    /// [`PoolError::DownStalled`] when a down read outlived the join bound.
+    pub fn join_split(&self) -> Result<(), PoolError> {
+        if self.down.is_none() {
+            return Ok(());
+        }
+        let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        self.join_all(&mut batch)
     }
 
     /// Phase 2 of [`Self::ensure_batch`]: one batched source read landing
@@ -764,10 +1533,13 @@ impl ExpertPool {
     /// policy snapshot. The caller guarantees the device has consumed every
     /// pointer handed out (the glue's `copy_done`).
     pub fn end_batch_step(&self) {
-        self.batch_claims
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .next_step(self);
+        let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        // Role-major: every down read lands (or fails) before any lease
+        // drops; a stalled one keeps its claims (the caller's join already
+        // turned a stall fatal).
+        let _ = self.join_all(&mut batch);
+        self.cancel_poisoned(&mut batch);
+        batch.next_step(self);
     }
 
     /// [`Self::end_batch_step`] under EXCLUSIVE residency (O10): after the
@@ -779,6 +1551,8 @@ impl ExpertPool {
     /// drained lease vector's contents, moved into a reused scratch.
     pub fn end_batch_step_exclusive(&self) {
         let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.join_all(&mut batch);
+        self.cancel_poisoned(&mut batch);
         // Swap the step's leases into a reused scratch (no per-step
         // allocation — decode hot path) so `lease_of` is writable while we
         // walk them.
@@ -840,19 +1614,40 @@ impl ExpertPool {
         if experts.is_empty() {
             return;
         }
+        // Role-major: a unit with a down read queued is mid-fill, so
+        // claiming it below would park the decode thread on its own fill
+        // gate. Join first, and hold `batch_claims` across the batch
+        // (decode-thread-only, uncontended; lock order batch_claims →
+        // d2h_pending → shard) so no unit turns SPLIT mid-batch; a poisoned
+        // unit (still SPLIT) has no pool copy to give and is dropped.
+        let batch = self.down.is_some().then(|| {
+            let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.join_layer(layer, &mut batch, self.join_deadline());
+            batch
+        });
+        let base = layer as usize * self.geometry.n_experts as usize;
         // One snapshot for the whole batch: the floor decisions within one
         // compute share the snapshot the H2D ensure path used (refreshed at
         // end_batch_step), so victims rank consistently across the step.
-        let snapshot = self
-            .batch_claims
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .snapshot
-            .clone();
+        let snapshot = match &batch {
+            Some(batch) => batch.snapshot.clone(),
+            None => self
+                .batch_claims
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot
+                .clone(),
+        };
         // One pending-table lock per batch: every claim pushed under it, so
         // CLOCK cannot recycle a claimed slot mid-batch either.
         let mut pending = self.d2h_pending.lock().unwrap_or_else(|e| e.into_inner());
         for (i, (&expert, &floor)) in experts.iter().zip(floors).enumerate() {
+            if let Some(batch) = &batch
+                && batch.lease_of.get(base + expert as usize) == Some(&SPLIT)
+            {
+                out[i] = D2hIncoming::Dropped;
+                continue;
+            }
             out[i] = match self.residency.claim_d2h(layer, expert, &snapshot, floor) {
                 super::residency::D2hClaim::Resident => D2hIncoming::Resident,
                 super::residency::D2hClaim::Dropped => D2hIncoming::Dropped,
@@ -956,6 +1751,8 @@ impl ExpertPool {
     /// invariant), so no lease is in flight on the device.
     pub fn reset_exclusive_batch(&self) {
         let mut batch = self.batch_claims.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.join_all(&mut batch);
+        self.cancel_poisoned(&mut batch);
         let mut scratch = self
             .exclusive_scratch
             .lock()
@@ -1031,6 +1828,22 @@ impl ExpertPool {
     /// Whether `(layer, expert)` is resident (filled or mid-fill).
     pub fn is_resident(&self, layer: u32, expert: u32) -> bool {
         self.residency.is_resident(layer, expert)
+    }
+
+    /// Test seam: the next role-major down job fails without reading
+    /// (no-op without role-major page-in).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_next_down_read_for_test(&self) {
+        if let Some(down) = &self.down {
+            down.fail_next.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Claimed units of `layer` (filled or mid-fill), one lock-free load:
+    /// Σ[`Self::is_resident`] over the layer's experts between flips.
+    pub fn resident_count(&self, layer: u32) -> u32 {
+        self.residency.resident_count(layer)
     }
 
     /// Counts one in-flight demand page-in until the guard drops (every
@@ -2184,6 +2997,37 @@ mod tests {
         assert_eq!(lease.bytes()[0], 0x11);
     }
 
+    fn resident_oracle(pool: &ExpertPool) -> u32 {
+        (0..N_EXPERTS).filter(|&e| pool.is_resident(0, e)).count() as u32
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn resident_count_tracks_fills_cancel_and_eviction() {
+        let pool = test_pool(2);
+        assert_eq!(pool.resident_count(0), 0);
+        pool.ensure_range(true, 0, ExpertKind::Gate, 0, 1, &mut |_| {})
+            .unwrap();
+        assert_eq!(pool.resident_count(0), 2);
+        assert_eq!(pool.resident_count(0), resident_oracle(&pool));
+        // Full pool: the next fill evicts one and claims one.
+        pool.ensure_range(true, 0, ExpertKind::Gate, 2, 2, &mut |_| {})
+            .unwrap();
+        assert_eq!(pool.stats.evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.resident_count(0), 2);
+        assert_eq!(pool.resident_count(0), resident_oracle(&pool));
+        // A failed fill cancels its claim (evicting a victim on the way).
+        let pool = test_pool_failing(2, (0, ExpertKind::Gate, 2));
+        pool.ensure_range(true, 0, ExpertKind::Gate, 0, 0, &mut |_| {})
+            .unwrap();
+        assert!(
+            pool.ensure_range(true, 0, ExpertKind::Gate, 2, 2, &mut |_| {})
+                .is_err()
+        );
+        assert_eq!(pool.resident_count(0), 1);
+        assert_eq!(pool.resident_count(0), resident_oracle(&pool));
+    }
+
     // Sequential unit test over loom-primitive pool types: needs no exploration
     // (the t6 model covers the interleavings) and cannot run outside `model()`.
     #[test]
@@ -2524,5 +3368,515 @@ mod tests {
             step.ensure_range_leased(0, ExpertKind::Gate, 0, 0, &mut ptrs),
             Err(PoolError::Contract { .. })
         ));
+    }
+}
+
+/// Role-major page-in (§3.4 P3) over a stub source whose down-only drains
+/// block on a per-call latch. Channels with `try_recv` assert ordering;
+/// every wait has a deadline — no sleeps.
+#[cfg(all(test, not(loom)))]
+mod role_major_tests {
+    use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+    use std::time::Duration;
+
+    use super::super::primitives::arc_dyn;
+    use super::*;
+    use crate::pool::SlotClass;
+
+    const N: u32 = 8;
+    const STRIDE: usize = 64;
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn byte(kind: ExpertKind, expert: u32) -> u8 {
+        0x10 * (kind.ordinal() as u8 + 1) + expert as u8
+    }
+
+    /// What a latched down drain does once released.
+    enum Release {
+        Land,
+        Fail,
+        Panic,
+    }
+
+    /// Writes plane-identifying bytes; a drain of only down planes reports
+    /// its experts on `started`, then waits for one `Release`.
+    struct LatchSource {
+        started: std::sync::Mutex<Sender<Vec<u32>>>,
+        release: std::sync::Mutex<Receiver<Release>>,
+    }
+
+    impl ExpertSource for LatchSource {
+        fn read_expert(
+            &self,
+            _layer: u32,
+            kind: ExpertKind,
+            expert: u32,
+            into: &mut [u8],
+            head: usize,
+        ) -> std::io::Result<()> {
+            into[head..head + STRIDE].fill(byte(kind, expert));
+            Ok(())
+        }
+
+        fn plane(&self, _: u32, _: ExpertKind, _: u32) -> Option<(u64, u64)> {
+            None
+        }
+
+        fn read_expert_batched(
+            &self,
+            layer: u32,
+            batch: &[(ExpertKind, u32)],
+            targets: &mut [(&mut [u8], usize)],
+        ) -> std::io::Result<()> {
+            if !batch.is_empty() && batch.iter().all(|&(k, _)| k == ExpertKind::Down) {
+                let experts = batch.iter().map(|&(_, e)| e).collect();
+                let _ = self.started.lock().unwrap().send(experts);
+                let rel = self.release.lock().unwrap().recv_timeout(DEADLINE);
+                match rel {
+                    Ok(Release::Land) => {}
+                    Ok(Release::Fail) => return Err(std::io::Error::other("down failed")),
+                    Ok(Release::Panic) => panic!("down read panicked"),
+                    Err(_) => return Err(std::io::Error::other("latch never released")),
+                }
+            }
+            for (&(kind, expert), (into, head)) in batch.iter().zip(targets.iter_mut()) {
+                self.read_expert(layer, kind, expert, into, *head)?;
+            }
+            Ok(())
+        }
+    }
+
+    struct Rig {
+        pool: Arc<ExpertPool>,
+        reader: Option<DownReaderHandle>,
+        started: Receiver<Vec<u32>>,
+        release: Sender<Release>,
+    }
+
+    fn rig(slots: u32) -> Rig {
+        rig_bounded(slots, DOWN_JOIN_TIMEOUT, true)
+    }
+
+    /// Two layers, `slots` unit slots, a join bound of `bound`; `reader`
+    /// spawns the down reader.
+    fn rig_bounded(slots: u32, bound: Duration, reader: bool) -> Rig {
+        let (started_tx, started) = channel();
+        let (release, release_rx) = channel();
+        let src = LatchSource {
+            started: std::sync::Mutex::new(started_tx),
+            release: std::sync::Mutex::new(release_rx),
+        };
+        let arena = Arena::new(&[SlotClass {
+            slot_size: 3 * STRIDE,
+            slots,
+        }])
+        .unwrap();
+        let unit = UnitLayout::new([STRIDE as u64; 3], [None; 3]).unwrap();
+        let pool = ExpertPool::try_new_role_major_bounded(
+            arena,
+            arc_dyn(std::sync::Arc::new(src)),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            PoolGeometry {
+                layers: vec![unit, unit],
+                n_experts: N,
+                expert_bytes: 0,
+            },
+            vec![0, 0],
+            4,
+            bound,
+        )
+        .unwrap();
+        let reader = reader.then(|| {
+            spawn_down_reader(&pool)
+                .expect("spawn")
+                .expect("role-major reader")
+        });
+        Rig {
+            pool,
+            reader,
+            started,
+            release,
+        }
+    }
+
+    fn ensure(pool: &ExpertPool, misses: &[(ExpertKind, u32)]) -> Result<Vec<usize>, PoolError> {
+        ensure_at(pool, 0, misses)
+    }
+
+    fn ensure_at(
+        pool: &ExpertPool,
+        layer: u32,
+        misses: &[(ExpertKind, u32)],
+    ) -> Result<Vec<usize>, PoolError> {
+        let mut out = vec![std::ptr::null(); misses.len()];
+        pool.ensure_batch(layer, misses, &mut out)?;
+        Ok(out.into_iter().map(|p| p as usize).collect())
+    }
+
+    /// Runs `f` on a thread; its result arrives on the returned channel.
+    fn spawn_rx<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx
+    }
+
+    /// The STRIDE bytes at a pool plane pointer handed out by ensure.
+    fn plane_at(pool: &ExpertPool, ptr: usize) -> Vec<u8> {
+        pool.arena.bytes_at_for_test(ptr as *const u8, STRIDE)
+    }
+
+    #[test]
+    fn gate_up_pointers_are_returned_before_down_lands() {
+        let r = rig(4);
+        let out = ensure(&r.pool, &[(ExpertKind::Gate, 2), (ExpertKind::Up, 2)]).unwrap();
+        assert_eq!(r.started.recv_timeout(DEADLINE).unwrap(), vec![2]);
+        assert_eq!(
+            plane_at(&r.pool, out[0]),
+            vec![byte(ExpertKind::Gate, 2); STRIDE]
+        );
+        assert_eq!(
+            plane_at(&r.pool, out[1]),
+            vec![byte(ExpertKind::Up, 2); STRIDE]
+        );
+        assert_eq!(r.pool.stats.split_units.load(Ordering::Relaxed), 1);
+        assert_eq!(r.pool.batch_leases(), 0, "no batch lease before the join");
+        assert_eq!(r.pool.outstanding_leases(0, 2), 1, "the claim's lease");
+        r.release.send(Release::Land).unwrap();
+        // The down segment's ensure joins and hands out the landed plane.
+        let down = ensure(&r.pool, &[(ExpertKind::Down, 2)]).unwrap();
+        assert_eq!(
+            plane_at(&r.pool, down[0]),
+            vec![byte(ExpertKind::Down, 2); STRIDE]
+        );
+        assert_eq!(down[0] - out[0], 2 * STRIDE, "one slot per unit");
+        r.pool.end_batch_step();
+        assert!(r.pool.is_resident(0, 2));
+        assert_eq!(r.pool.outstanding_leases(0, 2), 0);
+    }
+
+    #[test]
+    fn down_failure_errors_at_join_and_holds_the_slot_until_step_end() {
+        let r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Gate, 1)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        r.release.send(Release::Fail).unwrap();
+        assert!(matches!(
+            ensure(&r.pool, &[(ExpertKind::Down, 1)]),
+            Err(PoolError::Source { .. })
+        ));
+        // Poisoned: still mid-fill and leased — the slot cannot be recycled
+        // while C may read its gate/up bytes.
+        assert!(r.pool.is_resident(0, 1));
+        assert_eq!(r.pool.outstanding_leases(0, 1), 1);
+        assert_eq!(r.pool.resident_count(0), 1);
+        r.pool.end_batch_step();
+        assert!(!r.pool.is_resident(0, 1), "no ghost residency");
+        assert_eq!(r.pool.outstanding_leases(0, 1), 0);
+        assert_eq!(r.pool.resident_count(0), 0);
+        assert_eq!(r.pool.fill(), 0.0, "slot back on the free list");
+    }
+
+    #[test]
+    fn slots_follow_miss_order() {
+        let r = rig(4);
+        let out = ensure(
+            &r.pool,
+            &[
+                (ExpertKind::Gate, 5),
+                (ExpertKind::Gate, 1),
+                (ExpertKind::Gate, 3),
+            ],
+        )
+        .unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        assert!(
+            out[0] < out[1] && out[1] < out[2],
+            "slots in miss order: {out:?}"
+        );
+        r.release.send(Release::Land).unwrap();
+        r.pool.end_batch_step();
+    }
+
+    #[test]
+    fn end_batch_step_waits_for_the_down_read() {
+        let r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Gate, 4)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        let pool = r.pool.clone();
+        let ended = spawn_rx(move || pool.end_batch_step());
+        // The step end is blocked on the latch (the reader holds it).
+        assert!(matches!(ended.try_recv(), Err(TryRecvError::Empty)));
+        r.release.send(Release::Land).unwrap();
+        ended.recv_timeout(DEADLINE).expect("end_batch_step joined");
+        assert!(r.pool.is_resident(0, 4));
+        assert_eq!(r.pool.outstanding_leases(0, 4), 0);
+    }
+
+    #[test]
+    fn concurrent_claim_on_a_split_unit_parks_until_the_join() {
+        let r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Up, 6)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        let pool = r.pool.clone();
+        let claimed = spawn_rx(move || pool.ensure_unit(false, 0, 6));
+        assert!(
+            matches!(claimed.try_recv(), Err(TryRecvError::Empty)),
+            "a claim on a partially landed unit parks"
+        );
+        r.release.send(Release::Land).unwrap();
+        r.pool.join_split().unwrap();
+        claimed
+            .recv_timeout(DEADLINE)
+            .expect("parked claim woke")
+            .unwrap();
+        r.pool.end_batch_step();
+        assert_eq!(r.pool.outstanding_leases(0, 6), 0);
+    }
+
+    #[test]
+    fn second_handoff_on_a_layer_joins_the_first() {
+        let r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Gate, 1)]).unwrap();
+        assert_eq!(r.started.recv_timeout(DEADLINE).unwrap(), vec![1]);
+        let pool = r.pool.clone();
+        let second = spawn_rx(move || ensure(&pool, &[(ExpertKind::Gate, 2)]).map(|_| ()));
+        assert!(matches!(second.try_recv(), Err(TryRecvError::Empty)));
+        r.release.send(Release::Land).unwrap();
+        second.recv_timeout(DEADLINE).unwrap().unwrap();
+        assert_eq!(r.started.recv_timeout(DEADLINE).unwrap(), vec![2]);
+        assert_eq!(r.pool.batch_leases(), 1, "the first unit joined and leased");
+        r.release.send(Release::Land).unwrap();
+        r.pool.end_batch_step();
+        assert_eq!(r.pool.stats.split_units.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_miss_list_with_down_never_splits() {
+        let r = rig(4);
+        let out = ensure(
+            &r.pool,
+            &[
+                (ExpertKind::Gate, 3),
+                (ExpertKind::Up, 3),
+                (ExpertKind::Down, 3),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(r.started.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(r.pool.stats.split_units.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            plane_at(&r.pool, out[2]),
+            vec![byte(ExpertKind::Down, 3); STRIDE]
+        );
+        r.pool.end_batch_step();
+    }
+
+    #[test]
+    fn exclusive_step_end_leaves_a_split_unit_vram_only() {
+        let r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Gate, 7)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        r.release.send(Release::Land).unwrap();
+        r.pool.end_batch_step_exclusive();
+        assert!(!r.pool.is_resident(0, 7));
+        assert!(r.pool.is_vram(0, 7));
+    }
+
+    #[test]
+    fn panicking_down_read_fails_the_job() {
+        let r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Gate, 0)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        r.release.send(Release::Panic).unwrap();
+        assert!(matches!(
+            ensure(&r.pool, &[(ExpertKind::Down, 0)]),
+            Err(PoolError::Source { .. })
+        ));
+        r.pool.end_batch_step();
+        assert!(!r.pool.is_resident(0, 0));
+        // The reader survived the panic: a later split still lands.
+        ensure(&r.pool, &[(ExpertKind::Gate, 5)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        r.release.send(Release::Land).unwrap();
+        r.pool.end_batch_step();
+        assert!(r.pool.is_resident(0, 5));
+    }
+
+    #[test]
+    fn drop_with_a_job_queued_frees_the_arena() {
+        let mut r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Gate, 2)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        let arena = Arc::downgrade(&r.pool.arena);
+        r.release.send(Release::Land).unwrap();
+        let reader = r.reader.take();
+        let dropped = spawn_rx(move || {
+            drop(reader);
+            drop(r);
+        });
+        dropped.recv_timeout(DEADLINE).expect("teardown completed");
+        assert!(arena.upgrade().is_none(), "arena unmapped");
+    }
+
+    #[test]
+    fn settle_wakes_a_claimer_parked_on_a_poisoned_unit() {
+        let r = rig(4);
+        ensure(&r.pool, &[(ExpertKind::Gate, 3)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        r.release.send(Release::Fail).unwrap();
+        let pool = r.pool.clone();
+        let parked = spawn_rx(move || pool.ensure_unit(false, 0, 3));
+        assert!(matches!(parked.try_recv(), Err(TryRecvError::Empty)));
+        r.pool.settle_split().unwrap();
+        parked
+            .recv_timeout(DEADLINE)
+            .expect("parked prefetch woke")
+            .unwrap();
+        assert_eq!(r.pool.outstanding_leases(0, 3), 0);
+    }
+
+    /// Double ownership: the claim's lease is handed from the call to the
+    /// owned claim to the batch lease exactly once. Plain asserts (no
+    /// debug_assert), so a `--release` run checks the same invariant.
+    #[test]
+    fn split_claims_settle_exactly_once() {
+        let r = rig(4);
+        for round in 0..3u32 {
+            let (a, b) = (round, round + 4);
+            ensure(&r.pool, &[(ExpertKind::Gate, a), (ExpertKind::Up, b)]).unwrap();
+            r.started.recv_timeout(DEADLINE).unwrap();
+            assert_eq!(r.pool.outstanding_leases(0, a), 1);
+            assert_eq!(r.pool.outstanding_leases(0, b), 1);
+            r.release
+                .send(if round == 1 {
+                    Release::Fail
+                } else {
+                    Release::Land
+                })
+                .unwrap();
+            r.pool.end_batch_step();
+            let sum: u32 = (0..N).map(|e| u32::from(r.pool.is_resident(0, e))).sum();
+            assert_eq!(r.pool.resident_count(0), sum);
+            for e in 0..N {
+                assert_eq!(r.pool.outstanding_leases(0, e), 0, "lease leaked on {e}");
+            }
+        }
+    }
+
+    /// One join's bound is shared by every layer it waits on: two layers
+    /// with a stalled down read yield one `DownStalled` within ~one bound,
+    /// not one bound per layer.
+    #[test]
+    fn stalled_down_read_stalls_once_within_the_bound() {
+        // Per-layer bounds would take 2 × BOUND (two layers); the 0.5 ×
+        // BOUND margin absorbs scheduler jitter on a loaded box.
+        const BOUND: Duration = Duration::from_millis(200);
+        let r = rig_bounded(4, BOUND, true);
+        ensure_at(&r.pool, 0, &[(ExpertKind::Gate, 1)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        // Layer 1's job queues behind layer 0's stalled read on the one
+        // reader thread, so it stalls too.
+        ensure_at(&r.pool, 1, &[(ExpertKind::Gate, 2)]).unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            r.pool.join_split(),
+            Err(PoolError::DownStalled { layer: 0 })
+        ));
+        let took = t0.elapsed();
+        assert!(took >= BOUND, "returned before the bound: {took:?}");
+        assert!(took < BOUND * 3 / 2, "one bound per layer: {took:?}");
+        // The stalled claims keep their slots.
+        assert_eq!(r.pool.outstanding_leases(0, 1), 1);
+        assert_eq!(r.pool.outstanding_leases(1, 2), 1);
+        r.release.send(Release::Land).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        r.release.send(Release::Land).unwrap();
+        r.pool.end_batch_step();
+        assert!(r.pool.is_resident(0, 1) && r.pool.is_resident(1, 2));
+        assert_eq!(r.pool.outstanding_leases(0, 1), 0);
+    }
+
+    /// No reader running: the join fails the job at once (no bound wait)
+    /// and the unit is cancelled at the step end.
+    #[test]
+    fn join_without_a_reader_fails_at_once() {
+        let r = rig_bounded(4, DOWN_JOIN_TIMEOUT, false);
+        ensure(&r.pool, &[(ExpertKind::Gate, 3)]).unwrap();
+        let pool = r.pool.clone();
+        let joined = spawn_rx(move || ensure(&pool, &[(ExpertKind::Down, 3)]).map(|_| ()));
+        assert!(matches!(
+            joined.recv_timeout(DEADLINE).expect("join returned"),
+            Err(PoolError::Source { .. })
+        ));
+        r.pool.end_batch_step();
+        assert!(!r.pool.is_resident(0, 3));
+        assert_eq!(r.pool.outstanding_leases(0, 3), 0);
+    }
+
+    /// A poisoned unit keeps its only slot until the step ends: a
+    /// concurrent claim on another key finds no slot (Busy), one on the
+    /// poisoned key parks; both resolve only after `end_batch_step`.
+    #[test]
+    fn poisoned_slot_is_not_reusable_before_step_end() {
+        let r = rig(1);
+        ensure(&r.pool, &[(ExpertKind::Gate, 4)]).unwrap();
+        r.started.recv_timeout(DEADLINE).unwrap();
+        r.release.send(Release::Fail).unwrap();
+        assert!(matches!(
+            ensure(&r.pool, &[(ExpertKind::Down, 4)]),
+            Err(PoolError::Source { .. })
+        ));
+        assert_eq!(r.pool.stats.source_errors.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            r.pool.ensure_unit(false, 0, 5),
+            Err(PoolError::Busy)
+        ));
+        let pool = r.pool.clone();
+        let parked = spawn_rx(move || pool.ensure_unit(false, 0, 4));
+        assert!(
+            matches!(parked.try_recv(), Err(TryRecvError::Empty)),
+            "a claim on the poisoned unit parks"
+        );
+        assert_eq!(r.pool.outstanding_leases(0, 4), 1, "slot still held");
+        r.pool.end_batch_step();
+        // Woken by the cancel: it refills the unit itself.
+        parked
+            .recv_timeout(DEADLINE)
+            .expect("parked claim woke")
+            .unwrap();
+        assert!(r.pool.is_resident(0, 4));
+        assert_eq!(r.pool.outstanding_leases(0, 4), 0);
+        assert_eq!(r.pool.stats.source_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn plain_pool_has_no_reader() {
+        let arena = Arena::new(&[SlotClass {
+            slot_size: 3 * STRIDE,
+            slots: 1,
+        }])
+        .unwrap();
+        let (started, _) = channel();
+        let (_, release) = channel();
+        let pool = ExpertPool::new(
+            arena,
+            arc_dyn(std::sync::Arc::new(LatchSource {
+                started: std::sync::Mutex::new(started),
+                release: std::sync::Mutex::new(release),
+            })),
+            Arc::new(SnapshotHandle::new(Arc::new(PolicySnapshot::empty()))),
+            Arc::new(P3Stats::new()),
+            PoolGeometry {
+                layers: vec![UnitLayout::new([STRIDE as u64; 3], [None; 3]).unwrap()],
+                n_experts: N,
+                expert_bytes: 0,
+            },
+            vec![0],
+        );
+        assert!(spawn_down_reader(&pool).expect("spawn").is_none());
+        pool.settle_split().unwrap();
     }
 }

@@ -52,6 +52,11 @@ pub struct RunArgs {
     /// Skip the O5 admission check against running instances and the RAM fit.
     #[arg(long)]
     pub allow_overcommit: bool,
+    /// Never sample an end-of-generation token: every completion runs to
+    /// `--n-predict` (fixed-length benchmarks). Always in-process: a served
+    /// instance builds its own sampler chain.
+    #[arg(long, conflicts_with = "keep")]
+    pub ignore_eos: bool,
     #[command(flatten)]
     pub engine: EngineArgs,
 }
@@ -134,6 +139,11 @@ pub struct EngineArgs {
     /// pool; refused on the CPU substrate).
     #[arg(long, hide = true)]
     pub async_h2d: bool,
+    /// Role-major expert page-in: hand a disk-missed expert's gate/up
+    /// planes to the GPU before its down plane lands (background down
+    /// reader; needs the RAM expert pool).
+    #[arg(long)]
+    pub role_major_pagein: bool,
     /// Device-side landed wait: `on` publishes each decode MoE layer's
     /// routed ids to a mapped ring and waits on the GPU for its experts to
     /// land (stream wait-value, else a wait kernel) instead of a host sync
@@ -322,6 +332,7 @@ impl EngineArgs {
             numa_interleave: l.get(flag(self.numa_interleave), "numa_interleave", false)?,
             o_direct: l.get(flag(self.o_direct), "o_direct", false)?,
             async_h2d: l.get(flag(self.async_h2d), "async_h2d", false)?,
+            role_major_pagein: l.get(flag(self.role_major_pagein), "role_major_pagein", false)?,
             device_wait: l.get(self.device_wait, "device_wait", d.device_wait)?,
             vram_experts_frac: l.get(
                 self.vram_experts_frac,
@@ -580,10 +591,16 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     } else {
         sys.available_memory()
     };
-    let (config, requested_snapshot) = engine_config(&args.engine, &model, 1, &layers, ram_free)?;
+    let (mut config, requested_snapshot) =
+        engine_config(&args.engine, &model, 1, &layers, ram_free)?;
+    config.ignore_eos = args.ignore_eos;
     let eff = crate::serve::effective(&config, requested_snapshot)?;
     let reg = golem_registry::Registry::open()?;
-    if !args.new && args.parity_dump.is_none() {
+    // A served instance samples with its own chain and was loaded with its
+    // own page-in mode: an EOG-suppressed or role-major run must load
+    // in-process.
+    let needs_in_process = config.ignore_eos || config.role_major_pagein;
+    if !args.new && args.parity_dump.is_none() && !needs_in_process {
         // Same layers as `serve`: the key a `--keep` server was started
         // with, or the operator's configured key for an existing one.
         let api_key: Option<String> = layers.opt(None, "api_key")?;
@@ -719,7 +736,25 @@ pub fn run(args: &RunArgs) -> Result<(), Box<dyn Error>> {
             eprintln!("golem: timing CSV trailer: {e}");
         }
     }
+    if let (Some(p), Some(h)) = (session.p3_stats(), session.p3_hooks()) {
+        let line = pool_stats_line(
+            p.split_units.load(std::sync::atomic::Ordering::Relaxed),
+            h.ensure_calls(),
+        );
+        eprintln!("golem: {line}");
+        if let Some(Err(e)) = timing_out
+            .as_mut()
+            .map(|f| writeln!(f, "# {line}").and_then(|()| f.flush()))
+        {
+            eprintln!("golem: timing CSV trailer: {e}");
+        }
+    }
     result
+}
+
+/// End-of-run RAM pool line (stderr and `# pool …` CSV trailer, §11).
+fn pool_stats_line(split_units: u64, ensure_calls: usize) -> String {
+    format!("pool split_units={split_units} ensure_calls={ensure_calls}")
 }
 
 /// §9 defaults: infer what the model folder and the compiled backend already
@@ -952,7 +987,8 @@ pub(crate) fn resolved_config_line(config: &EngineConfig) -> String {
     format!(
         "ctx={} batch={} predict={} threads={} gpu_layers={} fa={} kv={} cpu_moe={:?} \
          ram_experts_gib={} device_cache_experts={} io_threads={:?} manifest={:?} \
-         vram_order={:?} prefetch={:?} prefetch_lookahead={} model_size={}",
+         vram_order={:?} prefetch={:?} prefetch_lookahead={} model_size={} ignore_eos={} \
+         role_major_pagein={} async_h2d={} cpu_expert_math={}",
         config.n_ctx,
         config.batch_tokens,
         config.n_predict,
@@ -971,6 +1007,10 @@ pub(crate) fn resolved_config_line(config: &EngineConfig) -> String {
         std::fs::metadata(&config.model_path)
             .map(|m| m.len())
             .unwrap_or(0),
+        config.ignore_eos,
+        config.role_major_pagein,
+        config.async_h2d,
+        config.cpu_expert_math,
     )
 }
 
@@ -1390,6 +1430,11 @@ mod tests {
     use golem_engine::ParityStep;
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn pool_stats_line_names_split_units_and_ensure_calls() {
+        assert_eq!(pool_stats_line(3, 17), "pool split_units=3 ensure_calls=17");
+    }
 
     /// Real target facts (golem-plan's GLM-5.3-Flash fixture numbers).
     fn glm() -> golem_plan::ModelFacts {

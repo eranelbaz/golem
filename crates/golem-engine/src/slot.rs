@@ -637,6 +637,7 @@ pub(crate) fn step(
             continue;
         }
         session.prefill_end(&a.ffi)?;
+        a.ffi.prefill_ms = a.ffi.prefill_t0.map(|t| t.elapsed().as_secs_f64() * 1e3);
         if !a.ffi.replay {
             session.snapshot_prompt(&a.ffi, s.seq);
         }
@@ -647,6 +648,10 @@ pub(crate) fn step(
         s.pos = a.ffi.prompt.len();
         if n_dec == 0 && n_gen == 0 {
             session.start_decode()?;
+        }
+        // The trailer reports slot 0's prefill (§11).
+        if s.seq == 0 {
+            session.record_prefill(&a.ffi);
         }
         let n = s.generated.len() as u32;
         s.tok = session.sample(&a.sampler, &a.ffi, s.row, s.parity.as_mut(), n);
