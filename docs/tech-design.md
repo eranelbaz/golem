@@ -15,7 +15,7 @@ Every decision the product spec leaves open, resolved. Rationale in the referenc
 | D1 | Implementation language | **Rust** (stable, edition 2024) for everything except the vendored compute substrate |
 | D2 | Inference engine | **Thin fork of llama.cpp (pinned commit) as compute/kernels substrate**, embedded in a Rust process via C ABI; Golem owns placement, paging, I/O, serving, CLI (§3) |
 | D3 | AMD compute backend | **ROCm/HIP** on gfx1100 (RX 7900 XTX). Vulkan/wgpu deferred; NVIDIA later = same fork built for CUDA (§3.5) |
-| D4 | v1 weights | **`unsloth/GLM-5.3-Flash-GGUF`, UD-Q4_K_XL** as the default; any quant of that repo may run (*amended 2026-10-17*, O7), exact repo revision + SHA-256 pinned in the model manifest at M0; the in-house quantizer is **not** v1 scope (§4) |
+| D4 | v1 weights | **`unsloth/GLM-5.3-Flash-GGUF`; the served quant is whatever `golem.toml` (`[models.*].path`, §9) points at** — any quant of that repo may run (*amended 2026-10-17*, O7), exact repo revision + SHA-256 pinned in the model manifest at M0; the in-house quantizer is **not** v1 scope (§4) |
 | D5 | Caching algorithm | Decayed-frequency score (LRU×LFU hybrid) + relative swap margin (amended 2026-09-29, D-9; was θ-hysteresis) + min-dwell, per (layer, expert) key, independently per tier; user limits are **caps** (`--vram-experts-gib`, `--ram-experts-gib`); floors dropped (O3, §6) |
 | D6 | Multi-disk mode | **Full mirrored replicas**, striped across drives through one shared chunk queue (amended 2026-10-03, §5.2); manifest-validated; degrade-on-drive-failure (§5) |
 | D7 | OpenAI API subset | Chat completions (stream + non-stream), `/v1/models`, `/health`. Tools **supported** via the pinned chat template (O2). Reasoning → `reasoning_content`. Strict-allowlist field policy (§8) |
@@ -39,8 +39,8 @@ Non-decisions, deliberately: no performance targets (spec §Acceptance — they 
 | O4 | `golem run` with no running instance: spawn a detached server, or run in-process in the foreground | **In-process, foreground**; attach if a compatible instance exists; `--keep` leaves a server | §2.1, §9 | R-12 |
 | O5 | Second instance whose planned VRAM/locked RAM exceeds physical: warn or block by default | **Block by default**; `--allow-overcommit` | §9.3 | R-13 |
 | O6 | MTP speculative decoding as a v1 track | **Ruled 2026-10-03: deferred, spike first.** M3.5 could not measure it: no MTP draft or verify code exists. Spike: from P3 routing traces, measure the routed-expert union of consecutive decode tokens per layer. Adopt MTP as a track only if the union is ≤ ≈1.3× one token's expert bytes. Arithmetic: one MTP layer gives 1 draft token; at ≈85–90% acceptance (DeepSeek-V3, not measured here) that is ≈1.85 tokens per verify pass, so speedup ≈ 1.85 / (union ÷ single-token bytes), i.e. ≈1.15× at a 1.6× union and ≈1.4× at 1.3×. *Amended 2026-10-03 (BMoE, §7.5):* external acceptance is below the borrowed 85–90% (BMoE 71/60/52% at draft lengths 2/3/4), one NextN layer can draft k > 1 tokens recursively, and on llama.cpp kernels MTP-verified output need not be bit-identical to plain greedy (a k-token verify batch changes reduction order, §7.4; BMoE saw it even between ubatch sizes). So the spike measures the union ratio U_k for windows k ∈ {2, 3, 4}; the bar generalizes to expected tokens per pass ÷ U_k ≥ ≈1.4; and adoption means an opt-in, reported `--mtp` with the same per-configuration determinism exception as O1. **Ruled 2026-10-07 (M3.10 spike): rejected for v1.** Measured U_2/U_3/U_4 = 1.71/2.33/2.91, so even at 100% acceptance tokens per pass ÷ U_k ≤ 1.17/1.29/1.37 < 1.4 (`docs/baselines/m3.10-mtp-spike.md`) | §7.5 | R-2 |
-| O7 | Expert quant floor: may Golem trade quality for bytes below UD-Q4_K_XL? | ~~Ruled 2026-10-03: no. UD-Q4_K_XL is the floor; no ~3-bit (Q3/IQ3) expert quant.~~ **Re-ruled 2026-10-17: yes.** No quant floor: any GLM-5.3-Flash quant may run, UD-Q4_K_XL stays the default. Measurements name the quant they ran on | §4.1, §2.4, §14 M3.5 (d), §15 | D-5 |
-| O8 | What decides between competing speed levers? | **Ruled 2026-10-06: decode performance first.** Adopt whatever measurably gives the most decode tok/s at the default UD-Q4_K_XL (O7), judged by the §12.3 A/B. The GPU-only default (I2) stays in principle; O1's opt-in CPU+DMA split becomes the default only if it wins that A/B. §2.4 re-estimates its gain at ≈+7–10% at this RAM size (20–30% of expert bytes from disk), +42–47% at 10%, and 1.7–2.5× only as the disk share approaches 0 | §2.4, §14 | — |
+| O7 | Expert quant floor: may Golem trade quality for bytes below UD-Q4_K_XL? | ~~Ruled 2026-10-03: no. UD-Q4_K_XL is the floor; no ~3-bit (Q3/IQ3) expert quant.~~ **Re-ruled 2026-10-17: yes.** No quant floor: any GLM-5.3-Flash quant may run; the served one comes from `golem.toml` (`[models.*].path`, §9). Measurements name the quant they ran on | §4.1, §2.4, §14 M3.5 (d), §15 | D-5 |
+| O8 | What decides between competing speed levers? | **Ruled 2026-10-06: decode performance first.** Adopt whatever measurably gives the most decode tok/s at the configured quant (golem.toml, O7), judged by the §12.3 A/B. The GPU-only default (I2) stays in principle; O1's opt-in CPU+DMA split becomes the default only if it wins that A/B. §2.4 re-estimates its gain at ≈+7–10% at this RAM size (20–30% of expert bytes from disk), +42–47% at 10%, and 1.7–2.5× only as the disk share approaches 0 | §2.4, §14 | — |
 | O9 | MTP (O6) before or after the O1 CPU+DMA split? | **Ruled 2026-10-06: before**, as long as it stays cheaper and the U_k spike shows a gain. The vendored substrate already carries a GLM5NEXT MTP draft context (§7.5), so the cost is wiring, not a draft model | §7.5, §14 | — |
 | O10 | Inclusive or exclusive RAM/VRAM expert residency? | **Ruled 2026-10-06: exclusive**, as a separate task after the M3.7 policy replay sizes the gain. Today an expert in VRAM keeps its RAM pool slot, so ≈750 VRAM slots × 15.2 MB ≈ 10.6 GiB of the pool (≈17% of a 63 GiB pool) is duplicated. **Re-ruled 2026-10-08 on the M3.15 A/B: inclusive stays the default**, exclusive is opt-in (`--residency exclusive`): −19% cold tok/s for −2.6% disk bytes, because kept evictions D2H on the refill stream (`docs/baselines/m3.15-exclusive-residency.md`) | §6.3 | — |
 
@@ -88,7 +88,7 @@ Inside the instance process:
 
 | Tier | Backed by | Managed by | Size |
 |------|-----------|------------|------|
-| Disk | GGUF shard files on 1..N drives, mirrored | `golem-store` | full model (~165–200 GB est. for Q4_K_XL-class quant; authoritative numbers come from the GGUF tensor table, never hardcoded) |
+| Disk | GGUF shard files on 1..N drives, mirrored | `golem-store` | full model (~165–200 GB at the reference Q4_K_XL-class quant, §2.4; the served quant comes from `golem.toml` §9, so authoritative numbers come from the GGUF tensor table, never hardcoded) |
 | RAM | one mlock'd expert pool per instance (host buffer of the vendored substrate) | `golem-placement` + store | default: min(75% of free RAM at start, total expert bytes); `--ram-experts-gib` override |
 | VRAM | device expert-copy cache (persistent across steps) + non-expert weights + KV + workspaces | scheduler patches (P2) under Rust policy | `--vram-experts-gib` budget (floors dropped, O3) |
 
@@ -110,7 +110,7 @@ Everything that is **not** a routed-expert weight (embeddings, attention project
 
 ### 2.4 Throughput ceilings (amended 2026-09-29)
 
-These are first-order bounds for UD-Q4_K_XL on this machine. They are arithmetic, not targets: the governing numbers each design choice below must move.
+These are first-order bounds, computed on UD-Q4_K_XL — reference arithmetic for that quant, not the served default (§9, `golem.toml`) — on this machine. They are arithmetic, not targets: the governing numbers each design choice below must move.
 
 - **Bytes per token.** One routed expert costs gate 4.72 + up 4.72 + down 5.77 ≈ 15.2 MB per layer. × 8 routed × 42 trunk MoE layers ≈ **5.1 GB of expert weights per token**. The GGUF carries 43 expert layers, but blk.45 is the MTP/NextN block, which the loader skips while `load_mtp = false`.
 - **PCIe ceiling (GPU-only, I2).** Every expert not already in VRAM crosses PCIe 4.0 x16 (≈25 GB/s pinned, markedly less when pageable). Decode ≤ 25 / (5.1 · (1 − h)) ≈ **4.9 / (1 − h) tok/s**, where h is the VRAM hit rate. After non-expert weights (8.35 GiB), ROCm overhead (2.64 GiB), KV and workspace, about 8–11 GiB remains for experts, i.e. ≈550–750 of 12,096 trunk experts (≈5%). So h is bounded by routing skew and must be *measured* (P4 counters), not assumed. *(M3.5 measured 27 GB/s pinned, so the ceiling is ≈5.3 / (1 − h); the §2.4 split table uses 27.)*
@@ -258,9 +258,10 @@ Every "MLA" reference below means the 11 sparse-attention layers only.
 
 ### 4.1 v1 weights (D4)
 
-- Primary: `unsloth/GLM-5.3-Flash-GGUF`, quantization **UD-Q4_K_XL** — the best capacity/quality tradeoff for a 24 GB VRAM + disk-tiered architecture (≈4.5–5 bpw keeps the resident-set calculus meaningful). Exact repo revision and per-shard SHA-256s are pinned into the model manifest during M0 (the repo carries several non-interchangeable variants; the manifest makes the choice auditable and `golem plan` exact).
+- Served quant: whatever `golem.toml` (`[models.*].path`, §9) points at. The quants served today (§9): GLM-5.3-Flash at UD-IQ3_XXS, DeepSeek-V4.1-Flash at UD-IQ2_XXS. Any quant of the repo may run; there is no default quant (O7). Exact repo revision and per-shard SHA-256s are pinned into the model manifest during M0 (the repo carries several non-interchangeable variants; the manifest makes the choice auditable and `golem plan` exact). Sizing numbers elsewhere in this doc name the quant they were measured on.
+- For reference arithmetic only — the capacity/quality tradeoff notes below were computed on **UD-Q4_K_XL** (≈4.5–5 bpw keeps the resident-set calculus meaningful). They are not a default.
 - Auxiliary for validation: **Q8_0** of the same revision — used by the parity harness (§12.2) because high-precision quant minimizes quantization noise when bisecting correctness issues across GPU/CPU execution.
-- **Quantization is the largest single performance lever** (amended 2026-09-29, review D-5). Bytes per token, and with them the §2.4 PCIe ceiling, the disk-miss cost and the number of experts that fit in RAM/VRAM, scale linearly with expert bits. A ~3-bit expert quant (UD-Q3_K_XL / IQ3_XXS class) cuts ≈30–35% of expert bytes, raises the PCIe ceiling proportionally, and fits ≈50% more experts per tier. Parity is judged against "the same quantized model", so a lower quant does not break acceptance. Its quality cost is gated separately: perplexity delta on the wikitext slice (M5.1). `golem plan` therefore treats the quant as a first-class input and reports the §2.4 ceilings per candidate quant. *~~Decided 2026-10-03 (O7): the lever is closed downward.~~ Re-ruled 2026-10-17 (O7): the lever is open; any quant may run, UD-Q4_K_XL stays the default.*
+- **Quantization is the largest single performance lever** (amended 2026-09-29, review D-5). Bytes per token, and with them the §2.4 PCIe ceiling, the disk-miss cost and the number of experts that fit in RAM/VRAM, scale linearly with expert bits. A ~3-bit expert quant (UD-Q3_K_XL / IQ3_XXS class) cuts ≈30–35% of expert bytes, raises the PCIe ceiling proportionally, and fits ≈50% more experts per tier. Parity is judged against "the same quantized model", so a lower quant does not break acceptance. Its quality cost is gated separately: perplexity delta on the wikitext slice (M5.1). `golem plan` therefore treats the quant as a first-class input and reports the §2.4 ceilings per candidate quant. *~~Decided 2026-10-03 (O7): the lever is closed downward.~~ Re-ruled 2026-10-17 (O7): the lever is open; any quant may run, the served one comes from `golem.toml` (`[models.*].path`, §9).*
 - The official FP8 safetensors checkpoint + in-house quantizer is **not** v1 scope (the spec makes it a fallback "only if no suitable GGUF exists"; M0 confirms the GGUF path works on gfx1100 before anything else). The quantization pipeline stays a separately-scoped future capability per spec §Model preparation.
 
 ### 4.2 Manifest
@@ -269,12 +270,12 @@ Every downloaded model gets `$GOLEM_DATA_DIR/models/<name>/manifest.json`:
 
 ```jsonc
 {
-  "name": "glm-5.3-flash-ud-q4k-xl",
+  "name": "glm-5.3-flash-<quant>",
   "repo": "unsloth/GLM-5.3-Flash-GGUF",
   "revision": "<hf commit sha>",
-  "quant": "UD-Q4_K_XL",
+  "quant": "<quant per golem.toml [models.*].path, e.g. UD-IQ3_XXS>",
   "arch": "glm5next",
-  "shards": [ { "file": "glm-5.3-flash-UD-Q4_K_XL-00001-of-000xx.gguf",
+  "shards": [ { "file": "glm-5.3-flash-<quant>-00001-of-000xx.gguf",
                 "bytes": 0, "sha256": "<...>",
                 "replicas": ["/mnt/ssd0/golem/models/...", "/mnt/ssd1/golem/models/..."] } ],
   "expert_index": [ { "tensor": "blk.3.ffn_gate_exps", "layer": 3, "experts": 256,
