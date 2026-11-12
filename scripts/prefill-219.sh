@@ -92,7 +92,7 @@ mkdir -p "$OUT"
 if pgrep -x golem >/dev/null; then
   echo "FATAL: a golem process is running (stop it first: RAM/VRAM/drives)"; exit 2
 fi
-[[ ${SKIP_BUILD:-0} == 1 ]] || scripts/build.sh build -p golem-cli
+[[ ${SKIP_BUILD:-0} == 1 ]] || cargo build --release -p golem-cli
 
 shards=$(python3 - "$MODEL" <<'EOF'
 import os, sys, tomllib, glob

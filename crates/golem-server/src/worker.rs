@@ -1,12 +1,12 @@
 //! Decode worker: owns the `!Send` `Session` (inside a `Scheduler`) on one
 //! std thread and batches up to `parallel` jobs across its slots; jobs queue
-//! on a `sync_channel(max parallel − 1)`. A job naming another model is held
+//! on an unbounded channel until a slot frees. A job naming another model is held
 //! by the worker (still counted queued) until every slot drains, then swapped
 //! for: strict arrival order, so no request waits behind a later one.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -338,8 +338,8 @@ pub struct ShutdownTimeout(pub Duration);
 
 /// Owner side of the worker thread.
 pub struct WorkerHandle {
-    /// Job queue (`parallel − 1` deep): `try_send` fails → 503 `golem_busy`.
-    pub jobs: SyncSender<Job>,
+    /// Unbounded job queue, served in arrival order.
+    pub jobs: Sender<Job>,
     /// Shared health.
     pub health: Arc<HealthState>,
     /// The session's device expert-cache K after load (timing CSV header).
@@ -503,12 +503,7 @@ fn spawn(
         ));
     }
     let health = Arc::new(health);
-    // max parallel − 1 queued jobs: with every slot busy the handler's
-    // `try_send` fills this, then 503s — never more queued than can start
-    // once one slot frees (parallel 1 keeps the rendezvous). A held swap job
-    // sits outside it, so it never blocks same-model dequeue.
-    let max_parallel = models.iter().map(|(_, c)| c.parallel).max().unwrap_or(1);
-    let (jobs, rx) = sync_channel::<Job>(max_parallel.saturating_sub(1) as usize);
+    let (jobs, rx) = channel::<Job>();
     let (loaded_tx, loaded_rx) = sync_channel::<Result<Option<u32>, EngineError>>(0);
     let h = health.clone();
     let join = std::thread::Builder::new()
@@ -1628,11 +1623,11 @@ mod tests {
         let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20), TurnSinks::default())
             .expect("worker");
         let (a, mut ra) = job("count to ten", 64);
-        assert!(w.jobs.try_send(a).is_ok(), "slot 0");
+        assert!(w.jobs.send(a).is_ok(), "slot 0");
         assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
         let (gone, mut rg) = job("x", 4);
         gone.cancel.store(true, Ordering::SeqCst);
-        assert!(w.jobs.try_send(gone).is_ok(), "queued");
+        assert!(w.jobs.send(gone).is_ok(), "queued");
         let (b, mut rb) = job("hello", 4);
         assert!(w.jobs.send(b).is_ok(), "slot 1");
         assert!(

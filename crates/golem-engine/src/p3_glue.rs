@@ -39,6 +39,7 @@ use std::sync::atomic::{
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::stall::Hook;
 use crate::stream::StreamState;
 
 use golem_gguf::blk_of;
@@ -3345,7 +3346,8 @@ pub(crate) fn p3_fatal(context: String) -> ! {
 /// Runs an FFI callback body, turning a panic (poisoned lock, failed assert)
 /// into a `p3_fatal` with context: unwinding out of `extern "C"` would abort
 /// without saying why.
-fn guarded<R>(what: &str, body: impl FnOnce() -> R) -> R {
+fn guarded<R>(hook: Hook, body: impl FnOnce() -> R) -> R {
+    crate::stall::hook(hook);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(r) => r,
         Err(payload) => {
@@ -3354,7 +3356,7 @@ fn guarded<R>(what: &str, body: impl FnOnce() -> R) -> R {
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("non-string panic payload");
-            p3_fatal(format!("{what} panicked: {msg}"))
+            p3_fatal(format!("{} panicked: {msg}", hook.name()))
         }
     }
 }
@@ -3383,7 +3385,8 @@ pub extern "C" fn cpu_lease(
     out_ids: *mut i32,
     out_ptrs3: *mut *const c_void,
 ) -> i32 {
-    guarded("cpu_lease", || {
+    guarded(Hook::CpuLease, || {
+        crate::stall::blk(blk);
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         let layer = i64::from(blk) - i64::from(h.dense_lead);
@@ -3456,7 +3459,7 @@ pub extern "C" fn ensure_host_resident(
     hits_ready: raw::golem_hits_ready_fn,
     hits_ud: *mut c_void,
 ) -> i32 {
-    guarded("ensure_host_resident", || {
+    guarded(Hook::EnsureHostResident, || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         let Some(entry) = h.entry_for(tensor) else {
@@ -3599,7 +3602,7 @@ pub extern "C" fn ensure_host_resident(
 /// complete. One call per compute — never per expert.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn copy_done(payload: *mut c_void) {
-    guarded("copy_done", || {
+    guarded(Hook::CopyDone, || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         h.copy_done_calls.fetch_add(1, Ordering::Relaxed);
@@ -3675,7 +3678,8 @@ pub extern "C" fn stream_source(
     n_ids: i32,
     out_ptrs: *mut *const c_void,
 ) -> i32 {
-    guarded("stream_source", || {
+    guarded(Hook::StreamSource, || {
+        crate::stall::blk(blk);
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         let flag = h.abort.load(Ordering::Acquire);
@@ -3733,7 +3737,7 @@ pub extern "C" fn stream_source(
 /// backstop covers the tail.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn stream_release(payload: *mut c_void, seq: u64) {
-    guarded("stream_release", || {
+    guarded(Hook::StreamRelease, || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         if let Some(s) = &h.stream {
@@ -3769,7 +3773,7 @@ pub extern "C" fn evict_dest_batch(
     out_ptrs: *const *mut c_void,
     keep: *mut i32,
 ) {
-    guarded("evict_dest_batch", || {
+    guarded(Hook::EvictDestBatch, || {
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         let Some(entry) = h.entry_for(tensor) else {
@@ -3854,7 +3858,8 @@ pub extern "C" fn evict_dest_batch(
 /// is recycled.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn evict_abandon(payload: *mut c_void, blk: i32, experts: *const i32, n: i32) {
-    guarded("evict_abandon", || {
+    guarded(Hook::EvictAbandon, || {
+        crate::stall::blk(blk);
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         if experts.is_null() || n < 0 {
@@ -3891,7 +3896,8 @@ pub extern "C" fn predict(
     ids: *const i32,
     n_ids: i32,
 ) {
-    guarded("predict", || {
+    guarded(Hook::Predict, || {
+        crate::stall::blk(target_blk);
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         let lead = h.dense_lead as i32;
@@ -3942,7 +3948,8 @@ pub extern "C" fn routing(
     n_ids: i64,
     n_experts: i32,
 ) {
-    guarded("routing", || {
+    guarded(Hook::Routing, || {
+        crate::stall::blk(blk);
         // SAFETY: see `state_of`.
         let h = unsafe { state_of(payload) };
         h.routing_calls.fetch_add(1, Ordering::Relaxed);

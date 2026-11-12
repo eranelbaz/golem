@@ -8,7 +8,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 AB="$REPO/scripts/ab-bench.sh"
 WORK="${GOLEM_AB_WORK:-$REPO/.ab-work}"
 
-[[ -x $AB ]] || { echo "FATAL: $AB missing (build first: scripts/build.sh build)" >&2; exit 1; }
+[[ -x $AB ]] || { echo "FATAL: $AB missing or not executable" >&2; exit 1; }
 command -v nvidia-smi >/dev/null 2>&1 && echo "note: golem v1 targets AMD GPUs" >&2 || true
 # GPU name + VRAM from drm sysfs (amdgpu).
 gpu() {

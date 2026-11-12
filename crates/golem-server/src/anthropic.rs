@@ -497,7 +497,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn worker_failure_is_an_anthropic_error_stream_and_not() {
         for stream in [false, true] {
-            let (jobs, rx) = std::sync::mpsc::sync_channel::<crate::Job>(0);
+            let (jobs, rx) = std::sync::mpsc::channel::<crate::Job>();
             std::thread::spawn(move || {
                 if let Ok(job) = rx.recv() {
                     job.events
@@ -544,7 +544,7 @@ mod tests {
     async fn x_api_key_or_bearer_authorize_and_401_is_authentication_error() {
         let mut cfg = crate::test_support::test_server_config();
         cfg.api_key = Some("s3cret".into());
-        let (jobs, _rx) = std::sync::mpsc::sync_channel::<crate::Job>(0);
+        let (jobs, _rx) = std::sync::mpsc::channel::<crate::Job>();
         let health = std::sync::Arc::new(HealthState::new());
         health.set(crate::ServeState::Healthy);
         let app = crate::router(AppState {

@@ -13,6 +13,7 @@ pub mod scheduler;
 pub mod session;
 pub mod slot;
 pub mod snapshot;
+mod stall;
 pub mod stream;
 pub mod timing;
 pub mod verify;

@@ -133,6 +133,11 @@ impl AccessFeed for PredictionQueue {
 pub struct PrefetchHandle {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    /// Held across each page-in, `paused` re-checked under it: once `pause`
+    /// returns no page-in is in flight and none starts until `resume`
+    /// (§7.6.4: the stream warm skips resident experts without leasing them,
+    /// so an eviction between warm and source is fatal).
+    in_flight: Arc<Mutex<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -142,14 +147,17 @@ impl PrefetchHandle {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Suspends the prefetch loop (`paused` rounds spin on a short backoff).
+    /// Suspends the prefetch loop; returns once an in-flight page-in has
+    /// finished (`paused` rounds spin on a short backoff). The caller must
+    /// hold no unfinished fill claim: the page-in may wait on it.
     pub fn pause(&self) {
-        self.paused.store(true, Ordering::Relaxed);
+        self.paused.store(true, Ordering::SeqCst);
+        drop(self.in_flight.lock().unwrap());
     }
 
     /// Resumes the prefetch loop.
     pub fn resume(&self) {
-        self.paused.store(false, Ordering::Relaxed);
+        self.paused.store(false, Ordering::SeqCst);
     }
 
     /// True once the thread has exited (a drained one-shot feed).
@@ -188,9 +196,11 @@ pub fn spawn_prefetch(
     const DEMAND_BACKOFF: Duration = Duration::from_micros(200);
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
+    let in_flight = Arc::new(Mutex::new(()));
     let thread = {
         let stop = stop.clone();
         let paused = paused.clone();
+        let in_flight = in_flight.clone();
         spawn(move || {
             if let Some(set) = &io_cpuset
                 && let Err(e) = golem_store::sys::pin_current_thread(set)
@@ -251,6 +261,12 @@ pub fn spawn_prefetch(
                         access.requeue(std::iter::once((layer, expert)).chain(units).collect());
                         break;
                     }
+                    let gate = in_flight.lock().unwrap();
+                    if paused.load(Ordering::SeqCst) {
+                        drop(gate);
+                        access.requeue(std::iter::once((layer, expert)).chain(units).collect());
+                        break;
+                    }
                     match pool.ensure_unit(false, layer, expert) {
                         Ok(()) => {
                             // The promotion bit may have landed while this
@@ -267,6 +283,7 @@ pub fn spawn_prefetch(
                             tracing::warn!(layer, expert, error = %e, "prefetch page-in failed; continuing")
                         }
                     }
+                    drop(gate);
                 }
             }
         })
@@ -274,6 +291,7 @@ pub fn spawn_prefetch(
     PrefetchHandle {
         stop,
         paused,
+        in_flight,
         thread: Some(thread),
     }
 }
@@ -526,6 +544,37 @@ mod tests {
         until(|| handle.finished());
         assert!((0..4).all(|e| pool.residency.is_resident(0, e)));
         assert_eq!(pool.stats.prefetch_pageins.load(Ordering::Relaxed), 4);
+    }
+
+    /// `pause` waits out an in-flight page-in, and no unit pages in after it
+    /// returns: a paused round hands its untried tail back.
+    #[test]
+    #[cfg(not(loom))]
+    fn pause_waits_for_the_in_flight_page_in() {
+        let source = StdArc::new(GateSource::new((0, 0)));
+        let pool = test_pool(8, arc_dyn(source.clone()));
+        let feed = StdArc::new(WarmFeed::new((0..4).map(|e| (0, e)).collect()));
+        let handle = spawn_prefetch(pool.clone(), arc_dyn(feed.clone()), None);
+        until(|| source.attempts((0, 0)) == 1);
+        let paused = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                handle.pause();
+                paused.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let early = paused.load(std::sync::atomic::Ordering::Relaxed);
+            source.release();
+            assert!(!early, "pause returned mid page-in");
+        });
+        let done = pool.stats.prefetch_pageins.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(done, 1);
+        assert_eq!(pool.stats.prefetch_pageins.load(Ordering::Relaxed), 1);
+        assert!(!feed.exhausted(), "the paused tail stays queued");
+        handle.resume();
+        until(|| handle.finished());
+        assert!((0..4).all(|e| pool.residency.is_resident(0, e)));
     }
 
     /// A demand page-in that starts after a round's take hands the whole

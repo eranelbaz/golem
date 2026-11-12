@@ -462,6 +462,7 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         }
     }
 
+    let stall = crate::stall::DecodeScope::enter(1, 0, false);
     // SAFETY: ctx is a live llama_context; batch arrays are allocated and fully written.
     let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
     if code != 0 {
@@ -478,6 +479,7 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
     // (probes, future draft loops) must not rely on that.
     // SAFETY: ctx is live.
     unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+    drop(stall);
 
     // SAFETY: vocab is live; n_vocab is the loaded vocab size (non-negative).
     let n_vocab = unsafe { raw::llama_vocab_n_tokens(vocab) };
@@ -508,6 +510,7 @@ fn decode_self_check(ctx: &Context, vocab: *const raw::llama_vocab) -> Result<()
         // an idle context between decodes is the documented llama_memory_clear use.
         unsafe { raw::llama_memory_clear(raw::llama_get_memory(ctx.as_ptr()), true) };
 
+        let _stall = crate::stall::DecodeScope::enter(1, 0, false);
         // SAFETY: same invariants as the first decode; batch arrays are still alive.
         let code = unsafe { raw::llama_decode(ctx.as_ptr(), batch.inner) };
         if code != 0 {
@@ -1954,6 +1957,7 @@ impl SessionInner {
             _ => (None, None),
         };
         let ctx = self.loaded.ctx();
+        let stall = crate::stall::DecodeScope::enter(n as u32, n_gen, stream.is_some());
         // SAFETY: ctx is a live context; batch slots 0..n_tokens fully written.
         let code = unsafe { raw::llama_decode(ctx.as_ptr(), self.batch.inner) };
         if code != 0 {
@@ -2000,6 +2004,7 @@ impl SessionInner {
         // The lease-release contract: synchronize before the next compute.
         // SAFETY: ctx is live.
         unsafe { raw::llama_synchronize(ctx.as_ptr()) };
+        drop(stall);
         if n_gen as usize == n
             && let Some(p3) = self.p3.as_ref()
         {
