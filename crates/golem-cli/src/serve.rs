@@ -736,6 +736,32 @@ mod tests {
     }
 
     #[test]
+    fn no_default_model_resolves_models_tables_and_rejects_unset_model_name() {
+        let env = |_: &str| None;
+        let l = crate::config::Layers {
+            file: toml::from_str(
+                "[models.ds]\npath = \"/m/ds.gguf\"\n[models.glm]\npath = \"/m/glm.gguf\"\n",
+            )
+            .unwrap(),
+            profile: toml::Table::new(),
+            path: None,
+            env: &env,
+        };
+        let s = super::start_model(&l, None, None, true, (None, None)).unwrap();
+        assert_eq!(s.name.as_deref(), Some("ds"));
+        assert_eq!(s.extra.len(), 1);
+        let s = super::start_model(&l, None, Some("glm".into()), true, (None, None)).unwrap();
+        assert_eq!(
+            (s.name.as_deref(), s.extra[0].0.as_str()),
+            (Some("glm"), "ds")
+        );
+        let e = super::start_model(&l, None, Some("nope".into()), true, (None, None))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("names no [models.*] entry"), "{e}");
+    }
+
+    #[test]
     fn models_tables_name_paths_and_override_knobs() {
         let file: toml::Table = toml::from_str(
             "ctx = 8192\n[models.ds]\npath = \"~/m/ds.gguf\"\nctx = 4096\n[models.glm]\npath = \"/m/glm.gguf\"\n",
