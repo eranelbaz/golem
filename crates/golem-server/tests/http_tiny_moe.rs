@@ -158,15 +158,7 @@ async fn non_streaming_disconnect_frees_slot() {
         std::thread::sleep(Duration::from_millis(200));
         drop(s);
         let t = Instant::now();
-        // Busy until the worker observes the cancel; retry like a client
-        // honouring `Retry-After`, within the 10 s bound.
-        loop {
-            let resp = raw_response(raw_post(addr, &hi(2)));
-            if !resp.starts_with("HTTP/1.1 503") || t.elapsed() > Duration::from_secs(10) {
-                break (resp, t.elapsed());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        (raw_response(raw_post(addr, &hi(2))), t.elapsed())
     })
     .await
     .unwrap();

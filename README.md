@@ -79,23 +79,23 @@ Example for an RX 6800 XT (gfx1030) with ROCm outside `/opt/rocm`:
 
 ```sh
 ROCM_PATH=/opt/rocm-7.2.4 GOLEM_LLAMA_SYS_BACKEND=hip \
-GOLEM_LLAMA_SYS_AMDGPU_TARGET=gfx1030 scripts/build.sh build
+GOLEM_LLAMA_SYS_AMDGPU_TARGET=gfx1030 cargo build --release
 ```
 
 ## Quick start
 
 ```sh
-scripts/build.sh build                       # release build → target/release/golem
+cargo build --release                        # release build → target/release/golem
 
 # 1. Pull the model from Hugging Face (example: unsloth dynamic UD-IQ4_XS)
 hf download unsloth/GLM-5.3-Flash-GGUF \
   --include "UD-IQ4_XS/*" --local-dir ~/models/glm-5.3-flash-ud-iq4-xs
 
-# 2. Plan memory (exit 2 = does not fit)
-scripts/build.sh run plan ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf --ctx 32768
+# 2. Plan memory (exit 2 = does not fit; run from the repo root)
+target/release/golem plan ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf --ctx 32768
 
 # 3. Serve
-scripts/build.sh run serve ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf \
+target/release/golem serve ~/models/glm-5.3-flash-ud-iq4-xs/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf \
   --port 8080 --ctx 32768 --n-predict 4096 --prefill-stream
 ```
 
@@ -135,8 +135,10 @@ a top-level `model`, `serve` starts with nothing loaded (`/health` → `idle`)
 and the first request loads its model (`/health` reports `null` while it
 loads); with `idle_unload_min` the model is unloaded again after that many
 idle minutes (only with every slot free and nothing queued, so any `parallel`
-works). Each model gets its own `golem optimize` profile. Several models need
-`parallel = 1`; several models, idle unload or no top-level `model` need no
+works).
+With `coresident = true` (top level) the models stay loaded together and a switch costs no load; it is refused with `ram_experts_gib`/`cpu_moe_layers` (one pooled session per process), and a failed load drops the others and retries once. Each model gets its own `golem optimize` profile. `parallel` applies to every model; a request for another
+model waits (strict arrival order) until the running turns finish, then the
+model swaps; several models, idle unload or no top-level `model` need no
 `timing_csv`/`routing_trace`, and all models must agree on setting `ram_experts_gib`/`cpu_moe_layers`. Engine
 flags and `GOLEM_*` env apply to every model and beat per-model keys.
 

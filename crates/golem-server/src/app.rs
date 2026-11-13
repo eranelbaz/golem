@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::Sender;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -28,16 +28,11 @@ use crate::worker::{EVENT_CAPACITY, Event, HealthState, Job, ServeState};
 pub struct AppState {
     /// Listener and API identity.
     pub cfg: Arc<ServerConfig>,
-    /// Rendezvous hand-off to the decode worker.
-    pub jobs: SyncSender<Job>,
+    /// Unbounded job queue to the decode worker.
+    pub jobs: Sender<Job>,
     /// Instance health.
     pub health: Arc<HealthState>,
 }
-
-/// A wait shorter than one turn's post-turn work on the target, so an agent
-/// firing its next turn right after the previous response is not refused.
-const ACCEPT_RETRY: Duration = Duration::from_millis(250);
-const ACCEPT_STEP: Duration = Duration::from_millis(10);
 
 /// Error response: status plus §8.4 envelope.
 pub(crate) struct ApiError(pub StatusCode, pub ErrorEnvelope);
@@ -256,9 +251,9 @@ async fn chat_inner(
     .into_response())
 }
 
-/// Hands a validated request to the worker: refuses by instance state,
-/// retries a full queue for [`ACCEPT_RETRY`], then 503 `golem_busy`. The
-/// guard cancels the job when the caller drops it.
+/// Hands a validated request to the worker's queue: refuses by instance
+/// state only, never for load. The guard cancels the job when the caller
+/// drops it.
 pub(crate) async fn submit(
     st: &AppState,
     req: golem_api::ChatCompletionRequest,
@@ -280,31 +275,17 @@ pub(crate) async fn submit(
     let cancel = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop(cancel.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
-    let mut job = Job {
+    let job = Job {
         req,
         cancel,
         events: tx,
         reasoning,
     };
-    let deadline = Instant::now() + ACCEPT_RETRY;
     // Counted before the send: the worker's dequeue may run first.
     st.health.queued.fetch_add(1, Ordering::SeqCst);
-    loop {
-        match st.jobs.try_send(job) {
-            Ok(()) => break,
-            Err(TrySendError::Disconnected(_)) => {
-                st.health.queued.fetch_sub(1, Ordering::SeqCst);
-                return Err(backend_gone());
-            }
-            Err(TrySendError::Full(j)) => {
-                if Instant::now() >= deadline {
-                    st.health.queued.fetch_sub(1, Ordering::SeqCst);
-                    return Err(api_err(ErrorCode::Busy, "all slots busy"));
-                }
-                job = j;
-                tokio::time::sleep(ACCEPT_STEP).await;
-            }
-        }
+    if st.jobs.send(job).is_err() {
+        st.health.queued.fetch_sub(1, Ordering::SeqCst);
+        return Err(backend_gone());
     }
     Ok((rx, guard))
 }
@@ -485,7 +466,7 @@ pub(crate) mod tests {
 
     /// [`scripted`] ending in `outcome`.
     pub(crate) fn scripted_with(events: Vec<Event>, outcome: TurnOutcome) -> Router {
-        let (jobs, rx) = std::sync::mpsc::sync_channel::<Job>(0);
+        let (jobs, rx) = std::sync::mpsc::channel::<Job>();
         std::thread::spawn(move || {
             if let Ok(job) = rx.recv() {
                 assert_eq!(job.reasoning, ReasoningMode::Separate);
@@ -538,7 +519,7 @@ pub(crate) mod tests {
     async fn api_key_guards_v1_but_not_health() {
         let mut cfg = crate::test_support::test_server_config();
         cfg.api_key = Some("s3cret".into());
-        let (jobs, _rx) = std::sync::mpsc::sync_channel::<Job>(0);
+        let (jobs, _rx) = std::sync::mpsc::channel::<Job>();
         let health = Arc::new(HealthState::new());
         health.set(ServeState::Healthy);
         let app = router(AppState {

@@ -625,10 +625,10 @@ mod tests {
 
     #[test]
     fn error_body_carries_type_and_golem_code() {
-        let e = ErrorEnvelope::new(ErrorCode::Busy, "all slots busy");
+        let e = ErrorEnvelope::new(ErrorCode::Busy, "server draining");
         assert_eq!(
             error_body(&e, error_type(e.error.code)),
-            json!({"type": "error", "error": {"type": "overloaded_error", "message": "golem_busy: all slots busy"}})
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "golem_busy: server draining"}})
         );
     }
 }

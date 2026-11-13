@@ -14,7 +14,7 @@ PORT="${KV_AB_PORT:-8090}"
 OUT="${KV_AB_OUT:-/tmp/kv-ab}"
 mkdir -p "$OUT"
 
-./scripts/build.sh build
+cargo build --release
 
 for T in "${TYPES[@]}"; do
   echo "=== $T ==="

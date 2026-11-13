@@ -4,7 +4,7 @@ Community benchmark table for GoLeM. Add your machine, send a PR.
 
 ## How to add a benchmark
 
-1. Build the release binary: `scripts/build.sh build` (ROCm/HIP required).
+1. Build the release binary: `cargo build --release` (ROCm/HIP required).
 2. Check `ulimit -l` is `unlimited` (the expert pool is mlocked).
 3. Run the two legs with [`benchmarks/bench.sh`](benchmarks/bench.sh):
 

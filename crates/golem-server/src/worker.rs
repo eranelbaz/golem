@@ -1,10 +1,12 @@
 //! Decode worker: owns the `!Send` `Session` (inside a `Scheduler`) on one
 //! std thread and batches up to `parallel` jobs across its slots; jobs queue
-//! on a `sync_channel(parallel − 1)`.
+//! on an unbounded channel until a slot frees. A job naming another model is held
+//! by the worker (still counted queued) until every slot drains, then swapped
+//! for: strict arrival order, so no request waits behind a later one.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -336,8 +338,8 @@ pub struct ShutdownTimeout(pub Duration);
 
 /// Owner side of the worker thread.
 pub struct WorkerHandle {
-    /// Job queue (`parallel − 1` deep): `try_send` fails → 503 `golem_busy`.
-    pub jobs: SyncSender<Job>,
+    /// Unbounded job queue, served in arrival order.
+    pub jobs: Sender<Job>,
     /// Shared health.
     pub health: Arc<HealthState>,
     /// The session's device expert-cache K after load (timing CSV header).
@@ -386,35 +388,34 @@ pub fn spawn_worker(cfg: EngineConfig, sinks: TurnSinks) -> Result<WorkerHandle,
         vec![(String::new(), cfg)],
         None,
         true,
+        false,
         HealthState::new(),
         sinks,
     )
 }
 
-/// [`spawn_worker`] serving several named models, at most one loaded (§8.1).
-/// A job naming an unloaded model drops the loaded one, loads it, then runs.
+/// [`spawn_worker`] serving several named models (§8.1). One decodes at a
+/// time. A job naming another model drops the loaded one, loads it, then
+/// runs; with `coresident` the others stay loaded (no pooled models), the
+/// switch costs no load, and a failed load drops them and retries once.
 /// `idle_unload` set or `preload` false: nothing loads at start. With
 /// `idle_unload` set the loaded model is dropped after that long with every
-/// slot free and no job queued, so any `parallel` works. Several models need
-/// `parallel` 1 (a job is dequeued only with the slot idle, so a swap never
-/// cuts a turn). Several models, idle unload or lazy load need no turn sinks
-/// (one per session, header written at preload), and served models must
+/// slot free and no job queued. A job naming another model is held,
+/// admission stops, the running turns finish, then the swap happens (a swap
+/// never cuts a turn); jobs behind it wait in arrival order. Several models,
+/// idle unload or lazy load need no turn sinks (one per session, header written at preload), and served models must
 /// agree on expert offload (the first load fixes the process-wide
 /// op-offload threshold, `init_backend`).
 pub fn spawn_worker_models(
     models: Vec<(String, EngineConfig)>,
     idle_unload: Option<Duration>,
     preload: bool,
+    coresident: bool,
     sinks: TurnSinks,
 ) -> Result<WorkerHandle, EngineError> {
     let Some((_, first)) = models.first() else {
         return Err(EngineError::InvalidConfig("no model to serve".into()));
     };
-    if models.len() > 1 && models.iter().any(|(_, c)| c.parallel != 1) {
-        return Err(EngineError::InvalidConfig(
-            "several models need parallel 1".into(),
-        ));
-    }
     let lazy = models.len() > 1 || idle_unload.is_some() || !preload;
     if lazy && (sinks.timing.is_some() || sinks.trace.is_some()) {
         return Err(EngineError::InvalidConfig(
@@ -430,7 +431,21 @@ pub fn spawn_worker_models(
             "served models must agree on setting ram_experts_gib/cpu_moe_layers".into(),
         ));
     }
-    spawn(models, idle_unload, preload, HealthState::new(), sinks)
+    if coresident && offload(first) {
+        return Err(EngineError::InvalidConfig(
+            "coresident models cannot use ram_experts_gib/cpu_moe_layers: the engine \
+             holds one pooled session per process"
+                .into(),
+        ));
+    }
+    spawn(
+        models,
+        idle_unload,
+        preload,
+        coresident,
+        HealthState::new(),
+        sinks,
+    )
 }
 
 /// [`spawn_worker`] with fault injection scoped to this worker.
@@ -444,6 +459,7 @@ pub fn spawn_worker_with_hooks(
         vec![(String::new(), cfg)],
         None,
         true,
+        false,
         HealthState {
             hooks,
             ..HealthState::new()
@@ -468,6 +484,7 @@ fn spawn(
     models: Vec<(String, EngineConfig)>,
     idle_unload: Option<Duration>,
     preload: bool,
+    coresident: bool,
     health: HealthState,
     mut sinks: TurnSinks,
 ) -> Result<WorkerHandle, EngineError> {
@@ -486,17 +503,15 @@ fn spawn(
         ));
     }
     let health = Arc::new(health);
-    // parallel − 1 queued jobs: with every slot busy the handler's
-    // `try_send` fills this, then 503s — never more queued than can start
-    // once one slot frees (parallel 1 keeps the rendezvous).
-    let (jobs, rx) = sync_channel::<Job>(cfg.parallel.saturating_sub(1) as usize);
+    let (jobs, rx) = channel::<Job>();
     let (loaded_tx, loaded_rx) = sync_channel::<Result<Option<u32>, EngineError>>(0);
     let h = health.clone();
     let join = std::thread::Builder::new()
         .name("golem-decode".into())
         .spawn(move || {
             let names: Vec<&str> = models.iter().map(|(n, _)| n.as_str()).collect();
-            let mut cur: Option<(usize, Scheduler)> = None;
+            let mut pool: Vec<Option<Scheduler>> = models.iter().map(|_| None).collect();
+            let mut cur: Option<usize> = None;
             let mut first = None;
             if idle_unload.is_some() || !preload {
                 h.set(ServeState::Idle);
@@ -520,7 +535,8 @@ fn spawn(
                         h.set_experts(Some((&mut s, names[0])));
                         h.set(ServeState::Healthy);
                         let _ = loaded_tx.send(Ok(s.session().device_cache_experts()));
-                        cur = Some((0, s));
+                        pool[0] = Some(s);
+                        cur = Some(0);
                     }
                     Err(e) => {
                         h.set_experts(None);
@@ -531,7 +547,7 @@ fn spawn(
                 }
             }
             loop {
-                let Some((i, sch)) = cur.as_mut() else {
+                let Some((i, sch)) = cur.and_then(|i| pool[i].as_mut().map(|s| (i, s))) else {
                     // Nothing loaded: the next job picks the model.
                     let Ok(job) = rx.recv() else { return };
                     let next = model_index(&names, &job);
@@ -544,8 +560,8 @@ fn spawn(
                         let _ = job.events.try_send(Event::Failed(draining()));
                         continue;
                     }
-                    if let Some(s) = load_for(&models, next, &job, &rx, &h) {
-                        cur = Some((next, s));
+                    if load_for(&models, &mut pool, next, &job, &rx, &h) {
+                        cur = Some(next);
                         first = Some(job);
                     }
                     continue;
@@ -557,7 +573,7 @@ fn spawn(
                     &mut sinks,
                     Served {
                         models: &names,
-                        cur: *i,
+                        cur: i,
                         idle_unload,
                     },
                     first.take(),
@@ -566,7 +582,7 @@ fn spawn(
                     // fatal exit's policy state is not trusted.
                     Exit::Graceful => {
                         h.set_experts(None);
-                        save_warm_state(sch);
+                        pool.iter_mut().flatten().for_each(save_warm_state);
                         return;
                     }
                     Exit::Fatal => {
@@ -576,24 +592,35 @@ fn spawn(
                     }
                     exit => {
                         save_warm_state(sch);
-                        // Dropped before any next load: two never fit; the
-                        // endpoint must not report the dropped model.
                         h.set_experts(None);
                         cur = None;
                         h.loaded.store(usize::MAX, Ordering::SeqCst);
-                        // `/health` tiers and `/metrics` must not report the
-                        // dropped model's residency.
                         *h.metrics.lock().unwrap_or_else(|p| p.into_inner()) =
                             MetricsSnapshot::default();
-                        h.swap_state(ServeState::Idle);
-                        match exit {
-                            Exit::Swap(job) => first = Some(*job),
-                            _ => tracing::info!("idle: model unloaded"),
+                        let swap = match exit {
+                            Exit::Swap(job) => Some(*job),
+                            _ => None,
+                        };
+                        if swap.is_none() || !coresident {
+                            // Dropped before any next load: two never fit; the
+                            // endpoint must not report the dropped model.
+                            pool.iter_mut().for_each(|s| *s = None);
+                            h.swap_state(ServeState::Idle);
+                            if swap.is_none() {
+                                tracing::info!("idle: model unloaded");
+                            }
                         }
-                        if let Some(job) = first.take() {
+                        if let Some(job) = swap {
                             let next = model_index(&names, &job);
-                            if let Some(s) = load_for(&models, next, &job, &rx, &h) {
-                                cur = Some((next, s));
+                            let ready = if let Some(s) = pool[next].as_mut() {
+                                h.loaded.store(next, Ordering::SeqCst);
+                                h.set_experts(Some((s, names[next])));
+                                true
+                            } else {
+                                load_for(&models, &mut pool, next, &job, &rx, &h)
+                            };
+                            if ready {
+                                cur = Some(next);
                                 first = Some(job);
                             }
                         }
@@ -669,25 +696,38 @@ fn model_index(names: &[&str], job: &Job) -> usize {
     names.iter().position(|n| *n == job.req.model).unwrap_or(0)
 }
 
-/// Loads `models[next]` for `job`; on failure answers it and every job
-/// already queued behind it (they leave the queue, so `parallel` > 1 never
-/// retries a minutes-long failing load per job) and stays `idle`.
+/// Loads `models[next]` into `pool` for `job`; with other models resident and
+/// a failing load, drops them and retries once (they may not have left room).
+/// On final failure answers `job` and every job already queued behind it (they
+/// leave the queue, so `parallel` > 1 never retries a minutes-long failing
+/// load per job) and stays `idle`.
 fn load_for(
     models: &[(String, EngineConfig)],
+    pool: &mut [Option<Scheduler>],
     next: usize,
     job: &Job,
     rx: &Receiver<Job>,
     h: &HealthState,
-) -> Option<Scheduler> {
+) -> bool {
     h.swap_state(ServeState::Loading);
     tracing::info!("loading model `{}`", models[next].0);
-    match Session::new(&models[next].1).and_then(Scheduler::new) {
+    let mut loaded = Session::new(&models[next].1).and_then(Scheduler::new);
+    if loaded.is_err() && pool.iter().any(Option::is_some) {
+        tracing::warn!(
+            "loading `{}` beside the resident models failed; dropping them and retrying",
+            models[next].0
+        );
+        pool.iter_mut().for_each(|s| *s = None);
+        loaded = Session::new(&models[next].1).and_then(Scheduler::new);
+    }
+    match loaded {
         // A drain begun mid-load: `admit` refuses the job, `run` then exits.
         Ok(mut s) => {
             h.loaded.store(next, Ordering::SeqCst);
             h.set_experts(Some((&mut s, &models[next].0)));
             h.swap_state(ServeState::Healthy);
-            Some(s)
+            pool[next] = Some(s);
+            true
         }
         Err(e) => {
             h.set_experts(None);
@@ -703,7 +743,7 @@ fn load_for(
                 let _ = queued.events.try_send(Event::Failed(err.clone()));
             }
             h.swap_state(ServeState::Idle);
-            None
+            false
         }
     }
 }
@@ -742,6 +782,7 @@ fn run(
     served: Served<'_>,
     mut first: Option<Job>,
 ) -> Exit {
+    let mut held: Option<Job> = None;
     let Served {
         models,
         cur,
@@ -768,6 +809,8 @@ fn run(
         while sch.free_slots() > 0 {
             let job = if let Some(j) = first.take() {
                 j
+            } else if let Some(j) = held.take() {
+                j
             } else if idle && runs.iter().all(Option::is_none) {
                 let got = match idle_unload {
                     Some(d) => rx
@@ -793,17 +836,21 @@ fn run(
                 }
             };
             // A cancelled or draining job takes `admit`'s refusal, never a
-            // minutes-long swap.
+            // minutes-long swap. Another model's job waits, held, for the
+            // running slots to finish; nothing is admitted behind it.
             if models
                 .iter()
                 .position(|n| *n == job.req.model)
                 .is_some_and(|n| n != cur)
-                && runs.iter().all(Option::is_none)
                 && !job.cancel.load(Ordering::SeqCst)
                 && !health.stopping()
             {
-                health.queued.fetch_sub(taken, Ordering::SeqCst);
-                return Exit::Swap(Box::new(job));
+                if runs.iter().all(Option::is_none) {
+                    health.queued.fetch_sub(taken, Ordering::SeqCst);
+                    return Exit::Swap(Box::new(job));
+                }
+                held = Some(job);
+                break;
             }
             match admit(sch, &mut runs, job, health) {
                 Ok(()) => {
@@ -839,6 +886,7 @@ fn run(
             continue;
         }
         if storage_lost(sch, &mut runs, health) {
+            refuse_held(&mut held, health, storage_unavailable());
             refuse_all(rx, health);
             return Exit::Fatal;
         }
@@ -877,6 +925,7 @@ fn run(
             }
             // A page-in failed mid-decode on a dead shard (ABI v13).
             Ok(Err(EngineError::StorageUnavailable)) if storage_lost(sch, &mut runs, health) => {
+                refuse_held(&mut held, health, storage_unavailable());
                 refuse_all(rx, health);
                 return Exit::Fatal;
             }
@@ -902,6 +951,7 @@ fn run(
         };
         if fatal {
             fail_all(&mut runs, health);
+            refuse_held(&mut held, health, crate::app::backend_gone_envelope());
             return Exit::Fatal;
         }
     }
@@ -931,6 +981,14 @@ fn storage_lost(sch: &mut Scheduler, runs: &mut [Option<SlotRun>], health: &Heal
     }
     publish_metrics(sch, health, &[]);
     true
+}
+
+/// Answers the held swap job, if any, and drops it from the queued count.
+fn refuse_held(held: &mut Option<Job>, health: &HealthState, err: ErrorEnvelope) {
+    if let Some(job) = held.take() {
+        health.queued.fetch_sub(1, Ordering::SeqCst);
+        let _ = job.events.try_send(Event::Failed(err));
+    }
 }
 
 /// No further decode may touch the dead shard: answers every later job
@@ -1565,11 +1623,11 @@ mod tests {
         let w = spawn_worker_with_hooks(cfg, TestHooks::slow_decode(20), TurnSinks::default())
             .expect("worker");
         let (a, mut ra) = job("count to ten", 64);
-        assert!(w.jobs.try_send(a).is_ok(), "slot 0");
+        assert!(w.jobs.send(a).is_ok(), "slot 0");
         assert!(matches!(ra.blocking_recv(), Some(Event::Text(_))));
         let (gone, mut rg) = job("x", 4);
         gone.cancel.store(true, Ordering::SeqCst);
-        assert!(w.jobs.try_send(gone).is_ok(), "queued");
+        assert!(w.jobs.send(gone).is_ok(), "queued");
         let (b, mut rb) = job("hello", 4);
         assert!(w.jobs.send(b).is_ok(), "slot 1");
         assert!(
