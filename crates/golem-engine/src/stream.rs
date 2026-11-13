@@ -31,10 +31,7 @@ use golem_store::recycle;
 use crate::config::PrefillGate;
 use crate::p3_glue::p3_fatal;
 
-/// Staging slots (§7.6.2: ≥ 2 max planes of RAM). Peak concurrent use is 5
-/// (two sourced planes still held until their slab reuse + up to three warm
-/// planes ahead of the copy loop), 6 leaves one spare.
-const STAGING_SLOTS: u32 = 6;
+use golem_plan::STAGING_SLOTS;
 
 /// Reader threads: one per warm plane in flight (≤ 3 ahead of the copy
 /// loop), so the next plane's drain starts while the previous one's tail

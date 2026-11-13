@@ -2623,7 +2623,11 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // Prefill-stream state (§7.6, ruling R3 kept streaming on): the pinned
     // staging ring + reader thread (GPU-registered with the pool arena below).
     let stream = if stream_enabled {
-        let slot_bytes = geo.n_experts as usize * max_plane_stride as usize;
+        let slot_bytes = usize::try_from(golem_plan::staging_slot_bytes(
+            geo.n_experts,
+            max_plane_stride,
+        ))
+        .map_err(|_| EngineError::PoolInit("staging slot exceeds usize".into()))?;
         let health = store.clone();
         let storage_lost = Box::new(move || {
             health

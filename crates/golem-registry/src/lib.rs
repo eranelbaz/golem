@@ -306,8 +306,10 @@ pub fn exited(i: &Instance) -> bool {
 
 /// O5 admission: planned VRAM against the device total, planned total RAM
 /// against `min(ram_total − Σ running planned_ram, ram_free − 4 GiB)`.
-/// Target: one GLM instance plans pool 63 + snapshots 4 + staging 3.7 + host
-/// 2 = 72.7 GiB; a second sees min(93 − 72.7, free − 4) ≈ 16 GiB → refused.
+/// Target: one GLM instance plans pool 63 + snapshots 4 + host 2 = 69 GiB;
+/// a second sees min(93 − 69, free − 4) ≈ 20 GiB → refused. With
+/// `--prefill-stream` the staging ring adds 11.09 GiB (snapshots shrink to
+/// fit): ≈ 79 GiB planned, ≈ 14 GiB left.
 pub fn admit(
     running: &[Instance],
     new_vram: u64,
