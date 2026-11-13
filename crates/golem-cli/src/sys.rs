@@ -1,6 +1,6 @@
 //! The CLI's process-control FFI for `serve --detach`: pipe, fork, setsid,
 //! stdio redirection, the optimize child's parent-death signal, and the
-//! `run` shutdown signal handlers.
+//! `run` shutdown signal handlers and `RLIMIT_MEMLOCK` read.
 #![allow(unsafe_code)]
 
 use std::fs::File;
@@ -301,4 +301,17 @@ impl StdinLines<'_> {
 
 fn utf8(b: Vec<u8>) -> io::Result<String> {
     String::from_utf8(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// `RLIMIT_MEMLOCK` bytes, `None` = unlimited.
+pub fn memlock_limit() -> Option<u64> {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain getrlimit(2) with a valid out-pointer; no invariants.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } != 0 {
+        return None; // cannot read the limit — let the arena backstop decide
+    }
+    (rl.rlim_cur != libc::RLIM_INFINITY).then_some(rl.rlim_cur)
 }

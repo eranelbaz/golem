@@ -1,14 +1,12 @@
 //! `golem run` (tech design §9): greedy decode of a local GGUF model, either
 //! one-shot via `--prompt` or as a stdin multi-turn chat REPL.
-// The RLIMIT_MEMLOCK preflight is the one sanctioned unsafe call-site here.
-#![allow(unsafe_code)]
 
 use std::error::Error;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::sys::Input;
+use crate::sys::{Input, memlock_limit};
 use golem_engine::FinishReason;
 use golem_engine::ParityStep;
 use golem_engine::TurnRequest;
@@ -824,19 +822,6 @@ fn suggest_pool_gib(model: &Path, manifest: Option<&Path>) -> Option<u64> {
     }
     let gib = cap.min(expert_bytes) / (1 << 30);
     (gib > 0).then_some(gib)
-}
-
-/// `RLIMIT_MEMLOCK` bytes, `None` = unlimited.
-fn memlock_limit() -> Option<u64> {
-    // SAFETY: plain getrlimit(2) with an out-pointer; no invariants.
-    let mut rl = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } != 0 {
-        return None; // cannot read the limit — let the arena backstop decide
-    }
-    (rl.rlim_cur != libc::RLIM_INFINITY).then_some(rl.rlim_cur)
 }
 
 /// mlock preflight, before any weights load: refuse to start when the expert
