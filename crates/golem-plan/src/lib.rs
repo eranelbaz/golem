@@ -935,6 +935,30 @@ fn stream_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
     }
 }
 
+/// Prefill staging slots (§7.6): peak concurrent use is 5 (two sourced
+/// planes held until their slab reuse + up to three warm planes ahead of
+/// the copy loop), 6 leaves one spare.
+pub const STAGING_SLOTS: u32 = 6;
+
+/// Minimum bytes of one staging slot: one plane of every expert, each
+/// region padded by up to two 4 KiB pages for its unaligned head and tail
+/// (the engine grows a slot further only if a plane's real layout needs it).
+/// Target: 288 × (6,881,280 + 8,192) = 1,984,167,936 B.
+#[must_use]
+pub fn staging_slot_bytes(n_expert: u32, max_plane_stride: u64) -> u64 {
+    u64::from(n_expert) * (max_plane_stride + 2 * 4096)
+}
+
+/// Pinned staging ring for prefill streaming (§7.6). Target: 6 ×
+/// 1,984,167,936 = 11,905,007,616 B (11.09 GiB).
+fn staging_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
+    if i.prefill_stream {
+        u64::from(STAGING_SLOTS) * staging_slot_bytes(m.n_expert, m.max_plane_stride)
+    } else {
+        0
+    }
+}
+
 /// Exclusive-residency victim ring (§6.3 O10): slots × 3 × max plane
 /// stride. Target: 16 × 3 × 6,881,280 = 330,301,440 B ≈ 1.4% of 24 GiB.
 #[must_use]
@@ -943,7 +967,8 @@ pub fn victim_ring_bytes(m: &ModelFacts, i: &PlanInput) -> u64 {
 }
 
 /// RAM tier (§10). Default pool = min(0.75 · free, Σ expert bytes); target:
-/// 0.75 × 88 GiB = 66 GiB < Σ experts, + 2 GiB host + 3.69 GiB staging ring.
+/// 0.75 × 88 GiB = 66 GiB < Σ experts, + 2 GiB host + 11.09 GiB staging ring
+/// when prefill streaming is on.
 #[must_use]
 pub fn ram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
     let pool = match i.experts {
@@ -968,7 +993,7 @@ pub fn ram_terms(m: &ModelFacts, mach: &Machine, i: &PlanInput) -> Vec<Term> {
         },
         Term {
             name: "staging_ring",
-            bytes: stream_bytes(m, i),
+            bytes: staging_bytes(m, i),
         },
     ]
 }
@@ -1006,7 +1031,8 @@ mod tests {
     }
 
     /// Real target: stream_slabs = 2 × 288 × 6,881,280 = 3,963,617,280 B;
-    /// staging_ring the same; rs = 145.56 MiB.
+    /// staging_ring 6 × 288 × (6,881,280 + 8,192) = 11,905,007,616 B;
+    /// rs = 145.56 MiB.
     #[test]
     fn stream_slabs_match_design_7_6() {
         let r = plan(
@@ -1018,7 +1044,7 @@ mod tests {
             },
         );
         assert_eq!(get(&r.vram, "stream_slabs"), 3_977_379_840);
-        assert_eq!(get(&r.ram, "staging_ring"), 3_963_617_280);
+        assert_eq!(get(&r.ram, "staging_ring"), 11_905_007_616);
     }
 
     /// Victim ring (§6.3 O10): 16 × 3 × 6,881,280 = 330,301,440 B ≈ 1.4% of
@@ -1409,7 +1435,7 @@ mod tests {
         };
         assert_eq!(
             get(&ram_terms(&glm(), &box24(), &i), "staging_ring"),
-            3_963_617_280
+            11_905_007_616
         );
         let off = ram_terms(&glm(), &box24(), &PlanInput::default());
         assert_eq!(get(&off, "staging_ring"), 0);

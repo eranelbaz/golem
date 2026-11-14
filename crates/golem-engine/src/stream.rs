@@ -31,10 +31,7 @@ use golem_store::recycle;
 use crate::config::PrefillGate;
 use crate::p3_glue::p3_fatal;
 
-/// Staging slots (§7.6.2: ≥ 2 max planes of RAM). Peak concurrent use is 5
-/// (two sourced planes still held until their slab reuse + up to three warm
-/// planes ahead of the copy loop), 6 leaves one spare.
-const STAGING_SLOTS: u32 = 6;
+use golem_plan::STAGING_SLOTS;
 
 /// Reader threads: one per warm plane in flight (≤ 3 ahead of the copy
 /// loop), so the next plane's drain starts while the previous one's tail
@@ -87,7 +84,7 @@ struct Task {
     layer: u32,
     kind: ExpertKind,
     /// Slot base; expert `e` lands at `plane_at[row + e]` past it.
-    base: *mut u8,
+    base: SlotBase,
     /// Staged ids, ascending.
     ids: Vec<u32>,
     slot: usize,
@@ -105,7 +102,7 @@ struct Hold {
 struct Pending {
     slot: usize,
     /// Slot base (valid when `slot != usize::MAX`).
-    base: *mut u8,
+    base: SlotBase,
     /// Staged (non-resident at warm time) ids, ascending.
     staged_ids: Vec<u32>,
     /// Every id warmed for this plane (routed set), ascending.
@@ -208,13 +205,18 @@ pub struct StreamState {
     test_before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-// SAFETY: `Task.base`/`Pending.base` point into the mlocked arena the state
-// owns (the `arena` field keeps it alive); no raw pointer dangles. All uses
-// are serialized by the seq protocol: a slot is handed out only when its
-// reads are done and its previous plane's H2D + compute completed under C's
-// slab event sync.
-unsafe impl Send for StreamState {}
-unsafe impl Sync for StreamState {}
+/// A staging slot's base pointer inside the state's arena (null for no slot).
+#[derive(Clone, Copy)]
+struct SlotBase(*mut u8);
+
+// SAFETY: the pointer targets the mlocked arena the owning `StreamState`
+// keeps alive (`arena` field); every access is serialized by the seq
+// protocol: a slot is handed out only when its reads are done and its
+// previous plane's H2D + compute completed under C's slab event sync.
+unsafe impl Send for SlotBase {}
+// SAFETY: as for `Send`; shared copies are only offset, never dereferenced
+// outside the seq protocol.
+unsafe impl Sync for SlotBase {}
 
 impl StreamState {
     /// Builds the staging ring (`STAGING_SLOTS` slots, mlocked) and spawns
@@ -367,7 +369,7 @@ impl StreamState {
                 // Other readers write other slots or other experts' regions.
                 let region = unsafe {
                     std::slice::from_raw_parts_mut(
-                        task.base.add(off - head),
+                        task.base.0.add(off - head),
                         (head + plane_len).next_multiple_of(page),
                     )
                 };
@@ -558,7 +560,7 @@ impl StreamState {
             .filter(|&id| !self.pool.is_resident(layer, id))
             .collect();
         let (slot, base) = if staged_ids.is_empty() {
-            (usize::MAX, std::ptr::null_mut())
+            (usize::MAX, SlotBase(std::ptr::null_mut()))
         } else {
             let (guard, slot, base) = self.take_slot(inner)?;
             inner = guard;
@@ -594,7 +596,7 @@ impl StreamState {
     fn take_slot<'a>(
         &self,
         mut inner: std::sync::MutexGuard<'a, Inner>,
-    ) -> Result<(std::sync::MutexGuard<'a, Inner>, usize, *mut u8), StreamError> {
+    ) -> Result<(std::sync::MutexGuard<'a, Inner>, usize, SlotBase), StreamError> {
         let start = Instant::now();
         loop {
             check_read(inner.read).inspect_err(|_| add_ns(&self.slot_wait_ns, start))?;
@@ -605,7 +607,7 @@ impl StreamState {
                 debug_assert_eq!(inner.pending_reads[s], 0);
                 add_ns(&self.slot_wait_ns, start);
                 // Slots are indexed 0..STAGING_SLOTS in the arena.
-                let base = self.arena.slot_base(s as u32);
+                let base = SlotBase(self.arena.slot_base(s as u32));
                 return Ok((inner, s, base));
             }
             inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
@@ -734,9 +736,12 @@ impl StreamState {
             } else if staged {
                 self.staged.fetch_add(1, Ordering::Relaxed);
                 self.bytes.fetch_add(plane_len as u64, Ordering::Relaxed);
-                // SAFETY: `plane_at` offsets lie inside the slot (`new`).
-                out[i] =
-                    unsafe { pending.base.add(self.plane_at[row + id as usize]) } as *const c_void;
+                // `plane_at` offsets lie inside the slot (`new`).
+                out[i] = pending
+                    .base
+                    .0
+                    .wrapping_add(self.plane_at[row + id as usize])
+                    as *const c_void;
             } else if pending.warmed_ids.binary_search(&id).is_err() {
                 // A whole fill over a routed-only warm with no misses has no
                 // slot yet: take one with no reads for the stale pointers.
@@ -746,10 +751,13 @@ impl StreamState {
                     pending.slot = slot;
                     pending.base = base;
                 }
-                // SAFETY: as above; the bytes are stale (never staged this
-                // plane) but finite, and the id is unrouted.
-                out[i] =
-                    unsafe { pending.base.add(self.plane_at[row + id as usize]) } as *const c_void;
+                // As above; the bytes are stale (never staged this plane)
+                // but finite, and the id is unrouted.
+                out[i] = pending
+                    .base
+                    .0
+                    .wrapping_add(self.plane_at[row + id as usize])
+                    as *const c_void;
             } else {
                 // A warmed id lost residency after warm (the pause protocol
                 // forbids it): fatal, never stale.

@@ -16,11 +16,13 @@
 - Expert bytes are copied at most once disk → pool (straight into the slot) and once pool → device (from pinned memory). Any extra copy needs a benchmark.
 - Pool memory is mlocked **and** GPU-registered; pageable H2D is a bug.
 - Expert bytes never enter the page cache: no `MAP_POPULATE` of expert tensors. Use `O_DIRECT`, else `POSIX_FADV_DONTNEED` after the read.
-- Every expert `MUL_MAT_ID` runs on the GPU and is verified at runtime by the engine. Silent CPU expert math is a correctness bug.
+- Every expert `MUL_MAT_ID` node runs on the GPU and is verified at runtime by the engine. Silent CPU expert math is a correctness bug.
+- One exception: opt-in `--cpu-expert-math` (O1) computes leased non-VRAM experts on a CPU side job beside the GPU node, reported in `golem_cpu_expert_math_*`. It never moves a node off the GPU, so `golem_expert_mul_mat_id_off_gpu_total` stays 0 and the runtime check stays strict.
 
 ## Rust
 
 - `unsafe` stays in the FFI and arena modules, with a `// SAFETY:` per block naming the invariant.
+- Permitted modules (workspace `unsafe_code = "deny"`, `allow` only here): `golem-llama-sys`; engine FFI glue `golem-engine/src/{session,p3_glue,stream,chat}.rs`; `*/src/sys.rs` syscall wrappers (cli, registry, store); `golem-store/src/readers.rs` crew task hand-off; `golem-placement/src/pool/arena.rs`.
 - A safe `pub fn` cannot cause UB: aliasing is enforced by types (lease/claim tokens), never by doc comments. No `&self → &mut` accessors in public API.
 - `unsafe impl Send/Sync` only on the narrowest raw-pointer wrapper.
 - One implementation per concern: one GGUF reader, one expert-tensor name matcher shared by C and Rust, one expert index. Use workspace deps (`sha2`, `thiserror`) instead of hand-rolling.

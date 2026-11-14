@@ -44,6 +44,15 @@ async fn app(idle: Option<Duration>) -> (axum::Router, golem_server::WorkerHandl
     (app, w)
 }
 
+/// Joins the worker so its sessions are freed before the process exits
+/// (HIP teardown racing exit segfaults).
+async fn close(w: golem_server::WorkerHandle) {
+    tokio::task::spawn_blocking(move || w.shutdown(|| {}, Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("worker joins");
+}
+
 async fn ask(app: &axum::Router, model: &str) -> (u16, Value) {
     let body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 4, "temperature": 0});
@@ -76,7 +85,7 @@ async fn health_model(app: &axum::Router) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn request_for_the_other_model_swaps_it_in() {
-    let (app, _w) = app(None).await;
+    let (app, w) = app(None).await;
     let (s, first) = ask(&app, "tiny-moe").await;
     assert_eq!(s, 200, "{first}");
     for m in ["tiny-hybrid", "tiny-moe"] {
@@ -129,6 +138,8 @@ async fn request_for_the_other_model_swaps_it_in() {
         (s, b["error"]["code"].as_str()),
         (400, Some("golem_model_mismatch"))
     );
+    drop(app);
+    close(w).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -145,6 +156,8 @@ async fn idle_unload_starts_empty_and_reloads_on_request() {
     assert_eq!(health_model(&app).await, Value::Null);
     let (s, b) = ask(&app, "tiny-moe").await;
     assert_eq!((s, b["model"].as_str()), (200, Some("tiny-moe")), "{b}");
+    drop(app);
+    close(w).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -185,6 +198,8 @@ async fn idle_unload_serves_parallel_2_and_unloads_when_all_slots_free() {
     assert_eq!(w.health.loaded(), None);
     let (s, b) = ask(&app, "tiny-moe").await;
     assert_eq!((s, b["model"].as_str()), (200, Some("tiny-moe")), "{b}");
+    drop(app);
+    close(w).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -231,7 +246,14 @@ async fn parallel_2_models_hold_swap_job_until_slots_drain() {
     ] {
         assert_eq!((s, b["model"].as_str()), (200, Some(m)), "{b}");
     }
-    assert!(!w.health.pending());
+    // The worker clears its in-flight set on the loop pass after `Done`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while w.health.pending() {
+        assert!(std::time::Instant::now() < deadline, "worker never settled");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(app);
+    close(w).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -274,4 +296,6 @@ async fn coresident_models_stay_loaded_across_switches() {
         base + 2,
         "both stay resident"
     );
+    drop(app);
+    close(w).await;
 }

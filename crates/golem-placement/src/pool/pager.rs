@@ -1176,6 +1176,24 @@ impl ExpertPool {
         fills: &mut Vec<(u32, u32, FillClaim<'m>)>,
     ) -> Result<(), PoolError> {
         let base = layer as usize * self.geometry.n_experts as usize;
+        self.residency.claim_resident_batch(
+            layer,
+            misses.iter().map(|&(_, e)| e),
+            |expert, slot, prefetch_hit| {
+                let at = base + expert as usize;
+                if batch.lease_of[at] != UNCLAIMED {
+                    return false;
+                }
+                self.stats.fast_hits.fetch_add(1, Ordering::Relaxed);
+                if prefetch_hit {
+                    self.stats.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                self.stats.demand_claims.fetch_add(1, Ordering::Relaxed);
+                batch.lease_of[at] = batch.leases.len() as u32;
+                batch.leases.push(self.lease(layer, expert, slot));
+                true
+            },
+        );
         for &(_, expert) in misses {
             let at = base + expert as usize;
             if batch.lease_of[at] != UNCLAIMED {

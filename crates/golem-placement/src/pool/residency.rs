@@ -919,6 +919,36 @@ impl ResidencyMap {
         Some(sh.slot_of[i] as u32)
     }
 
+    /// Demand-claims every RESIDENT key among `experts` under ONE shard lock
+    /// of `layer` — the `Resident` arm of [`Self::claim_for`] batched over a
+    /// layer's miss list. A key mid-fill, not resident or lease-saturated is
+    /// skipped (the caller claims it through `claim_for`, which parks or
+    /// returns `Busy`). `grant(expert, slot, prefetch_hit)` runs under the
+    /// lock and returns whether the caller takes the lease; only then is the
+    /// lease counted, the reference bit set and the prefetch mark cleared.
+    pub(crate) fn claim_resident_batch(
+        &self,
+        layer: u32,
+        experts: impl IntoIterator<Item = u32>,
+        mut grant: impl FnMut(u32, u32, bool) -> bool,
+    ) {
+        let mut sh = self.shards[layer as usize].shard.lock().unwrap();
+        for e in experts {
+            let i = self.local(e);
+            if !Self::bit_test(&sh.bits, i)
+                || Self::bit_test(&sh.filling, i)
+                || sh.leases[i] == u16::MAX
+            {
+                continue;
+            }
+            if grant(e, sh.slot_of[i] as u32, Self::bit_test(&sh.prefetched, i)) {
+                sh.leases[i] += 1;
+                Self::bit_clear(&mut sh.prefetched, i);
+                Self::ref_set(&mut sh.ref_bits, i);
+            }
+        }
+    }
+
     /// Leases a leading fraction of the RESIDENT keys among `ids` under ONE
     /// shard lock (CPU expert path): resident = bit set, not mid-fill, lease
     /// count not saturated; out-of-range and repeated ids are skipped. Takes
@@ -1420,6 +1450,34 @@ mod tests {
         let snap = PolicySnapshot::empty();
         assert_eq!(take(&m, &snap, 0, 3), Got::Filled(0));
         assert!(m.is_resident(0, 3));
+        m.release_lease(0, 3);
+    }
+
+    #[test]
+    #[cfg(not(loom))] // loom primitives require a model() context
+    fn claim_resident_batch_leases_resident_keys_only() {
+        let m = map(1, 8, vec![0..4]);
+        let snap = PolicySnapshot::empty();
+        warm(&m, &snap, 0, 1);
+        prefetch(&m, &snap, 0, 2);
+        let Ok(Claim::Filled { claim, .. }) = m.claim(0, 3, &snap) else {
+            panic!("first claim must fill")
+        };
+        let mut got = Vec::new();
+        m.claim_resident_batch(0, [1, 2, 3, 5], |e, s, hit| {
+            got.push((e, s, hit));
+            e != 2
+        });
+        assert_eq!(
+            got,
+            vec![(1, 0, false), (2, 1, true)],
+            "mid-fill 3 and absent 5 skipped"
+        );
+        assert_eq!(m.lease_count(0, 1), 1);
+        assert_eq!(m.lease_count(0, 2), 0, "declined grant takes no lease");
+        assert_eq!(m.lease_count(0, 3), 1, "only the fill claim's lease");
+        claim.finish();
+        m.release_lease(0, 1);
         m.release_lease(0, 3);
     }
 

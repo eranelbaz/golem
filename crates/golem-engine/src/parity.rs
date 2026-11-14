@@ -1,7 +1,6 @@
 //! Parity dump support (T2 harness leg): the per-generation-step record
 //! type and the top-2 logits fetch backing `Session::chat_turn_parity`.
-//! Raw llama.cpp FFI, mirroring session.rs's unsafe-allowed module style.
-#![allow(unsafe_code)]
+//! The logits row itself is read in session.rs (FFI glue); this module is safe.
 
 use golem_llama_sys::raw;
 use serde::Serialize;
@@ -46,34 +45,6 @@ pub(crate) fn top2_of(logits: &[f32], skip: &[raw::llama_logit_bias]) -> (f32, f
         1 => (top[0], 0.0),
         _ => (top[0], top[1]),
     }
-}
-
-/// Fetches the logits row for `ith` and returns its top-2 values. A pure read:
-/// `llama_sampler_sample` has already consumed the row by the time this runs,
-/// and the accessor mutates no context state, so decode behavior is identical
-/// with or without recording.
-///
-/// # Safety
-/// `ctx` must be a live `llama_context` whose most recent decode succeeded and
-/// emitted logits for slot `ith`, and `n_vocab` must be that row's length.
-/// Tokens in `skip` (the `ignore_eos` biases) never rank.
-pub(crate) unsafe fn top2_logits_ith(
-    ctx: *mut raw::llama_context,
-    ith: i32,
-    n_vocab: usize,
-    skip: &[raw::llama_logit_bias],
-) -> (f32, f32) {
-    // SAFETY: ctx is live and its last decode emitted logits for slot ith
-    // (caller contract, llama.h); a null return would be a broken FFI
-    // invariant, not a model rejection — same precedent as the session.rs
-    // decode self-check.
-    let ptr = unsafe { raw::llama_get_logits_ith(ctx, ith) };
-    if ptr.is_null() {
-        panic!("llama_get_logits_ith returned null during parity recording");
-    }
-    // SAFETY: ptr is non-null and valid for n_vocab f32 values (llama.h contract).
-    let logits = unsafe { std::slice::from_raw_parts(ptr, n_vocab) };
-    top2_of(logits, skip)
 }
 
 #[cfg(test)]

@@ -1,14 +1,12 @@
 //! `golem run` (tech design §9): greedy decode of a local GGUF model, either
 //! one-shot via `--prompt` or as a stdin multi-turn chat REPL.
-// The RLIMIT_MEMLOCK preflight is the one sanctioned unsafe call-site here.
-#![allow(unsafe_code)]
 
 use std::error::Error;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::sys::Input;
+use crate::sys::{Input, memlock_limit};
 use golem_engine::FinishReason;
 use golem_engine::ParityStep;
 use golem_engine::TurnRequest;
@@ -481,8 +479,9 @@ pub fn engine_config(
 /// staging_ring ≤ ram_free − 4 GiB`. Returns `(snapshot bytes, pool GiB)`.
 /// Default snapshots `max(2 GiB, 2 × floor)` shrink to the floor first, then
 /// the pool shrinks; below the floor the plan is infeasible (never clamped).
-/// Target: 83 − 4 = 79 GiB; pool 63 + staging 3.7 + host 2 = 68.7 → 10.3 GiB
-/// left ≥ default 4.0 GiB (floor 2.0 GiB at 100k ctx, parallel 1).
+/// Target: 83 − 4 = 79 GiB; pool 63 + host 2 = 65 → 14 GiB left ≥ default
+/// 4.0 GiB (floor 2.0 GiB at 100k ctx, parallel 1); `--prefill-stream` adds
+/// an 11.09 GiB staging ring, leaving 2.9 GiB ≥ the floor, so snapshots take it.
 fn fit_ram(
     facts: &golem_plan::ModelFacts,
     ram_free: u64,
@@ -823,19 +822,6 @@ fn suggest_pool_gib(model: &Path, manifest: Option<&Path>) -> Option<u64> {
     }
     let gib = cap.min(expert_bytes) / (1 << 30);
     (gib > 0).then_some(gib)
-}
-
-/// `RLIMIT_MEMLOCK` bytes, `None` = unlimited.
-fn memlock_limit() -> Option<u64> {
-    // SAFETY: plain getrlimit(2) with an out-pointer; no invariants.
-    let mut rl = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } != 0 {
-        return None; // cannot read the limit — let the arena backstop decide
-    }
-    (rl.rlim_cur != libc::RLIM_INFINITY).then_some(rl.rlim_cur)
 }
 
 /// mlock preflight, before any weights load: refuse to start when the expert
@@ -1551,16 +1537,24 @@ mod tests {
 
     #[test]
     fn fit_ram_real_target_keeps_default_snapshots() {
-        // 83 GiB free − 4 = 79; pool 63 + staging 3.7 + host 2 = 68.7 → 10.3 left.
+        // 83 GiB free − 4 = 79; pool 63 + host 2 = 65 → 14 left ≥ default.
         let floor = golem_plan::snapshot_bytes(152_630_000, 19_712, 100_000);
-        let (snap, pool) = fit_ram(&glm(), 83 * GIB, &cfg(100_000, 63, None)).unwrap();
+        let off = EngineConfig {
+            prefill_stream: false,
+            ..cfg(100_000, 63, None)
+        };
+        let (snap, pool) = fit_ram(&glm(), 83 * GIB, &off).unwrap();
         assert_eq!((snap, pool), ((2 * GIB).max(2 * floor), 63));
+        // + 11.09 GiB staging ring → 2.91 GiB left: snapshots shrink into it.
+        let (snap, pool) = fit_ram(&glm(), 83 * GIB, &cfg(100_000, 63, None)).unwrap();
+        assert_eq!(pool, 63);
+        assert!(floor <= snap && snap < (2 * GIB).max(2 * floor), "{snap}");
     }
 
     #[test]
     fn fit_ram_shrinks_snapshots_then_pool_and_refuses_below_floor() {
         let floor = golem_plan::snapshot_bytes(152_630_000, 19_712, 100_000);
-        // 70 GiB free: 66 budget − 68.7 fixed+pool → default can't fit; pool gives way.
+        // 70 GiB free: 66 budget − 76.09 fixed+pool → default can't fit; pool gives way.
         let (snap, pool) = fit_ram(&glm(), 70 * GIB, &cfg(100_000, 63, None)).unwrap();
         assert_eq!(snap, floor);
         assert!((1..63).contains(&pool));

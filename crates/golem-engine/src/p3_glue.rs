@@ -30,7 +30,6 @@
 
 use golem_placement::pool::SlotClass;
 use golem_placement::{HALF_LIFE_STEPS, decay_factor};
-use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{
@@ -261,25 +260,16 @@ struct HookState {
     /// layers are renumbered to exclude it.
     dense_lead: u32,
     n_experts: u32,
-    /// `golem_ctx_generation` at registration: every `last_entry` hit is
-    /// tagged with it, so an address recycled across sessions can never hit
-    /// a stale entry.
-    generation: u64,
     /// The live ctx pointer while hooks are registered, else null. Set at
     /// enable; cleared in `SessionHooks::drop` AFTER the unregister-join (so
     /// no callback can read it) and BEFORE the ctx is freed. Read by the
     /// decode thread (copy_done flush) and the publisher thread.
     ctx_ptr: AtomicPtr<raw::golem_ctx>,
-    /// tensor pointer → entry; filled on first callback per tensor (guarded
-    /// by its own mutex, never held across `ensure_batch` — the residency
-    /// shard lock stays leaf-most, §6.6).
-    tensors: Mutex<HashMap<usize, TensorEntry>>,
-    /// Last `entry_for` hit on the decode thread, tagged with the ctx
-    /// generation. C stages a layer's experts back to back on one tensor, so
-    /// this answers nearly every call without the table lock; the tag
-    /// rejects a recycled address left over from a previous session's
-    /// registration. Decode-thread-only writer; mutex for `&self`.
-    last_entry: Mutex<Option<(usize, u64, TensorEntry)>>,
+    /// Registered tensor pointer per `layer * 3 + kind.ordinal()`, 0 until
+    /// first sight passes the cross-checks. Lock-free after registration;
+    /// the table lives in this per-session state, so an address recycled
+    /// from a previous session's ctx can never hit.
+    tensors: Box<[AtomicUsize]>,
     /// `ensure_host_resident` invocations, for the per-1000 slow-path line.
     slow_calls: AtomicUsize,
     /// Cumulative ns spent inside the ensure trampoline's page-in section
@@ -2623,7 +2613,11 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
     // Prefill-stream state (§7.6, ruling R3 kept streaming on): the pinned
     // staging ring + reader thread (GPU-registered with the pool arena below).
     let stream = if stream_enabled {
-        let slot_bytes = geo.n_experts as usize * max_plane_stride as usize;
+        let slot_bytes = usize::try_from(golem_plan::staging_slot_bytes(
+            geo.n_experts,
+            max_plane_stride,
+        ))
+        .map_err(|_| EngineError::PoolInit("staging slot exceeds usize".into()))?;
         let health = store.clone();
         let storage_lost = Box::new(move || {
             health
@@ -2772,13 +2766,8 @@ fn enable_inner(config: &EngineConfig) -> Result<SessionHooks, EngineError> {
         ensure_calls: AtomicUsize::new(0),
         copy_done_calls: AtomicUsize::new(0),
         order_pushes_failed: AtomicUsize::new(0),
-        tensors: Mutex::new(HashMap::new()),
-        last_entry: Mutex::new(None),
+        tensors: (0..3 * n_layers).map(|_| AtomicUsize::new(0)).collect(),
         ctx_ptr: AtomicPtr::new(ctx.as_ptr()),
-        generation: {
-            // SAFETY: FFI query on a live ctx.
-            unsafe { raw::golem_ctx_generation(ctx.as_ptr()) }
-        },
         miss_scratch: Mutex::new(Vec::with_capacity(3 * k.min(geo.n_experts) as usize)),
         evict_scratch: Mutex::new(Vec::with_capacity(geo.n_experts as usize)),
         spare_snapshot: Mutex::new(None),
@@ -3368,6 +3357,7 @@ fn guarded<R>(hook: Hook, body: impl FnOnce() -> R) -> R {
 /// the callback runs strictly inside the registration's lifetime (the C
 /// unregister-join precedes the recovery).
 unsafe fn state_of<'a>(payload: *mut c_void) -> &'a HookState {
+    // SAFETY: the caller contract above keeps the `Arc` allocation live.
     unsafe { &*(payload as *const HookState) }
 }
 
@@ -4065,28 +4055,6 @@ impl HookState {
             return None;
         }
         let key = tensor as usize;
-        {
-            let last = self.last_entry.lock().unwrap_or_else(|e| e.into_inner());
-            // The generation tag rejects a recycled address left over from a
-            // previous session's registration.
-            if let Some((k, tag, entry)) = last.as_ref()
-                && *k == key
-                && *tag == self.generation
-            {
-                return Some(*entry);
-            }
-        }
-        if let Some(&entry) = self
-            .tensors
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            *self.last_entry.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some((key, self.generation, entry));
-            return Some(entry);
-        }
-        // First sight: identify, cross-check, register.
         // SAFETY: `tensor` is a live ggml_tensor owned by the substrate for
         // the callback's duration (ggml-backend.cpp passes the expert weights
         // tensor it is about to read); reading name/ne/nb/data is what the P1
@@ -4094,9 +4062,17 @@ impl HookState {
         let t = unsafe { &*(tensor as *const raw::ggml_tensor) };
         // SAFETY: `t.name` is a NUL-terminated char array inside the live
         // tensor (ggml sets it at tensor creation).
-        let name = unsafe { CStr::from_ptr(t.name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
+        let cname = unsafe { CStr::from_ptr(t.name.as_ptr()) };
+        let name = cname.to_str().unwrap_or("");
+        if let Some(kind) = ExpertKind::from_tensor_name(name)
+            && let Some(layer) = blk_of(name).and_then(|b| b.checked_sub(self.dense_lead))
+            && let Some(slot) = self.tensors.get(layer as usize * 3 + kind.ordinal())
+            && slot.load(Ordering::Acquire) == key
+        {
+            return Some(TensorEntry { layer });
+        }
+        // First sight: identify, cross-check, register.
+        let name = cname.to_string_lossy().into_owned();
 
         let Some(kind) = ExpertKind::from_tensor_name(&name) else {
             return None; // not an expert plane: no-op (upstream behavior)
@@ -4171,12 +4147,7 @@ impl HookState {
         }
 
         let entry = TensorEntry { layer };
-        self.tensors
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, entry);
-        *self.last_entry.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((key, self.generation, entry));
+        self.tensors[layer as usize * 3 + kind.ordinal()].store(key, Ordering::Release);
         tracing::debug!(tensor = %name, layer, ?kind, stride, "P3 tensor registered");
         Some(entry)
     }

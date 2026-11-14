@@ -2153,9 +2153,16 @@ impl SessionInner {
         }
         if let Some(steps) = parity {
             // Pure read of the same row — no decode behavior change.
-            // SAFETY: row idx holds n_vocab logits (as above).
-            let (top1, top2) =
-                unsafe { parity::top2_logits_ith(ctx.as_ptr(), idx, ffi.n_vocab, &self.eog_bias) };
+            // SAFETY: ctx is live and its last decode emitted logits for row
+            // idx (llama.h); a null return would be a broken FFI invariant,
+            // not a model rejection — same precedent as the decode self-check.
+            let ptr = unsafe { raw::llama_get_logits_ith(ctx.as_ptr(), idx) };
+            if ptr.is_null() {
+                panic!("llama_get_logits_ith returned null during parity recording");
+            }
+            // SAFETY: ptr is non-null and valid for n_vocab f32 values (llama.h).
+            let logits = unsafe { std::slice::from_raw_parts(ptr, ffi.n_vocab) };
+            let (top1, top2) = parity::top2_of(logits, &self.eog_bias);
             steps.push(ParityStep {
                 position,
                 token,
@@ -2486,10 +2493,9 @@ pub fn expert_placement() -> ExpertPlacement {
 
 /// Runtime proof of design I2 over the graphs built between `before` and
 /// `after`: every expert `MUL_MAT_ID` on the GPU, and at least one seen (a
-/// zero count would prove nothing). A future opt-in CPU expert-math mode
-/// (§1 O1) would report the CPU count here instead of refusing; the counters are
-/// process-global, so that mode also needs per-session counts if strict and
-/// opted-in sessions can share a process. The window covers graph builds:
+/// zero count would prove nothing). `--cpu-expert-math` (§1 O1) runs leased
+/// experts beside the GPU node, never moving the node, so it stays strict
+/// under that flag too. The window covers graph builds:
 /// a reused graph keeps the placement of the build that produced it. HIP
 /// substrate only (the gate at the call site).
 fn check_experts_on_gpu(
