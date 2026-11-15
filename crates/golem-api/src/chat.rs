@@ -318,9 +318,6 @@ pub struct ModelCard {
     pub created: u64,
     /// Always `golem`.
     pub owned_by: String,
-    /// Display name for clients that show one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
     /// Context window per sequence, in tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<u32>,
@@ -336,6 +333,8 @@ pub struct ModelCard {
 /// Capabilities of one served model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCaps {
-    /// The model thinks and the thinking can be turned off per request.
+    /// The server delivers thinking in `reasoning_content` (`--reasoning
+    /// separate`, one setting for every served model) and it can be turned
+    /// off per request.
     pub reasoning: bool,
 }

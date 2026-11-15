@@ -42,14 +42,15 @@ pub mod dims {
 pub const DEFAULT_SEED: u64 = crate::tiny_moe::DEFAULT_SEED;
 
 /// Generates the fixture under `.test-cache/tiny-deepseek2/` and returns its
-/// path. Safe to call concurrently.
+/// path. Safe to call concurrently. Bump the `-vN` file suffix whenever the
+/// generator changes, or a stale cached file is reused.
 pub fn cached_fixture() -> PathBuf {
     let dir = repo_root().join(".test-cache").join("tiny-deepseek2");
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("tiny-deepseek2-mixed.gguf");
+    let path = dir.join("tiny-deepseek2-mixed-v1.gguf");
     if !path.exists() {
         let tensors = tensors(DEFAULT_SEED);
-        write_gguf_atomic(&path, &kvs(), &tensors);
+        write_gguf_atomic(&path, &kvs(), &tensors).unwrap();
     }
     path
 }
@@ -103,6 +104,8 @@ fn kvs() -> Vec<GgufKv> {
             &a("attention.key_length"),
             u(dims::KV_LORA_RANK + dims::ROPE_DIM),
         ),
+        // Like the real file: the cached latent is KV_LORA_RANK wide, while
+        // value_length_mla is the per-head value width after decompression.
         kv(&a("attention.value_length"), u(dims::KV_LORA_RANK)),
         kv(&a("attention.key_length_mla"), u(dims::KEY_LENGTH_MLA)),
         kv(&a("attention.value_length_mla"), u(dims::VALUE_LENGTH_MLA)),

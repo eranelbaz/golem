@@ -366,13 +366,16 @@ async fn models(State(st): State<AppState>) -> Result<Json<ModelList>, ApiError>
             .iter()
             .enumerate()
             .map(|(i, n)| {
+                debug_assert!(
+                    st.cfg.model_limits.is_empty()
+                        || st.cfg.model_limits.len() == st.cfg.models.len()
+                );
                 let limits = st.cfg.model_limits.get(i);
                 ModelCard {
                     id: n.clone(),
                     object: "model".into(),
                     created: now_secs(),
                     owned_by: "golem".into(),
-                    display_name: None,
                     max_input_tokens: limits.map(|l| l.0),
                     max_tokens: limits.map(|l| l.1),
                     golem: Some(ModelCaps {

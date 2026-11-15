@@ -1504,6 +1504,12 @@ mod tests {
         ]);
         assert_eq!(facts_kv(&ds2, 1, F16, F16).unwrap().kv_per_token, 1_152);
         assert_eq!(facts_kv(&ds2, 1, Q8_0, Q8_0).unwrap().kv_per_token, 612);
+        let ds2_mla = kvs(&[
+            ("attention.head_count_kv", KvVal::Int(1)),
+            ("attention.key_length", KvVal::Int(576)),
+            ("attention.key_length_mla", KvVal::Int(192)),
+        ]);
+        assert_eq!(facts_kv(&ds2_mla, 1, F16, F16).unwrap().kv_per_token, 1_152);
         // deepseek41 (DeepSeek-V4.1-Flash header): only the 4 KV-source
         // layers own compressed rows; the all-SWA raw cache is fixed state.
         let mut ratios = vec![0, 0];

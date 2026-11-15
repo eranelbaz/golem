@@ -711,7 +711,8 @@ mod tests {
     }
 
     /// Tensor names of the real GLM-4.7-Flash deepseek2 GGUF (47 blocks, blk.0
-    /// dense, blk.1..=46 MoE, separate rank-3 expert planes).
+    /// dense, blk.1..=46 MoE, separate rank-3 expert planes). Names are
+    /// transcribed from the published file, not read from one.
     #[test]
     fn deepseek2_real_tensor_names() {
         let moe = [

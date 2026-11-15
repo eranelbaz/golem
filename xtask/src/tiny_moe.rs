@@ -396,16 +396,19 @@ pub(crate) fn write_gguf_atomic(
     path: &std::path::Path,
     kvs: &[GgufKv],
     tensors: &[(GgufTensorMeta, Vec<u8>)],
-) {
+) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension(format!("gguf.{}.tmp", std::process::id()));
-    let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
-    crate::gguf::write_gguf(&mut w, kvs, tensors).unwrap();
-    w.flush().unwrap();
+    let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    crate::gguf::write_gguf(&mut w, kvs, tensors)?;
+    w.flush()?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        assert!(path.exists(), "rename {}: {e}", path.display());
+        if !path.exists() {
+            return Err(e);
+        }
     }
+    Ok(())
 }
 
 pub(crate) fn kv(key: &str, value: GgufValue) -> GgufKv {

@@ -73,7 +73,8 @@ fn cached(name: &str, clamp_exp: Option<f32>) -> PathBuf {
         let tensors = tensors(DEFAULT_SEED);
         for (shard_no, path) in paths.iter().enumerate() {
             let shard: &[_] = if shard_no == 0 { &[] } else { &tensors };
-            write_gguf_atomic(path, &kvs(shard_no as u16, tensors.len(), clamp_exp), shard);
+            write_gguf_atomic(path, &kvs(shard_no as u16, tensors.len(), clamp_exp), shard)
+                .unwrap();
         }
     }
     paths[0].clone()
