@@ -358,6 +358,9 @@ pub(crate) fn resolve_model(
 }
 
 async fn models(State(st): State<AppState>) -> Result<Json<ModelList>, ApiError> {
+    debug_assert!(
+        st.cfg.model_limits.is_empty() || st.cfg.model_limits.len() == st.cfg.models.len()
+    );
     Ok(Json(ModelList {
         object: "list".into(),
         data: st
@@ -366,10 +369,6 @@ async fn models(State(st): State<AppState>) -> Result<Json<ModelList>, ApiError>
             .iter()
             .enumerate()
             .map(|(i, n)| {
-                debug_assert!(
-                    st.cfg.model_limits.is_empty()
-                        || st.cfg.model_limits.len() == st.cfg.models.len()
-                );
                 let limits = st.cfg.model_limits.get(i);
                 ModelCard {
                     id: n.clone(),
