@@ -5,5 +5,6 @@ pub mod parity;
 pub mod parity_compare;
 pub mod replay;
 pub mod shape_moe;
+pub mod tiny_deepseek2;
 pub mod tiny_hybrid;
 pub mod tiny_moe;

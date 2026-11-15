@@ -191,7 +191,8 @@ fn check_expert_counts(experts: &Experts) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// For each suffix, `(ne, ggml_type)` must be identical across all layers.
+/// For each suffix, `ne` must be identical across all layers; `ggml_type` may
+/// differ per layer (mixed-quant files), the pool sizes slots per layer.
 fn check_cross_layer_uniformity(experts: &Experts) -> Result<(), EngineError> {
     for suffix in EXPERT_SUFFIXES {
         let mut layers = experts.values().filter_map(|s| s.get(suffix)).copied();
@@ -199,11 +200,11 @@ fn check_cross_layer_uniformity(experts: &Experts) -> Result<(), EngineError> {
             continue;
         };
         for t in layers {
-            if t.ne != first.ne || t.ggml_type != first.ggml_type {
+            if t.ne != first.ne {
                 return Err(EngineError::UnsupportedModel(format!(
                     "ffn_{suffix}_exps tensors differ across layers: {} has ne = {:?}, \
-                     ggml_type = {}, but {} has ne = {:?}, ggml_type = {}",
-                    first.name, first.ne, first.ggml_type, t.name, t.ne, t.ggml_type
+                     but {} has ne = {:?}",
+                    first.name, first.ne, t.name, t.ne
                 )));
             }
         }
@@ -213,7 +214,7 @@ fn check_cross_layer_uniformity(experts: &Experts) -> Result<(), EngineError> {
 
 /// Runs the subset of the tech-design §4.3 sanity checks against parsed
 /// GGUF metadata: expert-tensor coverage, per-layer expert count, and
-/// cross-layer shape/dtype uniformity. Violations are
+/// cross-layer shape uniformity. Violations are
 /// [`EngineError::UnsupportedModel`] with the offending names and shapes.
 pub fn check(metadata: &GgufMetadata) -> Result<(), EngineError> {
     // The MTP/NextN block is skipped at load and carries its own expert set;
@@ -324,6 +325,13 @@ mod tests {
         assert!(matches!(err, EngineError::UnsupportedModel(_)));
         assert!(err.to_string().contains("ffn_gate_exps"));
         assert!(err.to_string().contains("blk.0") && err.to_string().contains("blk.1"));
+    }
+
+    #[test]
+    fn dtype_mismatch_across_layers_accepted() {
+        let mut m = valid_meta();
+        m.tensors[3].ggml_type = 12;
+        assert!(check(&m).is_ok());
     }
 
     #[test]

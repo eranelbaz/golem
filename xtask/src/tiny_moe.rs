@@ -355,10 +355,57 @@ pub fn generate_with_eos(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Fill {
+pub(crate) enum Fill {
     Ones,
     Zeros,
     Random,
+}
+
+/// Appends an F32 tensor of `dims` filled per `fill` (random in ±0.05).
+pub(crate) fn push_f32(
+    out: &mut Vec<(GgufTensorMeta, Vec<u8>)>,
+    rng: &mut Xorshift,
+    name: String,
+    dims: Vec<u64>,
+    fill: Fill,
+) {
+    let n = dims.iter().product::<u64>() as usize;
+    let data = (0..n)
+        .flat_map(|_| {
+            match fill {
+                Fill::Ones => 1.0f32,
+                Fill::Zeros => 0.0,
+                Fill::Random => rng.next_f32() * 0.1,
+            }
+            .to_le_bytes()
+        })
+        .collect();
+    out.push((
+        GgufTensorMeta {
+            name,
+            dims,
+            ggml_type: golem_gguf::GGML_TYPE_F32,
+        },
+        data,
+    ));
+}
+
+/// Writes a GGUF to `path` via a per-process temp file and rename; a
+/// concurrent generator winning the rename is fine, its bytes are identical.
+pub(crate) fn write_gguf_atomic(
+    path: &std::path::Path,
+    kvs: &[GgufKv],
+    tensors: &[(GgufTensorMeta, Vec<u8>)],
+) {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("gguf.{}.tmp", std::process::id()));
+    let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
+    crate::gguf::write_gguf(&mut w, kvs, tensors).unwrap();
+    w.flush().unwrap();
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        assert!(path.exists(), "rename {}: {e}", path.display());
+    }
 }
 
 pub(crate) fn kv(key: &str, value: GgufValue) -> GgufKv {

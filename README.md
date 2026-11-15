@@ -14,6 +14,7 @@ Supported models:
 |---|---|---|
 | [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) | `glm5next` / `glm5-next` | target, measured |
 | [DeepSeek-V4.1-Flash](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | `deepseek41` | experimental (serves UD-IQ2_XXS; no baseline yet) |
+| [GLM-4.7-Flash](https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF) | `deepseek2` | experimental (lazy expert planes + lookahead patched; exercised only on a synthetic fixture so far; no baseline yet) |
 
 ## Target hardware
 

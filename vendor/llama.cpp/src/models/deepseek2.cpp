@@ -133,8 +133,10 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader & ml) {
             }
 
             // MoE branch
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
-            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, flags);
+            // Golem (design §4.3): routed planes are staged by Golem's pool; no-op unless lazy_mode is ON.
+            const int expert_flags = flags | TENSOR_READ_LAZY;
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, expert_flags);
+            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, expert_flags);
 
             // Shared expert branch
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
@@ -633,6 +635,31 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
+
+        // Golem next-layer routing prediction (design §6.5): staging-only, decode graphs only.
+        const int pred_ahead = n_tokens == 1 ? golem_predict_lookahead(model.golem_ctx) : 0;
+        for (int d = 1; d <= pred_ahead && il + d < n_layer; ++d) {
+            const int t = il + d;
+            if (t < (int) hparams.n_layer_dense_lead) {
+                continue;
+            }
+            const auto & nxt = model.layers[t];
+            if (nxt.ffn_gate_inp == nullptr || nxt.ffn_norm == nullptr) {
+                continue;
+            }
+            ggml_tensor * h = build_norm(ffn_inp, nxt.ffn_norm, nullptr, LLM_NORM_RMS, -1);
+            ggml_tensor * logits = build_lora_mm(nxt.ffn_gate_inp, h);
+            ggml_tensor * probs = hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID
+                ? ggml_sigmoid(ctx0, logits) : ggml_soft_max(ctx0, logits);
+            if (nxt.ffn_exp_probs_b) {
+                probs = ggml_add(ctx0, probs, nxt.ffn_exp_probs_b);
+            }
+            const int k = std::min<int>(n_expert, hparams.n_expert_used() + golem_predict_margin(model.golem_ctx));
+            ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, probs, k));
+            ggml_format_name(pred, "golem_pred-%d-%d", t, il);
+            ggml_set_output(pred);
+            ggml_build_forward_expand(gf, pred);
+        }
 
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);

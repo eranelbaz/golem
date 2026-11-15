@@ -1495,6 +1495,15 @@ mod tests {
                 .for_each(|(k, _)| *k = k.replacen("a.", &format!("{arch}."), 1));
             assert_eq!(facts_kv(&glm5, 1, Q8_0, Q8_0).unwrap().kv_per_token, 1_312);
         }
+        // deepseek2 MLA (GLM-4.7-Flash: 576 K = 512 lora + 64 rope, no indexer):
+        // 576 × 2 = 1,152 B/layer f16, 576 / 32 × 34 = 612 q8_0.
+        let ds2 = kvs(&[
+            ("attention.head_count_kv", KvVal::Int(1)),
+            ("attention.key_length", KvVal::Int(576)),
+            ("attention.key_length_mla", KvVal::Int(256)),
+        ]);
+        assert_eq!(facts_kv(&ds2, 1, F16, F16).unwrap().kv_per_token, 1_152);
+        assert_eq!(facts_kv(&ds2, 1, Q8_0, Q8_0).unwrap().kv_per_token, 612);
         // deepseek41 (DeepSeek-V4.1-Flash header): only the 4 KV-source
         // layers own compressed rows; the all-SWA raw cache is fixed state.
         let mut ratios = vec![0, 0];

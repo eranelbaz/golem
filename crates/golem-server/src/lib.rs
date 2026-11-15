@@ -29,6 +29,9 @@ pub struct ServerConfig {
     /// Served model ids (§8.1), in the worker's model order: a request must
     /// name one, `/v1/models` lists them, `/health` reports the loaded one.
     pub models: Vec<String>,
+    /// `(n_ctx, n_predict)` per entry of `models`, same order; advertised on
+    /// `/v1/models`. Shorter than `models` leaves the rest unadvertised.
+    pub model_limits: Vec<(u32, u32)>,
     /// When set, `/v1/*` and `/metrics` require `Authorization: Bearer <key>`
     /// (`/health` stays open).
     pub api_key: Option<String>,
@@ -434,6 +437,7 @@ pub mod test_support {
             host: IpAddr::from([127, 0, 0, 1]),
             port: 0,
             models: vec!["tiny-moe".into()],
+            model_limits: Vec::new(),
             api_key: None,
             reasoning: ReasoningMode::Separate,
             // Shutdown tests exercise the cancel path; drain tests set it.

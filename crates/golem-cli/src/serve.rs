@@ -533,6 +533,8 @@ pub fn serve(
         .filter(|m| *m > 0)
         .map(|m| std::time::Duration::from_secs(m * 60));
     let coresident = base.get(None, "coresident", false)?;
+    let model_limits: Vec<(u32, u32)> =
+        models.iter().map(|(_, c)| (c.n_ctx, c.n_predict)).collect();
     let worker = spawn_worker_models(models, idle_unload, preload, coresident, sinks)?;
     tracing::info!(
         device_cache_experts = worker.device_cache_experts,
@@ -559,6 +561,7 @@ pub fn serve(
         models: std::iter::once(model_name)
             .chain(extra.into_iter().map(|(n, _, _)| n))
             .collect(),
+        model_limits,
         api_key,
         drain_grace: golem_server::DRAIN_GRACE,
         reasoning: match l.reasoning {

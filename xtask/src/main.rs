@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 use std::io::Write;
 
-use xtask::{parity, parity_compare, replay, shape_moe, tiny_hybrid, tiny_moe};
+use xtask::{parity, parity_compare, replay, shape_moe, tiny_deepseek2, tiny_hybrid, tiny_moe};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -16,6 +16,7 @@ fn main() {
             }
         }
         Some("gen-tiny-hybrid") => println!("{}", tiny_hybrid::cached_fixture().display()),
+        Some("gen-tiny-deepseek2") => println!("{}", tiny_deepseek2::cached_fixture().display()),
         Some("parity") => parity::run(args.collect()),
         Some("parity-compare") => parity_compare::run(args.collect()),
         Some("replay") => replay::run(args.collect()),
