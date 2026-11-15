@@ -4,15 +4,14 @@
 //! follow the vendored `test-llama-archs` glm5next fixture; n_embd = 256 so
 //! the expert planes can be K-quants (Q4_K/Q5_K/Q6_K: 144/176/210 B rows).
 //!
-//! Not matched to GLM-5.3-Flash UD-Q4_K_XL (45 layers, 288 experts, 6 shards):
+//! Not matched to GLM-5.3-Flash (45 layers, 288 experts, 6 shards):
 //! 8 experts × 36–53 KB planes keep generation and CPU decode fast.
 
-use std::io::Write;
 use std::path::PathBuf;
 
-use crate::gguf::{self, GgufKv, GgufTensorMeta, GgufValue};
-use crate::tiny_moe::{Xorshift, d, kv, repo_root, token_table};
-use golem_gguf::{GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K};
+use crate::gguf::{GgufKv, GgufTensorMeta, GgufValue};
+use crate::tiny_moe::{Fill, Xorshift, d, kv, push_f32, repo_root, token_table, write_gguf_atomic};
+use golem_gguf::{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K};
 
 pub mod dims {
     pub const N_VOCAB: u32 = 320;
@@ -49,7 +48,7 @@ pub const DEFAULT_SEED: u64 = crate::tiny_moe::DEFAULT_SEED;
 
 const N_SHARDS: u16 = 2;
 /// Expert plane types (gate, up, down), uniform across layers.
-const EXPERT_TYPES: [u32; 3] = [GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K];
+pub(crate) const EXPERT_TYPES: [u32; 3] = [GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K];
 
 /// Generates the split fixture under `.test-cache/tiny-hybrid/` and returns
 /// the first shard (the path llama.cpp loads). Safe to call concurrently.
@@ -74,20 +73,8 @@ fn cached(name: &str, clamp_exp: Option<f32>) -> PathBuf {
         let tensors = tensors(DEFAULT_SEED);
         for (shard_no, path) in paths.iter().enumerate() {
             let shard: &[_] = if shard_no == 0 { &[] } else { &tensors };
-            let tmp = path.with_extension(format!("gguf.{}.tmp", std::process::id()));
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
-            gguf::write_gguf(
-                &mut w,
-                &kvs(shard_no as u16, tensors.len(), clamp_exp),
-                shard,
-            )
-            .unwrap();
-            w.flush().unwrap();
-            // A concurrent generator may have won the rename; its bytes are identical.
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                let _ = std::fs::remove_file(&tmp);
-                assert!(path.exists(), "rename {}: {e}", path.display());
-            }
+            write_gguf_atomic(path, &kvs(shard_no as u16, tensors.len(), clamp_exp), shard)
+                .unwrap();
         }
     }
     paths[0].clone()
@@ -168,13 +155,6 @@ fn kvs(shard_no: u16, n_tensors: usize, clamp_exp: Option<f32>) -> Vec<GgufKv> {
     out
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fill {
-    Ones,
-    Zeros,
-    Random,
-}
-
 /// f16 1e-3: the K-quant super-block scales, small so dequantized weights
 /// stay near ±1.
 const QUANT_SCALE_F16: [u8; 2] = 0x1419u16.to_le_bytes();
@@ -183,27 +163,8 @@ fn tensors(seed: u64) -> Vec<(GgufTensorMeta, Vec<u8>)> {
     use dims::*;
     let mut rng = Xorshift::new(seed);
     let mut out = Vec::new();
-    let mut push = |name: String, dims: Vec<u64>, fill: Fill| {
-        let n = dims.iter().product::<u64>() as usize;
-        let data = (0..n)
-            .flat_map(|_| {
-                match fill {
-                    Fill::Ones => 1.0f32,
-                    Fill::Zeros => 0.0,
-                    Fill::Random => rng.next_f32() * 0.1,
-                }
-                .to_le_bytes()
-            })
-            .collect();
-        out.push((
-            GgufTensorMeta {
-                name,
-                dims,
-                ggml_type: GGML_TYPE_F32,
-            },
-            data,
-        ));
-    };
+    let mut push =
+        |name: String, dims: Vec<u64>, fill: Fill| push_f32(&mut out, &mut rng, name, dims, fill);
     let d_inner = KDA_HEAD_DIM * N_HEAD;
     let hc_mix = (2 + HC_MULT) * HC_MULT;
 
@@ -340,7 +301,7 @@ fn tensors(seed: u64) -> Vec<(GgufTensorMeta, Vec<u8>)> {
 /// Random K-quant blocks with every f16 super-block scale (`d`, and `dmin`
 /// where present) pinned to [`QUANT_SCALE_F16`]: random scale bits would
 /// include f16 Inf/NaN.
-fn quant_plane(rng: &mut Xorshift, ggml_type: u32, dims: &[u64]) -> Vec<u8> {
+pub(crate) fn quant_plane(rng: &mut Xorshift, ggml_type: u32, dims: &[u64]) -> Vec<u8> {
     let (blck, size) = golem_gguf::ggml_type_block(ggml_type).unwrap();
     let n_blocks = dims.iter().product::<u64>() / blck;
     let scale_offsets: &[usize] = match ggml_type {

@@ -318,4 +318,23 @@ pub struct ModelCard {
     pub created: u64,
     /// Always `golem`.
     pub owned_by: String,
+    /// Context window per sequence, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u32>,
+    /// Default generation cap, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Capabilities advertised to clients (`reasoning`: thinking blocks are
+    /// delivered separately and `thinking: disabled` turns them off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golem: Option<ModelCaps>,
+}
+
+/// Capabilities of one served model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelCaps {
+    /// The server delivers thinking in `reasoning_content` (`--reasoning
+    /// separate`, one setting for every served model) and it can be turned
+    /// off per request.
+    pub reasoning: bool,
 }

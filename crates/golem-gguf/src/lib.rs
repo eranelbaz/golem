@@ -710,6 +710,56 @@ mod tests {
         }
     }
 
+    /// Tensor names of the real GLM-4.7-Flash deepseek2 GGUF (47 blocks, blk.0
+    /// dense, blk.1..=46 MoE, separate rank-3 expert planes). Names are
+    /// transcribed from the published file, not read from one.
+    #[test]
+    fn deepseek2_real_tensor_names() {
+        let moe = [
+            "attn_k_b.weight",
+            "attn_kv_a_mqa.weight",
+            "attn_kv_a_norm.weight",
+            "attn_norm.weight",
+            "attn_output.weight",
+            "attn_q_a.weight",
+            "attn_q_a_norm.weight",
+            "attn_q_b.weight",
+            "attn_v_b.weight",
+            "exp_probs_b.bias",
+            "ffn_down_exps.weight",
+            "ffn_down_shexp.weight",
+            "ffn_gate_exps.weight",
+            "ffn_gate_inp.weight",
+            "ffn_gate_shexp.weight",
+            "ffn_norm.weight",
+            "ffn_up_exps.weight",
+            "ffn_up_shexp.weight",
+        ];
+        let mut planes = 0;
+        for l in 1..=46 {
+            for s in moe {
+                let got = ExpertKind::from_tensor_name(&format!("blk.{l}.{s}"));
+                let want = ExpertKind::ALL
+                    .into_iter()
+                    .find(|k| s == format!("{}.weight", k.stem()));
+                assert_eq!(got, want, "blk.{l}.{s}");
+                planes += usize::from(got.is_some());
+            }
+        }
+        assert_eq!(planes, 46 * 3);
+        for s in [
+            "ffn_down.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_norm.weight",
+        ] {
+            assert_eq!(ExpertKind::from_tensor_name(&format!("blk.0.{s}")), None);
+        }
+        for s in ["token_embd.weight", "output_norm.weight", "output.weight"] {
+            assert_eq!(ExpertKind::from_tensor_name(s), None);
+        }
+    }
+
     #[test]
     fn expert_name_matcher_exact_stem_and_weight() {
         assert_eq!(

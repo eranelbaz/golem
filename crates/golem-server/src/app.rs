@@ -12,7 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use golem_api::chat::{Choice, FinishReason, ModelCard, ToolCall};
+use golem_api::chat::{Choice, FinishReason, ModelCaps, ModelCard, ToolCall};
 use golem_api::{
     ChatCompletionResponse, ChatMessage, ErrorCode, ErrorEnvelope, MessageContent, ModelList, Usage,
 };
@@ -358,17 +358,29 @@ pub(crate) fn resolve_model(
 }
 
 async fn models(State(st): State<AppState>) -> Result<Json<ModelList>, ApiError> {
+    debug_assert!(
+        st.cfg.model_limits.is_empty() || st.cfg.model_limits.len() == st.cfg.models.len()
+    );
     Ok(Json(ModelList {
         object: "list".into(),
         data: st
             .cfg
             .models
             .iter()
-            .map(|n| ModelCard {
-                id: n.clone(),
-                object: "model".into(),
-                created: now_secs(),
-                owned_by: "golem".into(),
+            .enumerate()
+            .map(|(i, n)| {
+                let limits = st.cfg.model_limits.get(i);
+                ModelCard {
+                    id: n.clone(),
+                    object: "model".into(),
+                    created: now_secs(),
+                    owned_by: "golem".into(),
+                    max_input_tokens: limits.map(|l| l.0),
+                    max_tokens: limits.map(|l| l.1),
+                    golem: Some(ModelCaps {
+                        reasoning: st.cfg.reasoning == crate::ReasoningMode::Separate,
+                    }),
+                }
             })
             .collect(),
     }))
@@ -513,6 +525,35 @@ pub(crate) mod tests {
             Event::Reasoning("plan".into()),
             Event::Text("answer".into()),
         ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn models_advertise_limits_and_reasoning() {
+        use tower::ServiceExt;
+        let mut cfg = crate::test_support::test_server_config();
+        cfg.model_limits = vec![(32768, 8192)];
+        let (jobs, _rx) = std::sync::mpsc::channel::<Job>();
+        let health = Arc::new(HealthState::new());
+        let app = router(AppState {
+            cfg: Arc::new(cfg),
+            jobs,
+            health,
+        });
+        let r = app
+            .oneshot(
+                axum::http::Request::get("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap())
+                .unwrap();
+        let m = &v["data"][0];
+        assert_eq!(m["max_input_tokens"], 32768);
+        assert_eq!(m["max_tokens"], 8192);
+        assert_eq!(m["golem"]["reasoning"], true);
     }
 
     #[tokio::test(flavor = "multi_thread")]
